@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+/u60-datad
+/u60-datad.stripped
+
+# transient helper scripts
+scripts/_*.sh
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
