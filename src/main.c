@@ -10,6 +10,7 @@
  */
 #include "json.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -25,8 +26,23 @@
 #endif
 #define STATE_FILE STATE_DIR "/state.json"
 #define STATE_TMP  STATE_DIR "/state.json.tmp"
+#define LOG_FILE   "/data/logfs/key.log"
 
 #define RAW_MAX 8192
+#define LOG_RAW_MAX 65536
+#define LOG_TAIL_LINES 1000
+
+struct qos_info {
+    int qci;
+    int ambr_dl_raw;
+    int ambr_ul_raw;
+    int ambr_dl_unit;
+    int ambr_ul_unit;
+    double ambr_dl;
+    double ambr_ul;
+    int have_qci;
+    int have_ambr;
+};
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -80,6 +96,11 @@ static void emit_int(struct buf *b, const char *key, const char *src, const char
     bappend(b, "\"%s\":%ld", key, json_get_int(src, srckey, def));
 }
 
+static void emit_double(struct buf *b, const char *key, double val)
+{
+    bappend(b, "\"%s\":%.3f", key, val);
+}
+
 static long mem_used_pct(const char *sysinfo)
 {
     char mem[1024];
@@ -90,11 +111,160 @@ static long mem_used_pct(const char *sysinfo)
     return (total - avail) * 100 / total;
 }
 
+static double ambr_unit_to_mbps(int unit)
+{
+    switch (unit) {
+    case 0: return 1.0 / 1000.0 / 1000.0; /* bps */
+    case 1: return 1.0 / 1000.0;          /* Kbps */
+    case 2: return 4.0 / 1000.0;          /* 4 Kbps */
+    case 3: return 16.0 / 1000.0;         /* 16 Kbps */
+    case 4: return 64.0 / 1000.0;         /* 64 Kbps */
+    case 5: return 256.0 / 1000.0;        /* 256 Kbps */
+    case 6: return 1.0;                   /* Mbps */
+    default: return 0.0;
+    }
+}
+
+/* Find the last `lines` lines of a file and copy them into `out`. */
+static int read_log_tail(const char *path, size_t lines, char *out, size_t outlen)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { out[0] = 0; return -1; }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        out[0] = 0;
+        return -1;
+    }
+
+    long end = ftell(fp);
+    if (end <= 0) {
+        fclose(fp);
+        out[0] = 0;
+        return -1;
+    }
+
+    long pos = end;
+    long start = 0;
+    size_t seen = 0;
+    char blk[4096];
+
+    while (pos > 0 && seen <= lines) {
+        size_t want = (pos >= (long)sizeof blk) ? sizeof blk : (size_t)pos;
+        pos -= (long)want;
+
+        if (fseek(fp, pos, SEEK_SET) != 0) break;
+        size_t got = fread(blk, 1, want, fp);
+        if (got == 0) break;
+
+        for (long i = (long)got - 1; i >= 0; i--) {
+            if (blk[i] == '\n') {
+                seen++;
+                if (seen > lines) {
+                    start = pos + i + 1;
+                    goto found_start;
+                }
+            }
+        }
+    }
+
+found_start:
+    if (start < 0) start = 0;
+    if (start > end) start = end;
+
+    long tail_len = end - start;
+    if (tail_len <= 0) {
+        fclose(fp);
+        out[0] = 0;
+        return -1;
+    }
+
+    if ((size_t)tail_len >= outlen) {
+        start = end - (long)(outlen - 1);
+        tail_len = end - start;
+    }
+
+    if (fseek(fp, start, SEEK_SET) != 0) {
+        fclose(fp);
+        out[0] = 0;
+        return -1;
+    }
+
+    size_t n = fread(out, 1, (size_t)tail_len, fp);
+    out[n] = 0;
+    fclose(fp);
+    return n > 0 ? 0 : -1;
+}
+
+static int line_get_int(const char *line, const char *key, int *out)
+{
+    const char *p = strstr(line, key);
+    if (!p) return 0;
+
+    p += strlen(key);
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '=') return 0;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    char *end;
+    long v = strtol(p, &end, 10);
+    if (end == p) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+static void parse_qos_log(char *logbuf, struct qos_info *qos)
+{
+    memset(qos, 0, sizeof *qos);
+
+    char *line = logbuf;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next) *next = 0;
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\r') line[len - 1] = 0;
+
+        if (!qos->have_qci && strstr(line, "[DATA]") && strstr(line, "qci")) {
+            int qci;
+            if (line_get_int(line, "qci", &qci)) {
+                qos->qci = qci;
+                qos->have_qci = 1;
+            }
+        } else if (qos->have_qci && strstr(line, "[DATA]") && strstr(line, "qci")) {
+            int qci;
+            if (line_get_int(line, "qci", &qci))
+                qos->qci = qci;
+        }
+
+        {
+            int dl, dl_unit, ul, ul_unit;
+            if (line_get_int(line, "session_ambr_dl", &dl) &&
+                line_get_int(line, "session_ambr_dl_unit", &dl_unit) &&
+                line_get_int(line, "session_ambr_ul", &ul) &&
+                line_get_int(line, "session_ambr_ul_unit", &ul_unit)) {
+                qos->ambr_dl_raw = dl;
+                qos->ambr_dl_unit = dl_unit;
+                qos->ambr_ul_raw = ul;
+                qos->ambr_ul_unit = ul_unit;
+                qos->ambr_dl = (double)dl * ambr_unit_to_mbps(dl_unit);
+                qos->ambr_ul = (double)ul * ambr_unit_to_mbps(ul_unit);
+                qos->have_ambr = 1;
+            }
+        }
+
+        if (!next) break;
+        line = next + 1;
+    }
+}
+
 /* Poll everything and build the unified snapshot into `out`. */
 static void build_snapshot(char *out, size_t outlen, int with_board, const char *board_cache)
 {
     char net[RAW_MAX], batt[RAW_MAX], chg[RAW_MAX], therm[1024];
     char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048];
+    static char logtail[LOG_RAW_MAX];
+    struct qos_info qos;
 
     run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
     run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
@@ -106,6 +276,10 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     run_ubus("zwrt_data", "get_wwandst",
              "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
     run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
+    if (read_log_tail(LOG_FILE, LOG_TAIL_LINES, logtail, sizeof logtail) == 0)
+        parse_qos_log(logtail, &qos);
+    else
+        memset(&qos, 0, sizeof qos);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -162,6 +336,17 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "rx_bytes", traf, "real_rx_bytes", 0);         bappend(&b, ",");
     emit_int(&b, "tx_bytes", traf, "real_tx_bytes", 0);         bappend(&b, ",");
     emit_int(&b, "session_time", traf, "real_time", 0);
+    bappend(&b, "},");
+
+    /* qos: parsed from the tail of key.log. */
+    bappend(&b, "\"qos\":{");
+    bappend(&b, "\"qci\":%d,", qos.have_qci ? qos.qci : 0);
+    emit_double(&b, "ambr_dl", qos.have_ambr ? qos.ambr_dl : 0.0); bappend(&b, ",");
+    emit_double(&b, "ambr_ul", qos.have_ambr ? qos.ambr_ul : 0.0); bappend(&b, ",");
+    bappend(&b, "\"ambr_dl_raw\":%d,", qos.have_ambr ? qos.ambr_dl_raw : 0);
+    bappend(&b, "\"ambr_ul_raw\":%d,", qos.have_ambr ? qos.ambr_ul_raw : 0);
+    bappend(&b, "\"ambr_dl_unit\":%d,", qos.have_ambr ? qos.ambr_dl_unit : 0);
+    bappend(&b, "\"ambr_ul_unit\":%d", qos.have_ambr ? qos.ambr_ul_unit : 0);
     bappend(&b, "},");
 
     /* system */
