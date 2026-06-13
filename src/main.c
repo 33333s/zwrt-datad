@@ -65,6 +65,21 @@ static int run_ubus(const char *svc, const char *method, const char *args,
     return n > 0 ? 0 : -1;
 }
 
+/* Read a single uci value via `uci get`. Empty string on failure. */
+static void uci_get(const char *key, char *out, size_t outlen)
+{
+    char cmd[160];
+    snprintf(cmd, sizeof cmd, "uci -q get %s 2>/dev/null", key);
+    out[0] = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return;
+    if (fgets(out, outlen, fp)) {
+        size_t n = strlen(out);
+        while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+    }
+    pclose(fp);
+}
+
 /* ---- append helpers for building the snapshot ---- */
 struct buf { char *p; size_t cap; size_t len; };
 
@@ -99,6 +114,18 @@ static void emit_int(struct buf *b, const char *key, const char *src, const char
 static void emit_double(struct buf *b, const char *key, double val)
 {
     bappend(b, "\"%s\":%.3f", key, val);
+}
+
+/* Emit "key":"<v>" from a raw value (not from a JSON src) with quote escaping. */
+static void emit_str_val(struct buf *b, const char *key, const char *v)
+{
+    bappend(b, "\"%s\":\"", key);
+    for (const char *c = v; *c; c++) {
+        if (*c == '"' || *c == '\\') bappend(b, "\\%c", *c);
+        else if ((unsigned char)*c < 0x20) bappend(b, " ");
+        else bappend(b, "%c", *c);
+    }
+    bappend(b, "\"");
 }
 
 static long mem_used_pct(const char *sysinfo)
@@ -262,7 +289,7 @@ static void parse_qos_log(char *logbuf, struct qos_info *qos)
 static void build_snapshot(char *out, size_t outlen, int with_board, const char *board_cache)
 {
     char net[RAW_MAX], batt[RAW_MAX], chg[RAW_MAX], therm[1024];
-    char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048];
+    char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024];
     static char logtail[LOG_RAW_MAX];
     struct qos_info qos;
 
@@ -276,6 +303,7 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     run_ubus("zwrt_data", "get_wwandst",
              "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
     run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
+    run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
     if (read_log_tail(LOG_FILE, LOG_TAIL_LINES, logtail, sizeof logtail) == 0)
         parse_qos_log(logtail, &qos);
     else
@@ -305,6 +333,9 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "nr_cell_id", net, "nr5g_cell_id", 0); bappend(&b, ",");
     emit_int(&b, "nr_channel", net, "nr5g_action_channel", 0); bappend(&b, ",");
     emit_str(&b, "nr_bw", net, "nr5g_bandwidth");    bappend(&b, ",");
+    /* CA descriptors: ';'-separated carriers, ','-separated fields. Passthrough. */
+    emit_str(&b, "nrca", net, "nrca");               bappend(&b, ",");
+    emit_str(&b, "lteca", net, "lteca");             bappend(&b, ",");
     emit_str(&b, "wan_status", rstat, "current_wan_status");
     bappend(&b, "},");
 
@@ -327,6 +358,20 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "lan", rnum, "lan_num", 0);
     bappend(&b, "},");
 
+    /* main WiFi (2.4G/5G share one SSID). Key name is "wlan" not "wifi" so the
+     * consumer's lookup doesn't collide with clients.wifi. */
+    {
+        char ssid[128], wkey[128], enc[64];
+        uci_get("wireless.main_2g.ssid", ssid, sizeof ssid);
+        uci_get("wireless.main_2g.key", wkey, sizeof wkey);
+        uci_get("wireless.main_2g.encryption", enc, sizeof enc);
+        bappend(&b, "\"wlan\":{");
+        emit_str_val(&b, "ssid", ssid); bappend(&b, ",");
+        emit_str_val(&b, "key", wkey);  bappend(&b, ",");
+        emit_str_val(&b, "enc", enc);
+        bappend(&b, "},");
+    }
+
     /* traffic: realtime session counters + speeds (bytes/s). */
     bappend(&b, "\"traffic\":{");
     emit_int(&b, "rx_speed", traf, "real_rx_speed", 0);         bappend(&b, ",");
@@ -346,7 +391,8 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     bappend(&b, "\"ambr_dl_raw\":%d,", qos.have_ambr ? qos.ambr_dl_raw : 0);
     bappend(&b, "\"ambr_ul_raw\":%d,", qos.have_ambr ? qos.ambr_ul_raw : 0);
     bappend(&b, "\"ambr_dl_unit\":%d,", qos.have_ambr ? qos.ambr_dl_unit : 0);
-    bappend(&b, "\"ambr_ul_unit\":%d", qos.have_ambr ? qos.ambr_ul_unit : 0);
+    bappend(&b, "\"ambr_ul_unit\":%d,", qos.have_ambr ? qos.ambr_ul_unit : 0);
+    emit_str(&b, "usb_mode", usb, "mode");
     bappend(&b, "},");
 
     /* system */

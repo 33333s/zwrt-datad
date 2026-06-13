@@ -33,7 +33,14 @@ Consumers read this file. They must not call `ubus` directly.
     "nr_cell_id": 0,
     "nr_channel": 0,
     "nr_bw": "100MHz",
+    "nrca": "0,273,1,41,504990,100,0,-140.0,-43.0,-23.0,-120.0;",
+    "lteca": "",
     "wan_status": "ipv4_ipv6_connected"
+  },
+  "wlan": {
+    "ssid": "MyWiFi",
+    "key": "password123",
+    "enc": "sae-mixed"
   },
   "battery": {
     "percent": 66,
@@ -66,7 +73,8 @@ Consumers read this file. They must not call `ubus` directly.
     "ambr_dl_raw": 300,
     "ambr_ul_raw": 100,
     "ambr_dl_unit": 6,
-    "ambr_ul_unit": 6
+    "ambr_ul_unit": 6,
+    "usb_mode": "debug"
   },
   "system": {
     "uptime": 11202,
@@ -84,7 +92,10 @@ Consumers read this file. They must not call `ubus` directly.
 | snapshot | source |
 |----------|--------|
 | `net.*` | `zte_nwinfo_api nwinfo_get_netinfo` |
+| `net.nrca` / `net.lteca` | `zte_nwinfo_api nwinfo_get_netinfo`（载波聚合描述符，原样透传） |
 | `net.wan_status` | `zwrt_router.api router_get_status_no_auth` |
+| `wlan.*` | `uci get wireless.main_2g.{ssid,key,encryption}` |
+| `qos.usb_mode` | `zwrt_bsp.usb list`（`mode`：`debug`=ADB 开，`user`=ADB 关） |
 | `battery.*` | `zwrt_bsp.battery list` |
 | `battery.charging/charger_*` | `zwrt_bsp.charger list` |
 | `clients.*` | `zwrt_router.api router_get_user_list_num` |
@@ -99,3 +110,6 @@ Consumers read this file. They must not call `ubus` directly.
 - `traffic` is realtime session data from `type:1`.
 - `qos.ambr_*` is normalized to Mbps.
 - `qos.ambr_*_raw` plus `qos.ambr_*_unit` are kept so consumers do not need to duplicate the vendor unit table.
+- `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
+- WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
+- `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
