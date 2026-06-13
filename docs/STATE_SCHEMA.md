@@ -55,7 +55,11 @@ Consumers read this file. They must not call `ubus` directly.
     "time_to_full": 390,
     "charging": 1,
     "charger_connect": 1,
-    "charger_type": 4
+    "charger_type": 4,
+    "chg_uv": 4794000,
+    "chg_ua": 456000,
+    "bat_uv": 4502765,
+    "bat_ua": 59327
   },
   "clients": {
     "total": 0,
@@ -111,6 +115,8 @@ Consumers read this file. They must not call `ubus` directly.
 | `qos.usb_mode` | `zwrt_bsp.usb list`（`mode`：`debug`=ADB 开，`user`=ADB 关） |
 | `battery.*` | `zwrt_bsp.battery list` |
 | `battery.charging/charger_*` | `zwrt_bsp.charger list` |
+| `battery.chg_uv/chg_ua` | `/sys/class/power_supply/usb/voltage_now`、`current_now`（充电器输入 µV/µA） |
+| `battery.bat_uv/bat_ua` | `/sys/class/power_supply/battery/voltage_now`、`current_now`（电池 µV/µA） |
 | `clients.total/wifi/lan` | `zwrt_router.api router_get_user_list_num` |
 | `clients.list` | `/tmp/dhcp.leases`（每行 `expiry mac ip name clientid`） |
 | `nfc.switch` | `zwrt_nfc zwrt_nfc_wifi_get`（1=开） |
