@@ -138,6 +138,17 @@ static long mem_used_pct(const char *sysinfo)
     return (total - avail) * 100 / total;
 }
 
+/* Read a single integer from a sysfs file (0 on failure). */
+static long read_long_file(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    long v = 0;
+    if (fscanf(fp, "%ld", &v) != 1) v = 0;
+    fclose(fp);
+    return v;
+}
+
 /* Instantaneous CPU usage % from /proc/stat (delta since the previous call). */
 static long cpu_usage_pct(void)
 {
@@ -423,7 +434,13 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "time_to_full", batt, "battery_time_to_full", -1); bappend(&b, ",");
     emit_int(&b, "charging", chg, "charge_status", 0);        bappend(&b, ",");
     emit_int(&b, "charger_connect", chg, "charger_connect", 0); bappend(&b, ",");
-    emit_int(&b, "charger_type", chg, "charger_type", 0);
+    emit_int(&b, "charger_type", chg, "charger_type", 0);        bappend(&b, ",");
+    /* voltage/current from power_supply sysfs (µV / µA). chg_* = charger input
+     * (usb), bat_* = battery; UI computes V, mA and charge/discharge power. */
+    bappend(&b, "\"chg_uv\":%ld,", read_long_file("/sys/class/power_supply/usb/voltage_now"));
+    bappend(&b, "\"chg_ua\":%ld,", read_long_file("/sys/class/power_supply/usb/current_now"));
+    bappend(&b, "\"bat_uv\":%ld,", read_long_file("/sys/class/power_supply/battery/voltage_now"));
+    bappend(&b, "\"bat_ua\":%ld",  read_long_file("/sys/class/power_supply/battery/current_now"));
     bappend(&b, "},");
 
     /* connected clients (count + per-device list from DHCP leases) */
