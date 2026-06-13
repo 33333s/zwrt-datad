@@ -406,6 +406,11 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     /* CA descriptors: ';'-separated carriers, ','-separated fields. Passthrough. */
     emit_str(&b, "nrca", net, "nrca");               bappend(&b, ",");
     emit_str(&b, "lteca", net, "lteca");             bappend(&b, ",");
+    /* network selection + band-lock (available/current bands, comma lists) */
+    emit_str(&b, "net_select", net, "net_select");   bappend(&b, ",");
+    emit_str(&b, "sa_bands", net, "nr5g_sa_band_lock");   bappend(&b, ",");
+    emit_str(&b, "nsa_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
+    emit_str(&b, "lte_bands", net, "lte_band");      bappend(&b, ",");
     emit_str(&b, "wan_status", rstat, "current_wan_status");
     bappend(&b, "},");
 
@@ -495,6 +500,10 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "cpu_temp", therm, "cpuss_temp", 0); bappend(&b, ",");
     bappend(&b, "\"cpu_usage\":%ld,", cpu_usage_pct());
     bappend(&b, "\"mem_used_pct\":%ld,", mem_used_pct(sysinfo));
+    { char mem[1024]; long tot = 0, av = 0;
+      if (json_get(sysinfo, "memory", mem, sizeof mem)) {
+          tot = json_get_int(mem, "total", 0); av = json_get_int(mem, "available", 0); }
+      bappend(&b, "\"mem_total\":%ld,\"mem_avail\":%ld,", tot, av); }
     emit_str_val(&b, "sw_version", s_swver); bappend(&b, ",");
     emit_str_val(&b, "imei", s_imei);        bappend(&b, ",");
     if (with_board) {
