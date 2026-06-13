@@ -29,8 +29,8 @@
 #define LOG_FILE   "/data/logfs/key.log"
 
 #define RAW_MAX 8192
-#define LOG_RAW_MAX 65536
-#define LOG_TAIL_LINES 1000
+#define LOG_RAW_MAX (512 * 1024)
+#define LOG_TAIL_LINES 6000
 
 struct qos_info {
     int qci;
@@ -136,6 +136,53 @@ static long mem_used_pct(const char *sysinfo)
     long avail = json_get_int(mem, "available", 0);
     if (total <= 0) return -1;
     return (total - avail) * 100 / total;
+}
+
+/* Instantaneous CPU usage % from /proc/stat (delta since the previous call). */
+static long cpu_usage_pct(void)
+{
+    static unsigned long long prev_idle = 0, prev_total = 0;
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return -1;
+    char lbl[8];
+    unsigned long long u = 0, n = 0, s = 0, i = 0, io = 0, ir = 0, si = 0, st = 0;
+    int got = fscanf(fp, "%7s %llu %llu %llu %llu %llu %llu %llu %llu",
+                     lbl, &u, &n, &s, &i, &io, &ir, &si, &st);
+    fclose(fp);
+    if (got < 5) return -1;
+    unsigned long long idle = i + io;
+    unsigned long long total = u + n + s + i + io + ir + si + st;
+    unsigned long long dt = total - prev_total, di = idle - prev_idle;
+    long pct = (prev_total && dt) ? (long)((dt - di) * 100 / dt) : -1;
+    prev_idle = idle; prev_total = total;
+    return pct;
+}
+
+/* Emit "list":[{name,ip,mac},...] of DHCP leases (current LAN devices). */
+static void emit_client_list(struct buf *b)
+{
+    bappend(b, "\"list\":[");
+    FILE *fp = fopen("/tmp/dhcp.leases", "r");
+    int n = 0;
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof line, fp) && n < 32) {
+            /* format: <expiry> <mac> <ip> <name> <clientid> */
+            char mac[32] = "", ip[48] = "", name[80] = "-";
+            if (sscanf(line, "%*s %31s %47s %79s", mac, ip, name) >= 2) {
+                if (!name[0] || (name[0] == '*' && !name[1])) strcpy(name, "未命名");
+                if (n) bappend(b, ",");
+                bappend(b, "{");
+                emit_str_val(b, "name", name); bappend(b, ",");
+                emit_str_val(b, "ip", ip);     bappend(b, ",");
+                emit_str_val(b, "mac", mac);
+                bappend(b, "}");
+                n++;
+            }
+        }
+        fclose(fp);
+    }
+    bappend(b, "]");
 }
 
 static double ambr_unit_to_mbps(int unit)
@@ -289,8 +336,9 @@ static void parse_qos_log(char *logbuf, struct qos_info *qos)
 static void build_snapshot(char *out, size_t outlen, int with_board, const char *board_cache)
 {
     char net[RAW_MAX], batt[RAW_MAX], chg[RAW_MAX], therm[1024];
-    char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024];
+    char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024], nfc[512];
     static char logtail[LOG_RAW_MAX];
+    static char s_imei[32] = "", s_swver[80] = "";   /* static: fetch once */
     struct qos_info qos;
 
     run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
@@ -304,10 +352,32 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
              "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
     run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
     run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
+    run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
     if (read_log_tail(LOG_FILE, LOG_TAIL_LINES, logtail, sizeof logtail) == 0)
         parse_qos_log(logtail, &qos);
     else
         memset(&qos, 0, sizeof qos);
+
+    /* qci/ambr come from rare PDU-setup log lines that scroll out of the tail
+     * window over time; once seen, keep the last known good values. */
+    static struct qos_info sticky;
+    if (qos.have_qci) { sticky.qci = qos.qci; sticky.have_qci = 1; }
+    if (qos.have_ambr) {
+        sticky.ambr_dl = qos.ambr_dl; sticky.ambr_ul = qos.ambr_ul;
+        sticky.ambr_dl_raw = qos.ambr_dl_raw; sticky.ambr_ul_raw = qos.ambr_ul_raw;
+        sticky.ambr_dl_unit = qos.ambr_dl_unit; sticky.ambr_ul_unit = qos.ambr_ul_unit;
+        sticky.have_ambr = 1;
+    }
+    qos = sticky;
+
+    /* device identifiers change rarely: fetch once. */
+    if (!s_imei[0]) {
+        char r[256];
+        if (run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, r, sizeof r) == 0)
+            if (!json_get(r, "imei", s_imei, sizeof s_imei)) s_imei[0] = 0;
+    }
+    if (!s_swver[0])
+        uci_get("zwrt_common_info.common_config.wa_inner_version", s_swver, sizeof s_swver);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -351,24 +421,48 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "charger_type", chg, "charger_type", 0);
     bappend(&b, "},");
 
-    /* connected clients */
+    /* connected clients (count + per-device list from DHCP leases) */
     bappend(&b, "\"clients\":{");
     emit_int(&b, "total", rnum, "access_total_num", 0); bappend(&b, ",");
     emit_int(&b, "wifi", rnum, "wireless_num", 0);      bappend(&b, ",");
-    emit_int(&b, "lan", rnum, "lan_num", 0);
+    emit_int(&b, "lan", rnum, "lan_num", 0);            bappend(&b, ",");
+    emit_client_list(&b);
     bappend(&b, "},");
 
     /* main WiFi (2.4G/5G share one SSID). Key name is "wlan" not "wifi" so the
      * consumer's lookup doesn't collide with clients.wifi. */
     {
-        char ssid[128], wkey[128], enc[64];
+        char ssid[128], wkey[128], enc[64], dis[8];
         uci_get("wireless.main_2g.ssid", ssid, sizeof ssid);
         uci_get("wireless.main_2g.key", wkey, sizeof wkey);
         uci_get("wireless.main_2g.encryption", enc, sizeof enc);
+        uci_get("wireless.main_2g.disabled", dis, sizeof dis);
         bappend(&b, "\"wlan\":{");
         emit_str_val(&b, "ssid", ssid); bappend(&b, ",");
         emit_str_val(&b, "key", wkey);  bappend(&b, ",");
-        emit_str_val(&b, "enc", enc);
+        emit_str_val(&b, "enc", enc);   bappend(&b, ",");
+        bappend(&b, "\"enabled\":%d", (dis[0] == '1') ? 0 : 1);
+        bappend(&b, "},");
+    }
+
+    /* NFC (tap-to-share WiFi): switch 1 = on. */
+    bappend(&b, "\"nfc\":{");
+    emit_int(&b, "switch", nfc, "switch", 0);
+    bappend(&b, "},");
+
+    /* DHCP / LAN */
+    {
+        char ip[48], start[16], limit[16], lease[16];
+        uci_get("network.lan.ipaddr", ip, sizeof ip);
+        uci_get("dhcp.lan.zte_start", start, sizeof start);
+        if (!start[0]) uci_get("dhcp.lan.start", start, sizeof start);
+        uci_get("dhcp.lan.limit", limit, sizeof limit);
+        uci_get("dhcp.lan.leasetime", lease, sizeof lease);
+        bappend(&b, "\"dhcp\":{");
+        emit_str_val(&b, "ip", ip);          bappend(&b, ",");
+        emit_str_val(&b, "start", start);    bappend(&b, ",");
+        emit_str_val(&b, "limit", limit);    bappend(&b, ",");
+        emit_str_val(&b, "leasetime", lease);
         bappend(&b, "},");
     }
 
@@ -399,7 +493,10 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     bappend(&b, "\"system\":{");
     emit_int(&b, "uptime", sysinfo, "uptime", 0);    bappend(&b, ",");
     emit_int(&b, "cpu_temp", therm, "cpuss_temp", 0); bappend(&b, ",");
+    bappend(&b, "\"cpu_usage\":%ld,", cpu_usage_pct());
     bappend(&b, "\"mem_used_pct\":%ld,", mem_used_pct(sysinfo));
+    emit_str_val(&b, "sw_version", s_swver); bappend(&b, ",");
+    emit_str_val(&b, "imei", s_imei);        bappend(&b, ",");
     if (with_board) {
         emit_str(&b, "model", board_cache, "model");        bappend(&b, ",");
         emit_str(&b, "hostname", board_cache, "hostname");  bappend(&b, ",");
