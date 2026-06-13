@@ -35,6 +35,10 @@ Consumers read this file. They must not call `ubus` directly.
     "nr_bw": "100MHz",
     "nrca": "0,273,1,41,504990,100,0,-140.0,-43.0,-23.0,-120.0;",
     "lteca": "",
+    "net_select": "WL_AND_5G",
+    "sa_bands": "1,28,41,78",
+    "nsa_bands": "1,28,41,78",
+    "lte_bands": "1,3,8,40,41",
     "wan_status": "ipv4_ipv6_connected"
   },
   "wlan": {
@@ -85,6 +89,8 @@ Consumers read this file. They must not call `ubus` directly.
     "cpu_temp": 41,
     "cpu_usage": 17,
     "mem_used_pct": 52,
+    "mem_total": 1667604480,
+    "mem_avail": 789684224,
     "sw_version": "BD_FLYMODEMMU5250V1.0.0B27",
     "imei": "863500074315883",
     "model": "ZTE U60Pro",
@@ -108,6 +114,9 @@ Consumers read this file. They must not call `ubus` directly.
 | `clients.total/wifi/lan` | `zwrt_router.api router_get_user_list_num` |
 | `clients.list` | `/tmp/dhcp.leases`（每行 `expiry mac ip name clientid`） |
 | `nfc.switch` | `zwrt_nfc zwrt_nfc_wifi_get`（1=开） |
+| `net.net_select` | `nwinfo_get_netinfo`（选网模式；锁频页可写回 `nwinfo_set_netselect`） |
+| `net.sa_bands`/`nsa_bands`/`lte_bands` | `nwinfo_get_netinfo` 的 `nr5g_sa_band_lock`/`nr5g_nsa_band_lock`/`lte_band`（可用/已锁频段，逗号列表） |
+| `system.mem_total`/`mem_avail` | `system info` 的 `memory.total`/`memory.available`（字节） |
 | `wlan.enabled` | `uci get wireless.main_2g.disabled`（取反） |
 | `dhcp.*` | `uci`：`network.lan.ipaddr`、`dhcp.lan.zte_start/limit/leasetime` |
 | `system.cpu_usage` | `/proc/stat`（相邻轮询的占用率差值） |
