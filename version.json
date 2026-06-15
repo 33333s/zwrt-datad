@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "datad": {
+    "version": "0.3.2",
+    "asset": "u60-datad-aarch64",
+    "notes": "新增短信读取（未读数 + 最近短信，解码 UTF-16BE，含消息 id）"
+  }
+}
