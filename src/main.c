@@ -196,6 +196,91 @@ static void emit_client_list(struct buf *b)
     bappend(b, "]");
 }
 
+/* Decode a UTF-16BE hex string (ZTE SMS content) into UTF-8. */
+static void sms_decode(const char *hex, char *out, size_t cap)
+{
+    size_t o = 0;
+    const char *p = hex;
+    while (p[0] && p[1] && p[2] && p[3] && o + 5 < cap) {
+        char b4[5] = { p[0], p[1], p[2], p[3], 0 };
+        unsigned cp = (unsigned)strtol(b4, NULL, 16);
+        p += 4;
+        if (cp >= 0xD800 && cp <= 0xDBFF && p[0] && p[1] && p[2] && p[3]) { /* surrogate pair */
+            char l4[5] = { p[0], p[1], p[2], p[3], 0 };
+            unsigned lo = (unsigned)strtol(l4, NULL, 16);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); p += 4; }
+        }
+        if (cp < 0x80) out[o++] = (char)cp;
+        else if (cp < 0x800) { out[o++] = 0xC0 | (cp >> 6); out[o++] = 0x80 | (cp & 0x3F); }
+        else if (cp < 0x10000) { out[o++] = 0xE0 | (cp >> 12); out[o++] = 0x80 | ((cp >> 6) & 0x3F); out[o++] = 0x80 | (cp & 0x3F); }
+        else if (o + 4 < cap) { out[o++] = 0xF0 | (cp >> 18); out[o++] = 0x80 | ((cp >> 12) & 0x3F); out[o++] = 0x80 | ((cp >> 6) & 0x3F); out[o++] = 0x80 | (cp & 0x3F); }
+    }
+    out[o] = 0;
+}
+
+/* SMS: unread count (each call, cheap) + recent received list (refreshed every
+ * ~10 calls; reading+decoding is heavier). Emits "sms":{unread,list:[...]}. */
+static void emit_sms(struct buf *b)
+{
+    static int tick = 0;
+    static long prev_unread = -1;
+    static char list_items[6000] = "";   /* cached inner JSON of the list */
+    char cap_raw[1024];
+    run_ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", NULL, cap_raw, sizeof cap_raw);
+    long unread = json_get_int(cap_raw, "sms_dev_unread_num", 0) +
+                  json_get_int(cap_raw, "sms_sim_unread_num", 0);
+
+    /* reload the list every 10 ticks, OR immediately when the unread count
+     * changes (new SMS, or the UI marked one read) so the per-item dot tracks. */
+    int reload = (tick == 0) || (unread != prev_unread);
+    prev_unread = unread;
+    if (reload) {
+        static char raw[16384];
+        run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
+                 "{\"page\":0,\"data_per_page\":6,\"mem_store\":1,\"tags\":10,"
+                 "\"order_by\":\"order by id desc\",\"sms_no_encode_flag\":\"1\"}",
+                 raw, sizeof raw);
+        struct buf lb = { list_items, sizeof list_items, 0 };
+        char arr[15000];
+        int n = 0;
+        if (json_get(raw, "messages", arr, sizeof arr)) {
+            for (char *q = arr; (q = strchr(q, '{')) && n < 8; ) {
+                char *end = strchr(q, '}');
+                if (!end) break;
+                char obj[4096]; size_t L = (size_t)(end - q) + 1;
+                if (L >= sizeof obj) L = sizeof obj - 1;
+                memcpy(obj, q, L); obj[L] = 0;
+                char num[40] = "", date[40] = "", tag[8] = "", hex[2048] = "";
+                json_get(obj, "number", num, sizeof num);
+                json_get(obj, "date", date, sizeof date);
+                json_get(obj, "tag", tag, sizeof tag);
+                json_get(obj, "content", hex, sizeof hex);
+                long id = json_get_int(obj, "id", 0);
+                /* date "YY,MM,DD,HH,MM,SS,+TZ" -> "MM-DD HH:MM" */
+                char shown[16] = "";
+                { int yy, mo, dd, hh, mi; if (sscanf(date, "%d,%d,%d,%d,%d", &yy, &mo, &dd, &hh, &mi) == 5)
+                    snprintf(shown, sizeof shown, "%02d-%02d %02d:%02d", mo, dd, hh, mi); }
+                char text[700]; sms_decode(hex, text, sizeof text);
+                if (n) bappend(&lb, ",");
+                bappend(&lb, "{");
+                bappend(&lb, "\"id\":%ld,", id);
+                emit_str_val(&lb, "num", num);    bappend(&lb, ",");
+                emit_str_val(&lb, "date", shown); bappend(&lb, ",");
+                /* received-message tag: "1" = unread, "0" = read */
+                bappend(&lb, "\"unread\":%d,", (tag[0] == '1') ? 1 : 0);
+                emit_str_val(&lb, "text", text);
+                bappend(&lb, "}");
+                n++;
+                q = end + 1;
+            }
+        }
+        list_items[lb.len] = 0;
+    }
+    tick = (tick + 1) % 10;
+
+    bappend(b, "\"sms\":{\"unread\":%ld,\"list\":[%s]}", unread, list_items);
+}
+
 static double ambr_unit_to_mbps(int unit)
 {
     switch (unit) {
@@ -450,6 +535,10 @@ static void build_snapshot(char *out, size_t outlen, int with_board, const char 
     emit_int(&b, "lan", rnum, "lan_num", 0);            bappend(&b, ",");
     emit_client_list(&b);
     bappend(&b, "},");
+
+    /* SMS: unread count + recent received messages (decoded). */
+    emit_sms(&b);
+    bappend(&b, ",");
 
     /* main WiFi (2.4G/5G share one SSID). Key name is "wlan" not "wifi" so the
      * consumer's lookup doesn't collide with clients.wifi. */
