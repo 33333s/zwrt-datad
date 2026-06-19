@@ -2,6 +2,7 @@
 *.o
 /u60-datad
 /u60-datad.stripped
+/u60-datad-aarch64
 
 # transient helper scripts
 scripts/_*.sh

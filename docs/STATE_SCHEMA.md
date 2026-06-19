@@ -124,7 +124,7 @@ Consumers read this file. They must not call `ubus` directly.
 | `clients.total/wifi/lan` | `zwrt_router.api router_get_user_list_num` |
 | `clients.list` | `/tmp/dhcp.leases`（每行 `expiry mac ip name clientid`） |
 | `sms.unread` | `zwrt_wms_get_wms_capacity` 的 `sms_dev_unread_num + sms_sim_unread_num` |
-| `sms.list` | `zte_libwms_get_sms_data {page:0,data_per_page:6,mem_store:1,tags:10,order_by:"order by id desc"}`；`id` 为消息 ID（标记已读用），`text` 为 UTF-16BE 十六进制后端解成 UTF-8，`date` 由 `YY,MM,DD,HH,MM,SS,+TZ` 格式化为 `MM-DD HH:MM`，`unread` 取自每条 `tag`（**"1"=未读，"0"=已读**） |
+| `sms.list` | `zte_libwms_get_sms_data {page:0,data_per_page:32,mem_store:1,tags:10,order_by:"order by id desc"}`；`id` 为消息 ID（标记已读用），`text` 为 UTF-16BE 十六进制后端解成 UTF-8，`date` 由 `YY,MM,DD,HH,MM,SS,+TZ` 格式化为 `MM-DD HH:MM`，`unread` 取自每条 `tag`（**"1"=未读，"0"=已读**） |
 | `nfc.switch` | `zwrt_nfc zwrt_nfc_wifi_get`（1=开） |
 | `net.net_select` | `nwinfo_get_netinfo`（选网模式；锁频页可写回 `nwinfo_set_netselect`） |
 | `net.sa_bands`/`nsa_bands`/`lte_bands` | `nwinfo_get_netinfo` 的 `nr5g_sa_band_lock`/`nr5g_nsa_band_lock`/`lte_band`（可用/已锁频段，逗号列表） |
@@ -150,5 +150,5 @@ Consumers read this file. They must not call `ubus` directly.
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
 - `qos.qci` / `qos.ambr_*`：来自 `key.log` 的 PDU 建立日志（偶发行）。后端读取较大的日志尾窗（6000 行）并**缓存最后一次读到的值**，因为这些行会随日志增长滚出窗口；一旦读到就保留，直到下次 PDU 重建。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
-- `sms`：只读。`sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，**或在未读数变化时立即重读**（新短信到达、或界面标记已读后，红点/图标能马上更新），最多 6 条。`text` 解码支持代理对（emoji）。本工程不实现发送/删除。
+- `sms`：只读。`sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，**或在未读数变化时立即重读**（新短信到达、或界面标记已读后，红点/图标能马上更新），最多 32 条。`text` 解码支持代理对（emoji）。本工程不实现发送/删除。
 - **标记已读**（界面行为，非本快照字段）：`ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id1>;<id2>;","tag":0}'`（id 分号分隔、末尾带分号；`tag:0`=已读）。
