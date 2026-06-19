@@ -31,6 +31,10 @@
 #define RAW_MAX 8192
 #define LOG_RAW_MAX (512 * 1024)
 #define LOG_TAIL_LINES 6000
+#define STATE_MAX 65536
+#define SMS_PAGE_SIZE 32
+#define SMS_LIST_MAX 49152
+#define SMS_RAW_MAX 131072
 
 struct qos_info {
     int qci;
@@ -89,7 +93,14 @@ static void bappend(struct buf *b, const char *fmt, ...)
     va_list ap; va_start(ap, fmt);
     int n = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
     va_end(ap);
-    if (n > 0) b->len += (size_t)n;
+    if (n <= 0) return;
+    size_t rem = b->cap - b->len;
+    if ((size_t)n >= rem) {
+        b->len = b->cap - 1;
+        b->p[b->len] = 0;
+    } else {
+        b->len += (size_t)n;
+    }
 }
 
 /* Emit "key":"<string value of src[srckey]>" with JSON escaping of quotes. */
@@ -224,7 +235,7 @@ static void emit_sms(struct buf *b)
 {
     static int tick = 0;
     static long prev_unread = -1;
-    static char list_items[6000] = "";   /* cached inner JSON of the list */
+    static char list_items[SMS_LIST_MAX] = "";   /* cached inner JSON of the list */
     char cap_raw[1024];
     run_ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", NULL, cap_raw, sizeof cap_raw);
     long unread = json_get_int(cap_raw, "sms_dev_unread_num", 0) +
@@ -235,16 +246,19 @@ static void emit_sms(struct buf *b)
     int reload = (tick == 0) || (unread != prev_unread);
     prev_unread = unread;
     if (reload) {
-        static char raw[16384];
-        run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
-                 "{\"page\":0,\"data_per_page\":6,\"mem_store\":1,\"tags\":10,"
+        static char raw[SMS_RAW_MAX];
+        char req[160];
+        snprintf(req, sizeof req,
+                 "{\"page\":0,\"data_per_page\":%d,\"mem_store\":1,\"tags\":10,"
                  "\"order_by\":\"order by id desc\",\"sms_no_encode_flag\":\"1\"}",
-                 raw, sizeof raw);
+                 SMS_PAGE_SIZE);
+        run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
+                 req, raw, sizeof raw);
         struct buf lb = { list_items, sizeof list_items, 0 };
-        char arr[15000];
+        static char arr[SMS_RAW_MAX];
         int n = 0;
         if (json_get(raw, "messages", arr, sizeof arr)) {
-            for (char *q = arr; (q = strchr(q, '{')) && n < 8; ) {
+            for (char *q = arr; (q = strchr(q, '{')) && n < SMS_PAGE_SIZE; ) {
                 char *end = strchr(q, '}');
                 if (!end) break;
                 char obj[4096]; size_t L = (size_t)(end - q) + 1;
@@ -651,7 +665,7 @@ int main(int argc, char **argv)
     static char board[RAW_MAX];
     run_ubus("system", "board", NULL, board, sizeof board);
 
-    char snap[RAW_MAX * 2];
+    static char snap[STATE_MAX];
     long cycle = 0;
     do {
         if (cycle % 3600 == 0 && cycle != 0)
