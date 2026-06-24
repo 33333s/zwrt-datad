@@ -133,21 +133,21 @@ static int parse_double_after(const char *s, const char *needle, double *out)
 
 static void refresh_qos_cache(void)
 {
-    FILE *fp = popen("tail -n 6000 /data/logfs/key.log 2>/dev/null", "r");
-    if (!fp) return;
-
     char line[1024];
-    while (fgets(line, sizeof line, fp)) {
-        int qci;
-        double dl, ul;
-
-        if (!strstr(line, "[DATA]")) continue;
-
-        if (parse_int_after(line, "qci", &qci)) {
+    int qci;
+    double dl, ul;
+    FILE *fp = popen("grep -a '\\[DATA\\].*qci' /data/logfs/key.log 2>/dev/null | tail -n 1", "r");
+    if (fp) {
+        if (fgets(line, sizeof line, fp) && parse_int_after(line, "qci", &qci)) {
             g_qci = qci;
             g_qci_valid = 1;
         }
+        pclose(fp);
+    }
 
+    fp = popen("grep -a 'apn_ambr' /data/logfs/key.log 2>/dev/null | tail -n 1", "r");
+    if (!fp) return;
+    if (fgets(line, sizeof line, fp)) {
         if (parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
             parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
             (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1))) {
