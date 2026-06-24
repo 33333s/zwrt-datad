@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.3.3",
+    "version": "0.4.0",
     "asset": "u60-datad-aarch64",
-    "notes": "短信列表读取上限扩大到 32 条，并扩大状态 JSON / 短信缓存"
+    "notes": "补齐 U60Pro 信号页所需字段，恢复系统/WiFi/QoS 数据，并新增 nr_band 与 ltecasig"
   }
 }
