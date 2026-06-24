@@ -30,14 +30,14 @@
 职责很简单：
 
 ```text
-ubus calls + key.log tail -> u60-datad -> /tmp/u60-datad/state.json -> consumers
+ubus calls + key.log latest-match parse -> u60-datad -> /tmp/u60-datad/state.json -> consumers
 ```
 
 当前实现要点：
 
 - 通过命令行调用 `ubus`，不直接链接 `libubus`
 - 用 `popen()` 读取 `ubus` 输出
-- 对 `key.log` 只读取最近若干行，避免每轮全量扫大文件
+- 对 `key.log` 只读取 QoS 相关的最后匹配行，避免每轮全量扫大文件
 - 默认 1 Hz 生成一次完整快照
 - 快照写入 tmpfs，并通过 `rename()` 原子替换
 
@@ -67,12 +67,14 @@ ubus calls + key.log tail -> u60-datad -> /tmp/u60-datad/state.json -> consumers
 
 日志：
 
-- `/data/logfs/key.log` 最近若干行
+- `/data/logfs/key.log` 的 QoS 相关 `[DATA]` 行
   - `qci`
-  - `session_ambr_dl`
-  - `session_ambr_dl_unit`
-  - `session_ambr_ul`
-  - `session_ambr_ul_unit`
+  - `apn_ambr_dl`
+  - `apn_ambr_dl_ext`
+  - `apn_ambr_dl_ext2`
+  - `apn_ambr_ul`
+  - `apn_ambr_ul_ext`
+  - `apn_ambr_ul_ext2`
 
 ## 已知约定
 
@@ -80,7 +82,8 @@ ubus calls + key.log tail -> u60-datad -> /tmp/u60-datad/state.json -> consumers
 - `state.json` 放在 tmpfs 下，读写都应保持轻量
 - 轮询频率不宜过高，默认 `1000ms` 是当前验证过的平衡点
 - `system board` 变化很少，按小时刷新缓存即可
-- 日志补充字段应优先走“读取最近若干行”的方式，不要每轮全量扫 `key.log`
+- 日志补充字段应优先走“读取最后匹配行”的方式，不要每轮全量扫 `key.log`
+- `qci` 与 `apn_ambr_*` 不能只共用一个简单尾窗：`AMBR` 日志通常比 `qci` 稀疏，实机上很容易出现 `qci` 还在更新、但 `AMBR` 已被其它新日志挤出窗口的情况。更稳的做法是分别取最后一条并缓存最后已知值。
 - 短信列表一次最多取 32 条，并缓存解码后的列表；状态快照缓冲需要足够容纳这部分 JSON，避免长短信或多条短信时被截断。
 
 ## 后续方向

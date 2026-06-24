@@ -84,12 +84,8 @@ Consumers read this file. They must not call `ubus` directly.
   },
   "qos": {
     "qci": 9,
-    "ambr_dl": 300.0,
-    "ambr_ul": 100.0,
-    "ambr_dl_raw": 300,
-    "ambr_ul_raw": 100,
-    "ambr_dl_unit": 6,
-    "ambr_ul_unit": 6,
+    "ambr_dl": "20008.641",
+    "ambr_ul": "10008.640",
     "usb_mode": "debug"
   },
   "system": {
@@ -135,7 +131,7 @@ Consumers read this file. They must not call `ubus` directly.
 | `system.sw_version` | `uci get zwrt_common_info.common_config.wa_inner_version` |
 | `system.imei` | `zwrt_zte_mdm.api get_imei`（一次性） |
 | `traffic.*` | `zwrt_data get_wwandst {"source_module":"deviceui","cid":1,"type":1}` |
-| `qos.*` | tail-read `/data/logfs/key.log` and parse latest `qci` / `session_ambr_*` |
+| `qos.*` | 读取 `/data/logfs/key.log` 中最后一条 `qci` 与最后一条 `apn_ambr_*` 相关 `[DATA]` 日志 |
 | `system.uptime/mem` | `system info` |
 | `system.cpu_temp` | `zwrt_bsp.thermal get_cpu_temp` (`cpuss_temp`) |
 | `system.model/fw` | `system board` |
@@ -143,12 +139,11 @@ Consumers read this file. They must not call `ubus` directly.
 ## Notes
 
 - `traffic` is realtime session data from `type:1`.
-- `qos.ambr_*` is normalized to Mbps.
-- `qos.ambr_*_raw` plus `qos.ambr_*_unit` are kept so consumers do not need to duplicate the vendor unit table.
+- `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
 - WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
-- `qos.qci` / `qos.ambr_*`：来自 `key.log` 的 PDU 建立日志（偶发行）。后端读取较大的日志尾窗（6000 行）并**缓存最后一次读到的值**，因为这些行会随日志增长滚出窗口；一旦读到就保留，直到下次 PDU 重建。
+- `qos.qci` / `qos.ambr_*`：来自 `key.log` 的 PDU 建立日志（偶发行）。由于 `qci` 往往比 `apn_ambr_*` 更频繁刷新，后端会分别取**最后一条 `qci`** 和 **最后一条 `apn_ambr_*`**，并缓存最后一次读到的值；一旦读到就保留，直到下次 PDU 重建。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms`：只读。`sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，**或在未读数变化时立即重读**（新短信到达、或界面标记已读后，红点/图标能马上更新），最多 32 条。`text` 解码支持代理对（emoji）。本工程不实现发送/删除。
 - **标记已读**（界面行为，非本快照字段）：`ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id1>;<id2>;","tag":0}'`（id 分号分隔、末尾带分号；`tag:0`=已读）。
