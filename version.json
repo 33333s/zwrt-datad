@@ -3,6 +3,6 @@
   "datad": {
     "version": "0.5.0",
     "asset": "u60-datad-aarch64",
-    "notes": "对外传输层切到 HTTP/SSE，并补充 U60Pro/G5Pro 的设备侧回退兼容"
+    "notes": "对外传输层切到 HTTP/SSE，并补充已验证机型的设备侧回退兼容"
   }
 }
