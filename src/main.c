@@ -2,8 +2,8 @@
  * zwrt-datad - unified device-state aggregator for OpenWRT device plugins.
  *
  * Single producer: polls a fixed set of ubus getters at a controlled rate,
- * normalizes them into one flat JSON snapshot, and publishes it atomically to
- * a tmpfs file. Any number of consumers (devui, web, scripts) read that file,
+ * normalizes them into one flat JSON snapshot, and serves it over HTTP/SSE.
+ * Any number of consumers (devui, web, scripts) share that single producer,
  * so ubus load is decoupled from consumer count. No vendor libs.
  *
  * SPDX-License-Identifier: MIT
@@ -12,8 +12,10 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -44,6 +46,7 @@
 #define SMS_TEXT_HEX_MAX 32768
 #define SMS_TEXT_UTF8_MAX 16384
 #define SMS_OBJECT_MAX (SMS_TEXT_HEX_MAX + 4096)
+#define CLIENT_LIST_MAX 16384
 #define SNAP_MAX 1048576
 
 static volatile sig_atomic_t g_run = 1;
@@ -553,6 +556,96 @@ static long read_long_file(const char *path, long def)
     return v;
 }
 
+static int read_line_file(const char *path, char *out, size_t outlen)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        if (outlen) out[0] = 0;
+        return 0;
+    }
+    if (!fgets(out, outlen, fp)) {
+        fclose(fp);
+        if (outlen) out[0] = 0;
+        return 0;
+    }
+    fclose(fp);
+    out[strcspn(out, "\r\n")] = 0;
+    return 1;
+}
+
+static long normalize_temp_reading(long raw)
+{
+    if (raw <= 0) return 0;
+    if (raw >= 1000) return (raw + 500) / 1000;
+    return raw;
+}
+
+static long read_cpu_temp_sysfs(void)
+{
+    static const char *roots[] = {
+        "/sys/devices/virtual/thermal",
+        "/sys/class/thermal"
+    };
+    char type_path[256], temp_path[256], type[128];
+    long cpuss_sum = 0, cpuss_count = 0, fallback = 0;
+
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++) {
+        DIR *dir = opendir(roots[i]);
+        if (!dir) continue;
+
+        struct dirent *de;
+        while ((de = readdir(dir))) {
+            long raw, temp;
+
+            if (strncmp(de->d_name, "thermal_zone", 12) != 0) continue;
+
+            snprintf(type_path, sizeof type_path, "%s/%s/type", roots[i], de->d_name);
+            snprintf(temp_path, sizeof temp_path, "%s/%s/temp", roots[i], de->d_name);
+            if (!read_line_file(type_path, type, sizeof type)) continue;
+
+            raw = read_long_file(temp_path, LONG_MIN);
+            if (raw == LONG_MIN || raw <= 0 || raw > 200000) continue;
+
+            temp = normalize_temp_reading(raw);
+            if (temp <= 0) continue;
+
+            if (!strncmp(type, "cpuss", 5)) {
+                cpuss_sum += temp;
+                cpuss_count++;
+            } else if (!fallback && (
+                           !strncmp(type, "cpu", 3) ||
+                           !strncmp(type, "sys-therm", 9) ||
+                           !strcmp(type, "pmx75_tz"))) {
+                fallback = temp;
+            } else if (temp > fallback) {
+                fallback = temp;
+            }
+        }
+        closedir(dir);
+        if (cpuss_count > 0) break;
+    }
+
+    if (cpuss_count > 0) return cpuss_sum / cpuss_count;
+    return fallback;
+}
+
+static long read_cpu_temp_value(const char *therm)
+{
+    static const char *keys[] = {
+        "cpuss_temp",
+        "cpu_temp",
+        "temperature",
+        "temp"
+    };
+
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        long v = json_get_int(therm, keys[i], -1);
+        if (v >= 0) return normalize_temp_reading(v);
+    }
+
+    return read_cpu_temp_sysfs();
+}
+
 static int cpu_usage_pct(void)
 {
     FILE *fp = fopen("/proc/stat", "r");
@@ -599,14 +692,27 @@ static void load_wifi_dhcp(char *ssid, size_t ssid_n,
                            char *lease, size_t lease_n)
 {
     FILE *fp = popen(
-        "echo SSID=$(uci -q get wireless.main_2g.ssid 2>/dev/null);"
-        "echo KEY=$(uci -q get wireless.main_2g.key 2>/dev/null);"
-        "echo ENC=$(uci -q get wireless.main_2g.encryption 2>/dev/null);"
-        "echo DIS=$(uci -q get wireless.main_2g.disabled 2>/dev/null);"
-        "echo IP=$(uci -q get network.lan.ipaddr 2>/dev/null);"
-        "echo START=$(uci -q get dhcp.lan.start 2>/dev/null);"
-        "echo LIMIT=$(uci -q get dhcp.lan.limit 2>/dev/null);"
-        "echo LEASE=$(uci -q get dhcp.lan.leasetime 2>/dev/null)", "r");
+        "section='';"
+        "fallback='';"
+        "for s in main_2g main_5g; do "
+        "  ssid=$(uci -q get wireless.$s.ssid 2>/dev/null);"
+        "  [ -n \"$ssid\" ] || continue;"
+        "  dis=$(uci -q get wireless.$s.disabled 2>/dev/null);"
+        "  [ -n \"$fallback\" ] || fallback=$s;"
+        "  [ \"$dis\" = \"1\" ] || { section=$s; break; };"
+        "done;"
+        "[ -n \"$section\" ] || section=$fallback;"
+        "if [ -n \"$section\" ]; then "
+        "  printf 'SSID=%s\\n' \"$(uci -q get wireless.$section.ssid 2>/dev/null)\";"
+        "  printf 'KEY=%s\\n' \"$(uci -q get wireless.$section.key 2>/dev/null)\";"
+        "  printf 'ENC=%s\\n' \"$(uci -q get wireless.$section.encryption 2>/dev/null)\";"
+        "  printf 'DIS=%s\\n' \"$(uci -q get wireless.$section.disabled 2>/dev/null)\";"
+        "fi;"
+        "printf 'IP=%s\\n' \"$(uci -q get network.lan.ipaddr 2>/dev/null)\";"
+        "printf 'START=%s\\n' \"$(uci -q get dhcp.lan.start 2>/dev/null)\";"
+        "printf 'LIMIT=%s\\n' \"$(uci -q get dhcp.lan.limit 2>/dev/null)\";"
+        "printf 'LEASE=%s\\n' \"$(uci -q get dhcp.lan.leasetime 2>/dev/null)\"",
+        "r");
     char line[256];
 
     ssid[0] = key[0] = enc[0] = ip[0] = start[0] = limit[0] = lease[0] = 0;
@@ -626,12 +732,81 @@ static void load_wifi_dhcp(char *ssid, size_t ssid_n,
     pclose(fp);
 }
 
-static void build_client_list_json(char *out, size_t outlen)
+static int append_client_entries_from_array(const char *arr_json, struct buf *outb, int *items)
+{
+    const char *p;
+    int appended = 0;
+
+    if (!arr_json || !items) return 0;
+    p = strchr(arr_json, '[');
+    if (!p) return 0;
+    p++;
+
+    while (*p) {
+        const char *obj_start;
+        size_t len;
+        int depth = 0, in_str = 0, esc = 0;
+        char obj[1024];
+        char ip[64], mac[64], host[128];
+        const char *name;
+
+        while (*p && *p != '{' && *p != ']') p++;
+        if (*p != '{') break;
+        obj_start = p;
+
+        for (; *p; p++) {
+            char c = *p;
+            if (in_str) {
+                if (esc) { esc = 0; continue; }
+                if (c == '\\') esc = 1;
+                else if (c == '"') in_str = 0;
+                continue;
+            }
+            if (c == '"') in_str = 1;
+            else if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) { p++; break; }
+            }
+        }
+        if (depth != 0) break;
+
+        len = (size_t)(p - obj_start);
+        if (len >= sizeof obj) continue;
+
+        memcpy(obj, obj_start, len);
+        obj[len] = 0;
+
+        if (!json_get(obj, "ip_address", ip, sizeof ip) &&
+            !json_get(obj, "ip", ip, sizeof ip)) ip[0] = 0;
+        if (!json_get(obj, "mac_address", mac, sizeof mac) &&
+            !json_get(obj, "mac", mac, sizeof mac)) mac[0] = 0;
+        if (!json_get(obj, "hostname", host, sizeof host) &&
+            !json_get(obj, "name", host, sizeof host)) host[0] = 0;
+        if (!ip[0] && !mac[0]) continue;
+
+        name = (host[0] && strcmp(host, "--")) ? host : (mac[0] ? mac : ip);
+        if (*items) bappend(outb, ",");
+        (*items)++;
+        appended = 1;
+        bappend(outb, "{\"name\":\"");
+        bappend_json_esc(outb, name);
+        bappend(outb, "\",\"ip\":\"");
+        bappend_json_esc(outb, ip);
+        bappend(outb, "\",\"mac\":\"");
+        bappend_json_esc(outb, mac);
+        bappend(outb, "\"}");
+    }
+
+    return appended;
+}
+
+static int build_client_list_from_dhcp(char *out, size_t outlen)
 {
     FILE *fp = fopen("/tmp/dhcp.leases", "r");
     char line[512];
     struct buf b = { out, outlen, 0 };
-    int first = 1;
+    int items = 0;
 
     bappend(&b, "[");
     if (fp) {
@@ -643,8 +818,8 @@ static void build_client_list_json(char *out, size_t outlen)
                 continue;
             (void)exp; (void)cid;
             name = (host[0] && strcmp(host, "*")) ? host : mac;
-            if (!first) bappend(&b, ",");
-            first = 0;
+            if (items) bappend(&b, ",");
+            items++;
             bappend(&b, "{\"name\":\"");
             bappend_json_esc(&b, name);
             bappend(&b, "\",\"ip\":\"");
@@ -656,6 +831,43 @@ static void build_client_list_json(char *out, size_t outlen)
         fclose(fp);
     }
     bappend(&b, "]");
+    if (b.len >= b.cap) {
+        if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+        return 0;
+    }
+    return items;
+}
+
+static int build_client_list_from_router(char *out, size_t outlen)
+{
+    char lan[RAW_MAX], wifi[RAW_MAX], arr[RAW_MAX];
+    struct buf b = { out, outlen, 0 };
+    int items = 0;
+
+    bappend(&b, "[");
+    if (run_ubus("zwrt_router.api", "router_lan_access_list",
+                 "{\"start_id\":1,\"end_id\":64}", lan, sizeof lan) == 0 &&
+        json_get(lan, "lan_access_list_info", arr, sizeof arr)) {
+        append_client_entries_from_array(arr, &b, &items);
+    }
+    if (run_ubus("zwrt_router.api", "router_wireless_access_list",
+                 "{\"start_id\":1,\"end_id\":64}", wifi, sizeof wifi) == 0 &&
+        json_get(wifi, "wireless_access_list_info", arr, sizeof arr)) {
+        append_client_entries_from_array(arr, &b, &items);
+    }
+    bappend(&b, "]");
+    if (b.len >= b.cap) {
+        if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+        return 0;
+    }
+    return items;
+}
+
+static void build_client_list_json(char *out, size_t outlen)
+{
+    if (build_client_list_from_dhcp(out, outlen) > 0) return;
+    if (build_client_list_from_router(out, outlen) > 0) return;
+    if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
 }
 
 /* Poll everything and build the unified snapshot into `out`. */
@@ -668,14 +880,15 @@ static void build_snapshot(char *out, size_t outlen,
     char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024], nfc[1024];
     char wifi_ssid[128], wifi_key[128], wifi_enc[64];
     char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
-    char client_list[4096];
-    long chg_uv, chg_ua, bat_uv, bat_ua;
+    char client_list[CLIENT_LIST_MAX];
+    long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, wifi_enabled;
 
     run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
     run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
     run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
-    run_ubus("zwrt_bsp.thermal", "get_cpu_temp", NULL, therm, sizeof therm);
+    if (run_ubus("zwrt_bsp.thermal", "get_cpu_temp", NULL, therm, sizeof therm) != 0)
+        run_ubus("zwrt_bsp.thermal", "list", NULL, therm, sizeof therm);
     run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
     run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
     /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
@@ -698,6 +911,7 @@ static void build_snapshot(char *out, size_t outlen,
     bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
     bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
     cpu_usage = cpu_usage_pct();
+    cpu_temp = read_cpu_temp_value(therm);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -807,7 +1021,7 @@ static void build_snapshot(char *out, size_t outlen,
     /* system */
     bappend(&b, "\"system\":{");
     emit_int(&b, "uptime", sysinfo, "uptime", 0);    bappend(&b, ",");
-    emit_int(&b, "cpu_temp", therm, "cpuss_temp", 0); bappend(&b, ",");
+    bappend(&b, "\"cpu_temp\":%ld,", cpu_temp);
     bappend(&b, "\"cpu_usage\":%d,", cpu_usage);
     bappend(&b, "\"mem_used_pct\":%ld,", mem_used_pct(sysinfo));
     bappend(&b, "\"mem_total\":%ld,", mem_field(sysinfo, "total"));

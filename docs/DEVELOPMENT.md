@@ -28,6 +28,7 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - 默认 1 Hz 生成一次完整快照
 - `GET /state` 提供当前完整 JSON
 - `GET /events` 提供持续 SSE 推送
+- 对不同设备的 `thermal` / `wifi` / `client list` 数据源做回退适配
 
 ## 传输层约定
 
@@ -62,8 +63,10 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - `zwrt_bsp.battery list`
 - `zwrt_bsp.charger list`
 - `zwrt_bsp.thermal get_cpu_temp`
+- `zwrt_bsp.thermal list`（作为温度接口回退）
 - `zwrt_router.api router_get_user_list_num`
 - `zwrt_router.api router_get_status_no_auth`
+- `zwrt_router.api router_lan_access_list` / `router_wireless_access_list`（当 DHCP lease 不可用时）
 - `zwrt_data get_wwandst`
 - `zwrt_zte_mdm.api get_zwrt_common_info`
 - `zwrt_zte_mdm.api get_imei`
@@ -76,6 +79,7 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - `/tmp/dhcp.leases`
 - `uci`
 - `/proc/stat`
+- `thermal_zone` sysfs（当 ubus 不直接给 CPU 温度时）
 - `power_supply` sysfs
 
 ## 已知约定
@@ -87,6 +91,8 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - 手动刷新通过 `SIGUSR1` 触发
 - 换卡检测基于 `sim_iccid/current_sim_slot`
 - 短信列表一次最多取 32 条，并缓存解码后的列表
+- G5Pro 这类机型上如果 `/tmp/dhcp.leases` 为空，会自动回退到 `router_wireless_access_list`
+- 如果 `zwrt_bsp.thermal get_cpu_temp` 不存在，会自动回退到 `thermal_zone` 里的 `cpuss*`
 
 ## 构建
 
