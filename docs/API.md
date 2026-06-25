@@ -22,10 +22,6 @@ Content-Type: application/json; charset=utf-8
 Cache-Control: no-store
 ```
 
-### `GET /state.json`
-
-`/state` 的兼容别名，返回内容完全一致。
-
 ### `GET /events`
 
 建立 SSE 长连接。

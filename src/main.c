@@ -1097,7 +1097,7 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
             continue;
         }
 
-        if (!strcmp(path, "/state") || !strcmp(path, "/state.json")) {
+        if (!strcmp(path, "/state")) {
             (void)write_http_json(cli_fd, snap, snap_len);
             close(cli_fd);
             continue;

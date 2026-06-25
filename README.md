@@ -2,10 +2,9 @@
 
 `u60-datad` 是一个面向 ZTE U60Pro 的设备状态聚合器。它会统一轮询 `ubus`、按需扫描 `key.log`，把结果归一化成一份稳定 JSON，再通过轻量 HTTP 服务对外提供。
 
-`dev` 分支当前的传输层已经从“写本地 `state.json` 文件”切到：
+`dev` 分支当前的传输层已经彻底切到 `HTTP + SSE`：
 
 - `GET /state`：返回当前完整 JSON
-- `GET /state.json`：`/state` 的别名
 - `GET /events`：返回 `text/event-stream`，持续推送最新快照
 - `GET /healthz`：返回 `ok`
 
@@ -71,7 +70,7 @@ adb shell 'chmod 755 /etc/init.d/u60-datad &&
 
 ## 读取方式
 
-当前 `dev` 分支推荐消费者走 HTTP / SSE：
+当前 `dev` 分支消费者统一走 HTTP / SSE：
 
 ```sh
 curl http://127.0.0.1:9460/state
