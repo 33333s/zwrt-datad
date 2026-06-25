@@ -3,11 +3,13 @@
 #   /etc/init.d/u60-datad enable && /etc/init.d/u60-datad start
 # SPDX-License-Identifier: MIT
 
-START=95
+START=96
 USE_PROCD=1
-PROG=/usr/bin/u60-datad
+DIR=/data/u60pro
+PROG=$DIR/u60-datad
 
 start_service() {
+    [ -x "$PROG" ] || return 1
     procd_open_instance
     procd_set_param command "$PROG" -i 1000
     procd_set_param respawn

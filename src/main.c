@@ -10,13 +10,16 @@
  */
 #include "json.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -25,11 +28,27 @@
 #endif
 #define STATE_FILE STATE_DIR "/state.json"
 #define STATE_TMP  STATE_DIR "/state.json.tmp"
+#define KEY_LOG_PATH "/data/logfs/key.log"
+#define SIM_POLL_MS 5000
+#define QOS_RETRY_MS 120000
+#define SMS_REFRESH_EVERY 10
 
-#define RAW_MAX 8192
+#define RAW_MAX 32768
+#define SMS_RESPONSE_MAX 1048576
+#define SMS_LIST_MAX 1048576
+#define SMS_TEXT_HEX_MAX 32768
+#define SMS_TEXT_UTF8_MAX 16384
+#define SMS_OBJECT_MAX (SMS_TEXT_HEX_MAX + 4096)
+#define SNAP_MAX 1048576
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
+static volatile sig_atomic_t g_qos_refresh_req = 0;
+static void on_qos_signal(int s) { (void)s; g_qos_refresh_req = 1; }
+
+static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
+static int g_sms_list_valid;
+static long g_sms_unread_cache = 0;
 
 /* Run `ubus call <svc> <method> [args]` and capture stdout. 0 on output. */
 static int run_ubus(const char *svc, const char *method, const char *args,
@@ -56,9 +75,16 @@ static void bappend(struct buf *b, const char *fmt, ...)
 {
     if (b->len >= b->cap) return;
     va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
+    size_t room = b->cap - b->len;
+    int n = (room > 0) ? vsnprintf(b->p + b->len, room, fmt, ap) : -1;
     va_end(ap);
-    if (n > 0) b->len += (size_t)n;
+    if (n <= 0) return;
+    if ((size_t)n >= room) {
+        b->len = b->cap - 1;
+        if (b->cap > 0) b->p[b->len] = 0;
+    } else {
+        b->len += (size_t)n;
+    }
 }
 
 static void bappend_json_esc(struct buf *b, const char *s)
@@ -69,6 +95,253 @@ static void bappend_json_esc(struct buf *b, const char *s)
         else if ((unsigned char)*c < 0x20) bappend(b, " ");
         else bappend(b, "%c", *c);
     }
+}
+
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int read_hex_pair(const char **pp, unsigned char *out)
+{
+    const char *p = *pp;
+    int h1, h2;
+
+    while (*p && !isxdigit((unsigned char)*p)) p++;
+    if (!*p) return 0;
+    h1 = hex_val(*p++);
+    while (*p && !isxdigit((unsigned char)*p)) p++;
+    if (!*p) return 0;
+    h2 = hex_val(*p++);
+    if (h1 < 0 || h2 < 0) return 0;
+
+    *out = (unsigned char)((h1 << 4) | h2);
+    *pp = p;
+    return 1;
+}
+
+static size_t append_utf8_codepoint(char *out, size_t cap, size_t pos, uint32_t cp)
+{
+    if (cp <= 0x7F) {
+        if (pos + 1 >= cap) return pos;
+        out[pos++] = (char)cp;
+        return pos;
+    }
+    if (cp <= 0x7FF) {
+        if (pos + 2 >= cap) return pos;
+        out[pos++] = (char)(0xC0 | (cp >> 6));
+        out[pos++] = (char)(0x80 | (cp & 0x3F));
+        return pos;
+    }
+    if (cp <= 0xFFFF) {
+        if (pos + 3 >= cap) return pos;
+        out[pos++] = (char)(0xE0 | (cp >> 12));
+        out[pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[pos++] = (char)(0x80 | (cp & 0x3F));
+        return pos;
+    }
+    if (cp <= 0x10FFFF) {
+        if (pos + 4 >= cap) return pos;
+        out[pos++] = (char)(0xF0 | (cp >> 18));
+        out[pos++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[pos++] = (char)(0x80 | (cp & 0x3F));
+        return pos;
+    }
+    return pos;
+}
+
+static size_t utf16be_hex_to_utf8(const char *hex, char *out, size_t outlen)
+{
+    const char *p = hex ? hex : "";
+    size_t pos = 0;
+    uint32_t cp;
+    unsigned char b1, b2;
+
+    while (*p && pos + 1 < outlen) {
+        unsigned char hi, lo;
+        if (!read_hex_pair(&p, &hi)) break;
+        if (!read_hex_pair(&p, &lo)) break;
+        cp = ((uint32_t)hi << 8) | lo;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            const char *p2 = p;
+            if (read_hex_pair(&p2, &b1) && read_hex_pair(&p2, &b2)) {
+                uint32_t low = ((uint32_t)b1 << 8) | b2;
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    p = p2;
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (low - 0xDC00u);
+                } else {
+                    cp = 0xFFFDu;
+                }
+            } else {
+                cp = 0xFFFDu;
+            }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            cp = 0xFFFDu;
+        }
+        pos = append_utf8_codepoint(out, outlen, pos, cp);
+    }
+    if (outlen > 0) out[pos] = 0;
+    return pos;
+}
+
+static void format_sms_date(const char *raw, char *out, size_t outlen)
+{
+    int mm, dd, hh, mn, ss;
+    if (raw && sscanf(raw, "%*d,%d,%d,%d,%d,%d", &mm, &dd, &hh, &mn, &ss) == 5)
+        snprintf(out, outlen, "%02d-%02d %02d:%02d", mm, dd, hh, mn);
+    else if (outlen > 0)
+        out[0] = 0;
+}
+
+static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
+{
+    const char *arr = strstr(sms_reply, "\"list\"");
+    const char *begin = arr ? strchr(arr, '[') : strchr(sms_reply, '[');
+    const char *end, *p;
+    int depth = 0;
+    int in_str = 0;
+    int esc = 0;
+    int items = 0;
+    struct buf outb = { out, outlen, 0 };
+
+    if (!begin) {
+        if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+        return 0;
+    }
+
+    for (end = begin; *end; end++) {
+        char c = *end;
+        if (in_str) {
+            if (esc) { esc = 0; continue; }
+            if (c == '\\') esc = 1;
+            else if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') in_str = 1;
+        else if (c == '[') depth++;
+        else if (c == ']') {
+            if (depth == 0) break;
+            depth--;
+            if (depth == 0) { end++; break; }
+        }
+    }
+    if (!*end || depth != 0) {
+        if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+        return 0;
+    }
+
+    bappend(&outb, "[");
+    p = begin + 1;
+    while (p < end && items < 32) {
+        while (p < end && *p != '{') p++;
+        if (p >= end) break;
+
+        const char *obj_start = p;
+        int od = 0;
+        in_str = 0;
+        esc = 0;
+        for (; p < end; p++) {
+            char c = *p;
+            if (in_str) {
+                if (esc) { esc = 0; continue; }
+                if (c == '\\') esc = 1;
+                else if (c == '"') in_str = 0;
+                continue;
+            }
+            if (c == '"') in_str = 1;
+            else if (c == '{') od++;
+            else if (c == '}') {
+                od--;
+                if (od == 0) { p++; break; }
+            }
+        }
+        if (od != 0 || p > end) break;
+
+        char sms_obj[SMS_OBJECT_MAX];
+        size_t len = (size_t)(p - obj_start);
+        if (len >= sizeof sms_obj) continue;
+
+        memcpy(sms_obj, obj_start, len);
+        sms_obj[len] = 0;
+        {
+            char id_raw[64];
+            char num[64];
+            char date_raw[64];
+            char date[32];
+            char tag[16];
+            char text_hex[SMS_TEXT_HEX_MAX];
+            char text[SMS_TEXT_UTF8_MAX];
+            long id = 0;
+            int unread = 0;
+
+            if (!json_get(sms_obj, "id", id_raw, sizeof id_raw)) continue;
+            if (!json_get(sms_obj, "num", num, sizeof num)) num[0] = 0;
+            if (!json_get(sms_obj, "date", date_raw, sizeof date_raw)) date_raw[0] = 0;
+            if (!json_get(sms_obj, "tag", tag, sizeof tag)) {
+                long t = json_get_int(sms_obj, "tag", 0);
+                unread = t == 1 ? 1 : 0;
+            } else {
+                unread = (tag[0] == '1') ? 1 : 0;
+            }
+            if (!json_get(sms_obj, "text", text_hex, sizeof text_hex)) text_hex[0] = 0;
+
+            id = strtol(id_raw, NULL, 10);
+            format_sms_date(date_raw, date, sizeof date);
+            utf16be_hex_to_utf8(text_hex, text, sizeof text);
+
+            if (items) bappend(&outb, ",");
+            bappend(&outb, "{\"id\":%ld,\"num\":\"", id);
+            bappend_json_esc(&outb, num);
+            bappend(&outb, "\",\"date\":\"");
+            bappend_json_esc(&outb, date);
+            bappend(&outb, "\",\"unread\":%d,\"text\":\"", unread);
+            bappend_json_esc(&outb, text);
+            bappend(&outb, "\"}");
+            items++;
+        }
+    }
+    bappend(&outb, "]");
+    if (outb.len >= outb.cap) {
+        out[outlen - 1] = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_sms_unread_count(long fallback)
+{
+    char cap[SMS_RESPONSE_MAX];
+    char v[64];
+    long sim = 0, dev = 0;
+
+    if (run_ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", NULL, cap, sizeof cap) != 0)
+        return fallback;
+    if (json_get(cap, "sms_dev_unread_num", v, sizeof v)) dev = strtol(v, NULL, 10);
+    if (json_get(cap, "sms_sim_unread_num", v, sizeof v)) sim = strtol(v, NULL, 10);
+    return dev + sim;
+}
+
+static int refresh_sms_cache(void)
+{
+    char list_resp[SMS_RESPONSE_MAX];
+    static char next_cache[SMS_LIST_MAX];
+    if (run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
+                 "{\"page\":0,\"data_per_page\":32,\"mem_store\":1,\"tags\":10,\"order_by\":\"order by id desc\"}",
+                 list_resp, sizeof list_resp) != 0) {
+        return 0;
+    }
+    if (!parse_sms_list(list_resp, next_cache, sizeof next_cache)) {
+        return 0;
+    }
+    size_t list_len = strnlen(next_cache, sizeof next_cache);
+    memcpy(g_sms_list_cache, next_cache, list_len + 1);
+    g_sms_list_cache[sizeof(g_sms_list_cache) - 1] = 0;
+    g_sms_list_valid = 1;
+    return 1;
 }
 
 /* Emit "key":"<string value of src[srckey]>" with JSON escaping of quotes. */
@@ -109,6 +382,7 @@ static double g_ambr_dl, g_ambr_ul;
 static int g_ambr_dl_valid, g_ambr_ul_valid;
 static unsigned long long g_cpu_prev_total, g_cpu_prev_idle;
 static int g_cpu_prev_valid;
+static off_t g_qos_floor_off;
 
 static int parse_int_after(const char *s, const char *needle, int *out)
 {
@@ -131,23 +405,49 @@ static int parse_double_after(const char *s, const char *needle, double *out)
     return end != p;
 }
 
+static void clear_qos_cache(void)
+{
+    g_qci = 0;
+    g_qci_valid = 0;
+    g_ambr_dl = 0.0;
+    g_ambr_ul = 0.0;
+    g_ambr_dl_valid = 0;
+    g_ambr_ul_valid = 0;
+}
+
+static off_t file_size_or_zero(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0) return 0;
+    return st.st_size;
+}
+
 static void refresh_qos_cache(void)
 {
-    char line[1024];
+    char line[2048];
     int qci;
     double dl, ul;
-    FILE *fp = popen("grep -a '\\[DATA\\].*qci' /data/logfs/key.log 2>/dev/null | tail -n 1", "r");
-    if (fp) {
-        if (fgets(line, sizeof line, fp) && parse_int_after(line, "qci", &qci)) {
+    FILE *fp = fopen(KEY_LOG_PATH, "r");
+    off_t size = file_size_or_zero(KEY_LOG_PATH);
+    off_t floor = g_qos_floor_off;
+
+    if (!fp) return;
+    if (floor > 0) {
+        if (size <= 0 || floor > size) floor = 0;
+        if (floor > 0 && fseeko(fp, floor, SEEK_SET) != 0) floor = 0;
+        if (floor == 0) rewind(fp);
+    }
+
+    while (fgets(line, sizeof line, fp)) {
+        if (!strstr(line, "[DATA]")) continue;
+
+        if (strstr(line, "qci") && parse_int_after(line, "qci", &qci)) {
             g_qci = qci;
             g_qci_valid = 1;
         }
-        pclose(fp);
-    }
 
-    fp = popen("grep -a 'apn_ambr' /data/logfs/key.log 2>/dev/null | tail -n 1", "r");
-    if (!fp) return;
-    if (fgets(line, sizeof line, fp)) {
+        if (!strstr(line, "apn_ambr")) continue;
+
         if (parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
             parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
             (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1))) {
@@ -162,7 +462,31 @@ static void refresh_qos_cache(void)
             g_ambr_ul_valid = 1;
         }
     }
-    pclose(fp);
+    fclose(fp);
+    g_qos_floor_off = size;
+}
+
+static int read_sim_signature(char *out, size_t outlen)
+{
+    char sim[RAW_MAX];
+    char iccid[64], slot[16], imsi[32], state[32];
+
+    out[0] = 0;
+    if (run_ubus("zwrt_zte_mdm.api", "get_sim_info", NULL, sim, sizeof sim) != 0)
+        return 0;
+
+    if (!json_get(sim, "sim_iccid", iccid, sizeof iccid)) iccid[0] = 0;
+    if (!json_get(sim, "current_sim_slot", slot, sizeof slot)) slot[0] = 0;
+    if (!json_get(sim, "sim_imsi", imsi, sizeof imsi)) imsi[0] = 0;
+    if (!json_get(sim, "sim_states", state, sizeof state)) state[0] = 0;
+
+    if (!iccid[0] && !slot[0] && !imsi[0] && !state[0]) return 0;
+    snprintf(out, outlen, "slot=%s|iccid=%s|imsi=%s|state=%s",
+             slot[0] ? slot : "-",
+             iccid[0] ? iccid : "-",
+             imsi[0] ? imsi : "-",
+             state[0] ? state : "-");
+    return 1;
 }
 
 static long read_long_file(const char *path, long def)
@@ -306,7 +630,6 @@ static void build_snapshot(char *out, size_t outlen,
     run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
     run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
     run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
-    refresh_qos_cache();
     load_wifi_dhcp(wifi_ssid, sizeof wifi_ssid,
                    wifi_key, sizeof wifi_key,
                    wifi_enc, sizeof wifi_enc,
@@ -377,6 +700,12 @@ static void build_snapshot(char *out, size_t outlen,
     emit_int(&b, "wifi", rnum, "wireless_num", 0);      bappend(&b, ",");
     emit_int(&b, "lan", rnum, "lan_num", 0);            bappend(&b, ",");
     bappend(&b, "\"list\":%s", client_list);
+    bappend(&b, "},");
+
+    /* sms */
+    bappend(&b, "\"sms\":{");
+    bappend(&b, "\"unread\":%ld,", g_sms_unread_cache);
+    bappend(&b, "\"list\":%s", g_sms_list_valid ? g_sms_list_cache : "[]");
     bappend(&b, "},");
 
     /* traffic: realtime session counters + speeds (bytes/s). */
@@ -463,25 +792,85 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "}}");
 }
 
-static void atomic_write(const char *data, size_t len)
+static int atomic_write(const char *data, size_t len)
 {
     FILE *fp = fopen(STATE_TMP, "w");
-    if (!fp) return;
-    fwrite(data, 1, len, fp);
+    if (!fp) return 0;
+    size_t off = 0;
+    while (off < len) {
+        size_t w = fwrite(data + off, 1, len - off, fp);
+        if (w == 0) {
+            if (ferror(fp)) {
+                fclose(fp);
+                unlink(STATE_TMP);
+                return 0;
+            }
+            break;
+        }
+        off += w;
+    }
+    if (off < len) {
+        fclose(fp);
+        unlink(STATE_TMP);
+        return 0;
+    }
+    int fd = fileno(fp);
+    if (fflush(fp) != 0 || ferror(fp) || fsync(fd) != 0) {
+        fclose(fp);
+        unlink(STATE_TMP);
+        return 0;
+    }
     fclose(fp);
-    rename(STATE_TMP, STATE_FILE);   /* atomic on same fs */
+    if (rename(STATE_TMP, STATE_FILE) != 0) {
+        unlink(STATE_TMP);
+        return 0;
+    }
+    return 1;
+}
+
+/* Return pointer to the first byte after the leading {"ts":... , */
+static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
+{
+    const char *p;
+    if (!snap || len < 6 || !out_len) return NULL;
+
+    p = snap;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '{') return NULL;
+
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "\"ts\":", 5) != 0) return NULL;
+
+    p = strchr(p, ',');
+    if (!p) return NULL;
+    p++;
+
+    while (*p && isspace((unsigned char)*p)) p++;
+    *out_len = len - (size_t)(p - snap);
+    return p;
 }
 
 int main(int argc, char **argv)
 {
     int once = 0, interval_ms = 1000;
+    int sim_poll_every, qos_retry_every, qos_retry_left = 0;
+    char sim_sig[160];
+    int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
     }
+    if (interval_ms <= 0) interval_ms = 1000;
+
+    sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
+    qos_retry_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
+    if (sim_poll_every < 1) sim_poll_every = 1;
+    if (qos_retry_every < 1) qos_retry_every = 1;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_qos_signal);
     mkdir(STATE_DIR, 0755);
 
     /* board info changes rarely: fetch once, refresh hourly. */
@@ -491,14 +880,58 @@ int main(int argc, char **argv)
     run_ubus("system", "board", NULL, board, sizeof board);
     run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
+    clear_qos_cache();
+    g_qos_floor_off = 0;
+    refresh_qos_cache();
+    sim_sig_valid = read_sim_signature(sim_sig, sizeof sim_sig);
 
-    char snap[RAW_MAX * 2];
+    char snap[SNAP_MAX];
+    static char last_snap[SNAP_MAX];
+    static size_t last_snap_len;
     long cycle = 0;
+    long last_sms_unread = read_sms_unread_count(g_sms_unread_cache);
+    if (last_sms_unread >= 0) g_sms_unread_cache = last_sms_unread;
+
     do {
         if (cycle % 3600 == 0 && cycle != 0) {
             run_ubus("system", "board", NULL, board, sizeof board);
             run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
             run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
+        }
+
+        if (cycle == 0 || cycle % sim_poll_every == 0) {
+            char cur_sig[160];
+            int cur_valid = read_sim_signature(cur_sig, sizeof cur_sig);
+            if (cur_valid != sim_sig_valid || (cur_valid && strcmp(cur_sig, sim_sig) != 0)) {
+                if (cur_valid) snprintf(sim_sig, sizeof sim_sig, "%s", cur_sig);
+                else sim_sig[0] = 0;
+                sim_sig_valid = cur_valid;
+                g_qos_floor_off = file_size_or_zero(KEY_LOG_PATH);
+                clear_qos_cache();
+                g_qos_refresh_req = 1;
+                g_sms_list_valid = 0;
+                qos_retry_left = (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
+            }
+        }
+
+        if (g_qos_refresh_req) {
+            g_qos_refresh_req = 0;
+            refresh_qos_cache();
+            if (g_qci_valid || g_ambr_dl_valid || g_ambr_ul_valid) qos_retry_left = 0;
+        } else if (qos_retry_left > 0) {
+            if (qos_retry_left == 1 || (qos_retry_left % qos_retry_every) == 0)
+                refresh_qos_cache();
+            if (g_qci_valid || g_ambr_dl_valid || g_ambr_ul_valid) qos_retry_left = 0;
+            else qos_retry_left--;
+        }
+
+        {
+            long cur_sms_unread = read_sms_unread_count(g_sms_unread_cache);
+            if (cur_sms_unread >= 0) g_sms_unread_cache = cur_sms_unread;
+            if (!g_sms_list_valid || cycle % SMS_REFRESH_EVERY == 0 || g_sms_unread_cache != last_sms_unread) {
+                if (refresh_sms_cache()) g_sms_list_valid = 1;
+            }
+            last_sms_unread = g_sms_unread_cache;
         }
 
         build_snapshot(snap, sizeof snap,
@@ -511,7 +944,27 @@ int main(int argc, char **argv)
             fputc('\n', stdout);
             break;
         }
-        atomic_write(snap, strlen(snap));
+        {
+            size_t snap_len = strlen(snap);
+            int changed = 1;
+            if (snap_len == last_snap_len) {
+                changed = memcmp(last_snap, snap, snap_len) != 0;
+            }
+            if (changed) {
+                size_t cur_payload_len = 0, last_payload_len = 0;
+                const char *cur_payload = json_skip_ts(snap, snap_len, &cur_payload_len);
+                const char *last_payload = last_snap_len ? json_skip_ts(last_snap, last_snap_len, &last_payload_len) : NULL;
+                if (cur_payload && last_payload && cur_payload_len == last_payload_len &&
+                    memcmp(cur_payload, last_payload, cur_payload_len) == 0) {
+                    changed = 0;
+                }
+            }
+
+            if (changed && atomic_write(snap, snap_len)) {
+                memcpy(last_snap, snap, snap_len + 1);
+                last_snap_len = snap_len;
+            }
+        }
 
         struct timespec ts = { interval_ms / 1000, (long)(interval_ms % 1000) * 1000000L };
         nanosleep(&ts, NULL);

@@ -30,16 +30,37 @@
 职责很简单：
 
 ```text
-ubus calls + key.log latest-match parse -> u60-datad -> /tmp/u60-datad/state.json -> consumers
+ubus calls + key.log full-scan-on-demand cache -> u60-datad -> /tmp/u60-datad/state.json -> consumers
 ```
 
 当前实现要点：
 
 - 通过命令行调用 `ubus`，不直接链接 `libubus`
 - 用 `popen()` 读取 `ubus` 输出
-- 对 `key.log` 只读取 QoS 相关的最后匹配行，避免每轮全量扫大文件
+- 启动时对 `key.log` 做一次全量扫描，提取 QoS 缓存
+- 平时只输出缓存；手动刷新或换卡时再重读日志
 - 默认 1 Hz 生成一次完整快照
 - 快照写入 tmpfs，并通过 `rename()` 原子替换
+
+## 启动链路约束
+
+截至 **2026-06-25**，`u60-datad` 在这台 U60Pro 上的**稳定部署方式**仍然不是独立 `procd` 自启，而是由 `u60pro-devui` 的 `/data/u60pro/start.sh` 在 `rc.local` 阶段拉起：
+
+```text
+procd -> zte_topsw_devui -> rc.local -> /data/u60pro/start.sh -> u60-datad
+```
+
+原因不是 `u60-datad` 自己有问题，而是整条“完全禁用原厂 `zte_topsw_devui`、改成我们自己的 `procd` 自启”链路在这版固件上**不稳定**：
+
+- 干净重启后，`u60pro-devui` / `u60-datad` 都出现过 `inactive`
+- 原厂早期服务被禁用时，触摸节点 `event3` 有概率不出现
+- 同时还观察到过 `u60pro-devui` 的 `drm: SETCRTC failed: Permission denied`
+
+所以当前约束是：
+
+- `u60-datad` 要容忍**稍晚一点**才启动
+- 启动入口以 `/data/u60pro/start.sh` 为准，不要默认再额外启一份独立自启
+- 若以后再尝试把 `u60-datad` 改回独立 `procd` 服务，必须和整条屏幕/触摸 bring-up 一起重新实机验证
 
 ## 数据模型
 
@@ -81,10 +102,26 @@ ubus calls + key.log latest-match parse -> u60-datad -> /tmp/u60-datad/state.jso
 - UI 不应频繁直接调用后端做单项查询，而应直接读取快照文件
 - `state.json` 放在 tmpfs 下，读写都应保持轻量
 - 轮询频率不宜过高，默认 `1000ms` 是当前验证过的平衡点
+- 当前稳定启动路径里，`u60-datad` 可能由 `start.sh` 重复尝试拉起，因此保持“单进程幂等”很重要；启动脚本里已经有 `pidof u60-datad` guard，后续不要再额外引入第二条自启链路。
 - `system board` 变化很少，按小时刷新缓存即可
-- 日志补充字段应优先走“读取最后匹配行”的方式，不要每轮全量扫 `key.log`
-- `qci` 与 `apn_ambr_*` 不能只共用一个简单尾窗：`AMBR` 日志通常比 `qci` 稀疏，实机上很容易出现 `qci` 还在更新、但 `AMBR` 已被其它新日志挤出窗口的情况。更稳的做法是分别取最后一条并缓存最后已知值。
+- `qos` 日志缓存的策略是：**启动全量扫一次，之后只显示缓存**；不要每轮快照都去重扫 `key.log`
+- `qci` 与 `apn_ambr_*` 不能只依赖“最后一条日志”：`AMBR` 日志通常比 `qci` 稀疏，实机上很容易出现最新一条 `qci` 还在更新、但最新 `AMBR` 已经是更早的一行。更稳的做法是全量逐行提取最近一次有效值并缓存。
+- 手动刷新通过 `SIGUSR1` 触发；DevUI 的“刷新 AMBR 缓存”按钮复用的就是这条通路。
+- 换卡检测当前基于 `zwrt_zte_mdm.api get_sim_info` 的 `sim_iccid/current_sim_slot`。签名变化后会清空旧 QoS 缓存，并在新日志写入后自动补读。
 - 短信列表一次最多取 32 条，并缓存解码后的列表；状态快照缓冲需要足够容纳这部分 JSON，避免长短信或多条短信时被截断。
+
+## 发布与版本约定
+
+- U60Pro 的 datad 发布线固定走 GitHub 仓库 `33333s/zwrt-datad` 的 `u60pro` 分支。
+- 每个 release 只挂两份固定资产：`u60-datad-aarch64` 与 `version.json`。
+- `version.json` 是设备侧管理插件真正读取的版本源，示例：
+
+```jsonc
+{ "schema": 1,
+  "datad": { "version": "0.4.1", "asset": "u60-datad-aarch64" } }
+```
+
+- 发版时不要只打 tag；要把新的 `version.json` 和同版本二进制一起上传到 GitHub release。
 
 ## 后续方向
 
@@ -95,3 +132,17 @@ ubus calls + key.log latest-match parse -> u60-datad -> /tmp/u60-datad/state.jso
 - 更多 WiFi 细节
 
 扩展时继续保持“单一聚合器 + 文件快照”模式即可。
+
+## 2026-06-25 设备 Smoke Test 补记（短信状态链路）
+
+配合 UI 侧设备验证，本轮把 `u60-datad` 测试版临时推到设备 `/tmp/u60-datad.zigtest` 做运行态确认，没有覆盖正式 `/data/u60pro/u60-datad`。
+
+- 启动方式：`/tmp/u60-datad.zigtest -i 1000`
+- 运行结果：进程可正常拉起，采样时 RSS 约 `116 KB`，VSZ 约 `6596 KB`
+- 状态文件：设备侧在 `/tmp/u60-datad/state.json` 观察到新鲜输出，并命中 `sms` 相关字段
+- 结论：
+  - “短信是否进入状态文件”这条链路在设备上是通的
+  - 这次没有通过 UI 画面人工逐条点读短信，因此更准确地说，是先确认了 backend 产出与 UI 进程联动都已在设备上跑通
+- 清理 / 恢复：
+  - 测试完成后已删除 `/tmp/u60-datad.zigtest` 与临时日志
+  - 正式 `/data/u60pro/u60-datad -i 1000` 已恢复运行
