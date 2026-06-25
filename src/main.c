@@ -10,28 +10,33 @@
  */
 #include "json.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <stdint.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
-#ifndef STATE_DIR
-#define STATE_DIR "/tmp/u60-datad"
-#endif
-#define STATE_FILE STATE_DIR "/state.json"
-#define STATE_TMP  STATE_DIR "/state.json.tmp"
 #define KEY_LOG_PATH "/data/logfs/key.log"
 #define SIM_POLL_MS 5000
 #define QOS_RETRY_MS 120000
 #define SMS_REFRESH_EVERY 10
+
+#define HTTP_BIND_ADDR "127.0.0.1"
+#define HTTP_PORT 9460
+#define HTTP_MAX_CLIENTS 16
+#define HTTP_REQ_MAX 4096
 
 #define RAW_MAX 32768
 #define SMS_RESPONSE_MAX 1048576
@@ -49,6 +54,10 @@ static void on_qos_signal(int s) { (void)s; g_qos_refresh_req = 1; }
 static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
 static long g_sms_unread_cache = 0;
+
+struct sse_client {
+    int fd;
+};
 
 /* Run `ubus call <svc> <method> [args]` and capture stdout. 0 on output. */
 static int run_ubus(const char *svc, const char *method, const char *args,
@@ -837,40 +846,362 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "}}");
 }
 
-static int atomic_write(const char *data, size_t len)
+static int set_nonblock(int fd)
 {
-    FILE *fp = fopen(STATE_TMP, "w");
-    if (!fp) return 0;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static int wait_readable(int fd, int timeout_ms)
+{
+    fd_set rfds;
+    struct timeval tv;
+    int rc;
+
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    do {
+        rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+    } while (rc < 0 && errno == EINTR && g_run);
+
+    return rc > 0;
+}
+
+static int write_all(int fd, const char *buf, size_t len)
+{
     size_t off = 0;
     while (off < len) {
-        size_t w = fwrite(data + off, 1, len - off, fp);
-        if (w == 0) {
-            if (ferror(fp)) {
-                fclose(fp);
-                unlink(STATE_TMP);
-                return 0;
-            }
-            break;
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
         }
-        off += w;
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
     }
-    if (off < len) {
-        fclose(fp);
-        unlink(STATE_TMP);
-        return 0;
+    return 0;
+}
+
+static void sse_client_close(struct sse_client *c)
+{
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+}
+
+static int read_http_request(int fd, char *buf, size_t cap, int timeout_ms)
+{
+    size_t len = 0;
+
+    while (len + 1 < cap) {
+        if (!wait_readable(fd, timeout_ms)) return -1;
+
+        ssize_t n = read(fd, buf + len, cap - 1 - len);
+        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return -1;
+        }
+
+        len += (size_t)n;
+        buf[len] = 0;
+        if (strstr(buf, "\r\n\r\n")) return 0;
     }
-    int fd = fileno(fp);
-    if (fflush(fp) != 0 || ferror(fp) || fsync(fd) != 0) {
-        fclose(fp);
-        unlink(STATE_TMP);
-        return 0;
+
+    return -1;
+}
+
+static int parse_request_line(const char *req, char *method, size_t method_cap,
+                              char *path, size_t path_cap)
+{
+    if (sscanf(req, "%15s %255s", method, path) != 2) return -1;
+    method[method_cap - 1] = 0;
+    path[path_cap - 1] = 0;
+
+    char *q = strchr(path, '?');
+    if (q) *q = 0;
+    return 0;
+}
+
+static void write_http_error(int fd, int code, const char *text)
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof buf,
+                     "HTTP/1.1 %d %s\r\n"
+                     "Connection: close\r\n"
+                     "Content-Length: 0\r\n"
+                     "\r\n",
+                     code, text);
+    if (n > 0) (void)write_all(fd, buf, (size_t)n);
+}
+
+static int write_http_text(int fd, const char *ctype, const char *body)
+{
+    char hdr[256];
+    size_t body_len = strlen(body);
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: %s\r\n"
+                     "Cache-Control: no-store\r\n"
+                     "Connection: close\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n",
+                     ctype, body_len);
+    if (n <= 0) return -1;
+    if (write_all(fd, hdr, (size_t)n) < 0) return -1;
+    return write_all(fd, body, body_len);
+}
+
+static int write_http_json(int fd, const char *snap, size_t snap_len)
+{
+    char hdr[256];
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: application/json; charset=utf-8\r\n"
+                     "Cache-Control: no-store\r\n"
+                     "Connection: close\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n",
+                     snap_len);
+    if (n <= 0) return -1;
+    if (write_all(fd, hdr, (size_t)n) < 0) return -1;
+    return write_all(fd, snap, snap_len);
+}
+
+static int write_sse_handshake(int fd)
+{
+    static const char hdr[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "X-Accel-Buffering: no\r\n"
+        "\r\n"
+        "retry: 1000\n\n";
+    return write_all(fd, hdr, sizeof hdr - 1);
+}
+
+static int sse_send_snapshot(int fd, const char *snap, size_t snap_len)
+{
+    static const char prefix[] = "event: state\ndata: ";
+    static const char suffix[] = "\n\n";
+    if (write_all(fd, prefix, sizeof prefix - 1) < 0) return -1;
+    if (write_all(fd, snap, snap_len) < 0) return -1;
+    return write_all(fd, suffix, sizeof suffix - 1);
+}
+
+static int open_server_socket(const char *bind_addr, int port)
+{
+    struct sockaddr_in addr;
+    int fd;
+    int one = 1;
+
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "invalid port: %d\n", port);
+        return -1;
     }
-    fclose(fp);
-    if (rename(STATE_TMP, STATE_FILE) != 0) {
-        unlink(STATE_TMP);
-        return 0;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
     }
-    return 1;
+
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0) {
+        perror("setsockopt");
+        close(fd);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        fprintf(stderr, "invalid bind address: %s\n", bind_addr);
+        close(fd);
+        return -1;
+    }
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 8) < 0) {
+        perror("listen");
+        close(fd);
+        return -1;
+    }
+    if (set_nonblock(fd) < 0) {
+        perror("fcntl");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static void drain_or_close_sse_client(struct sse_client *c)
+{
+    char buf[256];
+    ssize_t n = read(c->fd, buf, sizeof buf);
+    if (n <= 0) {
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            sse_client_close(c);
+        return;
+    }
+
+    /* SSE is push-only here; if a client speaks back we drop it. */
+    sse_client_close(c);
+}
+
+static void broadcast_sse_snapshot(struct sse_client *clients, size_t nclients,
+                                   const char *snap, size_t snap_len)
+{
+    for (size_t i = 0; i < nclients; i++) {
+        if (clients[i].fd < 0) continue;
+        if (sse_send_snapshot(clients[i].fd, snap, snap_len) < 0)
+            sse_client_close(&clients[i]);
+    }
+}
+
+static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, size_t nclients,
+                                      const char *snap, size_t snap_len)
+{
+    char req[HTTP_REQ_MAX];
+    char method[16];
+    char path[256];
+
+    for (;;) {
+        int cli_fd = accept(srv_fd, NULL, NULL);
+        if (cli_fd < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            perror("accept");
+            return;
+        }
+
+        if (read_http_request(cli_fd, req, sizeof req, 2000) < 0 ||
+            parse_request_line(req, method, sizeof method, path, sizeof path) < 0) {
+            write_http_error(cli_fd, 400, "Bad Request");
+            close(cli_fd);
+            continue;
+        }
+
+        if (strcmp(method, "GET") != 0) {
+            write_http_error(cli_fd, 405, "Method Not Allowed");
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/state") || !strcmp(path, "/state.json")) {
+            (void)write_http_json(cli_fd, snap, snap_len);
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/healthz")) {
+            (void)write_http_text(cli_fd, "text/plain; charset=utf-8", "ok\n");
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/") || !strcmp(path, "/index") || !strcmp(path, "/index.txt")) {
+            (void)write_http_text(cli_fd, "text/plain; charset=utf-8",
+                                  "u60-datad dev HTTP API\n"
+                                  "GET /state   -> current JSON snapshot\n"
+                                  "GET /events  -> SSE stream\n"
+                                  "GET /healthz -> ok\n");
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/events")) {
+            int slot = -1;
+            for (size_t i = 0; i < nclients; i++) {
+                if (clients[i].fd < 0) {
+                    slot = (int)i;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                write_http_error(cli_fd, 503, "Too Many Clients");
+                close(cli_fd);
+                continue;
+            }
+            if (write_sse_handshake(cli_fd) < 0 ||
+                sse_send_snapshot(cli_fd, snap, snap_len) < 0 ||
+                set_nonblock(cli_fd) < 0) {
+                close(cli_fd);
+                continue;
+            }
+            clients[slot].fd = cli_fd;
+            continue;
+        }
+
+        write_http_error(cli_fd, 404, "Not Found");
+        close(cli_fd);
+    }
+}
+
+static void wait_with_http(int srv_fd, struct sse_client *clients, size_t nclients,
+                           const char *snap, size_t snap_len, int wait_ms)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += wait_ms / 1000;
+    deadline.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    while (g_run) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        long sec = deadline.tv_sec - now.tv_sec;
+        long nsec = deadline.tv_nsec - now.tv_nsec;
+        if (nsec < 0) {
+            sec -= 1;
+            nsec += 1000000000L;
+        }
+        if (sec < 0 || (sec == 0 && nsec <= 0)) return;
+
+        fd_set rfds;
+        struct timeval tv;
+        int rc, maxfd = srv_fd;
+
+        FD_ZERO(&rfds);
+        FD_SET(srv_fd, &rfds);
+        for (size_t i = 0; i < nclients; i++) {
+            if (clients[i].fd < 0) continue;
+            FD_SET(clients[i].fd, &rfds);
+            if (clients[i].fd > maxfd) maxfd = clients[i].fd;
+        }
+
+        tv.tv_sec = sec;
+        tv.tv_usec = nsec / 1000;
+        do {
+            rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        } while (rc < 0 && errno == EINTR && g_run);
+
+        if (rc < 0) {
+            perror("select");
+            return;
+        }
+        if (rc == 0) continue;
+
+        if (FD_ISSET(srv_fd, &rfds))
+            accept_ready_http_clients(srv_fd, clients, nclients, snap, snap_len);
+        for (size_t i = 0; i < nclients; i++) {
+            if (clients[i].fd >= 0 && FD_ISSET(clients[i].fd, &rfds))
+                drain_or_close_sse_client(&clients[i]);
+        }
+    }
 }
 
 /* Return pointer to the first byte after the leading {"ts":... , */
@@ -899,12 +1230,18 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
 int main(int argc, char **argv)
 {
     int once = 0, interval_ms = 1000;
+    const char *bind_addr = HTTP_BIND_ADDR;
+    int port = HTTP_PORT;
     int sim_poll_every, qos_retry_every, qos_retry_left = 0;
     char sim_sig[160];
     int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bind")) && i + 1 < argc)
+            bind_addr = argv[++i];
+        else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--port")) && i + 1 < argc)
+            port = atoi(argv[++i]);
     }
     if (interval_ms <= 0) interval_ms = 1000;
 
@@ -916,7 +1253,16 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_qos_signal);
-    mkdir(STATE_DIR, 0755);
+    signal(SIGPIPE, SIG_IGN);
+
+    int srv_fd = -1;
+    struct sse_client clients[HTTP_MAX_CLIENTS];
+    for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) clients[i].fd = -1;
+
+    if (!once) {
+        srv_fd = open_server_socket(bind_addr, port);
+        if (srv_fd < 0) return 1;
+    }
 
     /* board info changes rarely: fetch once, refresh hourly. */
     static char board[RAW_MAX];
@@ -1005,16 +1351,18 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (changed && atomic_write(snap, snap_len)) {
+            if (changed) {
+                broadcast_sse_snapshot(clients, HTTP_MAX_CLIENTS, snap, snap_len);
                 memcpy(last_snap, snap, snap_len + 1);
                 last_snap_len = snap_len;
             }
-        }
 
-        struct timespec ts = { interval_ms / 1000, (long)(interval_ms % 1000) * 1000000L };
-        nanosleep(&ts, NULL);
+            wait_with_http(srv_fd, clients, HTTP_MAX_CLIENTS, snap, snap_len, interval_ms);
+        }
         cycle++;
     } while (g_run);
 
+    for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
+    if (srv_fd >= 0) close(srv_fd);
     return 0;
 }
