@@ -118,7 +118,7 @@ procd -> zte_topsw_devui -> rc.local -> /data/u60pro/start.sh -> u60-datad
 
 ```jsonc
 { "schema": 1,
-  "datad": { "version": "0.4.1", "asset": "u60-datad-aarch64" } }
+  "datad": { "version": "0.4.2", "asset": "u60-datad-aarch64" } }
 ```
 
 - 发版时不要只打 tag；要把新的 `version.json` 和同版本二进制一起上传到 GitHub release。
@@ -146,3 +146,28 @@ procd -> zte_topsw_devui -> rc.local -> /data/u60pro/start.sh -> u60-datad
 - 清理 / 恢复：
   - 测试完成后已删除 `/tmp/u60-datad.zigtest` 与临时日志
   - 正式 `/data/u60pro/u60-datad -i 1000` 已恢复运行
+
+## 2026-06-25 短信列表出现大量空项（号码/正文为空）的根因
+
+- 设备侧原始短信接口 `ubus call zwrt_wms zte_libwms_get_sms_data ...` 当前返回的字段名是：
+  - `number`
+  - `content`
+  - `date`
+  - `id`
+  - `tag`
+- 但 `parse_sms_list()` 还在按旧字段名读取：
+  - `num`
+  - `text`
+- 这就导致现象很典型：
+  - `id` / `date` 能正常显示
+  - `num` / `text` 全部变成空串
+  - 前端短信页于是出现“一大堆日期正常、但号码和正文都空白”的短信项
+- 修正策略：
+  - 后端兼容两套字段名，优先读旧名 `num` / `text`
+  - 若旧名不存在，则回退到设备当前实际返回的 `number` / `content`
+- 现场附带还观察到设备上有两条 `u60-datad` 同时在跑；这不会制造“字段名错位”本身，但会放大排查噪音。后续部署修复版时，应顺手确认设备上只保留一条 `u60-datad` 进程，避免旧进程继续抢写 `/tmp/u60-datad/state.json`。
+- 已处理：
+  - 已在本地重新编译修复后的 `u60-datad`
+  - 已替换设备上的 `/data/u60pro/u60-datad`
+  - 已运行 `install-autostart.sh` 清理旧的重复自启链路
+  - 之后再次手动执行 `sh /data/u60pro/start.sh legacy`，把设备恢复到单 `u60-datad` + 单 `u60pro-devui` 的稳定运行态
