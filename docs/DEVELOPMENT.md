@@ -1,6 +1,6 @@
 # u60-datad 开发说明
 
-这份文档描述 `dev` 分支的当前实现。和稳定发布线相比，`dev` 的主要变化是把传输层从“本地文件快照”切成了 `HTTP + SSE`，方便后续 WebUI 直接接入。
+这份文档描述 `dev` 分支的当前实现。和稳定发布线相比，`dev` 的主要变化是把传输层彻底切成了 `HTTP + SSE`，方便后续 WebUI 直接接入。
 
 ## 项目目标
 
@@ -34,7 +34,6 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 当前 `dev` 分支的对外接口：
 
 - `GET /state`
-- `GET /state.json`
 - `GET /events`
 - `GET /healthz`
 

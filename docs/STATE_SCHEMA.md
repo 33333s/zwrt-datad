@@ -4,7 +4,6 @@
 
 ```text
 GET  /state
-GET  /state.json
 SSE  /events
 ```
 
@@ -140,7 +139,7 @@ SSE  /events
 
 ## Notes
 
-- `GET /state` / `GET /state.json` 返回的是完整 JSON 快照。
+- `GET /state` 返回的是完整 JSON 快照。
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
 - `traffic` is realtime session data from `type:1`.
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
