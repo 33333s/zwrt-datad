@@ -49,6 +49,20 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - 后续只有在快照内容变化时才再次推送
 - `ts` 不单独作为“变化”依据，避免无意义高频推送
 
+## 实机联调状态
+
+`2026-06-26` 已完成一轮真实设备联调，验证组合为：
+
+- `/data/u60pro/u60-datad`：当前 `dev` 线的 `HTTP + SSE` 版本
+- `/data/u60pro/u60pro-devui`：改为消费 `/state + /events` 的新版前端
+
+设备侧确认点：
+
+- `127.0.0.1:9460` 正常监听
+- `GET /state` 正常返回完整 JSON
+- `GET /events` 正常返回 `retry: 1000` 和连续的 `event: state`
+- `u60pro-devui` 与 `u60-datad` 在本机建立了稳定 SSE 长连接
+
 ## 启动链路
 
 当前 `dev` 依然沿用 U60Pro 现有的启动习惯，不主动改变设备上的 bring-up 方式。也就是说，这个分支只是先替换“后端对外通信方式”，不顺手重构设备自启方案。
