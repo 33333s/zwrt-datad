@@ -92,8 +92,8 @@ SSE  /events
   "device": {
     "profile": "mu5250",
     "profile_source": "model_name",
-    "api_template": "u60_mu5250",
-    "api_template_label": "U60 / MU5250",
+    "api_template": "MU5250",
+    "api_template_label": "MU5250",
     "api_template_supported": 1,
     "vendor": "ZTE",
     "model_name": "MU5250",
@@ -122,8 +122,8 @@ SSE  /events
 
 设备侧取数接口不再混写在一张总表里，而是按后端选中的模板拆分：
 
-- `device.api_template = u60_mu5250`
-  - 见 [`models/MU5250-U60.md`](models/MU5250-U60.md)
+- `device.api_template = MU5250`
+  - 见 [`models/MU5250.md`](models/MU5250.md)
 - 其他模板
   - 待后续逐个补充
 

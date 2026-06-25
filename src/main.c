@@ -87,8 +87,8 @@ struct device_template_spec {
 };
 
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
-    "u60_mu5250",
-    "U60 / MU5250",
+    "MU5250",
+    "MU5250",
     1,
     WIFI_SOURCE_U60_MAIN_2G,
     CLIENT_SOURCE_DHCP_ONLY,

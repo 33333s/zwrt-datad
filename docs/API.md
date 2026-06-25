@@ -88,7 +88,7 @@ ok
 具体某个机型模板会调用哪些设备接口，请看：
 
 - [`models/README.md`](models/README.md)
-- [`models/MU5250-U60.md`](models/MU5250-U60.md)
+- [`models/MU5250.md`](models/MU5250.md)
 
 ## Examples
 

@@ -18,7 +18,7 @@
 当前先按“模板是否已实现”理解：
 
 - 已实现模板：
-  - `u60_mu5250`
+  - `MU5250`
   - 匹配 `model_name = MU5250`
 - 待后续拆分适配：
   - `G5Pro` 和其他机型
@@ -42,7 +42,7 @@ common caches + model_name detect -> template select -> template-specific source
 - `GET /events` 提供持续 SSE 推送
 - 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
 - 后端根据 `device.model_name` 选择 `device.api_template`
-- 当前只把 `U60 / MU5250` 模板作为正式适配路径
+- 当前只把 `MU5250` 模板作为正式适配路径
 - 原来为其他机型加的宽松回退收进兼容模板，不再算正式支持
 
 ## 传输层约定
@@ -89,7 +89,7 @@ common caches + model_name detect -> template select -> template-specific source
 设备侧数据源不再统一写在一张总表里，而是按模板拆开维护：
 
 - 模板索引：[`models/README.md`](models/README.md)
-- 当前已实现：[`models/MU5250-U60.md`](models/MU5250-U60.md)
+- 当前已实现：[`models/MU5250.md`](models/MU5250.md)
 
 ## 已知约定
 
