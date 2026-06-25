@@ -98,8 +98,8 @@ SSE  /events
     "mem_avail": 789684224,
     "sw_version": "BD_FLYMODEMMU5250V1.0.0B27",
     "imei": "863500074315883",
-    "model": "ZTE U60Pro",
-    "hostname": "ZTE-U60Pro",
+    "model": "ZTE Device Name",
+    "hostname": "zte-device",
     "fw": "OpenWrt 23.05.4 r24012-d8dd03c46f"
   }
 }
@@ -141,6 +141,7 @@ SSE  /events
 
 - `GET /state` 返回的是完整 JSON 快照。
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
+- `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
 - `traffic` is realtime session data from `type:1`.
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
