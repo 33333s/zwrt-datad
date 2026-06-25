@@ -16,7 +16,7 @@
 
 > 这是一个 clean-room 实现，只依赖标准 OpenWRT 能力，不链接厂商私有库。
 
-当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前默认先把 `U60 / MU5250` 这条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前默认先把 `MU5250` 这条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：正式设备上的 `/data/u60pro/u60-datad` 已切到这条 `HTTP + SSE` 线，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
@@ -25,7 +25,7 @@
 当前只把后端模板明确分成“已实现”和“待拆分适配”两类：
 
 - 已实现并启用：
-  - `u60_mu5250`
+  - `MU5250`
   - 匹配机型：`model_name = MU5250`
   - 对应设备：`U60 Pro`
 - 待后续单独适配：
@@ -131,7 +131,7 @@ kill -USR1 $(pidof u60-datad)
 - 接口说明：[`docs/API.md`](docs/API.md)
 - 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
 - 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
-- U60 模板：[`docs/models/MU5250-U60.md`](docs/models/MU5250-U60.md)
+- MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
 - 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## 许可
