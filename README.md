@@ -107,6 +107,8 @@ es.addEventListener("state", (ev) => {
 });
 ```
 
+如果前端需要按机型切模板，优先使用 `state.device.model_name`；`state.device.profile` 是基于 `model_name` 生成的规范化键，`market_name` / `alias_name` 只建议用于展示。
+
 ## QoS / 短信说明
 
 QoS 相关有一个容易踩的点：`qci` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.5.0",
+    "version": "0.5.1",
     "asset": "u60-datad-aarch64",
-    "notes": "对外传输层切到 HTTP/SSE，并补充已验证机型的设备侧回退兼容"
+    "notes": "新增 device.model_name 机型识别层，并补充已验证机型的设备侧回退兼容"
   }
 }

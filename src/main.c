@@ -368,9 +368,117 @@ static void emit_str(struct buf *b, const char *key, const char *src, const char
     bappend(b, "\"");
 }
 
+static void emit_kv_str(struct buf *b, const char *key, const char *value)
+{
+    bappend(b, "\"%s\":\"", key);
+    bappend_json_esc(b, value ? value : "");
+    bappend(b, "\"");
+}
+
 static void emit_int(struct buf *b, const char *key, const char *src, const char *srckey, long def)
 {
     bappend(b, "\"%s\":%ld", key, json_get_int(src, srckey, def));
+}
+
+static void normalize_profile_token(const char *src, char *out, size_t outlen)
+{
+    size_t n = 0;
+    int prev_sep = 1;
+
+    if (!outlen) return;
+    out[0] = 0;
+    if (!src) return;
+
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (isalnum(*p)) {
+            if (n + 1 >= outlen) break;
+            out[n++] = (char)tolower(*p);
+            prev_sep = 0;
+        } else if (!prev_sep && (*p == '-' || *p == '_' || *p == ' ' || *p == '/' || *p == '.')) {
+            if (n + 1 >= outlen) break;
+            out[n++] = '_';
+            prev_sep = 1;
+        }
+    }
+
+    while (n > 0 && out[n - 1] == '_') n--;
+    out[n] = 0;
+}
+
+static void detect_device_identity(int with_board, const char *board_cache,
+                                   int with_common, const char *common_cache,
+                                   char *profile, size_t profile_n,
+                                   char *profile_source, size_t profile_source_n,
+                                   char *vendor, size_t vendor_n,
+                                   char *model_name, size_t model_name_n,
+                                   char *hardware_version, size_t hardware_version_n,
+                                   char *market_name, size_t market_name_n,
+                                   char *alias_name, size_t alias_name_n,
+                                   char *board_name, size_t board_name_n)
+{
+    char hw_model[128];
+    const char *source_value = NULL;
+    const char *source_name = "unknown";
+
+    if (profile_n) profile[0] = 0;
+    if (profile_source_n) profile_source[0] = 0;
+    if (vendor_n) vendor[0] = 0;
+    if (model_name_n) model_name[0] = 0;
+    if (hardware_version_n) hardware_version[0] = 0;
+    if (market_name_n) market_name[0] = 0;
+    if (alias_name_n) alias_name[0] = 0;
+    if (board_name_n) board_name[0] = 0;
+    if (sizeof hw_model) hw_model[0] = 0;
+
+    if (with_common) {
+        if (!json_get(common_cache, "manufacturer", vendor, vendor_n)) vendor[0] = 0;
+        if (!json_get(common_cache, "model_name", model_name, model_name_n)) model_name[0] = 0;
+        if (!json_get(common_cache, "hardware_version", hardware_version, hardware_version_n)) hardware_version[0] = 0;
+        if (!json_get(common_cache, "device_market_name", market_name, market_name_n)) market_name[0] = 0;
+        if (!json_get(common_cache, "device_alias_name", alias_name, alias_name_n)) alias_name[0] = 0;
+    }
+    if (with_board) {
+        if (!json_get(board_cache, "board_name", board_name, board_name_n)) board_name[0] = 0;
+    }
+
+    if (hardware_version[0]) {
+        size_t i = 0;
+        while (hardware_version[i] &&
+               hardware_version[i] != '_' &&
+               i + 1 < sizeof hw_model) {
+            hw_model[i] = hardware_version[i];
+            i++;
+        }
+        hw_model[i] = 0;
+    }
+
+    if (model_name[0]) {
+        source_value = model_name;
+        source_name = "model_name";
+    } else if (hw_model[0]) {
+        source_value = hw_model;
+        source_name = "hardware_version";
+    } else if (board_name[0]) {
+        source_value = board_name;
+        source_name = "board_name";
+    } else if (market_name[0]) {
+        source_value = market_name;
+        source_name = "device_market_name";
+    } else if (alias_name[0]) {
+        source_value = alias_name;
+        source_name = "device_alias_name";
+    }
+
+    if (source_value && *source_value) {
+        normalize_profile_token(source_value, profile, profile_n);
+    }
+    if (!profile[0] && profile_n > 0) {
+        snprintf(profile, profile_n, "unknown");
+        source_name = "unknown";
+    }
+    if (profile_source_n > 0) {
+        snprintf(profile_source, profile_source_n, "%s", source_name);
+    }
 }
 
 static long mem_used_pct(const char *sysinfo)
@@ -880,6 +988,9 @@ static void build_snapshot(char *out, size_t outlen,
     char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024], nfc[1024];
     char wifi_ssid[128], wifi_key[128], wifi_enc[64];
     char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
+    char device_profile[64], device_profile_source[64];
+    char device_vendor[64], device_model_name[128], device_hw[128];
+    char device_market_name[128], device_alias_name[128], device_board_name[128];
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, wifi_enabled;
@@ -912,6 +1023,16 @@ static void build_snapshot(char *out, size_t outlen,
     bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
     cpu_usage = cpu_usage_pct();
     cpu_temp = read_cpu_temp_value(therm);
+    detect_device_identity(with_board, board_cache,
+                           with_common, common_cache,
+                           device_profile, sizeof device_profile,
+                           device_profile_source, sizeof device_profile_source,
+                           device_vendor, sizeof device_vendor,
+                           device_model_name, sizeof device_model_name,
+                           device_hw, sizeof device_hw,
+                           device_market_name, sizeof device_market_name,
+                           device_alias_name, sizeof device_alias_name,
+                           device_board_name, sizeof device_board_name);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -1016,6 +1137,18 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "\"start\":\"");     bappend_json_esc(&b, dhcp_start); bappend(&b, "\",");
     bappend(&b, "\"limit\":\"");     bappend_json_esc(&b, dhcp_limit); bappend(&b, "\",");
     bappend(&b, "\"leasetime\":\""); bappend_json_esc(&b, dhcp_lease); bappend(&b, "\"");
+    bappend(&b, "},");
+
+    /* device identity: use model_name for adaptation, keep alias/market as display only. */
+    bappend(&b, "\"device\":{");
+    emit_kv_str(&b, "profile", device_profile);                bappend(&b, ",");
+    emit_kv_str(&b, "profile_source", device_profile_source);  bappend(&b, ",");
+    emit_kv_str(&b, "vendor", device_vendor);                  bappend(&b, ",");
+    emit_kv_str(&b, "model_name", device_model_name);          bappend(&b, ",");
+    emit_kv_str(&b, "hardware_version", device_hw);            bappend(&b, ",");
+    emit_kv_str(&b, "market_name", device_market_name);        bappend(&b, ",");
+    emit_kv_str(&b, "alias_name", device_alias_name);          bappend(&b, ",");
+    emit_kv_str(&b, "board_name", device_board_name);
     bappend(&b, "},");
 
     /* system */
