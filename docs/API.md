@@ -1,4 +1,4 @@
-# u60-datad API
+# zwrt-datad API
 
 `dev` 分支当前通过单个 HTTP 服务提供状态读取能力。
 
