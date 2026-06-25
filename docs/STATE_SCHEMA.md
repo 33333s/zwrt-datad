@@ -1,4 +1,4 @@
-# u60-datad state schema
+# zwrt-datad state schema
 
 `dev` 分支当前通过 HTTP / SSE 暴露统一状态快照：
 
