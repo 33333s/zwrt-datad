@@ -279,7 +279,8 @@ static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
             int unread = 0;
 
             if (!json_get(sms_obj, "id", id_raw, sizeof id_raw)) continue;
-            if (!json_get(sms_obj, "num", num, sizeof num)) num[0] = 0;
+            if (!json_get(sms_obj, "num", num, sizeof num) &&
+                !json_get(sms_obj, "number", num, sizeof num)) num[0] = 0;
             if (!json_get(sms_obj, "date", date_raw, sizeof date_raw)) date_raw[0] = 0;
             if (!json_get(sms_obj, "tag", tag, sizeof tag)) {
                 long t = json_get_int(sms_obj, "tag", 0);
@@ -287,7 +288,8 @@ static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
             } else {
                 unread = (tag[0] == '1') ? 1 : 0;
             }
-            if (!json_get(sms_obj, "text", text_hex, sizeof text_hex)) text_hex[0] = 0;
+            if (!json_get(sms_obj, "text", text_hex, sizeof text_hex) &&
+                !json_get(sms_obj, "content", text_hex, sizeof text_hex)) text_hex[0] = 0;
 
             id = strtol(id_raw, NULL, 10);
             format_sms_date(date_raw, date, sizeof date);

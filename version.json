@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.4.1",
+    "version": "0.4.2",
     "asset": "u60-datad-aarch64",
     "notes": "修复 JSON key 扫描误命中，补齐短信列表/正文状态输出，并放大快照缓冲避免长短信被截断"
   }
