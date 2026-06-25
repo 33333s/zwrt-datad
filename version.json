@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.4.2",
+    "version": "0.4.3",
     "asset": "u60-datad-aarch64",
-    "notes": "修复 JSON key 扫描误命中，补齐短信列表/正文状态输出，并放大快照缓冲避免长短信被截断"
+    "notes": "同时兼容旧 apn_ambr_* 与新 session_ambr_* 日志格式，避免部分用户读不到 AMBR"
   }
 }

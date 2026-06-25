@@ -118,7 +118,7 @@ procd -> zte_topsw_devui -> rc.local -> /data/u60pro/start.sh -> u60-datad
 
 ```jsonc
 { "schema": 1,
-  "datad": { "version": "0.4.2", "asset": "u60-datad-aarch64" } }
+  "datad": { "version": "0.4.3", "asset": "u60-datad-aarch64" } }
 ```
 
 - 发版时不要只打 tag；要把新的 `version.json` 和同版本二进制一起上传到 GitHub release。
@@ -171,3 +171,50 @@ procd -> zte_topsw_devui -> rc.local -> /data/u60pro/start.sh -> u60-datad
   - 已替换设备上的 `/data/u60pro/u60-datad`
   - 已运行 `install-autostart.sh` 清理旧的重复自启链路
   - 之后再次手动执行 `sh /data/u60pro/start.sh legacy`，把设备恢复到单 `u60-datad` + 单 `u60pro-devui` 的稳定运行态
+
+## 2026-06-25 插件更新后复查：设备仍在跑旧 datad
+
+- 复查时设备进程状态本身正常：
+  - `u60-datad` 只剩一份
+  - `u60pro-devui` 也在跑
+  - `/tmp/u60-datad/state.json` 在持续刷新
+- 但短信仍然是老问题：`id/date` 正常，`num/text` 全空。
+- 进一步核对二进制 hash：
+  - GitHub `v0.4.2` release 资产 `u60-datad-aarch64` 的 sha256 是 `fe978914ddeb97e25ccb22c04dc03ec4adaea9a155f9a4ee1635feed2774b563`
+  - 设备 `/data/u60pro/u60-datad` 的 sha256 是 `354050596062d500fb25f575f1d65fd0c2875db6ba39249928c820f6e8ad346d`
+- 结论：
+  - 插件这次并没有把设备实际运行的 datad 更新到 `v0.4.2`
+  - 设备当前跑的仍是旧版二进制，因此短信字段兼容修复没有生效
+
+## 2026-06-25 用户样本 `key.log.txt`：AMBR 读不到的根因
+
+- 用户提供的日志样本是 `/Users/y/Downloads/key.log.txt`。
+- 这份样本里：
+  - `apn_ambr_*` 只有 `2` 条，而且都停在 `2026-06-18 04:04:12` 之前
+  - `session_ambr_*` 有 `76` 条，并且最近一条一直更新到 `2026-06-25 19:32:29`
+- 当前样本的主流格式已经不是旧的：
+  - `apn_ambr_dl=... apn_ambr_ul=... apn_ambr_dl_ext=...`
+  - 而是新的：
+    - `session_ambr_dl=3000`
+    - `session_ambr_dl_unit=6(1Mbps)`
+    - `session_ambr_ul=200`
+    - `session_ambr_ul_unit=6(1Mbps)`
+- 同时 `qci` 仍然单独存在，例如 `qci = 6 6`。
+- 结论：
+  - 如果后端 AMBR parser 只认 `apn_ambr_*`，这个用户就很容易表现成“QCI 能读到，但 AMBR 读不到”
+  - 因为对他来说，真正持续更新的字段已经切到 `session_ambr_*`
+- 后续修正方向：
+  - 保留旧 `apn_ambr_*` 解析不动
+  - 增加 `session_ambr_dl/session_ambr_ul + *_unit` 的兼容解析作为 fallback
+  - 最稳的做法是优先取**最近一次有效**的 `session_ambr_*`；若完全没有，再退回旧 `apn_ambr_*`
+
+## 2026-06-25 AMBR 双格式兼容补记
+
+- 线上样本 `key.log.txt` 证明 AMBR 日志现在存在两套格式并存：
+  - 旧格式：`apn_ambr_dl/apn_ambr_ul/apn_ambr_*_ext*`
+  - 新格式：`session_ambr_dl/session_ambr_ul + session_ambr_*_unit`
+- 当前修正策略已改成双兼容：
+  - 扫到 `session_ambr_*` 时，按 `*_unit` 括号里的单位文本换算成 Mbps
+  - 扫到 `apn_ambr_*` 时，继续沿用旧解析逻辑
+  - 日志顺序扫描，最近一次有效值覆盖更早值
+- 这样老用户和新用户都能出 AMBR，不要求固件日志格式一致。

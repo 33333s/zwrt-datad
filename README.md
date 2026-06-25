@@ -120,7 +120,7 @@ kill -USR1 $(pidof u60-datad)
 
 ```jsonc
 { "schema": 1,
-  "datad": { "version": "0.4.2", "asset": "u60-datad-aarch64" } }
+  "datad": { "version": "0.4.3", "asset": "u60-datad-aarch64" } }
 ```
 
 发版时保持资产文件名不变，只更新版本号与内容即可。当前 U60Pro 发布线固定走 `u60pro` 分支，更新源以 GitHub latest release 为准。

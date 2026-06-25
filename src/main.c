@@ -407,6 +407,37 @@ static int parse_double_after(const char *s, const char *needle, double *out)
     return end != p;
 }
 
+static int parse_session_ambr_mbps(const char *s, const char *value_key,
+                                   const char *unit_key, double *out)
+{
+    const char *p = strstr(s, value_key);
+    const char *u = strstr(s, unit_key);
+    char *end;
+    double value, scale;
+
+    if (!p || !u) return 0;
+
+    p += strlen(value_key);
+    value = strtod(p, &end);
+    if (end == p) return 0;
+
+    u += strlen(unit_key);
+    u = strchr(u, '(');
+    if (!u) return 0;
+    u++;
+    scale = strtod(u, &end);
+    if (end == u) return 0;
+
+    if (strstr(end, "Gbps")) scale *= 1000.0;
+    else if (strstr(end, "Mbps")) scale *= 1.0;
+    else if (strstr(end, "Kbps") || strstr(end, "kbps")) scale /= 1000.0;
+    else if (strstr(end, "bps")) scale /= 1000000.0;
+    else return 0;
+
+    *out = value * scale;
+    return 1;
+}
+
 static void clear_qos_cache(void)
 {
     g_qci = 0;
@@ -448,20 +479,32 @@ static void refresh_qos_cache(void)
             g_qci_valid = 1;
         }
 
-        if (!strstr(line, "apn_ambr")) continue;
+        if (strstr(line, "session_ambr")) {
+            if (parse_session_ambr_mbps(line, "session_ambr_dl=", "session_ambr_dl_unit=", &dl)) {
+                g_ambr_dl = dl;
+                g_ambr_dl_valid = 1;
+            }
 
-        if (parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
-            parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
-            (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1))) {
-            g_ambr_dl = dl;
-            g_ambr_dl_valid = 1;
+            if (parse_session_ambr_mbps(line, "session_ambr_ul=", "session_ambr_ul_unit=", &ul)) {
+                g_ambr_ul = ul;
+                g_ambr_ul_valid = 1;
+            }
         }
 
-        if (parse_double_after(line, "apn_ambr_ul_ext2=", &ul) ||
-            parse_double_after(line, "apn_ambr_ul_ext=", &ul) ||
-            (parse_double_after(line, "apn_ambr_ul=", &ul) && (ul /= 1000.0, 1))) {
-            g_ambr_ul = ul;
-            g_ambr_ul_valid = 1;
+        if (strstr(line, "apn_ambr")) {
+            if (parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
+                parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
+                (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1))) {
+                g_ambr_dl = dl;
+                g_ambr_dl_valid = 1;
+            }
+
+            if (parse_double_after(line, "apn_ambr_ul_ext2=", &ul) ||
+                parse_double_after(line, "apn_ambr_ul_ext=", &ul) ||
+                (parse_double_after(line, "apn_ambr_ul=", &ul) && (ul /= 1000.0, 1))) {
+                g_ambr_ul = ul;
+                g_ambr_ul_valid = 1;
+            }
         }
     }
     fclose(fp);
