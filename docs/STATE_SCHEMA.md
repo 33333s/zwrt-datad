@@ -1,12 +1,14 @@
 # u60-datad state schema
 
-`u60-datad` publishes a single normalized snapshot at:
+`dev` 分支当前通过 HTTP / SSE 暴露统一状态快照：
 
 ```text
-/tmp/u60-datad/state.json
+GET  /state
+GET  /state.json
+SSE  /events
 ```
 
-Consumers read this file. They must not call `ubus` directly.
+消费者不应直接打 `ubus`，也不应自己扫 `key.log`。
 
 ## Shape
 
@@ -138,6 +140,8 @@ Consumers read this file. They must not call `ubus` directly.
 
 ## Notes
 
+- `GET /state` / `GET /state.json` 返回的是完整 JSON 快照。
+- `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
 - `traffic` is realtime session data from `type:1`.
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
