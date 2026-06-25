@@ -89,6 +89,16 @@ SSE  /events
     "ambr_ul": "10008.640",
     "usb_mode": "debug"
   },
+  "device": {
+    "profile": "mu5250",
+    "profile_source": "model_name",
+    "vendor": "ZTE",
+    "model_name": "MU5250",
+    "hardware_version": "MU5250_HW1.0",
+    "market_name": "U60 Pro",
+    "alias_name": "U60 Pro",
+    "board_name": "qcom,sdxpinn-idp"
+  },
   "system": {
     "uptime": 11202,
     "cpu_temp": 41,
@@ -128,6 +138,12 @@ SSE  /events
 | `system.mem_total`/`mem_avail` | `system info` 的 `memory.total`/`memory.available`（字节） |
 | `wlan.enabled` | `uci get wireless.main_2g.disabled`（取反） |
 | `dhcp.*` | `uci`：`network.lan.ipaddr`、`dhcp.lan.zte_start/limit/leasetime` |
+| `device.model_name` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `model_name` |
+| `device.hardware_version` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `hardware_version` |
+| `device.market_name` / `alias_name` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `device_market_name` / `device_alias_name` |
+| `device.board_name` | `system board` |
+| `device.profile` | 优先由 `device.model_name` 规范化得到；缺失时依次回退到 `hardware_version`、`board_name`、`market_name`、`alias_name` |
+| `device.profile_source` | 当前 `profile` 实际使用的数据来源键名 |
 | `system.cpu_usage` | `/proc/stat`（相邻轮询的占用率差值） |
 | `system.sw_version` | `uci get zwrt_common_info.common_config.wa_inner_version` |
 | `system.imei` | `zwrt_zte_mdm.api get_imei`（一次性） |
@@ -141,6 +157,8 @@ SSE  /events
 
 - `GET /state` 返回的是完整 JSON 快照。
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
+- 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
+- `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
 - `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
 - `traffic` is realtime session data from `type:1`.
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。

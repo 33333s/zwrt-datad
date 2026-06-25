@@ -83,6 +83,8 @@ ok
 
 当前快照是完整对象，不是增量 patch。每次 `/state` 和每条 SSE `state` 事件都返回一份完整 JSON。
 
+机型模板适配应优先读取 `device.model_name`；`device.profile` 是后端基于 `model_name` 生成的规范化键，适合直接做映射表索引。
+
 ## Examples
 
 一次性读状态：

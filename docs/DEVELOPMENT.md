@@ -42,6 +42,7 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - 默认 1 Hz 生成一次完整快照
 - `GET /state` 提供当前完整 JSON
 - `GET /events` 提供持续 SSE 推送
+- 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
 - 对不同设备的 `thermal` / `wifi` / `client list` 数据源做回退适配
 
 ## 传输层约定
