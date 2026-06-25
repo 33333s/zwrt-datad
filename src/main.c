@@ -62,6 +62,48 @@ struct sse_client {
     int fd;
 };
 
+enum wifi_source_mode {
+    WIFI_SOURCE_U60_MAIN_2G = 0,
+    WIFI_SOURCE_COMPAT_AUTO = 1
+};
+
+enum client_source_mode {
+    CLIENT_SOURCE_DHCP_ONLY = 0,
+    CLIENT_SOURCE_DHCP_THEN_ROUTER = 1
+};
+
+enum temp_source_mode {
+    TEMP_SOURCE_U60_UBUS_ONLY = 0,
+    TEMP_SOURCE_COMPAT_FALLBACK = 1
+};
+
+struct device_template_spec {
+    const char *id;
+    const char *label;
+    int supported;
+    enum wifi_source_mode wifi_mode;
+    enum client_source_mode client_mode;
+    enum temp_source_mode temp_mode;
+};
+
+static const struct device_template_spec TEMPLATE_U60_MU5250 = {
+    "u60_mu5250",
+    "U60 / MU5250",
+    1,
+    WIFI_SOURCE_U60_MAIN_2G,
+    CLIENT_SOURCE_DHCP_ONLY,
+    TEMP_SOURCE_U60_UBUS_ONLY
+};
+
+static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
+    "legacy_compat",
+    "Legacy compatibility fallback",
+    0,
+    WIFI_SOURCE_COMPAT_AUTO,
+    CLIENT_SOURCE_DHCP_THEN_ROUTER,
+    TEMP_SOURCE_COMPAT_FALLBACK
+};
+
 /* Run `ubus call <svc> <method> [args]` and capture stdout. 0 on output. */
 static int run_ubus(const char *svc, const char *method, const char *args,
                     char *out, size_t outlen)
@@ -405,6 +447,14 @@ static void normalize_profile_token(const char *src, char *out, size_t outlen)
     out[n] = 0;
 }
 
+static int has_prefix(const char *s, const char *prefix)
+{
+    size_t n;
+    if (!s || !prefix) return 0;
+    n = strlen(prefix);
+    return strncmp(s, prefix, n) == 0;
+}
+
 static void detect_device_identity(int with_board, const char *board_cache,
                                    int with_common, const char *common_cache,
                                    char *profile, size_t profile_n,
@@ -479,6 +529,16 @@ static void detect_device_identity(int with_board, const char *board_cache,
     if (profile_source_n > 0) {
         snprintf(profile_source, profile_source_n, "%s", source_name);
     }
+}
+
+static const struct device_template_spec *
+select_device_template(const char *model_name, const char *hardware_version)
+{
+    if ((model_name && !strcmp(model_name, "MU5250")) ||
+        has_prefix(hardware_version, "MU5250_")) {
+        return &TEMPLATE_U60_MU5250;
+    }
+    return &TEMPLATE_LEGACY_COMPAT;
 }
 
 static long mem_used_pct(const char *sysinfo)
@@ -737,7 +797,7 @@ static long read_cpu_temp_sysfs(void)
     return fallback;
 }
 
-static long read_cpu_temp_value(const char *therm)
+static long read_cpu_temp_value_compat(const char *therm)
 {
     static const char *keys[] = {
         "cpuss_temp",
@@ -752,6 +812,13 @@ static long read_cpu_temp_value(const char *therm)
     }
 
     return read_cpu_temp_sysfs();
+}
+
+static long read_cpu_temp_value_u60(const char *therm)
+{
+    long v = json_get_int(therm, "cpuss_temp", -1);
+    if (v < 0) return 0;
+    return normalize_temp_reading(v);
 }
 
 static int cpu_usage_pct(void)
@@ -790,14 +857,73 @@ static void chomp(char *s)
     while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = 0;
 }
 
-static void load_wifi_dhcp(char *ssid, size_t ssid_n,
-                           char *key, size_t key_n,
-                           char *enc, size_t enc_n,
-                           int *enabled,
-                           char *ip, size_t ip_n,
-                           char *start, size_t start_n,
-                           char *limit, size_t limit_n,
-                           char *lease, size_t lease_n)
+static void parse_wifi_dhcp_output(FILE *fp,
+                                   char *ssid, size_t ssid_n,
+                                   char *key, size_t key_n,
+                                   char *enc, size_t enc_n,
+                                   int *enabled,
+                                   char *ip, size_t ip_n,
+                                   char *start, size_t start_n,
+                                   char *limit, size_t limit_n,
+                                   char *lease, size_t lease_n)
+{
+    char line[256];
+
+    ssid[0] = key[0] = enc[0] = ip[0] = start[0] = limit[0] = lease[0] = 0;
+    *enabled = 1;
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        chomp(line);
+        if      (!strncmp(line, "SSID=", 5))  snprintf(ssid,  ssid_n,  "%s", line + 5);
+        else if (!strncmp(line, "KEY=", 4))   snprintf(key,   key_n,   "%s", line + 4);
+        else if (!strncmp(line, "ENC=", 4))   snprintf(enc,   enc_n,   "%s", line + 4);
+        else if (!strncmp(line, "DIS=", 4))   *enabled = atoi(line + 4) ? 0 : 1;
+        else if (!strncmp(line, "IP=", 3))    snprintf(ip,    ip_n,    "%s", line + 3);
+        else if (!strncmp(line, "START=", 6)) snprintf(start, start_n, "%s", line + 6);
+        else if (!strncmp(line, "LIMIT=", 6)) snprintf(limit, limit_n, "%s", line + 6);
+        else if (!strncmp(line, "LEASE=", 6)) snprintf(lease, lease_n, "%s", line + 6);
+    }
+}
+
+static void load_wifi_dhcp_u60(char *ssid, size_t ssid_n,
+                               char *key, size_t key_n,
+                               char *enc, size_t enc_n,
+                               int *enabled,
+                               char *ip, size_t ip_n,
+                               char *start, size_t start_n,
+                               char *limit, size_t limit_n,
+                               char *lease, size_t lease_n)
+{
+    FILE *fp = popen(
+        "printf 'SSID=%s\\n' \"$(uci -q get wireless.main_2g.ssid 2>/dev/null)\";"
+        "printf 'KEY=%s\\n' \"$(uci -q get wireless.main_2g.key 2>/dev/null)\";"
+        "printf 'ENC=%s\\n' \"$(uci -q get wireless.main_2g.encryption 2>/dev/null)\";"
+        "printf 'DIS=%s\\n' \"$(uci -q get wireless.main_2g.disabled 2>/dev/null)\";"
+        "printf 'IP=%s\\n' \"$(uci -q get network.lan.ipaddr 2>/dev/null)\";"
+        "printf 'START=%s\\n' \"$(uci -q get dhcp.lan.start 2>/dev/null)\";"
+        "printf 'LIMIT=%s\\n' \"$(uci -q get dhcp.lan.limit 2>/dev/null)\";"
+        "printf 'LEASE=%s\\n' \"$(uci -q get dhcp.lan.leasetime 2>/dev/null)\"",
+        "r");
+    parse_wifi_dhcp_output(fp,
+                           ssid, ssid_n,
+                           key, key_n,
+                           enc, enc_n,
+                           enabled,
+                           ip, ip_n,
+                           start, start_n,
+                           limit, limit_n,
+                           lease, lease_n);
+    if (fp) pclose(fp);
+}
+
+static void load_wifi_dhcp_compat(char *ssid, size_t ssid_n,
+                                  char *key, size_t key_n,
+                                  char *enc, size_t enc_n,
+                                  int *enabled,
+                                  char *ip, size_t ip_n,
+                                  char *start, size_t start_n,
+                                  char *limit, size_t limit_n,
+                                  char *lease, size_t lease_n)
 {
     FILE *fp = popen(
         "section='';"
@@ -821,23 +947,35 @@ static void load_wifi_dhcp(char *ssid, size_t ssid_n,
         "printf 'LIMIT=%s\\n' \"$(uci -q get dhcp.lan.limit 2>/dev/null)\";"
         "printf 'LEASE=%s\\n' \"$(uci -q get dhcp.lan.leasetime 2>/dev/null)\"",
         "r");
-    char line[256];
+    parse_wifi_dhcp_output(fp,
+                           ssid, ssid_n,
+                           key, key_n,
+                           enc, enc_n,
+                           enabled,
+                           ip, ip_n,
+                           start, start_n,
+                           limit, limit_n,
+                           lease, lease_n);
+    if (fp) pclose(fp);
+}
 
-    ssid[0] = key[0] = enc[0] = ip[0] = start[0] = limit[0] = lease[0] = 0;
-    *enabled = 1;
-    if (!fp) return;
-    while (fgets(line, sizeof line, fp)) {
-        chomp(line);
-        if      (!strncmp(line, "SSID=", 5))  snprintf(ssid,  ssid_n,  "%s", line + 5);
-        else if (!strncmp(line, "KEY=", 4))   snprintf(key,   key_n,   "%s", line + 4);
-        else if (!strncmp(line, "ENC=", 4))   snprintf(enc,   enc_n,   "%s", line + 4);
-        else if (!strncmp(line, "DIS=", 4))   *enabled = atoi(line + 4) ? 0 : 1;
-        else if (!strncmp(line, "IP=", 3))    snprintf(ip,    ip_n,    "%s", line + 3);
-        else if (!strncmp(line, "START=", 6)) snprintf(start, start_n, "%s", line + 6);
-        else if (!strncmp(line, "LIMIT=", 6)) snprintf(limit, limit_n, "%s", line + 6);
-        else if (!strncmp(line, "LEASE=", 6)) snprintf(lease, lease_n, "%s", line + 6);
+static void load_wifi_dhcp_for_template(const struct device_template_spec *tpl,
+                                        char *ssid, size_t ssid_n,
+                                        char *key, size_t key_n,
+                                        char *enc, size_t enc_n,
+                                        int *enabled,
+                                        char *ip, size_t ip_n,
+                                        char *start, size_t start_n,
+                                        char *limit, size_t limit_n,
+                                        char *lease, size_t lease_n)
+{
+    if (tpl->wifi_mode == WIFI_SOURCE_U60_MAIN_2G) {
+        load_wifi_dhcp_u60(ssid, ssid_n, key, key_n, enc, enc_n,
+                           enabled, ip, ip_n, start, start_n, limit, limit_n, lease, lease_n);
+        return;
     }
-    pclose(fp);
+    load_wifi_dhcp_compat(ssid, ssid_n, key, key_n, enc, enc_n,
+                          enabled, ip, ip_n, start, start_n, limit, limit_n, lease, lease_n);
 }
 
 static int append_client_entries_from_array(const char *arr_json, struct buf *outb, int *items)
@@ -971,11 +1109,45 @@ static int build_client_list_from_router(char *out, size_t outlen)
     return items;
 }
 
-static void build_client_list_json(char *out, size_t outlen)
+static void build_client_list_json_u60(char *out, size_t outlen)
+{
+    if (build_client_list_from_dhcp(out, outlen) > 0) return;
+    if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+}
+
+static void build_client_list_json_compat(char *out, size_t outlen)
 {
     if (build_client_list_from_dhcp(out, outlen) > 0) return;
     if (build_client_list_from_router(out, outlen) > 0) return;
     if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+}
+
+static void build_client_list_json_for_template(const struct device_template_spec *tpl,
+                                                char *out, size_t outlen)
+{
+    if (tpl->client_mode == CLIENT_SOURCE_DHCP_ONLY) {
+        build_client_list_json_u60(out, outlen);
+        return;
+    }
+    build_client_list_json_compat(out, outlen);
+}
+
+static int load_thermal_snapshot_for_template(const struct device_template_spec *tpl,
+                                              char *therm, size_t therm_n)
+{
+    if (tpl->temp_mode == TEMP_SOURCE_U60_UBUS_ONLY) {
+        return run_ubus("zwrt_bsp.thermal", "get_cpu_temp", NULL, therm, therm_n);
+    }
+    if (run_ubus("zwrt_bsp.thermal", "get_cpu_temp", NULL, therm, therm_n) != 0)
+        return run_ubus("zwrt_bsp.thermal", "list", NULL, therm, therm_n);
+    return 0;
+}
+
+static long read_cpu_temp_for_template(const struct device_template_spec *tpl, const char *therm)
+{
+    if (tpl->temp_mode == TEMP_SOURCE_U60_UBUS_ONLY)
+        return read_cpu_temp_value_u60(therm);
+    return read_cpu_temp_value_compat(therm);
 }
 
 /* Poll everything and build the unified snapshot into `out`. */
@@ -994,35 +1166,8 @@ static void build_snapshot(char *out, size_t outlen,
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, wifi_enabled;
+    const struct device_template_spec *device_template;
 
-    run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
-    run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
-    run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
-    if (run_ubus("zwrt_bsp.thermal", "get_cpu_temp", NULL, therm, sizeof therm) != 0)
-        run_ubus("zwrt_bsp.thermal", "list", NULL, therm, sizeof therm);
-    run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
-    run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
-    /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
-    run_ubus("zwrt_data", "get_wwandst",
-             "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
-    run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
-    run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
-    run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
-    load_wifi_dhcp(wifi_ssid, sizeof wifi_ssid,
-                   wifi_key, sizeof wifi_key,
-                   wifi_enc, sizeof wifi_enc,
-                   &wifi_enabled,
-                   dhcp_ip, sizeof dhcp_ip,
-                   dhcp_start, sizeof dhcp_start,
-                   dhcp_limit, sizeof dhcp_limit,
-                   dhcp_lease, sizeof dhcp_lease);
-    build_client_list_json(client_list, sizeof client_list);
-    chg_uv = read_long_file("/sys/class/power_supply/usb/voltage_now", 0);
-    chg_ua = read_long_file("/sys/class/power_supply/usb/current_now", 0);
-    bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
-    bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
-    cpu_usage = cpu_usage_pct();
-    cpu_temp = read_cpu_temp_value(therm);
     detect_device_identity(with_board, board_cache,
                            with_common, common_cache,
                            device_profile, sizeof device_profile,
@@ -1033,6 +1178,36 @@ static void build_snapshot(char *out, size_t outlen,
                            device_market_name, sizeof device_market_name,
                            device_alias_name, sizeof device_alias_name,
                            device_board_name, sizeof device_board_name);
+    device_template = select_device_template(device_model_name, device_hw);
+
+    run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
+    run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
+    run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
+    load_thermal_snapshot_for_template(device_template, therm, sizeof therm);
+    run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
+    run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
+    /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
+    run_ubus("zwrt_data", "get_wwandst",
+             "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
+    run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
+    run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
+    run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
+    load_wifi_dhcp_for_template(device_template,
+                                wifi_ssid, sizeof wifi_ssid,
+                                wifi_key, sizeof wifi_key,
+                                wifi_enc, sizeof wifi_enc,
+                                &wifi_enabled,
+                                dhcp_ip, sizeof dhcp_ip,
+                                dhcp_start, sizeof dhcp_start,
+                                dhcp_limit, sizeof dhcp_limit,
+                                dhcp_lease, sizeof dhcp_lease);
+    build_client_list_json_for_template(device_template, client_list, sizeof client_list);
+    chg_uv = read_long_file("/sys/class/power_supply/usb/voltage_now", 0);
+    chg_ua = read_long_file("/sys/class/power_supply/usb/current_now", 0);
+    bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
+    bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
+    cpu_usage = cpu_usage_pct();
+    cpu_temp = read_cpu_temp_for_template(device_template, therm);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -1139,10 +1314,13 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "\"leasetime\":\""); bappend_json_esc(&b, dhcp_lease); bappend(&b, "\"");
     bappend(&b, "},");
 
-    /* device identity: use model_name for adaptation, keep alias/market as display only. */
+    /* device identity + backend-selected source template. */
     bappend(&b, "\"device\":{");
     emit_kv_str(&b, "profile", device_profile);                bappend(&b, ",");
     emit_kv_str(&b, "profile_source", device_profile_source);  bappend(&b, ",");
+    emit_kv_str(&b, "api_template", device_template->id);      bappend(&b, ",");
+    emit_kv_str(&b, "api_template_label", device_template->label); bappend(&b, ",");
+    bappend(&b, "\"api_template_supported\":%d,", device_template->supported);
     emit_kv_str(&b, "vendor", device_vendor);                  bappend(&b, ",");
     emit_kv_str(&b, "model_name", device_model_name);          bappend(&b, ",");
     emit_kv_str(&b, "hardware_version", device_hw);            bappend(&b, ",");

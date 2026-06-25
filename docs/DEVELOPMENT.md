@@ -4,7 +4,7 @@
 
 ## 项目目标
 
-`u60-datad` 是一个 clean-room 设备状态聚合器，目标是在不依赖厂商私有库的前提下，把一类相近的 ZTE 便携式路由设备状态统一采集起来，对外输出成一份稳定 JSON。
+`u60-datad` 是一个 clean-room 设备状态聚合器，目标是在不依赖厂商私有库的前提下，把机型差异收口到后端模板层，对外输出成一份稳定 JSON。
 
 核心原则：
 
@@ -15,22 +15,20 @@
 
 ## 机型范围
 
-当前这条线建议理解为“通用聚合器 + 少量机型回退”：
+当前先按“模板是否已实现”理解：
 
-- 已验证机型：
-  - `ZTE U60Pro`
-  - `ZTE G5Pro`
-- 兼容目标：
-  - 具备相近 `ubus` 服务、`uci` 配置项和 `sysfs` 路径的同代设备
-- 非目标：
-  - 完全不同后台接口、不同短信栈或不同网络字段语义的设备，在没有适配层之前不应直接宣称支持
+- 已实现模板：
+  - `u60_mu5250`
+  - 匹配 `model_name = MU5250`
+- 待后续拆分适配：
+  - `G5Pro` 和其他机型
 
-因此，文档里提到的字段模型是“对外统一契约”，不等于设备内部一定使用完全相同的数据源路径。
+因此，字段模型仍然是统一对外契约，但设备内部取数路径现在明确按模板分开维护，不再把多机型回退默认混在一条主路径里。
 
 ## 当前架构
 
 ```text
-ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumers
+common caches + model_name detect -> template select -> template-specific sources -> HTTP /state + SSE /events
 ```
 
 当前实现要点：
@@ -43,7 +41,9 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - `GET /state` 提供当前完整 JSON
 - `GET /events` 提供持续 SSE 推送
 - 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
-- 对不同设备的 `thermal` / `wifi` / `client list` 数据源做回退适配
+- 后端根据 `device.model_name` 选择 `device.api_template`
+- 当前只把 `U60 / MU5250` 模板作为正式适配路径
+- 原来为其他机型加的宽松回退收进兼容模板，不再算正式支持
 
 ## 传输层约定
 
@@ -84,32 +84,12 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 
 如果以后要把它投入实际设备验证，建议继续沿用现有稳定拉起路径，再单独验证 HTTP/SSE 消费端。
 
-## 已接入数据源
+## 模板文档
 
-`ubus`：
+设备侧数据源不再统一写在一张总表里，而是按模板拆开维护：
 
-- `zte_nwinfo_api nwinfo_get_netinfo`
-- `zwrt_bsp.battery list`
-- `zwrt_bsp.charger list`
-- `zwrt_bsp.thermal get_cpu_temp`
-- `zwrt_bsp.thermal list`（作为温度接口回退）
-- `zwrt_router.api router_get_user_list_num`
-- `zwrt_router.api router_get_status_no_auth`
-- `zwrt_router.api router_lan_access_list` / `router_wireless_access_list`（当 DHCP lease 不可用时）
-- `zwrt_data get_wwandst`
-- `zwrt_zte_mdm.api get_zwrt_common_info`
-- `zwrt_zte_mdm.api get_imei`
-- `system info`
-- `system board`
-
-其他数据源：
-
-- `/data/logfs/key.log` 的 QoS `[DATA]` 行
-- `/tmp/dhcp.leases`
-- `uci`
-- `/proc/stat`
-- `thermal_zone` sysfs（当 ubus 不直接给 CPU 温度时）
-- `power_supply` sysfs
+- 模板索引：[`models/README.md`](models/README.md)
+- 当前已实现：[`models/MU5250-U60.md`](models/MU5250-U60.md)
 
 ## 已知约定
 
@@ -120,8 +100,7 @@ ubus calls + key.log cache -> u60-datad -> HTTP /state + SSE /events -> consumer
 - 手动刷新通过 `SIGUSR1` 触发
 - 换卡检测基于 `sim_iccid/current_sim_slot`
 - 短信列表一次最多取 32 条，并缓存解码后的列表
-- 某些机型上如果 `/tmp/dhcp.leases` 为空，会自动回退到 `router_wireless_access_list`
-- 如果 `zwrt_bsp.thermal get_cpu_temp` 不存在，会自动回退到 `thermal_zone` 里的 `cpuss*`
+- `device.api_template_supported = 1` 才代表当前机型已有明确模板；`0` 只表示落到了内部兼容模板
 
 ## 构建
 
@@ -187,7 +166,7 @@ kill -USR1 $(pidof u60-datad)
 
 这个 `dev` 分支当前只处理两件事：
 
-1. 保留现有统一字段模型和现有已验证机型的采集逻辑
+1. 保留统一字段模型，并把设备侧差异收口到模板层
 2. 把外部通信方式改成 `HTTP + SSE`
 
-也就是说，这个分支还不是“完整多设备主线”重构，只是先把传输层收口，给后续 WebUI 或适配层改造打基础。
+也就是说，这个分支现在是“先把 U60 模板做实，再逐个补别的机型模板”，而不是继续在主路径里堆隐式兼容分支。
