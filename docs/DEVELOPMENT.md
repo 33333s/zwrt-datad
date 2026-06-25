@@ -68,15 +68,15 @@ common caches + model_name detect -> template select -> template-specific source
 
 `2026-06-26` 已完成一轮真实设备联调，验证组合为：
 
-- `/data/u60pro/u60-datad`：当前 `dev` 线的 `HTTP + SSE` 版本
-- `/data/u60pro/u60pro-devui`：改为消费 `/state + /events` 的新版前端
+- `/data/plugins/zwrt-datad/zwrt-datad`：当前 `dev` 线的 `HTTP + SSE` 版本
+- `/data/plugins/u60pro-devui/u60pro-devui`：改为消费 `/state + /events` 的新版前端
 
 设备侧确认点：
 
 - `127.0.0.1:9460` 正常监听
 - `GET /state` 正常返回完整 JSON
 - `GET /events` 正常返回 `retry: 1000` 和连续的 `event: state`
-- `u60pro-devui` 与 `u60-datad` 在本机建立了稳定 SSE 长连接
+- `u60pro-devui` 与 `zwrt-datad` 在本机建立了稳定 SSE 长连接
 
 ## 启动链路
 
@@ -121,19 +121,19 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude -c src/json.c src/main.c
 前台运行：
 
 ```sh
-./u60-datad -i 1000
+./zwrt-datad -i 1000
 ```
 
 单次采样：
 
 ```sh
-./u60-datad --once
+./zwrt-datad --once
 ```
 
 改监听地址 / 端口：
 
 ```sh
-./u60-datad -b 0.0.0.0 -p 9460
+./zwrt-datad -b 0.0.0.0 -p 9460
 ```
 
 ## 调试
@@ -141,7 +141,7 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude -c src/json.c src/main.c
 直接看一份当前快照：
 
 ```sh
-./u60-datad --once
+./zwrt-datad --once
 ```
 
 读 HTTP：
@@ -159,7 +159,7 @@ curl -N http://127.0.0.1:9460/events
 QoS 缓存重读：
 
 ```sh
-kill -USR1 $(pidof u60-datad)
+kill -USR1 $(pidof zwrt-datad)
 ```
 
 ## 代码边界

@@ -74,7 +74,7 @@ ok
 示例：
 
 ```sh
-./u60-datad -i 1000 -b 127.0.0.1 -p 9460
+./zwrt-datad -i 1000 -b 127.0.0.1 -p 9460
 ```
 
 ## Snapshot Contract

@@ -1636,7 +1636,7 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
 
         if (!strcmp(path, "/") || !strcmp(path, "/index") || !strcmp(path, "/index.txt")) {
             (void)write_http_text(cli_fd, "text/plain; charset=utf-8",
-                                  "u60-datad dev HTTP API\n"
+                                  "zwrt-datad dev HTTP API\n"
                                   "GET /state   -> current JSON snapshot\n"
                                   "GET /events  -> SSE stream\n"
                                   "GET /healthz -> ok\n");

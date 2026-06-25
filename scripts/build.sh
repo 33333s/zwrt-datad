@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build u60-datad with the local Bootlin aarch64 musl toolchain.
-# Usage: wsl -- bash -lc 'bash /mnt/d/.../u60-datad/scripts/build.sh'
+# Build zwrt-datad with the local Bootlin aarch64 musl toolchain.
+# Usage: wsl -- bash -lc 'bash /mnt/d/.../zwrt-datad/scripts/build.sh'
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,9 +13,9 @@ cd "$ROOT"
 CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
   -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
 
-$CC $CFLAGS src/*.c -static -Wl,--gc-sections -o u60-datad
+$CC $CFLAGS src/*.c -static -Wl,--gc-sections -o zwrt-datad
 echo ">> link OK"
-"$TC/aarch64-linux-size" u60-datad
-"$TC/aarch64-linux-strip" -o u60-datad.stripped u60-datad 2>/dev/null || true
-ls -lh u60-datad u60-datad.stripped 2>/dev/null
+"$TC/aarch64-linux-size" zwrt-datad
+"$TC/aarch64-linux-strip" -o zwrt-datad.stripped zwrt-datad 2>/dev/null || true
+ls -lh zwrt-datad zwrt-datad.stripped 2>/dev/null
 echo "BUILD-OK"
