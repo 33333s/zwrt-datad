@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.5.1",
+    "version": "0.6.0",
     "asset": "u60-datad-aarch64",
-    "notes": "新增 device.model_name 机型识别层，并补充已验证机型的设备侧回退兼容"
+    "notes": "后端按 model_name 选择设备 API 模板，当前先固化 U60/MU5250 模板并把其他机型适配从主路径拆开"
   }
 }

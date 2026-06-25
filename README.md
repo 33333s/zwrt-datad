@@ -16,22 +16,21 @@
 
 > 这是一个 clean-room 实现，只依赖标准 OpenWRT 能力，不链接厂商私有库。
 
-当前这条 `dev` 线已经按真实设备数据验证过多种机型差异，后端会对温度、客户端列表和 Wi-Fi 主配置做设备侧回退，不再假设所有机型都暴露完全相同的 `ubus`/`uci` 路径。
+当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前默认先把 `U60 / MU5250` 这条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：正式设备上的 `/data/u60pro/u60-datad` 已切到这条 `HTTP + SSE` 线，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
-## 支持机型
+## 当前模板
 
-当前建议按“已验证”和“原则兼容”两档理解：
+当前只把后端模板明确分成“已实现”和“待拆分适配”两类：
 
-- 已验证：
-  - `ZTE U60Pro`
-  - `ZTE G5Pro`
-- 原则兼容：
-  - 使用近似 `ubus` / `uci` / `sysfs` 布局的 ZTE 同代便携式路由设备
-  - 但如果温度、客户端列表、主 Wi-Fi 配置或短信接口路径不同，仍需要补对应回退或适配
-
-这里的“支持”指后端能输出统一快照，不等于所有前端模板都已经针对该机型做过视觉或交互适配。
+- 已实现并启用：
+  - `u60_mu5250`
+  - 匹配机型：`model_name = MU5250`
+  - 对应设备：`U60 Pro`
+- 待后续单独适配：
+  - `G5Pro` 及其他机型
+  - 不再继续复用 `U60` 模板冒充“通用支持”
 
 ## 为什么需要它
 
@@ -107,7 +106,7 @@ es.addEventListener("state", (ev) => {
 });
 ```
 
-如果前端需要按机型切模板，优先使用 `state.device.model_name`；`state.device.profile` 是基于 `model_name` 生成的规范化键，`market_name` / `alias_name` 只建议用于展示。
+后端会先根据 `state.device.model_name` 选择设备侧 API 模板，并把结果写进 `state.device.api_template`。如果前端还需要切自己的 UI 模板，优先使用 `state.device.model_name` 或 `state.device.api_template`，不要再用 `market_name` / `alias_name` 做判断。
 
 ## QoS / 短信说明
 
@@ -131,6 +130,8 @@ kill -USR1 $(pidof u60-datad)
 
 - 接口说明：[`docs/API.md`](docs/API.md)
 - 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
+- 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
+- U60 模板：[`docs/models/MU5250-U60.md`](docs/models/MU5250-U60.md)
 - 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## 许可

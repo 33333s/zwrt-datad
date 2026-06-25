@@ -83,7 +83,12 @@ ok
 
 当前快照是完整对象，不是增量 patch。每次 `/state` 和每条 SSE `state` 事件都返回一份完整 JSON。
 
-机型模板适配应优先读取 `device.model_name`；`device.profile` 是后端基于 `model_name` 生成的规范化键，适合直接做映射表索引。
+设备侧 API 模板由后端根据 `device.model_name` 选择，并暴露在 `device.api_template` / `device.api_template_supported`。
+
+具体某个机型模板会调用哪些设备接口，请看：
+
+- [`models/README.md`](models/README.md)
+- [`models/MU5250-U60.md`](models/MU5250-U60.md)
 
 ## Examples
 

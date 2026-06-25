@@ -92,6 +92,9 @@ SSE  /events
   "device": {
     "profile": "mu5250",
     "profile_source": "model_name",
+    "api_template": "u60_mu5250",
+    "api_template_label": "U60 / MU5250",
+    "api_template_supported": 1,
     "vendor": "ZTE",
     "model_name": "MU5250",
     "hardware_version": "MU5250_HW1.0",
@@ -115,48 +118,21 @@ SSE  /events
 }
 ```
 
-## Source mapping
+## Template Docs
 
-| snapshot | source |
-|----------|--------|
-| `net.*` | `zte_nwinfo_api nwinfo_get_netinfo` |
-| `net.nrca` / `net.lteca` | `zte_nwinfo_api nwinfo_get_netinfo`（载波聚合描述符，原样透传） |
-| `net.wan_status` | `zwrt_router.api router_get_status_no_auth` |
-| `wlan.*` | `uci get wireless.main_2g.{ssid,key,encryption}` |
-| `qos.usb_mode` | `zwrt_bsp.usb list`（`mode`：`debug`=ADB 开，`user`=ADB 关） |
-| `battery.*` | `zwrt_bsp.battery list` |
-| `battery.charging/charger_*` | `zwrt_bsp.charger list` |
-| `battery.chg_uv/chg_ua` | `/sys/class/power_supply/usb/voltage_now`、`current_now`（充电器输入 µV/µA） |
-| `battery.bat_uv/bat_ua` | `/sys/class/power_supply/battery/voltage_now`、`current_now`（电池 µV/µA） |
-| `clients.total/wifi/lan` | `zwrt_router.api router_get_user_list_num` |
-| `clients.list` | `/tmp/dhcp.leases`（每行 `expiry mac ip name clientid`） |
-| `sms.unread` | `zwrt_wms_get_wms_capacity` 的 `sms_dev_unread_num + sms_sim_unread_num` |
-| `sms.list` | `zte_libwms_get_sms_data {page:0,data_per_page:32,mem_store:1,tags:10,order_by:"order by id desc"}`；`id` 为消息 ID（标记已读用），`text` 为 UTF-16BE 十六进制后端解成 UTF-8，`date` 由 `YY,MM,DD,HH,MM,SS,+TZ` 格式化为 `MM-DD HH:MM`，`unread` 取自每条 `tag`（**"1"=未读，"0"=已读**） |
-| `nfc.switch` | `zwrt_nfc zwrt_nfc_wifi_get`（1=开） |
-| `net.net_select` | `nwinfo_get_netinfo`（选网模式；锁频页可写回 `nwinfo_set_netselect`） |
-| `net.sa_bands`/`nsa_bands`/`lte_bands` | `nwinfo_get_netinfo` 的 `nr5g_sa_band_lock`/`nr5g_nsa_band_lock`/`lte_band`（可用/已锁频段，逗号列表） |
-| `system.mem_total`/`mem_avail` | `system info` 的 `memory.total`/`memory.available`（字节） |
-| `wlan.enabled` | `uci get wireless.main_2g.disabled`（取反） |
-| `dhcp.*` | `uci`：`network.lan.ipaddr`、`dhcp.lan.zte_start/limit/leasetime` |
-| `device.model_name` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `model_name` |
-| `device.hardware_version` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `hardware_version` |
-| `device.market_name` / `alias_name` | `zwrt_zte_mdm.api get_zwrt_common_info` 的 `device_market_name` / `device_alias_name` |
-| `device.board_name` | `system board` |
-| `device.profile` | 优先由 `device.model_name` 规范化得到；缺失时依次回退到 `hardware_version`、`board_name`、`market_name`、`alias_name` |
-| `device.profile_source` | 当前 `profile` 实际使用的数据来源键名 |
-| `system.cpu_usage` | `/proc/stat`（相邻轮询的占用率差值） |
-| `system.sw_version` | `uci get zwrt_common_info.common_config.wa_inner_version` |
-| `system.imei` | `zwrt_zte_mdm.api get_imei`（一次性） |
-| `traffic.*` | `zwrt_data get_wwandst {"source_module":"deviceui","cid":1,"type":1}` |
-| `qos.*` | 启动时全量扫描 `/data/logfs/key.log` 的 QoS `[DATA]` 日志并缓存；收到 `SIGUSR1` 或检测到换卡后重读 |
-| `system.uptime/mem` | `system info` |
-| `system.cpu_temp` | `zwrt_bsp.thermal get_cpu_temp` (`cpuss_temp`) |
-| `system.model/fw` | `system board` |
+设备侧取数接口不再混写在一张总表里，而是按后端选中的模板拆分：
+
+- `device.api_template = u60_mu5250`
+  - 见 [`models/MU5250-U60.md`](models/MU5250-U60.md)
+- 其他模板
+  - 待后续逐个补充
 
 ## Notes
 
 - `GET /state` 返回的是完整 JSON 快照。
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
+- 后端会优先根据 `device.model_name` 选择 `device.api_template`；设备侧接口选择已经由后端完成，不需要前端再猜设备应该打哪套 `ubus/uci/sysfs`。
+- `device.api_template_supported = 1` 表示当前机型已有明确模板；`0` 表示只落到了内部兼容模板，不应视为正式适配完成。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
 - `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
