@@ -1,12 +1,12 @@
 #!/bin/sh /etc/rc.common
-# procd init script for u60-datad. Install to /etc/init.d/u60-datad, then:
-#   /etc/init.d/u60-datad enable && /etc/init.d/u60-datad start
+# procd init script for zwrt-datad. Install to /etc/init.d/zwrt-datad, then:
+#   /etc/init.d/zwrt-datad enable && /etc/init.d/zwrt-datad start
 # SPDX-License-Identifier: MIT
 
 START=96
 USE_PROCD=1
-DIR=/data/u60pro
-PROG=$DIR/u60-datad
+DIR=/data/plugins/zwrt-datad
+PROG=$DIR/zwrt-datad
 
 start_service() {
     [ -x "$PROG" ] || return 1

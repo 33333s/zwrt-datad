@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.0",
-    "asset": "u60-datad-aarch64",
-    "notes": "后端按 model_name 选择设备 API 模板，当前先固化 U60/MU5250 模板并把其他机型适配从主路径拆开"
+    "version": "0.6.1",
+    "asset": "zwrt-datad-aarch64",
+    "notes": "后端统一发布为 zwrt-datad，并配套 /data/plugins/zwrt-datad 安装路径与 MU5250 模板识别"
   }
 }
