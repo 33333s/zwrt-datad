@@ -89,6 +89,7 @@ ok
 
 - [`models/README.md`](models/README.md)
 - [`models/MU5250.md`](models/MU5250.md)
+- [`models/MC8532B.md`](models/MC8532B.md)
 
 ## Examples
 

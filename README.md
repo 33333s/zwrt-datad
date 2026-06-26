@@ -16,7 +16,7 @@
 
 > 这是一个 clean-room 实现，只依赖标准 OpenWRT 能力，不链接厂商私有库。
 
-当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前默认先把 `MU5250` 这条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250` 和 `MC8532B` 两条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
@@ -28,9 +28,12 @@
   - `MU5250`
   - 匹配机型：`model_name = MU5250`
   - 对应设备：`U60 Pro`
+  - `MC8532B`
+  - 匹配机型：`model_name = MC8532B`
+  - 对应设备：`G5 Pro`
 - 待后续单独适配：
-  - `G5Pro` 及其他机型
-  - 不再继续复用 `U60` 模板冒充“通用支持”
+  - 其他机型
+  - 不再继续复用现有模板冒充“通用支持”
 
 ## 为什么需要它
 
@@ -132,6 +135,7 @@ kill -USR1 $(pidof zwrt-datad)
 - 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
 - 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
 - MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
+- MC8532B 模板：[`docs/models/MC8532B.md`](docs/models/MC8532B.md)
 - 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## 许可

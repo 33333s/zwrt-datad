@@ -124,6 +124,8 @@ SSE  /events
 
 - `device.api_template = MU5250`
   - 见 [`models/MU5250.md`](models/MU5250.md)
+- `device.api_template = MC8532B`
+  - 见 [`models/MC8532B.md`](models/MC8532B.md)
 - 其他模板
   - 待后续逐个补充
 
