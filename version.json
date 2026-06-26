@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.2",
+    "version": "0.6.3",
     "asset": "zwrt-datad-aarch64",
-    "notes": "后端统一发布为 zwrt-datad，并配套 /data/plugins/zwrt-datad 安装路径与 MU5250/MC8532B 模板识别"
+    "notes": "新增 MC8532B（G5 Pro）正式模板，并继续沿用 /data/plugins/zwrt-datad 安装路径"
   }
 }
