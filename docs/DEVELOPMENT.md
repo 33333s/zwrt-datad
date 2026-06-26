@@ -20,8 +20,10 @@
 - 已实现模板：
   - `MU5250`
   - 匹配 `model_name = MU5250`
+  - `MC8532B`
+  - 匹配 `model_name = MC8532B`
 - 待后续拆分适配：
-  - `G5Pro` 和其他机型
+  - 其他机型
 
 因此，字段模型仍然是统一对外契约，但设备内部取数路径现在明确按模板分开维护，不再把多机型回退默认混在一条主路径里。
 
@@ -42,7 +44,7 @@ common caches + model_name detect -> template select -> template-specific source
 - `GET /events` 提供持续 SSE 推送
 - 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
 - 后端根据 `device.model_name` 选择 `device.api_template`
-- 当前只把 `MU5250` 模板作为正式适配路径
+- 当前已把 `MU5250` / `MC8532B` 模板作为正式适配路径
 - 原来为其他机型加的宽松回退收进兼容模板，不再算正式支持
 
 ## 传输层约定
@@ -90,6 +92,7 @@ common caches + model_name detect -> template select -> template-specific source
 
 - 模板索引：[`models/README.md`](models/README.md)
 - 当前已实现：[`models/MU5250.md`](models/MU5250.md)
+- 当前已实现：[`models/MC8532B.md`](models/MC8532B.md)
 
 ## 已知约定
 
@@ -169,4 +172,4 @@ kill -USR1 $(pidof zwrt-datad)
 1. 保留统一字段模型，并把设备侧差异收口到模板层
 2. 把外部通信方式改成 `HTTP + SSE`
 
-也就是说，这个分支现在是“先把 U60 模板做实，再逐个补别的机型模板”，而不是继续在主路径里堆隐式兼容分支。
+也就是说，这个分支现在是“先把已确认机型模板做实，再逐个补别的机型模板”，而不是继续在主路径里堆隐式兼容分支。

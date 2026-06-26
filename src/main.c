@@ -95,6 +95,15 @@ static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     TEMP_SOURCE_U60_UBUS_ONLY
 };
 
+static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
+    "MC8532B",
+    "MC8532B",
+    1,
+    WIFI_SOURCE_COMPAT_AUTO,
+    CLIENT_SOURCE_DHCP_THEN_ROUTER,
+    TEMP_SOURCE_COMPAT_FALLBACK
+};
+
 static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
     "legacy_compat",
     "Legacy compatibility fallback",
@@ -537,6 +546,10 @@ select_device_template(const char *model_name, const char *hardware_version)
     if ((model_name && !strcmp(model_name, "MU5250")) ||
         has_prefix(hardware_version, "MU5250_")) {
         return &TEMPLATE_U60_MU5250;
+    }
+    if ((model_name && !strcmp(model_name, "MC8532B")) ||
+        has_prefix(hardware_version, "MC8532B")) {
+        return &TEMPLATE_G5PRO_MC8532B;
     }
     return &TEMPLATE_LEGACY_COMPAT;
 }
