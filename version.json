@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.3",
+    "version": "0.6.4",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MC8532B（G5 Pro）正式模板，并继续沿用 /data/plugins/zwrt-datad 安装路径"
+    "notes": "修复 U60 在 key.log 轮转后重启后端时丢失 qci/ambr 缓存的问题"
   }
 }

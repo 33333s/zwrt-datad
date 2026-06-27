@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #define KEY_LOG_PATH "/data/logfs/key.log"
+#define KEY_LOG_ROTATED_PATH "/data/logfs/key.log.0"
 #define SIM_POLL_MS 5000
 #define QOS_RETRY_MS 120000
 #define SMS_REFRESH_EVERY 10
@@ -648,15 +649,15 @@ static off_t file_size_or_zero(const char *path)
     return st.st_size;
 }
 
-static void refresh_qos_cache(void)
+static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
 {
     char line[2048];
     int qci;
     double dl, ul;
-    FILE *fp = fopen(KEY_LOG_PATH, "r");
-    off_t size = file_size_or_zero(KEY_LOG_PATH);
-    off_t floor = g_qos_floor_off;
+    FILE *fp = fopen(path, "r");
+    off_t size = file_size_or_zero(path);
 
+    if (size_out) *size_out = size;
     if (!fp) return;
     if (floor > 0) {
         if (size <= 0 || floor > size) floor = 0;
@@ -701,6 +702,12 @@ static void refresh_qos_cache(void)
         }
     }
     fclose(fp);
+}
+
+static void refresh_qos_cache(void)
+{
+    off_t size = 0;
+    scan_qos_file(KEY_LOG_PATH, g_qos_floor_off, &size);
     g_qos_floor_off = size;
 }
 
@@ -1811,6 +1818,7 @@ int main(int argc, char **argv)
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
     clear_qos_cache();
     g_qos_floor_off = 0;
+    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL);
     refresh_qos_cache();
     sim_sig_valid = read_sim_signature(sim_sig, sizeof sim_sig);
 
