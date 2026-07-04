@@ -576,6 +576,31 @@ static int g_qci;
 static int g_qci_valid;
 static double g_ambr_dl, g_ambr_ul;
 static int g_ambr_dl_valid, g_ambr_ul_valid;
+#define QOS_CANDIDATE_MAX 32
+struct qos_candidate {
+    int used;
+    int has_plmn;
+    int mcc;
+    int mnc;
+    int rank;
+    unsigned long seq;
+    int qci;
+    int qci_valid;
+    double ambr_dl;
+    double ambr_ul;
+    int ambr_dl_valid;
+    int ambr_ul_valid;
+};
+struct qos_values {
+    int qci;
+    int qci_valid;
+    double ambr_dl;
+    double ambr_ul;
+    int ambr_dl_valid;
+    int ambr_ul_valid;
+};
+static struct qos_candidate g_qos_candidates[QOS_CANDIDATE_MAX];
+static unsigned long g_qos_seq;
 static unsigned long long g_cpu_prev_total, g_cpu_prev_idle;
 static int g_cpu_prev_valid;
 static off_t g_qos_floor_off;
@@ -632,6 +657,242 @@ static int parse_session_ambr_mbps(const char *s, const char *value_key,
     return 1;
 }
 
+static int ascii_lower(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 'a';
+    return c;
+}
+
+static const char *find_ci(const char *s, const char *needle);
+
+static int contains_ci(const char *s, const char *needle)
+{
+    if (!s || !needle) return 0;
+    return find_ci(s, needle) != NULL;
+}
+
+static const char *find_ci(const char *s, const char *needle)
+{
+    size_t nlen;
+
+    if (!s || !needle) return 0;
+    nlen = strlen(needle);
+    if (nlen == 0) return s;
+    for (; *s; s++) {
+        size_t i;
+        for (i = 0; i < nlen; i++) {
+            if (!s[i] || ascii_lower((unsigned char)s[i]) != ascii_lower((unsigned char)needle[i]))
+                break;
+        }
+        if (i == nlen) return s;
+    }
+    return NULL;
+}
+
+static int qos_line_is_non_data_dnn(const char *line)
+{
+    return contains_ci(line, "dnn=ims") ||
+           contains_ci(line, "dnn=sos") ||
+           contains_ci(line, "dnn=emergency") ||
+           contains_ci(line, "access_point=ims");
+}
+
+static int qos_line_has_data_context(const char *line)
+{
+    if (qos_line_is_non_data_dnn(line)) return 0;
+    return contains_ci(line, "dnn=") || contains_ci(line, "access_point=");
+}
+
+static int parse_digits_after_ci(const char *s, const char *tag, int *out)
+{
+    const char *p = s;
+
+    while ((p = find_ci(p, tag)) != NULL) {
+        int value = 0;
+        int digits = 0;
+
+        p += strlen(tag);
+        if (*p < '0' || *p > '9') continue;
+        while (*p >= '0' && *p <= '9' && digits < 6) {
+            value = value * 10 + (*p - '0');
+            p++;
+            digits++;
+        }
+        if (digits > 0) {
+            *out = value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int qos_line_plmn(const char *line, int *mcc, int *mnc)
+{
+    int parsed_mcc = 0;
+    int parsed_mnc = 0;
+
+    if (!parse_digits_after_ci(line, "mcc", &parsed_mcc)) return 0;
+    if (!parse_digits_after_ci(line, "mnc", &parsed_mnc)) return 0;
+    *mcc = parsed_mcc;
+    *mnc = parsed_mnc;
+    return parsed_mcc > 0;
+}
+
+static int qos_context_rank(const char *line, int *mcc, int *mnc, int *has_plmn)
+{
+    int rank = 0;
+
+    if (!qos_line_has_data_context(line)) return 0;
+
+    *mcc = 0;
+    *mnc = 0;
+    *has_plmn = qos_line_plmn(line, mcc, mnc);
+    if (contains_ci(line, "access_point=")) rank = *has_plmn ? 30 : 20;
+    else if (contains_ci(line, "dnn=")) rank = *has_plmn ? 30 : 10;
+    return rank;
+}
+
+static int qos_candidate_has_values(const struct qos_candidate *cand)
+{
+    return cand->qci_valid || cand->ambr_dl_valid || cand->ambr_ul_valid;
+}
+
+static int qos_get_candidate(int has_plmn, int mcc, int mnc, int rank)
+{
+    int i;
+    int free_idx = -1;
+    int replace = -1;
+
+    for (i = 0; i < QOS_CANDIDATE_MAX; i++) {
+        struct qos_candidate *cand = &g_qos_candidates[i];
+
+        if (!cand->used) {
+            if (free_idx < 0) free_idx = i;
+            continue;
+        }
+        if (cand->has_plmn == has_plmn &&
+            (!has_plmn || (cand->mcc == mcc && cand->mnc == mnc))) {
+            if (rank > cand->rank) cand->rank = rank;
+            cand->seq = ++g_qos_seq;
+            return i;
+        }
+        if (replace < 0 ||
+            cand->rank < g_qos_candidates[replace].rank ||
+            (cand->rank == g_qos_candidates[replace].rank &&
+             cand->seq < g_qos_candidates[replace].seq)) {
+            replace = i;
+        }
+    }
+
+    if (free_idx >= 0) replace = free_idx;
+    if (replace < 0) return -1;
+    memset(&g_qos_candidates[replace], 0, sizeof g_qos_candidates[replace]);
+    g_qos_candidates[replace].used = 1;
+    g_qos_candidates[replace].has_plmn = has_plmn;
+    g_qos_candidates[replace].mcc = has_plmn ? mcc : 0;
+    g_qos_candidates[replace].mnc = has_plmn ? mnc : 0;
+    g_qos_candidates[replace].rank = rank;
+    g_qos_candidates[replace].seq = ++g_qos_seq;
+    return replace;
+}
+
+static int qos_candidate_from_line(const char *line)
+{
+    int mcc = 0;
+    int mnc = 0;
+    int has_plmn = 0;
+    int rank = qos_context_rank(line, &mcc, &mnc, &has_plmn);
+
+    if (rank <= 0) return -1;
+    return qos_get_candidate(has_plmn, mcc, mnc, rank);
+}
+
+static void qos_candidate_set_qci(int idx, int qci)
+{
+    if (idx >= 0 && idx < QOS_CANDIDATE_MAX && g_qos_candidates[idx].used) {
+        g_qos_candidates[idx].qci = qci;
+        g_qos_candidates[idx].qci_valid = 1;
+        g_qos_candidates[idx].seq = ++g_qos_seq;
+    }
+    g_qci = qci;
+    g_qci_valid = 1;
+}
+
+static void qos_candidate_set_ambr(int idx, double dl, int dl_valid,
+                                   double ul, int ul_valid)
+{
+    if (idx >= 0 && idx < QOS_CANDIDATE_MAX && g_qos_candidates[idx].used) {
+        if (dl_valid) {
+            g_qos_candidates[idx].ambr_dl = dl;
+            g_qos_candidates[idx].ambr_dl_valid = 1;
+        }
+        if (ul_valid) {
+            g_qos_candidates[idx].ambr_ul = ul;
+            g_qos_candidates[idx].ambr_ul_valid = 1;
+        }
+        g_qos_candidates[idx].seq = ++g_qos_seq;
+    }
+    if (dl_valid) {
+        g_ambr_dl = dl;
+        g_ambr_dl_valid = 1;
+    }
+    if (ul_valid) {
+        g_ambr_ul = ul;
+        g_ambr_ul_valid = 1;
+    }
+}
+
+static void select_qos_for_plmn(int mcc, int mnc, struct qos_values *out)
+{
+    int i;
+    int best = -1;
+    int best_score = -1;
+    unsigned long best_seq = 0;
+
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < QOS_CANDIDATE_MAX; i++) {
+        const struct qos_candidate *cand = &g_qos_candidates[i];
+        int score;
+
+        if (!cand->used || !qos_candidate_has_values(cand)) continue;
+        if (mcc > 0 && cand->has_plmn && cand->mcc == mcc && cand->mnc == mnc)
+            score = 300 + cand->rank;
+        else if (!cand->has_plmn)
+            score = 100 + cand->rank;
+        else
+            score = 10 + cand->rank;
+
+        if (score > best_score || (score == best_score && cand->seq > best_seq)) {
+            best = i;
+            best_score = score;
+            best_seq = cand->seq;
+        }
+    }
+
+    if (best >= 0) {
+        const struct qos_candidate *cand = &g_qos_candidates[best];
+        out->qci = cand->qci;
+        out->qci_valid = cand->qci_valid;
+        out->ambr_dl = cand->ambr_dl;
+        out->ambr_dl_valid = cand->ambr_dl_valid;
+        out->ambr_ul = cand->ambr_ul;
+        out->ambr_ul_valid = cand->ambr_ul_valid;
+        return;
+    }
+
+    out->qci = g_qci;
+    out->qci_valid = g_qci_valid;
+    out->ambr_dl = g_ambr_dl;
+    out->ambr_dl_valid = g_ambr_dl_valid;
+    out->ambr_ul = g_ambr_ul;
+    out->ambr_ul_valid = g_ambr_ul_valid;
+}
+
+static int qos_cache_has_values(void)
+{
+    return g_qci_valid || g_ambr_dl_valid || g_ambr_ul_valid;
+}
+
 static void clear_qos_cache(void)
 {
     g_qci = 0;
@@ -640,6 +901,8 @@ static void clear_qos_cache(void)
     g_ambr_ul = 0.0;
     g_ambr_dl_valid = 0;
     g_ambr_ul_valid = 0;
+    memset(g_qos_candidates, 0, sizeof g_qos_candidates);
+    g_qos_seq = 0;
 }
 
 static off_t file_size_or_zero(const char *path)
@@ -654,6 +917,12 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
     char line[2048];
     int qci;
     double dl, ul;
+    int dl_valid, ul_valid;
+    int qci_context_lines = 0;
+    int qci_context_idx = -1;
+    int pending_default_qci = 0;
+    int pending_default_qci_lines = 0;
+    int pending_default_qci_valid = 0;
     FILE *fp = fopen(path, "r");
     off_t size = file_size_or_zero(path);
 
@@ -666,40 +935,57 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
     }
 
     while (fgets(line, sizeof line, fp)) {
+        int candidate_idx;
+
         if (!strstr(line, "[DATA]")) continue;
 
+        candidate_idx = qos_candidate_from_line(line);
+        if (candidate_idx >= 0) {
+            qci_context_idx = candidate_idx;
+            qci_context_lines = 4;
+            if (pending_default_qci_valid) {
+                qos_candidate_set_qci(candidate_idx, pending_default_qci);
+                pending_default_qci_valid = 0;
+                pending_default_qci_lines = 0;
+            }
+        }
+
         if (strstr(line, "qci") && parse_int_after(line, "qci", &qci)) {
-            g_qci = qci;
-            g_qci_valid = 1;
-        }
-
-        if (strstr(line, "session_ambr")) {
-            if (parse_session_ambr_mbps(line, "session_ambr_dl=", "session_ambr_dl_unit=", &dl)) {
-                g_ambr_dl = dl;
-                g_ambr_dl_valid = 1;
-            }
-
-            if (parse_session_ambr_mbps(line, "session_ambr_ul=", "session_ambr_ul_unit=", &ul)) {
-                g_ambr_ul = ul;
-                g_ambr_ul_valid = 1;
-            }
-        }
-
-        if (strstr(line, "apn_ambr")) {
-            if (parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
-                parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
-                (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1))) {
-                g_ambr_dl = dl;
-                g_ambr_dl_valid = 1;
-            }
-
-            if (parse_double_after(line, "apn_ambr_ul_ext2=", &ul) ||
-                parse_double_after(line, "apn_ambr_ul_ext=", &ul) ||
-                (parse_double_after(line, "apn_ambr_ul=", &ul) && (ul /= 1000.0, 1))) {
-                g_ambr_ul = ul;
-                g_ambr_ul_valid = 1;
+            if (qci_context_idx >= 0 && qci_context_lines > 0) {
+                qos_candidate_set_qci(qci_context_idx, qci);
+            } else if (contains_ci(line, "default bearer qci")) {
+                pending_default_qci = qci;
+                pending_default_qci_lines = 4;
+                pending_default_qci_valid = 1;
+                if (!g_qci_valid) {
+                    g_qci = qci;
+                    g_qci_valid = 1;
+                }
+            } else if (!g_qci_valid) {
+                g_qci = qci;
+                g_qci_valid = 1;
             }
         }
+
+        if (strstr(line, "session_ambr") && candidate_idx >= 0) {
+            dl_valid = parse_session_ambr_mbps(line, "session_ambr_dl=", "session_ambr_dl_unit=", &dl);
+            ul_valid = parse_session_ambr_mbps(line, "session_ambr_ul=", "session_ambr_ul_unit=", &ul);
+            qos_candidate_set_ambr(candidate_idx, dl, dl_valid, ul, ul_valid);
+        }
+
+        if (strstr(line, "apn_ambr") && candidate_idx >= 0) {
+            dl_valid = parse_double_after(line, "apn_ambr_dl_ext2=", &dl) ||
+                       parse_double_after(line, "apn_ambr_dl_ext=", &dl) ||
+                       (parse_double_after(line, "apn_ambr_dl=", &dl) && (dl /= 1000.0, 1));
+            ul_valid = parse_double_after(line, "apn_ambr_ul_ext2=", &ul) ||
+                       parse_double_after(line, "apn_ambr_ul_ext=", &ul) ||
+                       (parse_double_after(line, "apn_ambr_ul=", &ul) && (ul /= 1000.0, 1));
+            qos_candidate_set_ambr(candidate_idx, dl, dl_valid, ul, ul_valid);
+        }
+        if (qci_context_lines > 0 && --qci_context_lines == 0)
+            qci_context_idx = -1;
+        if (pending_default_qci_lines > 0 && --pending_default_qci_lines == 0)
+            pending_default_qci_valid = 0;
     }
     fclose(fp);
 }
@@ -709,6 +995,14 @@ static void refresh_qos_cache(void)
     off_t size = 0;
     scan_qos_file(KEY_LOG_PATH, g_qos_floor_off, &size);
     g_qos_floor_off = size;
+}
+
+static void rescan_qos_cache(void)
+{
+    clear_qos_cache();
+    g_qos_floor_off = 0;
+    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL);
+    refresh_qos_cache();
 }
 
 static int read_sim_signature(char *out, size_t outlen)
@@ -1186,6 +1480,8 @@ static void build_snapshot(char *out, size_t outlen,
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, wifi_enabled;
+    int qos_mcc, qos_mnc;
+    struct qos_values qos;
     const struct device_template_spec *device_template;
 
     detect_device_identity(with_board, board_cache,
@@ -1228,6 +1524,9 @@ static void build_snapshot(char *out, size_t outlen,
     bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
     cpu_usage = cpu_usage_pct();
     cpu_temp = read_cpu_temp_for_template(device_template, therm);
+    qos_mcc = json_get_int(net, "rmcc", 0);
+    qos_mnc = json_get_int(net, "rmnc", 0);
+    select_qos_for_plmn(qos_mcc, qos_mnc, &qos);
 
     struct buf b = { out, outlen, 0 };
     bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
@@ -1261,7 +1560,8 @@ static void build_snapshot(char *out, size_t outlen,
     emit_str(&b, "sa_bands", net, "nr5g_sa_band_lock"); bappend(&b, ",");
     emit_str(&b, "nsa_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
     emit_str(&b, "lte_bands", net, "lte_band");      bappend(&b, ",");
-    emit_str(&b, "wan_status", rstat, "current_wan_status");
+    emit_str(&b, "wan_status", rstat, "current_wan_status"); bappend(&b, ",");
+    bappend(&b, "\"HSR\":false");
     bappend(&b, "},");
 
     /* battery / charger */
@@ -1305,10 +1605,10 @@ static void build_snapshot(char *out, size_t outlen,
 
     /* qos: last known bearer/QoS values cached from modem key.log */
     bappend(&b, "\"qos\":{");
-    bappend(&b, "\"qci\":%d,", g_qci_valid ? g_qci : 0);
-    if (g_ambr_dl_valid) bappend(&b, "\"ambr_dl\":\"%.3f\",", g_ambr_dl);
+    bappend(&b, "\"qci\":%d,", qos.qci_valid ? qos.qci : 0);
+    if (qos.ambr_dl_valid) bappend(&b, "\"ambr_dl\":\"%.3f\",", qos.ambr_dl);
     else                 bappend(&b, "\"ambr_dl\":\"\",");
-    if (g_ambr_ul_valid) bappend(&b, "\"ambr_ul\":\"%.3f\",", g_ambr_ul);
+    if (qos.ambr_ul_valid) bappend(&b, "\"ambr_ul\":\"%.3f\",", qos.ambr_ul);
     else                 bappend(&b, "\"ambr_ul\":\"\",");
     emit_str(&b, "usb_mode", usb, "mode");
     bappend(&b, "},");
@@ -1843,22 +2143,22 @@ int main(int argc, char **argv)
                 if (cur_valid) snprintf(sim_sig, sizeof sim_sig, "%s", cur_sig);
                 else sim_sig[0] = 0;
                 sim_sig_valid = cur_valid;
-                g_qos_floor_off = file_size_or_zero(KEY_LOG_PATH);
-                clear_qos_cache();
-                g_qos_refresh_req = 1;
+                rescan_qos_cache();
+                g_qos_refresh_req = 0;
                 g_sms_list_valid = 0;
-                qos_retry_left = (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
+                qos_retry_left = qos_cache_has_values() ? 0 :
+                    (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
             }
         }
 
         if (g_qos_refresh_req) {
             g_qos_refresh_req = 0;
-            refresh_qos_cache();
-            if (g_qci_valid || g_ambr_dl_valid || g_ambr_ul_valid) qos_retry_left = 0;
+            rescan_qos_cache();
+            if (qos_cache_has_values()) qos_retry_left = 0;
         } else if (qos_retry_left > 0) {
             if (qos_retry_left == 1 || (qos_retry_left % qos_retry_every) == 0)
                 refresh_qos_cache();
-            if (g_qci_valid || g_ambr_dl_valid || g_ambr_ul_valid) qos_retry_left = 0;
+            if (qos_cache_has_values()) qos_retry_left = 0;
             else qos_retry_left--;
         }
 

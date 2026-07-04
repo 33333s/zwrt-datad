@@ -83,6 +83,8 @@ ok
 
 当前快照是完整对象，不是增量 patch。每次 `/state` 和每条 SSE `state` 事件都返回一份完整 JSON。
 
+高铁专网确认结果随快照一起返回在 `net.HSR`。该值只应来自信令确认，不按 ARFCN/EARFCN 直接判定；当前公开版尚未实现 modem SIB1 信令确认链路，因此保持 `false`。
+
 设备侧 API 模板由后端根据 `device.model_name` 选择，并暴露在 `device.api_template` / `device.api_template_supported`。
 
 具体某个机型模板会调用哪些设备接口，请看：

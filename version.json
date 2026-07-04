@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.4",
+    "version": "0.6.5",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 U60 在 key.log 轮转后重启后端时丢失 qci/ambr 缓存的问题"
+    "notes": "整理公开仓库边界并同步 HSR 状态字段文档"
   }
 }

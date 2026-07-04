@@ -1,11 +1,25 @@
 # Build artifacts
 *.o
+/zwrt-datad
+/zwrt-datad.stripped
+/zwrt-datad-aarch64
+/zwrt-datad-*.stripped
+/*.stripped
 /u60-datad
 /u60-datad.stripped
 /u60-datad-aarch64
 
 # transient helper scripts
 scripts/_*.sh
+
+# Private-only modem/signaling artifacts
+/docs/WORKLOG.md
+/docs/modem.md
+/docs/MODEM_SIGNALING.md
+/docs/G5PRO_WORKFLOW.md
+/src/modem_*
+/scripts/modem_*
+/scripts/scan_modem_samples.py
 
 # editor / OS
 .vscode/

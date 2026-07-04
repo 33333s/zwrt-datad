@@ -16,6 +16,8 @@
 
 > 这是一个 clean-room 实现，只依赖标准 OpenWRT 能力，不链接厂商私有库。
 
+公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
+
 当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250` 和 `MC8532B` 两条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
@@ -113,10 +115,12 @@ es.addEventListener("state", (ev) => {
 
 ## QoS / 短信说明
 
-QoS 相关有一个容易踩的点：`qci` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：
+QoS 相关有一个容易踩的点：`qci` / `session_ambr` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：
 
 - 进程启动时全量扫描一次 `key.log`
-- 逐行提取最近一次有效的 `qci` / `apn_ambr_*`
+- 优先提取带 `access_point=` 或非 IMS `dnn=` 上下文的数据承载 `qci` / `AMBR`
+- 忽略 `dnn=ims` / emergency 承载，避免 IMS 的 256/256 覆盖主数据 AMBR
+- 裸 `qci = ...` 只在紧跟有效数据承载上下文，或完全没有更可信值时兜底
 - 后续只显示缓存，不在每轮快照里反复扫日志
 - 收到 `SIGUSR1` 时立即重读
 - 检测到 `sim_iccid/current_sim_slot` 变化时清空旧缓存，并在新日志写入后自动补读
@@ -133,6 +137,7 @@ kill -USR1 $(pidof zwrt-datad)
 
 - 接口说明：[`docs/API.md`](docs/API.md)
 - 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
+- 仓库边界：[`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)
 - 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
 - MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
 - MC8532B 模板：[`docs/models/MC8532B.md`](docs/models/MC8532B.md)
