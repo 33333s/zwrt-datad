@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.5",
+    "version": "0.6.6",
     "asset": "zwrt-datad-aarch64",
-    "notes": "整理公开仓库边界并同步 HSR 状态字段文档"
+    "notes": "修复轮转后 QoS 缓存优先级：当前 key.log 优先，key.log.0 仅补缺"
   }
 }

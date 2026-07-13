@@ -99,7 +99,7 @@ common caches + model_name detect -> template select -> template-specific source
 - WebUI / 脚本不应再各自直接打 `ubus`
 - 轮询频率不宜过高，默认 `1000ms` 是当前平衡点
 - `system board` / `common info` / `imei` 变化很少，按小时刷新缓存即可
-- `qos` 日志缓存策略仍然是：启动按 `key.log.0` -> `key.log` 全量扫一次，之后只显示缓存；输出时优先采用当前 `rmcc/rmnc` 匹配的 APN 承载，非 IMS `dnn=` 只在没有当前 PLMN 命中时兜底，IMS / emergency 不覆盖主数据 AMBR。
+- `qos` 日志缓存策略仍然是：启动按 `key.log.0` -> `key.log` 全量扫一次，之后只显示缓存；`key.log` 是当前轮转文件，具有高于 `key.log.0` 的候选优先级，旧日志仅在当前日志缺少对应字段时补缺；同一文件内再优先采用当前 `rmcc/rmnc` 匹配的 APN 承载。非 IMS `dnn=` 可作为数据承载候选，IMS / emergency 不覆盖主数据 AMBR。
 - 手动刷新通过 `SIGUSR1` 触发
 - 换卡检测基于 `sim_iccid/current_sim_slot`
 - 短信列表一次最多取 32 条，并缓存解码后的列表

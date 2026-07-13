@@ -145,7 +145,7 @@ SSE  /events
 - `net.HSR`：高铁专网确认结果。该值只应来自信令确认，不按 ARFCN/EARFCN 直接判定。当前公开版尚未实现 modem SIB1 信令确认链路，因此该字段保持 `false`，直到公开实现具备同等确认能力。
 - WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
-- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；输出时优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 只在没有当前 PLMN 命中时兜底。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
+- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms`：只读。`sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，**或在未读数变化时立即重读**（新短信到达、或界面标记已读后，红点/图标能马上更新），最多 32 条。`text` 解码支持代理对（emoji）。本工程不实现发送/删除。
 - **标记已读**（界面行为，非本快照字段）：`ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id1>;<id2>;","tag":0}'`（id 分号分隔、末尾带分号；`tag:0`=已读）。

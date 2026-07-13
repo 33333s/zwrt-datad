@@ -579,6 +579,8 @@ static int g_ambr_dl_valid, g_ambr_ul_valid;
 #define QOS_CANDIDATE_MAX 32
 struct qos_candidate {
     int used;
+    /* A value seen in key.log must take precedence over rotated key.log.0. */
+    int current_log;
     int has_plmn;
     int mcc;
     int mnc;
@@ -757,7 +759,8 @@ static int qos_candidate_has_values(const struct qos_candidate *cand)
     return cand->qci_valid || cand->ambr_dl_valid || cand->ambr_ul_valid;
 }
 
-static int qos_get_candidate(int has_plmn, int mcc, int mnc, int rank)
+static int qos_get_candidate(int has_plmn, int mcc, int mnc, int rank,
+                             int current_log)
 {
     int i;
     int free_idx = -1;
@@ -773,6 +776,7 @@ static int qos_get_candidate(int has_plmn, int mcc, int mnc, int rank)
         if (cand->has_plmn == has_plmn &&
             (!has_plmn || (cand->mcc == mcc && cand->mnc == mnc))) {
             if (rank > cand->rank) cand->rank = rank;
+            if (current_log) cand->current_log = 1;
             cand->seq = ++g_qos_seq;
             return i;
         }
@@ -792,11 +796,12 @@ static int qos_get_candidate(int has_plmn, int mcc, int mnc, int rank)
     g_qos_candidates[replace].mcc = has_plmn ? mcc : 0;
     g_qos_candidates[replace].mnc = has_plmn ? mnc : 0;
     g_qos_candidates[replace].rank = rank;
+    g_qos_candidates[replace].current_log = current_log;
     g_qos_candidates[replace].seq = ++g_qos_seq;
     return replace;
 }
 
-static int qos_candidate_from_line(const char *line)
+static int qos_candidate_from_line(const char *line, int current_log)
 {
     int mcc = 0;
     int mnc = 0;
@@ -804,7 +809,7 @@ static int qos_candidate_from_line(const char *line)
     int rank = qos_context_rank(line, &mcc, &mnc, &has_plmn);
 
     if (rank <= 0) return -1;
-    return qos_get_candidate(has_plmn, mcc, mnc, rank);
+    return qos_get_candidate(has_plmn, mcc, mnc, rank, current_log);
 }
 
 static void qos_candidate_set_qci(int idx, int qci)
@@ -842,12 +847,25 @@ static void qos_candidate_set_ambr(int idx, double dl, int dl_valid,
     }
 }
 
+static int qos_candidate_score(const struct qos_candidate *cand, int mcc, int mnc)
+{
+    int score = cand->current_log ? 1000 : 0;
+
+    /* key.log is newer than key.log.0; PLMN only breaks ties within one log. */
+    if (mcc > 0 && cand->has_plmn && cand->mcc == mcc && cand->mnc == mnc)
+        return score + 300 + cand->rank;
+    if (!cand->has_plmn)
+        return score + 100 + cand->rank;
+    return score + 10 + cand->rank;
+}
+
 static void select_qos_for_plmn(int mcc, int mnc, struct qos_values *out)
 {
     int i;
     int best = -1;
     int best_score = -1;
     unsigned long best_seq = 0;
+    int qci_score = -1, dl_score = -1, ul_score = -1;
 
     memset(out, 0, sizeof *out);
     for (i = 0; i < QOS_CANDIDATE_MAX; i++) {
@@ -855,12 +873,7 @@ static void select_qos_for_plmn(int mcc, int mnc, struct qos_values *out)
         int score;
 
         if (!cand->used || !qos_candidate_has_values(cand)) continue;
-        if (mcc > 0 && cand->has_plmn && cand->mcc == mcc && cand->mnc == mnc)
-            score = 300 + cand->rank;
-        else if (!cand->has_plmn)
-            score = 100 + cand->rank;
-        else
-            score = 10 + cand->rank;
+        score = qos_candidate_score(cand, mcc, mnc);
 
         if (score > best_score || (score == best_score && cand->seq > best_seq)) {
             best = i;
@@ -877,8 +890,33 @@ static void select_qos_for_plmn(int mcc, int mnc, struct qos_values *out)
         out->ambr_dl_valid = cand->ambr_dl_valid;
         out->ambr_ul = cand->ambr_ul;
         out->ambr_ul_valid = cand->ambr_ul_valid;
-        return;
     }
+
+    /* A newer partial record must not hide a valid value retained from key.log.0. */
+    for (i = 0; i < QOS_CANDIDATE_MAX; i++) {
+        const struct qos_candidate *cand = &g_qos_candidates[i];
+        int score;
+
+        if (!cand->used || !qos_candidate_has_values(cand)) continue;
+        score = qos_candidate_score(cand, mcc, mnc);
+        if (!out->qci_valid && cand->qci_valid && score > qci_score) {
+            out->qci = cand->qci;
+            out->qci_valid = 1;
+            qci_score = score;
+        }
+        if (!out->ambr_dl_valid && cand->ambr_dl_valid && score > dl_score) {
+            out->ambr_dl = cand->ambr_dl;
+            out->ambr_dl_valid = 1;
+            dl_score = score;
+        }
+        if (!out->ambr_ul_valid && cand->ambr_ul_valid && score > ul_score) {
+            out->ambr_ul = cand->ambr_ul;
+            out->ambr_ul_valid = 1;
+            ul_score = score;
+        }
+    }
+
+    if (out->qci_valid || out->ambr_dl_valid || out->ambr_ul_valid) return;
 
     out->qci = g_qci;
     out->qci_valid = g_qci_valid;
@@ -912,7 +950,8 @@ static off_t file_size_or_zero(const char *path)
     return st.st_size;
 }
 
-static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
+static void scan_qos_file(const char *path, off_t floor, off_t *size_out,
+                          int current_log)
 {
     char line[2048];
     int qci;
@@ -939,7 +978,7 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
 
         if (!strstr(line, "[DATA]")) continue;
 
-        candidate_idx = qos_candidate_from_line(line);
+        candidate_idx = qos_candidate_from_line(line, current_log);
         if (candidate_idx >= 0) {
             qci_context_idx = candidate_idx;
             qci_context_lines = 4;
@@ -993,7 +1032,7 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out)
 static void refresh_qos_cache(void)
 {
     off_t size = 0;
-    scan_qos_file(KEY_LOG_PATH, g_qos_floor_off, &size);
+    scan_qos_file(KEY_LOG_PATH, g_qos_floor_off, &size, 1);
     g_qos_floor_off = size;
 }
 
@@ -1001,7 +1040,7 @@ static void rescan_qos_cache(void)
 {
     clear_qos_cache();
     g_qos_floor_off = 0;
-    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL);
+    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
     refresh_qos_cache();
 }
 
@@ -2118,7 +2157,7 @@ int main(int argc, char **argv)
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
     clear_qos_cache();
     g_qos_floor_off = 0;
-    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL);
+    scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
     refresh_qos_cache();
     sim_sig_valid = read_sim_signature(sim_sig, sizeof sim_sig);
 

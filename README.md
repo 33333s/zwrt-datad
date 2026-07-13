@@ -117,7 +117,7 @@ es.addEventListener("state", (ev) => {
 
 QoS 相关有一个容易踩的点：`qci` / `session_ambr` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：
 
-- 进程启动时全量扫描一次 `key.log`
+- 进程启动时按 `key.log.0`、`key.log` 的顺序全量扫描；当前 `key.log` 的有效候选优先，旧轮转日志仅补缺
 - 优先提取带 `access_point=` 或非 IMS `dnn=` 上下文的数据承载 `qci` / `AMBR`
 - 忽略 `dnn=ims` / emergency 承载，避免 IMS 的 256/256 覆盖主数据 AMBR
 - 裸 `qci = ...` 只在紧跟有效数据承载上下文，或完全没有更可信值时兜底
