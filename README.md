@@ -68,6 +68,14 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude -c src/json.c src/main.c
 ./zwrt-datad -i 1000
 ```
 
+后台运行时，建议把常规输出交给服务管理器；若必须使用 `nohup`，不要把无上限日志写到 `/tmp`（多数设备的 `/tmp` 是内存文件系统）：
+
+```sh
+nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
+```
+
+运行边界和日志建议见 [`docs/RUNTIME.md`](docs/RUNTIME.md)。
+
 单次采样：
 
 ```sh

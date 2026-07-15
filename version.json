@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.6",
+    "version": "0.6.7",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复轮转后 QoS 缓存优先级：当前 key.log 优先，key.log.0 仅补缺"
+    "notes": "补充运行时日志约束；当前 key.log 优先，key.log.0 仅补缺"
   }
 }
