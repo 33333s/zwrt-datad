@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with strict warnings
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+            src/json.c src/device_exec.c src/system_ext.c src/control.c src/main.c \
+            -o zwrt-datad-test
+      - name: Test JSON helpers
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
+            tests/json_test.c src/json.c -o json-test
+          ./json-test
+      - name: Validate one-shot snapshot
+        run: |
+          ./zwrt-datad-test --once | python3 -m json.tool >/dev/null
+      - name: Exercise HTTP and control API
+        run: |
+          chmod +x tests/integration.sh tests/mock_ubus.sh tests/mock_uci.sh
+          tests/integration.sh ./zwrt-datad-test

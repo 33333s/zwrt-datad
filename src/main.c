@@ -9,6 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "json.h"
+#include "control.h"
+#include "device_exec.h"
+#include "system_ext.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -22,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -39,7 +43,7 @@
 #define HTTP_BIND_ADDR "127.0.0.1"
 #define HTTP_PORT 9460
 #define HTTP_MAX_CLIENTS 16
-#define HTTP_REQ_MAX 4096
+#define HTTP_REQ_MAX 65536
 
 #define RAW_MAX 32768
 #define SMS_RESPONSE_MAX 1048576
@@ -54,10 +58,21 @@ static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
 static volatile sig_atomic_t g_qos_refresh_req = 0;
 static void on_qos_signal(int s) { (void)s; g_qos_refresh_req = 1; }
+static volatile sig_atomic_t g_state_refresh_req = 0;
+static char g_auth_token[512];
 
 static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
 static long g_sms_unread_cache = 0;
+static char g_sim_cache[RAW_MAX];
+static char g_lan_interface[RAW_MAX];
+static char g_wan4_interface[RAW_MAX];
+static char g_wan6_interface[RAW_MAX];
+static char g_lan_runtime[RAW_MAX];
+static char g_cellular_runtime[RAW_MAX];
+static char g_traffic_accounting[RAW_MAX];
+static char g_traffic_limit[4096];
+static char g_traffic_clear_day[4096];
 
 struct sse_client {
     int fd;
@@ -118,18 +133,7 @@ static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
 static int run_ubus(const char *svc, const char *method, const char *args,
                     char *out, size_t outlen)
 {
-    char cmd[640];
-    if (args && *args)
-        snprintf(cmd, sizeof cmd, "ubus -t 3 call %s %s '%s' 2>/dev/null", svc, method, args);
-    else
-        snprintf(cmd, sizeof cmd, "ubus -t 3 call %s %s 2>/dev/null", svc, method);
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { out[0] = 0; return -1; }
-    size_t n = fread(out, 1, outlen - 1, fp);
-    out[n] = 0;
-    pclose(fp);
-    return n > 0 ? 0 : -1;
+    return device_ubus_call(svc, method, args, out, outlen);
 }
 
 /* ---- append helpers for building the snapshot ---- */
@@ -432,6 +436,32 @@ static void emit_int(struct buf *b, const char *key, const char *src, const char
     bappend(b, "\"%s\":%ld", key, json_get_int(src, srckey, def));
 }
 
+static void emit_json_value(struct buf *b, const char *key, const char *src,
+                            const char *srckey, const char *fallback)
+{
+    char value[RAW_MAX];
+    bappend(b, "\"%s\":", key);
+    if (src && *src && json_get(src, srckey, value, sizeof value) && value[0])
+        bappend(b, "%s", value);
+    else
+        bappend(b, "%s", fallback);
+}
+
+static void emit_interface_status(struct buf *b, const char *name, const char *src)
+{
+    char up[16];
+    bappend(b, "\"%s\":{", name);
+    if (src && json_get(src, "up", up, sizeof up))
+        bappend(b, "\"up\":%s,", !strcmp(up, "true") || !strcmp(up, "1") ? "true" : "false");
+    else bappend(b, "\"up\":false,");
+    emit_str(b, "proto", src, "proto"); bappend(b, ",");
+    emit_str(b, "device", src, "l3_device"); bappend(b, ",");
+    emit_json_value(b, "ipv4", src, "ipv4-address", "[]"); bappend(b, ",");
+    emit_json_value(b, "ipv6", src, "ipv6-address", "[]"); bappend(b, ",");
+    emit_json_value(b, "dns", src, "dns-server", "[]");
+    bappend(b, "}");
+}
+
 static void normalize_profile_token(const char *src, char *out, size_t outlen)
 {
     size_t n = 0;
@@ -603,8 +633,6 @@ struct qos_values {
 };
 static struct qos_candidate g_qos_candidates[QOS_CANDIDATE_MAX];
 static unsigned long g_qos_seq;
-static unsigned long long g_cpu_prev_total, g_cpu_prev_idle;
-static int g_cpu_prev_valid;
 static off_t g_qos_floor_off;
 
 static int parse_int_after(const char *s, const char *needle, int *out)
@@ -1052,6 +1080,7 @@ static int read_sim_signature(char *out, size_t outlen)
     out[0] = 0;
     if (run_ubus("zwrt_zte_mdm.api", "get_sim_info", NULL, sim, sizeof sim) != 0)
         return 0;
+    snprintf(g_sim_cache, sizeof g_sim_cache, "%s", sim);
 
     if (!json_get(sim, "sim_iccid", iccid, sizeof iccid)) iccid[0] = 0;
     if (!json_get(sim, "current_sim_slot", slot, sizeof slot)) slot[0] = 0;
@@ -1172,34 +1201,6 @@ static long read_cpu_temp_value_u60(const char *therm)
     long v = json_get_int(therm, "cpuss_temp", -1);
     if (v < 0) return 0;
     return normalize_temp_reading(v);
-}
-
-static int cpu_usage_pct(void)
-{
-    FILE *fp = fopen("/proc/stat", "r");
-    char line[256];
-    unsigned long long user, nice, sys, idle, iowait, irq, softirq, steal;
-    unsigned long long total, idle_all, dt, di;
-    int pct = -1;
-
-    if (!fp) return -1;
-    if (!fgets(line, sizeof line, fp)) { fclose(fp); return -1; }
-    fclose(fp);
-    if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-               &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 4)
-        return -1;
-
-    idle_all = idle + iowait;
-    total = user + nice + sys + idle + iowait + irq + softirq + steal;
-    if (g_cpu_prev_valid) {
-        dt = total - g_cpu_prev_total;
-        di = idle_all - g_cpu_prev_idle;
-        if (dt > 0) pct = (int)(((dt - di) * 100ULL) / dt);
-    }
-    g_cpu_prev_total = total;
-    g_cpu_prev_idle = idle_all;
-    g_cpu_prev_valid = 1;
-    return pct;
 }
 
 static void chomp(char *s)
@@ -1518,7 +1519,8 @@ static void build_snapshot(char *out, size_t outlen,
     char device_market_name[128], device_alias_name[128], device_board_name[128];
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
-    int cpu_usage, wifi_enabled;
+    int cpu_usage, cpu_usage_tenths, wifi_enabled;
+    char runtime_json[32768];
     int qos_mcc, qos_mnc;
     struct qos_values qos;
     const struct device_template_spec *device_template;
@@ -1561,7 +1563,8 @@ static void build_snapshot(char *out, size_t outlen,
     chg_ua = read_long_file("/sys/class/power_supply/usb/current_now", 0);
     bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
     bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
-    cpu_usage = cpu_usage_pct();
+    cpu_usage_tenths = system_ext_build_json(runtime_json, sizeof runtime_json);
+    cpu_usage = cpu_usage_tenths >= 0 ? (cpu_usage_tenths + 5) / 10 : -1;
     cpu_temp = read_cpu_temp_for_template(device_template, therm);
     qos_mcc = json_get_int(net, "rmcc", 0);
     qos_mnc = json_get_int(net, "rmnc", 0);
@@ -1639,7 +1642,16 @@ static void build_snapshot(char *out, size_t outlen,
     emit_int(&b, "max_tx_speed", traf, "real_max_tx_speed", 0); bappend(&b, ",");
     emit_int(&b, "rx_bytes", traf, "real_rx_bytes", 0);         bappend(&b, ",");
     emit_int(&b, "tx_bytes", traf, "real_tx_bytes", 0);         bappend(&b, ",");
-    emit_int(&b, "session_time", traf, "real_time", 0);
+    emit_int(&b, "session_time", traf, "real_time", 0);          bappend(&b, ",");
+    emit_int(&b, "day_rx_bytes", g_traffic_accounting, "day_rx_bytes", 0); bappend(&b, ",");
+    emit_int(&b, "day_tx_bytes", g_traffic_accounting, "day_tx_bytes", 0); bappend(&b, ",");
+    emit_int(&b, "month_rx_bytes", g_traffic_accounting, "month_rx_bytes", 0); bappend(&b, ",");
+    emit_int(&b, "month_tx_bytes", g_traffic_accounting, "month_tx_bytes", 0); bappend(&b, ",");
+    emit_int(&b, "total_rx_bytes", g_traffic_accounting, "total_rx_bytes", 0); bappend(&b, ",");
+    emit_int(&b, "total_tx_bytes", g_traffic_accounting, "total_tx_bytes", 0); bappend(&b, ",");
+    bappend(&b, "\"limit\":%s,\"clear_day\":%s",
+            g_traffic_limit[0] ? g_traffic_limit : "{}",
+            g_traffic_clear_day[0] ? g_traffic_clear_day : "{}");
     bappend(&b, "},");
 
     /* qos: last known bearer/QoS values cached from modem key.log */
@@ -1663,6 +1675,30 @@ static void build_snapshot(char *out, size_t outlen,
     /* nfc */
     bappend(&b, "\"nfc\":{");
     emit_int(&b, "switch", nfc, "switch", 0);
+    bappend(&b, "},");
+
+    /* Runtime interface state is refreshed at a lower cadence than radio data. */
+    bappend(&b, "\"interfaces\":{");
+    emit_interface_status(&b, "lan", g_lan_interface); bappend(&b, ",");
+    emit_interface_status(&b, "wan4", g_wan4_interface); bappend(&b, ",");
+    emit_interface_status(&b, "wan6", g_wan6_interface); bappend(&b, ",");
+    bappend(&b, "\"lan_config\":%s,\"cellular\":%s",
+            g_lan_runtime[0] ? g_lan_runtime : "{}",
+            g_cellular_runtime[0] ? g_cellular_runtime : "{}");
+    bappend(&b, "},");
+
+    /* SIM identity and provisioning state. Values remain device-local. */
+    bappend(&b, "\"sim\":{");
+    emit_str(&b, "iccid", g_sim_cache, "sim_iccid"); bappend(&b, ",");
+    emit_str(&b, "imsi", g_sim_cache, "sim_imsi"); bappend(&b, ",");
+    emit_str(&b, "msisdn", g_sim_cache, "msisdn"); bappend(&b, ",");
+    emit_str(&b, "state", g_sim_cache, "sim_states"); bappend(&b, ",");
+    emit_str(&b, "modem_state", g_sim_cache, "modem_main_state"); bappend(&b, ",");
+    emit_str(&b, "pin_status", g_sim_cache, "pin_status"); bappend(&b, ",");
+    emit_int(&b, "current_slot", g_sim_cache, "current_sim_slot", 0); bappend(&b, ",");
+    emit_int(&b, "dual_sim", g_sim_cache, "support_dual_sim", 0); bappend(&b, ",");
+    emit_int(&b, "sim1_provision", g_sim_cache, "sim1_provision_state", 0); bappend(&b, ",");
+    emit_int(&b, "sim2_provision", g_sim_cache, "sim2_provision_state", 0);
     bappend(&b, "},");
 
     /* dhcp */
@@ -1727,7 +1763,39 @@ static void build_snapshot(char *out, size_t outlen,
     } else {
         bappend(&b, ",\"imei\":\"\"");
     }
-    bappend(&b, "}}");
+    bappend(&b, "},");
+
+    /* Realtime system details that are intentionally sampled once per daemon cycle. */
+    bappend(&b, "\"runtime\":%s}", runtime_json[0] ? runtime_json : "{}");
+}
+
+static void refresh_interface_cache(void)
+{
+    char next[RAW_MAX];
+    if (run_ubus("network.interface.lan", "status", NULL, next, sizeof next) == 0)
+        snprintf(g_lan_interface, sizeof g_lan_interface, "%s", next);
+    if (run_ubus("network.interface.zte_wan", "status", NULL, next, sizeof next) == 0)
+        snprintf(g_wan4_interface, sizeof g_wan4_interface, "%s", next);
+    if (run_ubus("network.interface.zte_wan6", "status", NULL, next, sizeof next) == 0)
+        snprintf(g_wan6_interface, sizeof g_wan6_interface, "%s", next);
+    if (run_ubus("zwrt_router.api", "router_get_lan_info", NULL, next, sizeof next) == 0)
+        snprintf(g_lan_runtime, sizeof g_lan_runtime, "%s", next);
+    if (run_ubus("zwrt_data", "get_wwaniface",
+                 "{\"source_module\":\"web\",\"cid\":1,\"connect_status\":\"\"}",
+                 next, sizeof next) == 0)
+        snprintf(g_cellular_runtime, sizeof g_cellular_runtime, "%s", next);
+    if (run_ubus("zwrt_data", "get_wwandst",
+                 "{\"source_module\":\"web\",\"cid\":1,\"type\":4}",
+                 next, sizeof next) == 0)
+        snprintf(g_traffic_accounting, sizeof g_traffic_accounting, "%s", next);
+    if (run_ubus("zwrt_data", "get_wwandst_monthlimit",
+                 "{\"source_module\":\"web\",\"cid\":1}",
+                 next, sizeof next) == 0)
+        snprintf(g_traffic_limit, sizeof g_traffic_limit, "%s", next);
+    if (run_ubus("zwrt_data", "get_wwandst_clearday",
+                 "{\"source_module\":\"web\",\"cid\":1}",
+                 next, sizeof next) == 0)
+        snprintf(g_traffic_clear_day, sizeof g_traffic_clear_day, "%s", next);
 }
 
 static int set_nonblock(int fd)
@@ -1776,9 +1844,38 @@ static void sse_client_close(struct sse_client *c)
     c->fd = -1;
 }
 
+static const char *http_header_value(const char *req, const char *name,
+                                     char *out, size_t outlen)
+{
+    const char *line = strstr(req, "\r\n");
+    size_t name_len = strlen(name);
+    if (!line || !out || outlen == 0) return NULL;
+    line += 2;
+    while (*line && strncmp(line, "\r\n", 2) != 0) {
+        const char *end = strstr(line, "\r\n");
+        const char *value;
+        size_t len;
+        if (!end) return NULL;
+        if ((size_t)(end - line) > name_len && !strncasecmp(line, name, name_len) &&
+            line[name_len] == ':') {
+            value = line + name_len + 1;
+            while (value < end && isspace((unsigned char)*value)) value++;
+            len = (size_t)(end - value);
+            while (len && isspace((unsigned char)value[len - 1])) len--;
+            if (len >= outlen) len = outlen - 1;
+            memcpy(out, value, len);
+            out[len] = 0;
+            return out;
+        }
+        line = end + 2;
+    }
+    return NULL;
+}
+
 static int read_http_request(int fd, char *buf, size_t cap, int timeout_ms)
 {
     size_t len = 0;
+    size_t wanted = 0;
 
     while (len + 1 < cap) {
         if (!wait_readable(fd, timeout_ms)) return -1;
@@ -1792,10 +1889,25 @@ static int read_http_request(int fd, char *buf, size_t cap, int timeout_ms)
 
         len += (size_t)n;
         buf[len] = 0;
-        if (strstr(buf, "\r\n\r\n")) return 0;
+        if (!wanted) {
+            char *header_end = strstr(buf, "\r\n\r\n");
+            if (header_end) {
+                char value[64];
+                long body_len = 0;
+                size_t header_len = (size_t)(header_end + 4 - buf);
+                if (http_header_value(buf, "Content-Length", value, sizeof value)) {
+                    char *end;
+                    body_len = strtol(value, &end, 10);
+                    if (end == value || body_len < 0) return -1;
+                }
+                if ((unsigned long)body_len > cap - 1 - header_len) return -2;
+                wanted = header_len + (size_t)body_len;
+            }
+        }
+        if (wanted && len >= wanted) return (int)len;
     }
 
-    return -1;
+    return -2;
 }
 
 static int parse_request_line(const char *req, char *method, size_t method_cap,
@@ -1822,6 +1934,23 @@ static void write_http_error(int fd, int code, const char *text)
     if (n > 0) (void)write_all(fd, buf, (size_t)n);
 }
 
+static int write_http_json_status(int fd, int code, const char *status,
+                                  const char *body, size_t body_len)
+{
+    char hdr[320];
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 %d %s\r\n"
+                     "Content-Type: application/json; charset=utf-8\r\n"
+                     "Cache-Control: no-store\r\n"
+                     "Connection: close\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n",
+                     code, status, body_len);
+    if (n <= 0) return -1;
+    if (write_all(fd, hdr, (size_t)n) < 0) return -1;
+    return write_all(fd, body, body_len);
+}
+
 static int write_http_text(int fd, const char *ctype, const char *body)
 {
     char hdr[256];
@@ -1841,18 +1970,36 @@ static int write_http_text(int fd, const char *ctype, const char *body)
 
 static int write_http_json(int fd, const char *snap, size_t snap_len)
 {
-    char hdr[256];
-    int n = snprintf(hdr, sizeof hdr,
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: application/json; charset=utf-8\r\n"
-                     "Cache-Control: no-store\r\n"
-                     "Connection: close\r\n"
-                     "Content-Length: %zu\r\n"
-                     "\r\n",
-                     snap_len);
-    if (n <= 0) return -1;
-    if (write_all(fd, hdr, (size_t)n) < 0) return -1;
-    return write_all(fd, snap, snap_len);
+    return write_http_json_status(fd, 200, "OK", snap, snap_len);
+}
+
+static int secure_equal(const char *a, const char *b)
+{
+    size_t alen = a ? strlen(a) : 0;
+    size_t blen = b ? strlen(b) : 0;
+    size_t count = alen > blen ? alen : blen;
+    size_t diff = alen ^ blen;
+    for (size_t i = 0; i < count; i++) {
+        unsigned char ac = i < alen ? (unsigned char)a[i] : 0;
+        unsigned char bc = i < blen ? (unsigned char)b[i] : 0;
+        diff |= ac ^ bc;
+    }
+    return diff == 0;
+}
+
+static int request_authorized(const char *req)
+{
+    char value[768];
+    const char *token;
+    if (!g_auth_token[0]) return 1;
+    if (http_header_value(req, "Authorization", value, sizeof value)) {
+        token = value;
+        if (!strncasecmp(token, "Bearer ", 7)) token += 7;
+        if (secure_equal(token, g_auth_token)) return 1;
+    }
+    if (http_header_value(req, "X-Auth-Token", value, sizeof value) &&
+        secure_equal(value, g_auth_token)) return 1;
+    return 0;
 }
 
 static int write_sse_handshake(int fd)
@@ -1958,6 +2105,7 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
     char req[HTTP_REQ_MAX];
     char method[16];
     char path[256];
+    char control_response[65536];
 
     for (;;) {
         int cli_fd = accept(srv_fd, NULL, NULL);
@@ -1968,42 +2116,86 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
             return;
         }
 
-        if (read_http_request(cli_fd, req, sizeof req, 2000) < 0 ||
+        int read_rc = read_http_request(cli_fd, req, sizeof req, 2000);
+        if (read_rc < 0 ||
             parse_request_line(req, method, sizeof method, path, sizeof path) < 0) {
-            write_http_error(cli_fd, 400, "Bad Request");
-            close(cli_fd);
-            continue;
-        }
-
-        if (strcmp(method, "GET") != 0) {
-            write_http_error(cli_fd, 405, "Method Not Allowed");
-            close(cli_fd);
-            continue;
-        }
-
-        if (!strcmp(path, "/state")) {
-            (void)write_http_json(cli_fd, snap, snap_len);
+            write_http_error(cli_fd, read_rc == -2 ? 413 : 400,
+                             read_rc == -2 ? "Payload Too Large" : "Bad Request");
             close(cli_fd);
             continue;
         }
 
         if (!strcmp(path, "/healthz")) {
-            (void)write_http_text(cli_fd, "text/plain; charset=utf-8", "ok\n");
+            if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
+            else (void)write_http_text(cli_fd, "text/plain; charset=utf-8", "ok\n");
             close(cli_fd);
             continue;
         }
 
         if (!strcmp(path, "/") || !strcmp(path, "/index") || !strcmp(path, "/index.txt")) {
-            (void)write_http_text(cli_fd, "text/plain; charset=utf-8",
-                                  "zwrt-datad dev HTTP API\n"
-                                  "GET /state   -> current JSON snapshot\n"
-                                  "GET /events  -> SSE stream\n"
-                                  "GET /healthz -> ok\n");
+            if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
+            else (void)write_http_text(cli_fd, "text/plain; charset=utf-8",
+                                      "zwrt-datad HTTP API\n"
+                                      "GET  /state        -> current JSON snapshot\n"
+                                      "GET  /events       -> SSE state stream\n"
+                                      "GET  /capabilities -> device control capabilities\n"
+                                      "POST /control      -> allow-listed device control\n"
+                                      "GET  /healthz      -> ok\n");
             close(cli_fd);
             continue;
         }
 
+        if (!request_authorized(req)) {
+            static const char unauthorized[] =
+                "{\"ok\":false,\"error\":{\"code\":\"unauthorized\",\"message\":\"missing or invalid token\"}}";
+            (void)write_http_json_status(cli_fd, 401, "Unauthorized", unauthorized,
+                                         sizeof unauthorized - 1);
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/state")) {
+            if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
+            else (void)write_http_json(cli_fd, snap, snap_len);
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/capabilities")) {
+            const char *body = control_capabilities_json();
+            if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
+            else (void)write_http_json(cli_fd, body, strlen(body));
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/control")) {
+            char *body = strstr(req, "\r\n\r\n");
+            struct control_result control_status;
+            const char *http_status = "OK";
+            if (strcmp(method, "POST") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+                close(cli_fd);
+                continue;
+            }
+            body = body ? body + 4 : NULL;
+            control_status = control_execute(body, control_response, sizeof control_response);
+            if (control_status.http_status == 400) http_status = "Bad Request";
+            else if (control_status.http_status == 404) http_status = "Not Found";
+            else if (control_status.http_status == 502) http_status = "Bad Gateway";
+            (void)write_http_json_status(cli_fd, control_status.http_status, http_status,
+                                         control_response, strlen(control_response));
+            close(cli_fd);
+            if (control_status.refresh_state) g_state_refresh_req = 1;
+            continue;
+        }
+
         if (!strcmp(path, "/events")) {
+            if (strcmp(method, "GET") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+                close(cli_fd);
+                continue;
+            }
             int slot = -1;
             for (size_t i = 0; i < nclients; i++) {
                 if (clients[i].fd < 0) {
@@ -2043,7 +2235,7 @@ static void wait_with_http(int srv_fd, struct sse_client *clients, size_t nclien
         deadline.tv_nsec -= 1000000000L;
     }
 
-    while (g_run) {
+    while (g_run && !g_state_refresh_req) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
 
@@ -2111,12 +2303,30 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
     return p;
 }
 
+static int load_auth_token_file(const char *path)
+{
+    FILE *fp;
+    size_t n;
+    if (!path || !*path) return 0;
+    fp = fopen(path, "r");
+    if (!fp) return -1;
+    n = fread(g_auth_token, 1, sizeof g_auth_token - 1, fp);
+    fclose(fp);
+    g_auth_token[n] = 0;
+    while (n && isspace((unsigned char)g_auth_token[n - 1])) g_auth_token[--n] = 0;
+    while (*g_auth_token && isspace((unsigned char)*g_auth_token)) {
+        memmove(g_auth_token, g_auth_token + 1, strlen(g_auth_token));
+    }
+    return g_auth_token[0] ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     int once = 0, interval_ms = 1000;
     const char *bind_addr = HTTP_BIND_ADDR;
+    const char *auth_token_file = NULL;
     int port = HTTP_PORT;
-    int sim_poll_every, qos_retry_every, qos_retry_left = 0;
+    int sim_poll_every, interface_poll_every, qos_retry_every, qos_retry_left = 0;
     char sim_sig[160];
     int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
@@ -2126,12 +2336,29 @@ int main(int argc, char **argv)
             bind_addr = argv[++i];
         else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--port")) && i + 1 < argc)
             port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--auth-token-file") && i + 1 < argc)
+            auth_token_file = argv[++i];
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] [--auth-token-file path]");
+            return 0;
+        } else {
+            fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
+            return 2;
+        }
     }
     if (interval_ms <= 0) interval_ms = 1000;
+    if (auth_token_file && load_auth_token_file(auth_token_file) != 0) {
+        fprintf(stderr, "cannot read a non-empty auth token from %s\n", auth_token_file);
+        return 1;
+    }
+    if (!once && strcmp(bind_addr, "127.0.0.1") && strcmp(bind_addr, "::1") && !g_auth_token[0])
+        fprintf(stderr, "warning: non-loopback HTTP binding without an auth token\n");
 
     sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
+    interface_poll_every = sim_poll_every;
     qos_retry_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
     if (sim_poll_every < 1) sim_poll_every = 1;
+    if (interface_poll_every < 1) interface_poll_every = 1;
     if (qos_retry_every < 1) qos_retry_every = 1;
 
     signal(SIGINT, on_signal);
@@ -2169,6 +2396,8 @@ int main(int argc, char **argv)
     if (last_sms_unread >= 0) g_sms_unread_cache = last_sms_unread;
 
     do {
+        int force_refresh = g_state_refresh_req;
+        g_state_refresh_req = 0;
         if (cycle % 3600 == 0 && cycle != 0) {
             run_ubus("system", "board", NULL, board, sizeof board);
             run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
@@ -2189,6 +2418,9 @@ int main(int argc, char **argv)
                     (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
             }
         }
+
+        if (force_refresh || cycle == 0 || cycle % interface_poll_every == 0)
+            refresh_interface_cache();
 
         if (g_qos_refresh_req) {
             g_qos_refresh_req = 0;
