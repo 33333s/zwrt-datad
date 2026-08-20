@@ -136,6 +136,17 @@ static int run_ubus(const char *svc, const char *method, const char *args,
     return device_ubus_call(svc, method, args, out, outlen);
 }
 
+static void copy_text(char *dst, size_t dstlen, const char *src)
+{
+    size_t n;
+    if (!dst || dstlen == 0) return;
+    if (!src) src = "";
+    n = strlen(src);
+    if (n >= dstlen) n = dstlen - 1;
+    memmove(dst, src, n);
+    dst[n] = 0;
+}
+
 /* ---- append helpers for building the snapshot ---- */
 struct buf { char *p; size_t cap; size_t len; };
 
@@ -1080,7 +1091,7 @@ static int read_sim_signature(char *out, size_t outlen)
     out[0] = 0;
     if (run_ubus("zwrt_zte_mdm.api", "get_sim_info", NULL, sim, sizeof sim) != 0)
         return 0;
-    snprintf(g_sim_cache, sizeof g_sim_cache, "%s", sim);
+    copy_text(g_sim_cache, sizeof g_sim_cache, sim);
 
     if (!json_get(sim, "sim_iccid", iccid, sizeof iccid)) iccid[0] = 0;
     if (!json_get(sim, "current_sim_slot", slot, sizeof slot)) slot[0] = 0;
@@ -1149,8 +1160,10 @@ static long read_cpu_temp_sysfs(void)
 
             if (strncmp(de->d_name, "thermal_zone", 12) != 0) continue;
 
-            snprintf(type_path, sizeof type_path, "%s/%s/type", roots[i], de->d_name);
-            snprintf(temp_path, sizeof temp_path, "%s/%s/temp", roots[i], de->d_name);
+            int type_len = snprintf(type_path, sizeof type_path, "%s/%s/type", roots[i], de->d_name);
+            int temp_len = snprintf(temp_path, sizeof temp_path, "%s/%s/temp", roots[i], de->d_name);
+            if (type_len < 0 || (size_t)type_len >= sizeof type_path ||
+                temp_len < 0 || (size_t)temp_len >= sizeof temp_path) continue;
             if (!read_line_file(type_path, type, sizeof type)) continue;
 
             raw = read_long_file(temp_path, LONG_MIN);
@@ -1228,14 +1241,14 @@ static void parse_wifi_dhcp_output(FILE *fp,
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
         chomp(line);
-        if      (!strncmp(line, "SSID=", 5))  snprintf(ssid,  ssid_n,  "%s", line + 5);
-        else if (!strncmp(line, "KEY=", 4))   snprintf(key,   key_n,   "%s", line + 4);
-        else if (!strncmp(line, "ENC=", 4))   snprintf(enc,   enc_n,   "%s", line + 4);
+        if      (!strncmp(line, "SSID=", 5))  copy_text(ssid,  ssid_n,  line + 5);
+        else if (!strncmp(line, "KEY=", 4))   copy_text(key,   key_n,   line + 4);
+        else if (!strncmp(line, "ENC=", 4))   copy_text(enc,   enc_n,   line + 4);
         else if (!strncmp(line, "DIS=", 4))   *enabled = atoi(line + 4) ? 0 : 1;
-        else if (!strncmp(line, "IP=", 3))    snprintf(ip,    ip_n,    "%s", line + 3);
-        else if (!strncmp(line, "START=", 6)) snprintf(start, start_n, "%s", line + 6);
-        else if (!strncmp(line, "LIMIT=", 6)) snprintf(limit, limit_n, "%s", line + 6);
-        else if (!strncmp(line, "LEASE=", 6)) snprintf(lease, lease_n, "%s", line + 6);
+        else if (!strncmp(line, "IP=", 3))    copy_text(ip,    ip_n,    line + 3);
+        else if (!strncmp(line, "START=", 6)) copy_text(start, start_n, line + 6);
+        else if (!strncmp(line, "LIMIT=", 6)) copy_text(limit, limit_n, line + 6);
+        else if (!strncmp(line, "LEASE=", 6)) copy_text(lease, lease_n, line + 6);
     }
 }
 
@@ -1773,29 +1786,29 @@ static void refresh_interface_cache(void)
 {
     char next[RAW_MAX];
     if (run_ubus("network.interface.lan", "status", NULL, next, sizeof next) == 0)
-        snprintf(g_lan_interface, sizeof g_lan_interface, "%s", next);
+        copy_text(g_lan_interface, sizeof g_lan_interface, next);
     if (run_ubus("network.interface.zte_wan", "status", NULL, next, sizeof next) == 0)
-        snprintf(g_wan4_interface, sizeof g_wan4_interface, "%s", next);
+        copy_text(g_wan4_interface, sizeof g_wan4_interface, next);
     if (run_ubus("network.interface.zte_wan6", "status", NULL, next, sizeof next) == 0)
-        snprintf(g_wan6_interface, sizeof g_wan6_interface, "%s", next);
+        copy_text(g_wan6_interface, sizeof g_wan6_interface, next);
     if (run_ubus("zwrt_router.api", "router_get_lan_info", NULL, next, sizeof next) == 0)
-        snprintf(g_lan_runtime, sizeof g_lan_runtime, "%s", next);
+        copy_text(g_lan_runtime, sizeof g_lan_runtime, next);
     if (run_ubus("zwrt_data", "get_wwaniface",
                  "{\"source_module\":\"web\",\"cid\":1,\"connect_status\":\"\"}",
                  next, sizeof next) == 0)
-        snprintf(g_cellular_runtime, sizeof g_cellular_runtime, "%s", next);
+        copy_text(g_cellular_runtime, sizeof g_cellular_runtime, next);
     if (run_ubus("zwrt_data", "get_wwandst",
                  "{\"source_module\":\"web\",\"cid\":1,\"type\":4}",
                  next, sizeof next) == 0)
-        snprintf(g_traffic_accounting, sizeof g_traffic_accounting, "%s", next);
+        copy_text(g_traffic_accounting, sizeof g_traffic_accounting, next);
     if (run_ubus("zwrt_data", "get_wwandst_monthlimit",
                  "{\"source_module\":\"web\",\"cid\":1}",
                  next, sizeof next) == 0)
-        snprintf(g_traffic_limit, sizeof g_traffic_limit, "%s", next);
+        copy_text(g_traffic_limit, sizeof g_traffic_limit, next);
     if (run_ubus("zwrt_data", "get_wwandst_clearday",
                  "{\"source_module\":\"web\",\"cid\":1}",
                  next, sizeof next) == 0)
-        snprintf(g_traffic_clear_day, sizeof g_traffic_clear_day, "%s", next);
+        copy_text(g_traffic_clear_day, sizeof g_traffic_clear_day, next);
 }
 
 static int set_nonblock(int fd)
@@ -2408,7 +2421,7 @@ int main(int argc, char **argv)
             char cur_sig[160];
             int cur_valid = read_sim_signature(cur_sig, sizeof cur_sig);
             if (cur_valid != sim_sig_valid || (cur_valid && strcmp(cur_sig, sim_sig) != 0)) {
-                if (cur_valid) snprintf(sim_sig, sizeof sim_sig, "%s", cur_sig);
+                if (cur_valid) copy_text(sim_sig, sizeof sim_sig, cur_sig);
                 else sim_sig[0] = 0;
                 sim_sig_valid = cur_valid;
                 rescan_qos_cache();

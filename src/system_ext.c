@@ -157,7 +157,8 @@ static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
         long temp;
         size_t n;
         if (strncmp(ent->d_name, "thermal_zone", 12)) continue;
-        snprintf(path, sizeof path, "/sys/class/thermal/%s/type", ent->d_name);
+        int path_len = snprintf(path, sizeof path, "/sys/class/thermal/%s/type", ent->d_name);
+        if (path_len < 0 || (size_t)path_len >= sizeof path) continue;
         fp = fopen(path, "r");
         if (!fp) continue;
         if (!fgets(zones[count].type, sizeof zones[count].type, fp)) {
@@ -166,7 +167,8 @@ static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
         fclose(fp);
         n = strlen(zones[count].type);
         while (n && isspace((unsigned char)zones[count].type[n - 1])) zones[count].type[--n] = 0;
-        snprintf(path, sizeof path, "/sys/class/thermal/%s/temp", ent->d_name);
+        path_len = snprintf(path, sizeof path, "/sys/class/thermal/%s/temp", ent->d_name);
+        if (path_len < 0 || (size_t)path_len >= sizeof path) continue;
         fp = fopen(path, "r");
         if (!fp) continue;
         if (fscanf(fp, "%ld", &temp) != 1) { fclose(fp); continue; }
