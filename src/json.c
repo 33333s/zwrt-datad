@@ -24,6 +24,84 @@ static const char *skip_json_string(const char *p)
     return NULL;
 }
 
+static const char *skip_ws_ptr(const char *p)
+{
+    while (p && is_ws(*p)) p++;
+    return p;
+}
+
+static const char *skip_json_value(const char *p)
+{
+    char stack[64];
+    size_t depth = 0;
+
+    p = skip_ws_ptr(p);
+    if (!p || !*p) return NULL;
+    if (*p == '"') return skip_json_string(p);
+    if (*p != '{' && *p != '[') {
+        while (*p && *p != ',' && *p != '}' && *p != ']' && !is_ws(*p)) p++;
+        return p;
+    }
+
+    stack[depth++] = *p == '{' ? '}' : ']';
+    for (p++; *p; p++) {
+        if (*p == '"') {
+            p = skip_json_string(p);
+            if (!p) return NULL;
+            p--;
+            continue;
+        }
+        if (*p == '{' || *p == '[') {
+            if (depth == sizeof stack) return NULL;
+            stack[depth++] = *p == '{' ? '}' : ']';
+        } else if (*p == '}' || *p == ']') {
+            if (!depth || stack[depth - 1] != *p) return NULL;
+            if (--depth == 0) return p + 1;
+        }
+    }
+    return NULL;
+}
+
+static int next_object_member(const char **cursor, const char **member_start,
+                              const char **member_end, const char **key_start,
+                              size_t *key_len)
+{
+    const char *p = skip_ws_ptr(*cursor);
+    const char *after_key;
+    const char *value_end;
+
+    if (*p == ',') p = skip_ws_ptr(p + 1);
+    if (*p == '}') {
+        *cursor = p + 1;
+        return 0;
+    }
+    if (*p != '"') return -1;
+    *member_start = p;
+    *key_start = p + 1;
+    after_key = skip_json_string(p);
+    if (!after_key) return -1;
+    *key_len = (size_t)((after_key - 1) - *key_start);
+    p = skip_ws_ptr(after_key);
+    if (*p != ':') return -1;
+    value_end = skip_json_value(p + 1);
+    if (!value_end) return -1;
+    *member_end = value_end;
+    p = skip_ws_ptr(value_end);
+    if (*p != ',' && *p != '}') return -1;
+    *cursor = p;
+    return 1;
+}
+
+static int append_bytes(char *out, size_t outlen, size_t *used,
+                        const char *data, size_t len)
+{
+    if (*used + len >= outlen) return 0;
+    memcpy(out + *used, data, len);
+    *used += len;
+    out[*used] = 0;
+    return 1;
+}
+
 static int hex4(const char **pp, uint32_t *out)
 {
     const char *p = *pp;
@@ -217,4 +295,37 @@ long json_get_int(const char *json, const char *key, long def)
     char *end;
     long v = strtol(buf, &end, 10);
     return (end == buf) ? def : v;
+}
+
+int json_merge_objects(const char *base, const char *overlay, char *out, size_t outlen)
+{
+    const char *objects[2] = {base, overlay};
+    size_t used = 0;
+    int emitted = 0;
+
+    if (!base || !overlay || !out || outlen < 3) return 0;
+    out[0] = 0;
+    if (!append_bytes(out, outlen, &used, "{", 1)) return 0;
+
+    for (size_t object_index = 0; object_index < 2; object_index++) {
+        const char *cursor = skip_ws_ptr(objects[object_index]);
+        if (!cursor || *cursor != '{') return 0;
+        cursor++;
+        for (;;) {
+            const char *member_start, *member_end, *key_start;
+            size_t key_len;
+            char key[256];
+            int rc = next_object_member(&cursor, &member_start, &member_end,
+                                        &key_start, &key_len);
+            if (rc == 0) break;
+            if (rc < 0 || key_len >= sizeof key) return 0;
+            memcpy(key, key_start, key_len);
+            key[key_len] = 0;
+            if (object_index == 0 && find_key(overlay, key)) continue;
+            if (emitted++ && !append_bytes(out, outlen, &used, ",", 1)) return 0;
+            if (!append_bytes(out, outlen, &used, member_start,
+                              (size_t)(member_end - member_start))) return 0;
+        }
+    }
+    return append_bytes(out, outlen, &used, "}", 1);
 }

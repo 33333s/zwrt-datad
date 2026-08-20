@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.7",
+    "version": "0.7.0",
     "asset": "zwrt-datad-aarch64",
-    "notes": "补充运行时日志约束；当前 key.log 优先，key.log.0 仅补缺"
+    "notes": "新增私有控制 API、Token 鉴权、SIM/接口/流量状态和每核心实时系统数据"
   }
 }

@@ -18,4 +18,7 @@ int  json_get(const char *json, const char *key, char *out, size_t outlen);
 /* Integer value of `key`, or `def` if missing/unparseable. */
 long json_get_int(const char *json, const char *key, long def);
 
+/* Merge two top-level objects. Values from overlay replace matching base keys. */
+int json_merge_objects(const char *base, const char *overlay, char *out, size_t outlen);
+
 #endif /* U60_JSON_H */

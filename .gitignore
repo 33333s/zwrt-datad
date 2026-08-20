@@ -3,6 +3,11 @@
 /zwrt-datad
 /zwrt-datad.stripped
 /zwrt-datad-aarch64
+/zwrt-datad-hostcheck
+/zwrt-datad-aarch64-check
+/zwrt-datad-test
+/json-test.exe
+/json-test.pdb
 /zwrt-datad-*.stripped
 /*.stripped
 /u60-datad
@@ -26,3 +31,5 @@ scripts/_*.sh
 .idea/
 *.swp
 .DS_Store
+/tests/auth.token
+/tests/mock-calls.log

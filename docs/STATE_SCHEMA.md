@@ -1,6 +1,6 @@
 # zwrt-datad state schema
 
-`dev` 分支当前通过 HTTP / SSE 暴露统一状态快照：
+服务通过 HTTP / SSE 暴露统一状态快照：
 
 ```text
 GET  /state
@@ -74,6 +74,25 @@ SSE  /events
     "list": [ { "id": 53, "num": "10086", "date": "06-15 14:57", "unread": 0, "text": "正文…" } ]
   },
   "nfc": { "switch": 1 },
+  "interfaces": {
+    "lan": { "up": true, "proto": "static", "device": "br-lan", "ipv4": [], "ipv6": [], "dns": [] },
+    "wan4": { "up": true, "proto": "dhcp", "device": "rmnet_data0", "ipv4": [], "ipv6": [], "dns": [] },
+    "wan6": { "up": true, "proto": "dhcpv6", "device": "rmnet_data0", "ipv4": [], "ipv6": [], "dns": [] },
+    "lan_config": {},
+    "cellular": {}
+  },
+  "sim": {
+    "iccid": "8986000000000000000",
+    "imsi": "460000000000001",
+    "msisdn": "10086",
+    "state": "ready",
+    "modem_state": "online",
+    "pin_status": "disabled",
+    "current_slot": 1,
+    "dual_sim": 1,
+    "sim1_provision": 1,
+    "sim2_provision": 0
+  },
   "dhcp": { "ip": "192.168.0.1", "start": "192.168.0.2", "limit": "252", "leasetime": "86400" },
   "traffic": {
     "rx_speed": 1260,
@@ -82,7 +101,15 @@ SSE  /events
     "max_tx_speed": 13243,
     "rx_bytes": 11569922,
     "tx_bytes": 10832964,
-    "session_time": 11162
+    "session_time": 11162,
+    "day_rx_bytes": 11569922,
+    "day_tx_bytes": 10832964,
+    "month_rx_bytes": 111569922,
+    "month_tx_bytes": 101083296,
+    "total_rx_bytes": 511569922,
+    "total_tx_bytes": 410832964,
+    "limit": {},
+    "clear_day": {}
   },
   "qos": {
     "qci": 9,
@@ -115,6 +142,16 @@ SSE  /events
     "model": "ZTE Device Name",
     "hostname": "zte-device",
     "fw": "OpenWrt 23.05.4 r24012-d8dd03c46f"
+  },
+  "runtime": {
+    "cpu_usage_tenths": 172,
+    "cpu_cores": { "cpu0": 180, "cpu1": 164 },
+    "cpu_freq_mhz": { "cpu0": { "cur": 691, "max": 1728 } },
+    "thermal_zones": [ { "type": "cpuss-0", "temp_milli": 41000 } ],
+    "memory_kb": { "total": 1628520, "free": 120000, "available": 771176, "buffers": 4096, "cached": 420000, "swap_total": 0, "swap_free": 0 },
+    "storage": { "total": 1946157056, "used": 95105856, "available": 1851051200 },
+    "connections": { "tcp4": 12, "tcp6": 2, "udp4": 8, "udp6": 2, "unix": 91 },
+    "throughput": { "rx_bps": 126000, "tx_bps": 108100, "window_ms": 15000 }
   }
 }
 ```
@@ -139,7 +176,12 @@ SSE  /events
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
 - `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
-- `traffic` is realtime session data from `type:1`.
+- `traffic.rx_speed/tx_speed` 和会话计数来自 `type:1`；日/月/累计值、限额与清零日由低频设备状态刷新补充。
+- `interfaces` 每 5 秒刷新一次，控制成功时强制立即刷新。地址数组沿用 OpenWrt `network.interface.* status` 的对象结构。
+- `sim` 每 5 秒刷新一次；检测到 ICCID、卡槽或 SIM 状态变化时同时刷新 QoS 缓存。
+- `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
+- `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 和 `throughput` 单位分别为字节和字节/秒。
+- `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
 - `net.HSR`：高铁专网确认结果。该值只应来自信令确认，不按 ARFCN/EARFCN 直接判定。当前公开版尚未实现 modem SIB1 信令确认链路，因此该字段保持 `false`，直到公开实现具备同等确认能力。
@@ -147,5 +189,4 @@ SSE  /events
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
 - `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
-- `sms`：只读。`sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，**或在未读数变化时立即重读**（新短信到达、或界面标记已读后，红点/图标能马上更新），最多 32 条。`text` 解码支持代理对（emoji）。本工程不实现发送/删除。
-- **标记已读**（界面行为，非本快照字段）：`ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id1>;<id2>;","tag":0}'`（id 分号分隔、末尾带分号；`tag:0`=已读）。
+- `sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，或在未读数变化时立即重读，最多 32 条。发送、删除和标记已读通过私有 [`CONTROL_API.md`](CONTROL_API.md) 执行。
