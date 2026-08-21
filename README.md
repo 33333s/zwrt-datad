@@ -1,12 +1,14 @@
 # zwrt-datad
 
-`zwrt-datad` 是一个面向 ZTE 便携式 5G 路由设备的状态聚合器。它会统一轮询 `ubus`、按需扫描 `key.log`，把结果归一化成一份稳定 JSON，再通过轻量 HTTP 服务对外提供。
+`zwrt-datad` 是一个面向 ZTE 便携式 5G 路由设备的设备数据与控制服务。它会统一轮询 `ubus`、按需扫描 `key.log`，把结果归一化成稳定 JSON，并通过轻量 HTTP/SSE 与上层 UFI 服务交换数据。
 
-`dev` 分支当前的传输层已经彻底切到 `HTTP + SSE`：
+当前传输层使用 `HTTP + SSE`：
 
 - `GET /state`：返回当前完整 JSON
 - `GET /events`：返回 `text/event-stream`，持续推送最新快照
 - `GET /healthz`：返回 `ok`
+- `GET /capabilities`：返回允许的设备操作
+- `POST /control`：执行白名单内的设备控制
 
 默认监听地址：
 
@@ -14,11 +16,11 @@
 - `http://127.0.0.1:9460/state`
 - `http://127.0.0.1:9460/events`
 
-> 这是一个 clean-room 实现，只依赖标准 OpenWRT 能力，不链接厂商私有库。
+> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。UUID、OTA、插件、数据库、短信转发和前端鉴权仍属于上层 UFI，不进入 datad。
 
 公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
 
-当前这条 `dev` 线开始把“设备侧 API 模板选择”收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250` 和 `MC8532B` 两条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250` 和 `MC8532B` 两条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
@@ -57,7 +59,9 @@ bash scripts/build.sh
 主机侧语法检查：
 
 ```sh
-cc -std=c11 -Wall -Wextra -Werror -Iinclude -c src/json.c src/main.c
+cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
+  src/json.c src/device_exec.c src/system_ext.c src/control.c src/main.c \
+  -o zwrt-datad-test
 ```
 
 ## 运行
@@ -99,7 +103,7 @@ adb shell 'chmod 755 /etc/init.d/zwrt-datad &&
 
 ## 读取方式
 
-当前 `dev` 分支消费者统一走 HTTP / SSE：
+消费者统一走 HTTP / SSE：
 
 ```sh
 curl http://127.0.0.1:9460/state
@@ -118,6 +122,18 @@ es.addEventListener("state", (ev) => {
   console.log(state);
 });
 ```
+
+启用 Token 后，上层 UFI 使用请求头访问：
+
+```sh
+curl -H 'Authorization: Bearer <token>' http://127.0.0.1:9460/state
+curl -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"band.set_nr_nsa","params":{"bands":"41,78"}}' \
+  http://127.0.0.1:9460/control
+```
+
+控制接口只接受明确列入白名单的动作，不提供任意 `ubus` 或 Shell 透传。完整契约见 [`docs/CONTROL_API.md`](docs/CONTROL_API.md)。
 
 后端会先根据 `state.device.model_name` 选择设备侧 API 模板，并把结果写进 `state.device.api_template`。如果前端还需要切自己的 UI 模板，优先使用 `state.device.model_name` 或 `state.device.api_template`，不要再用 `market_name` / `alias_name` 做判断。
 
@@ -144,6 +160,7 @@ kill -USR1 $(pidof zwrt-datad)
 ## 文档
 
 - 接口说明：[`docs/API.md`](docs/API.md)
+- 控制接口：[`docs/CONTROL_API.md`](docs/CONTROL_API.md)
 - 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
 - 仓库边界：[`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)
 - 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
