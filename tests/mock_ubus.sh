@@ -34,6 +34,7 @@ case "$service:$method" in
     zwrt_zte_mdm.api:get_zwrt_common_info)
         model="${MOCK_MODEL_NAME:-MU5250}"
         market='U60 Pro'
+        [ "$model" = 'MC8532B' ] && market='G5 Pro'
         [ "$model" = 'MU5252' ] && market='TopFlow'
         [ "$model" = 'MC7523' ] && market='G5 Max WiFi'
         printf '{"manufacturer":"ZTE","model_name":"%s","hardware_version":"%s_HW1.0","device_market_name":"%s","wa_inner_version":"TEST-BUILD"}\n' \

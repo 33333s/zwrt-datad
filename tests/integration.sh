@@ -8,6 +8,7 @@ LAN_LOCAL_PORT=$((PORT + 1))
 LAN_PORT=$((PORT + 2))
 TOPFLOW_PORT=$((PORT + 3))
 MC7523_PORT=$((PORT + 4))
+MC8532B_PORT=$((PORT + 5))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
@@ -19,6 +20,7 @@ PID=""
 LAN_PID=""
 TOPFLOW_PID=""
 MC7523_PID=""
+MC8532B_PID=""
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
@@ -29,6 +31,8 @@ cleanup() {
     [ -n "$TOPFLOW_PID" ] && wait "$TOPFLOW_PID" 2>/dev/null || true
     [ -n "$MC7523_PID" ] && kill "$MC7523_PID" 2>/dev/null || true
     [ -n "$MC7523_PID" ] && wait "$MC7523_PID" 2>/dev/null || true
+    [ -n "$MC8532B_PID" ] && kill "$MC8532B_PID" 2>/dev/null || true
+    [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
 }
@@ -272,6 +276,47 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"service":"system","method":"info","args":{}}' \
     "http://127.0.0.1:$MC7523_PORT/ubus/call" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["uptime"] == 123
+'
+
+MOCK_MODEL_NAME=MC8532B \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "MC8532B"
+assert data["device"]["api_template_supported"] == 1
+assert data["device"]["full_ubus"] == 1
+assert data["modems"] == []
+assert data["thermal"]["cpu_celsius"] == 42
+assert data["thermal"]["zones"] == [
+    {"name": "battery", "celsius": 30.0},
+    {"name": "cpuss-0", "celsius": 41.25},
+]
+assert data["thermal"]["modems"] == []
+'
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MC8532B \
+"$BIN" -i 200 -p "$MC8532B_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+MC8532B_PID=$!
+
+i=0
+until curl -fsS "http://127.0.0.1:$MC8532B_PORT/healthz" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'MC8532B test server did not start' >&2; exit 1; }
+    sleep 0.1
+done
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"service":"system","method":"info","args":{}}' \
+    "http://127.0.0.1:$MC8532B_PORT/ubus/call" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 assert data["ok"] is True
