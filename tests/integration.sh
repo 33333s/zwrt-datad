@@ -232,7 +232,11 @@ assert data["device"]["api_template"] == "MC7523"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
-assert data["thermal"]["zones"] == []
+assert data["thermal"]["cpu_celsius"] == 42
+assert data["thermal"]["zones"] == [
+    {"name": "battery", "celsius": 30.0},
+    {"name": "cpuss-0", "celsius": 41.25},
+]
 '
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \

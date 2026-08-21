@@ -206,7 +206,7 @@ static const struct device_template_spec TEMPLATE_G5MAX_MC7523 = {
     "MC7523",
     1,
     1,
-    0,
+    1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
