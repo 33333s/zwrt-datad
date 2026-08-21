@@ -4,7 +4,8 @@
 
 #include <stddef.h>
 
-/* Build the realtime system extension object and return aggregate CPU usage. */
-int system_ext_build_json(char *out, size_t outlen);
+/* Build realtime system data plus an optional normalized thermal-zone array. */
+int system_ext_build_json(char *out, size_t outlen,
+                          char *thermal_out, size_t thermal_outlen);
 
 #endif

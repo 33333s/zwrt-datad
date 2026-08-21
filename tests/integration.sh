@@ -14,6 +14,7 @@ MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
+THERMAL_FIXTURE="$ROOT/tests/fixtures/thermal"
 PID=""
 LAN_PID=""
 TOPFLOW_PID=""
@@ -36,6 +37,7 @@ trap cleanup EXIT INT TERM
 printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$CALL_LOG"
 chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh"
+export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
@@ -54,7 +56,19 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/state")"
 [ "$code" = "401" ]
 
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
-    "http://127.0.0.1:$PORT/state" | python3 -m json.tool >/dev/null
+    "http://127.0.0.1:$PORT/state" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "MU5250"
+assert data["device"]["api_template_supported"] == 1
+assert data["device"]["full_ubus"] == 1
+assert data["modems"] == []
+assert data["thermal"]["cpu_celsius"] == 42
+assert data["thermal"]["zones"] == [
+    {"name": "battery", "celsius": 30.0},
+    {"name": "cpuss-0", "celsius": 41.25},
+]
+'
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$PORT/capabilities" | python3 -m json.tool >/dev/null
@@ -218,6 +232,7 @@ assert data["device"]["api_template"] == "MC7523"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
+assert data["thermal"]["zones"] == []
 '
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \

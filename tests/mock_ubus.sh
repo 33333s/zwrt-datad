@@ -71,6 +71,9 @@ case "$service:$method" in
     zwrt_data:get_wwandst)
         printf '%s\n' '{"real_time":12,"real_tx_bytes":120,"real_rx_bytes":240,"real_tx_speed":10,"real_rx_speed":20,"real_max_tx_speed":30,"real_max_rx_speed":40,"day_tx_bytes":120,"day_rx_bytes":240,"month_tx_bytes":120,"month_rx_bytes":240,"total_tx_bytes":120,"total_rx_bytes":240}'
         ;;
+    zwrt_bsp.thermal:get_cpu_temp)
+        printf '%s\n' '{"cpuss_temp":42}'
+        ;;
     network.interface.zte_mwan2:status|network.interface.zte_mwan2_6:status|network.interface.zte_mwan3:status|network.interface.zte_mwan3_6:status|network.interface.zte_mwan4:status|network.interface.zte_mwan4_6:status)
         printf '%s\n' '{"up":true,"proto":"dhcp","l3_device":"fixture0","ipv4-address":[],"ipv6-address":[],"dns-server":[]}'
         ;;
