@@ -8,7 +8,8 @@ Keep in this repository:
 - Public `/state` and `/events` schema
 - QoS, SMS, WiFi, client-list, battery, and traffic aggregation
 - Compile-time allow-listed device controls over local authenticated HTTP
-- Safe `fork/exec` wrappers for fixed `ubus`, `uci`, and WiFi operations
+- MU5252-only full ubus transport using validated service/method identifiers and argument-vector execution
+- Safe `fork/exec` wrappers for fixed and MU5252 runtime-selected `ubus`, plus fixed `uci` and WiFi operations
 - Public-safe build scripts and init script
 
 Do not copy into this repository:

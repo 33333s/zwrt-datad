@@ -93,6 +93,51 @@ SSE  /events
     "sim1_provision": 1,
     "sim2_provision": 0
   },
+  "modems": [
+    {
+      "id": "x75",
+      "role": "integrated_5g",
+      "transport": "rmnet",
+      "subid": 1,
+      "ifname": "rmnet_data0",
+      "wan_interface": "zte_mwan2",
+      "net": {},
+      "sim": {},
+      "wwan": {},
+      "interfaces": { "ipv4": {}, "ipv6": {} },
+      "traffic": {}
+    },
+    {
+      "id": "v3e1",
+      "role": "external_4g",
+      "transport": "cdc-ecm",
+      "subid": 3,
+      "ifname": "V3E1net0",
+      "wan_interface": "zte_mwan3",
+      "usb": { "path": "1-1", "id": "19d2:0581", "present": true, "carrier": 1 },
+      "debug": { "transport": "adb", "serial": "V3E1T12345", "available": true },
+      "net": {},
+      "sim": {},
+      "wwan": {},
+      "interfaces": { "ipv4": {}, "ipv6": {} },
+      "traffic": {}
+    },
+    {
+      "id": "v3e2",
+      "role": "external_4g",
+      "transport": "cdc-ecm",
+      "subid": 5,
+      "ifname": "V3E2net0",
+      "wan_interface": "zte_mwan4",
+      "usb": { "path": "1-2", "id": "19d2:1716", "present": true, "carrier": 1 },
+      "debug": { "transport": "adb", "serial": "V3E2T12345", "available": true },
+      "net": {},
+      "sim": {},
+      "wwan": {},
+      "interfaces": { "ipv4": {}, "ipv6": {} },
+      "traffic": {}
+    }
+  ],
   "dhcp": { "ip": "192.168.0.1", "start": "192.168.0.2", "limit": "252", "leasetime": "86400" },
   "traffic": {
     "rx_speed": 1260,
@@ -181,6 +226,8 @@ SSE  /events
 - `traffic.rx_speed/tx_speed` 和会话计数来自 `type:1`；日/月/累计值、限额与清零日由低频设备状态刷新补充。
 - `interfaces` 每 5 秒刷新一次，控制成功时强制立即刷新。地址数组沿用 OpenWrt `network.interface.* status` 的对象结构。
 - `sim` 每 5 秒刷新一次；检测到 ICCID、卡槽或 SIM 状态变化时同时刷新 QoS 缓存。
+- `modems` 是多基带设备的规范化列表。MU5252 固定包含 `x75`、`v3e1`、`v3e2` 三项；外挂基带的活动 `subid` 分别由 `3/4`、`5/6` 加当前基带卡槽计算。其他模板当前返回空数组。
+- `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 和 `throughput` 单位分别为字节和字节/秒。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。

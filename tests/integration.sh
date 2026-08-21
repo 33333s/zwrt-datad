@@ -6,6 +6,7 @@ BIN="${1:-$ROOT/zwrt-datad-test}"
 PORT="${ZWRT_DATAD_TEST_PORT:-19460}"
 LAN_LOCAL_PORT=$((PORT + 1))
 LAN_PORT=$((PORT + 2))
+TOPFLOW_PORT=$((PORT + 3))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
@@ -14,12 +15,15 @@ INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 PID=""
 LAN_PID=""
+TOPFLOW_PID=""
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
     [ -n "$PID" ] && wait "$PID" 2>/dev/null || true
     [ -n "$LAN_PID" ] && kill "$LAN_PID" 2>/dev/null || true
     [ -n "$LAN_PID" ] && wait "$LAN_PID" 2>/dev/null || true
+    [ -n "$TOPFLOW_PID" ] && kill "$TOPFLOW_PID" 2>/dev/null || true
+    [ -n "$TOPFLOW_PID" ] && wait "$TOPFLOW_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
 }
@@ -50,6 +54,18 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$PORT/capabilities" | python3 -m json.tool >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$PORT/ubus" | grep -F 'zte_nwinfo_api' >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$PORT/ubus?verbose=1" | grep -F 'nwinfo_get_msim_netinfo' >/dev/null
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"service":"system","method":"info","args":{}}' \
+    "http://127.0.0.1:$PORT/ubus/call")"
+[ "$code" = "404" ]
 
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
@@ -141,8 +157,47 @@ assert data["device"]["api_template_supported"] == 1
 assert data["net"]["type"] == "SA"
 assert data["net"]["operator"] == "Fixture TopFlow Mobile"
 assert data["net"]["nr_pci"] == 321
+assert [modem["id"] for modem in data["modems"]] == ["x75", "v3e1", "v3e2"]
+assert [modem["subid"] for modem in data["modems"]] == [2, 3, 5]
+assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
+assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
 '
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
+grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
+grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_MODEL_NAME=MU5252 \
+"$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+TOPFLOW_PID=$!
+
+i=0
+until curl -fsS "http://127.0.0.1:$TOPFLOW_PORT/healthz" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'TopFlow test server did not start' >&2; exit 1; }
+    sleep 0.1
+done
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"service":"system","method":"info","args":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/ubus/call" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["service"] == "system"
+assert data["method"] == "info"
+assert data["result"]["uptime"] == 123
+'
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"service":"system;reboot","method":"info","args":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/ubus/call")"
+[ "$code" = "400" ]
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \

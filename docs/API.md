@@ -78,6 +78,46 @@ data: {"ts":1782396733,...}
 
 返回内部协议版本、支持的控制动作和事件类型。
 
+### `GET /ubus`
+
+返回设备当前注册的完整 ubus 对象清单。传入 `?verbose=1` 时等价于设备侧 `ubus -v list`，同时返回所有方法及参数签名：
+
+```sh
+curl http://127.0.0.1:9460/ubus
+curl 'http://127.0.0.1:9460/ubus?verbose=1'
+```
+
+该接口本身只做只读发现，不接受对象名、方法名或参数；实际调用使用下面独立的 `/ubus/call`。LAN 端口访问时仍需要 Bearer Token。
+
+### `POST /ubus/call`（MU5252）
+
+MU5252 模板提供完整 ubus 调用能力，设备当前注册的对象和方法均可调用：
+
+```json
+{
+  "service": "system",
+  "method": "info",
+  "args": {}
+}
+```
+
+成功响应保留设备原始 JSON：
+
+```json
+{
+  "ok": true,
+  "service": "system",
+  "method": "info",
+  "result": { "uptime": 123 }
+}
+```
+
+- `args` 可省略；提供时必须是完整 JSON 对象。
+- 服务名、方法名和参数通过 `fork/exec` 参数数组传递，不经过 Shell。
+- 仅当当前模板为 `MU5252` 时启用；其他机型返回 `404 unsupported_device`。
+- 回环来源可使用本机免鉴权口；非回环来源必须走现有鉴权监听口。
+- 该入口不会区分 getter 和 setter。`reboot`、`sysupgrade`、网络重载、服务管理及厂商写接口都可能造成中断或数据丢失，调用方对目标和参数负责。
+
 ### `POST /control`
 
 执行白名单内的设备操作。接口不接受任意 Shell、任意命令名或任意 `ubus` 服务名。
