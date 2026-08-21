@@ -53,7 +53,8 @@ static int wait_child(pid_t pid, int *status, int timeout_ms)
     }
 }
 
-int device_run_capture(const char *const argv[], char *out, size_t outlen)
+static int device_run_capture_timeout(const char *const argv[], char *out, size_t outlen,
+                                      int timeout_ms)
 {
     int pipefd[2];
     pid_t pid;
@@ -87,7 +88,7 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
 
     close(pipefd[1]);
     (void)fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL, 0) | O_NONBLOCK);
-    deadline = monotonic_ms() + DEVICE_COMMAND_TIMEOUT_MS;
+    deadline = monotonic_ms() + timeout_ms;
 
     for (;;) {
         char scratch[1024];
@@ -128,9 +129,14 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
         errno = ETIMEDOUT;
         return -1;
     }
-    if (wait_child(pid, &status, DEVICE_COMMAND_TIMEOUT_MS) != 0) return -1;
+    if (wait_child(pid, &status, timeout_ms) != 0) return -1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
     return 0;
+}
+
+int device_run_capture(const char *const argv[], char *out, size_t outlen)
+{
+    return device_run_capture_timeout(argv, out, outlen, DEVICE_COMMAND_TIMEOUT_MS);
 }
 
 int device_run_quiet(const char *const argv[])
@@ -185,6 +191,37 @@ int device_ubus_list(int verbose, char *out, size_t outlen)
     argv[n++] = "list";
     argv[n] = NULL;
     if (device_run_capture(argv, out, outlen) != 0) return -1;
+    return out[0] ? 0 : -1;
+}
+
+static int valid_remote_sysfs_path(const char *path)
+{
+    if (!path || strncmp(path, "/sys/", 5) || strstr(path, "..")) return 0;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.' && *p != '/') return 0;
+    }
+    return 1;
+}
+
+int device_adb_read_file(const char *serial, const char *path,
+                         char *out, size_t outlen)
+{
+    const char *adb = getenv("ZWRT_DATAD_ADB_BIN");
+    const char *argv[7];
+    size_t n;
+    if (!valid_command_name(serial) || !valid_remote_sysfs_path(path) ||
+        !out || outlen == 0) return -1;
+    if (!adb || !*adb) adb = "adb";
+    argv[0] = adb;
+    argv[1] = "-s";
+    argv[2] = serial;
+    argv[3] = "shell";
+    argv[4] = "cat";
+    argv[5] = path;
+    argv[6] = NULL;
+    if (device_run_capture_timeout(argv, out, outlen, 2000) != 0) return -1;
+    n = strlen(out);
+    while (n && isspace((unsigned char)out[n - 1])) out[--n] = 0;
     return out[0] ? 0 : -1;
 }
 

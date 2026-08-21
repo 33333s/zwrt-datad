@@ -36,7 +36,7 @@ trap cleanup EXIT INT TERM
 
 printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$CALL_LOG"
-chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh"
+chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh"
 export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
@@ -171,6 +171,7 @@ MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
+ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 "$BIN" --once | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -184,6 +185,20 @@ assert [modem["id"] for modem in data["modems"]] == ["x75", "v3e1", "v3e2"]
 assert [modem["subid"] for modem in data["modems"]] == [2, 3, 5]
 assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
 assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
+assert data["thermal"]["cpu_celsius"] == 42
+assert data["thermal"]["zones"] == [
+    {"name": "battery", "celsius": 30.0},
+    {"name": "cpuss-0", "celsius": 41.25},
+]
+assert data["thermal"]["modems"][0] == {
+    "id": "x75", "available": True, "celsius": 42
+}
+assert data["thermal"]["modems"][1]["id"] == "v3e1"
+assert data["thermal"]["modems"][1]["available"] is True
+assert data["thermal"]["modems"][1]["celsius"] == 47
+assert data["thermal"]["modems"][2]["id"] == "v3e2"
+assert data["thermal"]["modems"][2]["available"] is True
+assert data["thermal"]["modems"][2]["celsius"] == 46
 '
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
@@ -193,6 +208,7 @@ ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
+ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
 

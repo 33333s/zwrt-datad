@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.3",
+    "version": "0.9.4",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MC7523 模板规范化 thermal 温度状态与 SSE 输出"
+    "notes": "新增 MU5252 X75/V3E1/V3E2 三基带规范化温度与低频 ADB 缓存"
   }
 }

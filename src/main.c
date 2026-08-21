@@ -70,6 +70,8 @@
 #define UBUS_CALL_RESPONSE_MAX (UBUS_CALL_RESULT_MAX + 4096)
 #define TOPFLOW_MODEM_COUNT 3
 #define TOPFLOW_EXTERNAL_MODEM_COUNT 2
+#define TOPFLOW_THERMAL_POLL_SEC 30
+#define TOPFLOW_V3E_TEMP_PATH "/sys/devices/virtual/power/zte_power/adc2_temp"
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -97,6 +99,10 @@ static char g_topflow_wwaniface[TOPFLOW_EXTERNAL_MODEM_COUNT][RAW_MAX];
 static char g_topflow_traffic[TOPFLOW_EXTERNAL_MODEM_COUNT][RAW_MAX];
 static char g_topflow_wan4[TOPFLOW_MODEM_COUNT][RAW_MAX];
 static char g_topflow_wan6[TOPFLOW_MODEM_COUNT][RAW_MAX];
+static long g_topflow_external_temp[TOPFLOW_EXTERNAL_MODEM_COUNT];
+static int g_topflow_external_temp_valid[TOPFLOW_EXTERNAL_MODEM_COUNT];
+static time_t g_topflow_external_temp_sampled_at[TOPFLOW_EXTERNAL_MODEM_COUNT];
+static time_t g_topflow_thermal_next_at;
 static char g_ubus_catalog[UBUS_CATALOG_MAX];
 static char g_ubus_call_args[HTTP_REQ_MAX];
 static char g_ubus_call_result[UBUS_CALL_RESULT_MAX];
@@ -193,7 +199,7 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     "MU5252",
     1,
     1,
-    0,
+    1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_U60_UBUS_ONLY,
@@ -1839,6 +1845,7 @@ static void refresh_topflow_multimodem_cache(void)
         "network.interface.zte_mwan4_6"
     };
     char next[RAW_MAX];
+    time_t now;
 
     if (!g_topflow_multimodem_enabled) return;
 
@@ -1872,6 +1879,66 @@ static void refresh_topflow_multimodem_cache(void)
         if (run_ubus("zwrt_data", "get_wwandst", args, next, sizeof next) == 0)
             copy_text(g_topflow_traffic[i], sizeof g_topflow_traffic[i], next);
     }
+
+    now = time(NULL);
+    if (g_topflow_thermal_next_at == 0 || now >= g_topflow_thermal_next_at) {
+        static const char *serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {
+            "V3E1T12345", "V3E2T12345"
+        };
+        static const char *usb_paths[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"1-1", "1-2"};
+        const char *adb_override = getenv("ZWRT_DATAD_ADB_BIN");
+        for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
+            char raw[64], path[128], *end = NULL;
+            long value;
+            snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/%s:1.3",
+                     usb_paths[i], usb_paths[i]);
+            if ((!adb_override || !*adb_override) && access(path, F_OK) != 0) {
+                g_topflow_external_temp_valid[i] = 0;
+                g_topflow_external_temp_sampled_at[i] = 0;
+                continue;
+            }
+            if (device_adb_read_file(serials[i], TOPFLOW_V3E_TEMP_PATH,
+                                     raw, sizeof raw) != 0) {
+                g_topflow_external_temp_valid[i] = 0;
+                g_topflow_external_temp_sampled_at[i] = 0;
+                continue;
+            }
+            errno = 0;
+            value = strtol(raw, &end, 10);
+            while (end && *end && isspace((unsigned char)*end)) end++;
+            if (errno || !end || end == raw || *end || value < -40 || value > 125) {
+                g_topflow_external_temp_valid[i] = 0;
+                g_topflow_external_temp_sampled_at[i] = 0;
+                continue;
+            }
+            g_topflow_external_temp[i] = value;
+            g_topflow_external_temp_valid[i] = 1;
+            g_topflow_external_temp_sampled_at[i] = now;
+        }
+        g_topflow_thermal_next_at = now + TOPFLOW_THERMAL_POLL_SEC;
+    }
+}
+
+static void emit_topflow_thermal_modems(struct buf *b, long x75_temp)
+{
+    static const char *ids[TOPFLOW_MODEM_COUNT] = {"x75", "v3e1", "v3e2"};
+    bappend(b, "[{");
+    emit_kv_str(b, "id", ids[0]); bappend(b, ",");
+    bappend(b, "\"available\":%s,\"celsius\":", x75_temp > 0 ? "true" : "false");
+    if (x75_temp > 0) bappend(b, "%ld", x75_temp);
+    else bappend(b, "null");
+    bappend(b, "}");
+    for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
+        bappend(b, ",{");
+        emit_kv_str(b, "id", ids[i + 1]); bappend(b, ",");
+        bappend(b, "\"available\":%s,\"celsius\":",
+                g_topflow_external_temp_valid[i] ? "true" : "false");
+        if (g_topflow_external_temp_valid[i]) bappend(b, "%ld", g_topflow_external_temp[i]);
+        else bappend(b, "null");
+        bappend(b, ",\"sampled_at\":%ld}",
+                (long)g_topflow_external_temp_sampled_at[i]);
+    }
+    bappend(b, "]");
 }
 
 static void prefixed_key(char *out, size_t outlen, const char *prefix, const char *suffix)
@@ -2201,10 +2268,13 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "},");
 
     /* Template-normalized thermal data; delivered in /state and SSE snapshots. */
-    bappend(&b, "\"thermal\":{\"cpu_celsius\":%ld,\"zones\":%s},",
+    bappend(&b, "\"thermal\":{\"cpu_celsius\":%ld,\"zones\":%s,\"modems\":",
             cpu_temp,
             device_template->thermal_zones && thermal_zones_json[0] ?
                 thermal_zones_json : "[]");
+    if (g_topflow_multimodem_enabled) emit_topflow_thermal_modems(&b, cpu_temp);
+    else bappend(&b, "[]");
+    bappend(&b, "},");
 
     /* Runtime interface state is refreshed at a lower cadence than radio data. */
     bappend(&b, "\"interfaces\":{");
