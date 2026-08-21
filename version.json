@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.4",
+    "version": "0.9.5",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MU5252 X75/V3E1/V3E2 三基带规范化温度与低频 ADB 缓存"
+    "notes": "新增 MC8532B 全量 ubus 验证与规范化 sysfs thermal 温度输出"
   }
 }
