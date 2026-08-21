@@ -994,7 +994,7 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out,
 {
     char line[2048];
     int qci;
-    double dl, ul;
+    double dl = 0.0, ul = 0.0;
     int dl_valid, ul_valid;
     int qci_context_lines = 0;
     int qci_context_idx = -1;
@@ -1009,7 +1009,10 @@ static void scan_qos_file(const char *path, off_t floor, off_t *size_out,
     if (floor > 0) {
         if (size <= 0 || floor > size) floor = 0;
         if (floor > 0 && fseeko(fp, floor, SEEK_SET) != 0) floor = 0;
-        if (floor == 0) rewind(fp);
+        if (floor == 0 && fseeko(fp, 0, SEEK_SET) != 0) {
+            fclose(fp);
+            return;
+        }
     }
 
     while (fgets(line, sizeof line, fp)) {
@@ -1917,7 +1920,11 @@ static int read_http_request(int fd, char *buf, size_t cap, int timeout_ms)
                 wanted = header_len + (size_t)body_len;
             }
         }
-        if (wanted && len >= wanted) return (int)len;
+        if (wanted && len >= wanted) {
+            /* Do not expose pipelined or surplus bytes as part of this body. */
+            buf[wanted] = 0;
+            return (int)wanted;
+        }
     }
 
     return -2;

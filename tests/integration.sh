@@ -6,12 +6,15 @@ BIN="${1:-$ROOT/zwrt-datad-test}"
 PORT="${ZWRT_DATAD_TEST_PORT:-19460}"
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
+INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
+INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
+INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 PID=""
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
     [ -n "$PID" ] && wait "$PID" 2>/dev/null || true
-    rm -f "$TOKEN_FILE" "$CALL_LOG"
+    rm -f "$TOKEN_FILE" "$CALL_LOG" "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
 }
 trap cleanup EXIT INT TERM
 
@@ -66,5 +69,54 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -d '{"action":"wifi.status","params":{}}' \
     "http://127.0.0.1:$PORT/control" | python3 -c \
     'import json,sys; data=json.load(sys.stdin); assert data["result"]["main_2g"]["ssid"] == "Fixture 2G"'
+
+code="$(curl -sS -o "$INVALID_JSON_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    --data-binary '{"action":"device.reboot"' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "400" ]
+python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["error"]["code"] == "invalid_request"' "$INVALID_JSON_OUT"
+
+python3 - "$PORT" <<'PY'
+import socket, sys
+
+request = (
+    b"POST /control HTTP/1.1\r\n"
+    b"Host: 127.0.0.1\r\n"
+    b"Authorization: Bearer fixture-private-token\r\n"
+    b"Content-Length: 0\r\n\r\n"
+    b'{"action":"device.reboot","params":{}}'
+)
+with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as sock:
+    sock.sendall(request)
+    response = sock.recv(4096)
+assert response.startswith(b"HTTP/1.1 400 "), response
+PY
+! grep -F 'device_reboot' "$CALL_LOG" >/dev/null
+
+code="$(curl -sS -o "$INVALID_PARAM_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"network.set_mode","params":{}}' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "400" ]
+python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["error"]["code"] == "invalid_parameter"' "$INVALID_PARAM_OUT"
+
+code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Must Not Be Staged","enabled":2}}' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "400" ]
+! grep -F "$(printf 'uci\tset ')" "$CALL_LOG" >/dev/null
+
+code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Staged First","encryption":"__mock_fail__"}}' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "502" ]
+grep -F "$(printf 'uci\trevert wireless')" "$CALL_LOG" >/dev/null
 
 echo 'integration OK'

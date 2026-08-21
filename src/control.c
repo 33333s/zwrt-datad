@@ -111,6 +111,18 @@ static void write_success(char *out, size_t outlen, const char *action,
     jb_add(&b, "}");
 }
 
+/* Prefix validation failures so the HTTP layer can distinguish them from
+ * device-side execution failures without leaking the marker to callers. */
+static void set_invalid_error(char *err, size_t errlen, const char *fmt, ...)
+{
+    va_list ap;
+    if (!err || errlen < 2) return;
+    err[0] = '\1';
+    va_start(ap, fmt);
+    (void)vsnprintf(err + 1, errlen - 1, fmt, ap);
+    va_end(ap);
+}
+
 static int valid_hex_hash(const char *s)
 {
     size_t n = s ? strlen(s) : 0;
@@ -174,13 +186,13 @@ static int build_args(const char *params, const struct param_spec *specs, size_t
         int present = json_get(params, specs[i].input, value, sizeof value);
         if (!present) {
             if (specs[i].required) {
-                snprintf(err, errlen, "missing parameter: %s", specs[i].input);
+                set_invalid_error(err, errlen, "missing parameter: %s", specs[i].input);
                 return 0;
             }
             continue;
         }
         if (specs[i].required && !value[0]) {
-            snprintf(err, errlen, "empty parameter: %s", specs[i].input);
+            set_invalid_error(err, errlen, "empty parameter: %s", specs[i].input);
             return 0;
         }
         if (emitted++) jb_add(&b, ",");
@@ -192,7 +204,7 @@ static int build_args(const char *params, const struct param_spec *specs, size_t
             break;
         case PARAM_INT:
             if (!normalized_int(value, &number)) {
-                snprintf(err, errlen, "invalid integer: %s", specs[i].input);
+                set_invalid_error(err, errlen, "invalid integer: %s", specs[i].input);
                 return 0;
             }
             jb_add(&b, "%ld", number);
@@ -201,7 +213,7 @@ static int build_args(const char *params, const struct param_spec *specs, size_t
             if (!strcmp(value, "1") || !strcmp(value, "true")) jb_add(&b, "true");
             else if (!strcmp(value, "0") || !strcmp(value, "false")) jb_add(&b, "false");
             else {
-                snprintf(err, errlen, "invalid boolean: %s", specs[i].input);
+                set_invalid_error(err, errlen, "invalid boolean: %s", specs[i].input);
                 return 0;
             }
             break;
@@ -209,7 +221,7 @@ static int build_args(const char *params, const struct param_spec *specs, size_t
     }
     jb_add(&b, "}");
     if (b.len + 1 >= b.cap) {
-        snprintf(err, errlen, "control arguments too large");
+        set_invalid_error(err, errlen, "control arguments too large");
         return 0;
     }
     return 1;
@@ -245,7 +257,7 @@ static int call_specs_require_any(const char *params, const char *service, const
     char args[CONTROL_UBUS_ARGS_MAX];
     if (!build_args(params, specs, count, args, sizeof args, err, errlen)) return 0;
     if (!strcmp(args, "{}")) {
-        snprintf(err, errlen, "no control fields supplied");
+        set_invalid_error(err, errlen, "no control fields supplied");
         return 0;
     }
     return ubus_call(service, method, args, result, result_len, err, errlen);
@@ -263,7 +275,7 @@ static int control_login(const char *params, char *result, size_t result_len,
     char hash[129], args[256], session[256], upper[129];
     struct json_buf b = {args, sizeof args, 0};
     if (!param_value(params, "password_hash", hash, sizeof hash) || !valid_hex_hash(hash)) {
-        snprintf(err, errlen, "password_hash must be a 64 character SHA-256 hex value");
+        set_invalid_error(err, errlen, "password_hash must be a 64 character SHA-256 hex value");
         return 0;
     }
     for (size_t i = 0; i <= strlen(hash); i++) upper[i] = (char)toupper((unsigned char)hash[i]);
@@ -287,7 +299,7 @@ static int control_change_password(const char *params, char *result, size_t resu
     struct json_buf b = {args, sizeof args, 0};
     if (!param_value(params, "old_hash", old_hash, sizeof old_hash) || !valid_hex_hash(old_hash) ||
         !param_value(params, "new_hash", new_hash, sizeof new_hash) || !valid_hex_hash(new_hash)) {
-        snprintf(err, errlen, "old_hash and new_hash must be SHA-256 hex values");
+        set_invalid_error(err, errlen, "old_hash and new_hash must be SHA-256 hex values");
         return 0;
     }
     for (size_t i = 0; i <= strlen(old_hash); i++) old_upper[i] = (char)toupper((unsigned char)old_hash[i]);
@@ -306,7 +318,7 @@ static int control_sim_slot(const char *params, char *result, size_t result_len,
     char raw[32], args[128], ignored[CONTROL_UBUS_RESPONSE_MAX];
     long slot, old_slot;
     if (!param_value(params, "slot", raw, sizeof raw) || !normalized_int(raw, &slot) || slot < 1 || slot > 2) {
-        snprintf(err, errlen, "slot must be 1 or 2");
+        set_invalid_error(err, errlen, "slot must be 1 or 2");
         return 0;
     }
     old_slot = slot == 2 ? 1 : 2;
@@ -371,46 +383,65 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
         {"pmf", "pmf"}, {"maxassoc", "maxassoc"}, {"hidden", "hidden"},
         {"isolate", "isolate"}
     };
-    char section[64], path[128], value[2048];
+    char section[64], path[128], values[sizeof fields / sizeof fields[0]][2048];
+    char enabled_value[32];
+    int present[sizeof fields / sizeof fields[0]];
+    int enabled_present;
+    long enabled = 0;
     int section_ok = 0, changed = 0;
     if (!param_value(params, "section", section, sizeof section)) {
-        snprintf(err, errlen, "missing parameter: section");
+        set_invalid_error(err, errlen, "missing parameter: section");
         return 0;
     }
     for (size_t i = 0; i < sizeof allowed / sizeof allowed[0]; i++)
         if (!strcmp(section, allowed[i])) section_ok = 1;
     if (!section_ok) {
-        snprintf(err, errlen, "unsupported wifi section");
+        set_invalid_error(err, errlen, "unsupported wifi section");
         return 0;
     }
+
+    /* Validate and copy every requested field before the first UCI mutation. */
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
-        if (!json_get(params, fields[i].input, value, sizeof value)) continue;
-        snprintf(path, sizeof path, "wireless.%s.%s", section, fields[i].option);
-        if (device_uci_set(path, value) != 0) {
-            snprintf(err, errlen, "failed to set wifi option: %s", fields[i].input);
-            return 0;
-        }
-        changed = 1;
+        present[i] = json_get(params, fields[i].input, values[i], sizeof values[i]);
+        if (present[i]) changed = 1;
     }
-    if (json_get(params, "enabled", value, sizeof value)) {
-        long enabled;
-        if (!normalized_int(value, &enabled) || (enabled != 0 && enabled != 1)) {
-            snprintf(err, errlen, "enabled must be 0 or 1");
-            return 0;
-        }
-        snprintf(path, sizeof path, "wireless.%s.disabled", section);
-        if (device_uci_set(path, enabled ? "0" : "1") != 0) {
-            snprintf(err, errlen, "failed to set wifi enabled state");
+    enabled_present = json_get(params, "enabled", enabled_value, sizeof enabled_value);
+    if (enabled_present) {
+        if (!normalized_int(enabled_value, &enabled) || (enabled != 0 && enabled != 1)) {
+            set_invalid_error(err, errlen, "enabled must be 0 or 1");
             return 0;
         }
         changed = 1;
     }
     if (!changed) {
-        snprintf(err, errlen, "no wifi fields supplied");
+        set_invalid_error(err, errlen, "no wifi fields supplied");
         return 0;
     }
-    if (device_uci_commit("wireless") != 0 || device_wifi_reload() != 0) {
-        snprintf(err, errlen, "failed to commit or reload wifi");
+
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+        if (!present[i]) continue;
+        snprintf(path, sizeof path, "wireless.%s.%s", section, fields[i].option);
+        if (device_uci_set(path, values[i]) != 0) {
+            (void)device_uci_revert("wireless");
+            snprintf(err, errlen, "failed to set wifi option: %s", fields[i].input);
+            return 0;
+        }
+    }
+    if (enabled_present) {
+        snprintf(path, sizeof path, "wireless.%s.disabled", section);
+        if (device_uci_set(path, enabled ? "0" : "1") != 0) {
+            (void)device_uci_revert("wireless");
+            snprintf(err, errlen, "failed to set wifi enabled state");
+            return 0;
+        }
+    }
+    if (device_uci_commit("wireless") != 0) {
+        (void)device_uci_revert("wireless");
+        snprintf(err, errlen, "failed to commit wifi configuration");
+        return 0;
+    }
+    if (device_wifi_reload() != 0) {
+        snprintf(err, errlen, "wifi configuration committed but reload failed");
         return 0;
     }
     snprintf(result, result_len, "{\"section\":\"%s\"}", section);
@@ -425,7 +456,7 @@ static int control_client_access(const char *action, const char *params,
     char mac[32], path[128], kick_args[128], ignored[CONTROL_UBUS_RESPONSE_MAX];
     int block = !strcmp(action, "client.block");
     if (!param_value(params, "mac", mac, sizeof mac) || !valid_mac(mac)) {
-        snprintf(err, errlen, "invalid mac address");
+        set_invalid_error(err, errlen, "invalid mac address");
         return 0;
     }
     for (char *p = mac; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -555,7 +586,7 @@ static int control_band(const char *action, const char *params,
     struct json_buf b = {args, sizeof args, 0};
     if (!param_value(params, "bands", bands, sizeof bands)) bands[0] = 0;
     if (!valid_band_list(bands)) {
-        snprintf(err, errlen, "bands must contain only numbers and commas");
+        set_invalid_error(err, errlen, "bands must contain only numbers and commas");
         return 0;
     }
     if (!strcmp(action, "band.set_lte")) {
@@ -614,13 +645,26 @@ struct control_result control_execute(const char *request_json,
     char action[128], params[CONTROL_PARAMS_MAX], result[CONTROL_UBUS_RESPONSE_MAX], err[256];
     int ok = 0;
 
-    if (!request_json || !json_get(request_json, "action", action, sizeof action) || !action[0]) {
+    if (!request_json || !json_is_valid_object(request_json)) {
+        write_error(response, response_len, "", "invalid_request", "request body must be a complete JSON object");
+        status.http_status = 400;
+        status.refresh_state = 0;
+        return status;
+    }
+    if (!json_get(request_json, "action", action, sizeof action) || !action[0]) {
         write_error(response, response_len, "", "invalid_request", "missing action");
         status.http_status = 400;
         status.refresh_state = 0;
         return status;
     }
-    if (!json_get(request_json, "params", params, sizeof params)) snprintf(params, sizeof params, "{}");
+    if (!json_get(request_json, "params", params, sizeof params)) {
+        snprintf(params, sizeof params, "{}");
+    } else if (!json_is_valid_object(params)) {
+        write_error(response, response_len, action, "invalid_request", "params must be a JSON object");
+        status.http_status = 400;
+        status.refresh_state = 0;
+        return status;
+    }
     result[0] = err[0] = 0;
 
     if (!strcmp(action, "device.login")) {
@@ -657,7 +701,7 @@ struct control_result control_execute(const char *request_json,
         struct json_buf b = {overrides, sizeof overrides, 0};
         if (build_args(params, specs, sizeof specs / sizeof specs[0], partial, sizeof partial, err, sizeof err)) {
             if (!strcmp(partial, "{}")) {
-                snprintf(err, sizeof err, "no cellular fields supplied");
+                set_invalid_error(err, sizeof err, "no cellular fields supplied");
             } else {
                 size_t n = strlen(partial);
                 if (n > 0 && partial[n - 1] == '}') partial[n - 1] = 0;
@@ -770,7 +814,7 @@ struct control_result control_execute(const char *request_json,
         char profile_id[128];
         if (!strcmp(action, "apn.modify") &&
             !param_value(params, "profile_id", profile_id, sizeof profile_id)) {
-            snprintf(err, sizeof err, "missing parameter: profile_id");
+            set_invalid_error(err, sizeof err, "missing parameter: profile_id");
         } else {
             ok = call_specs(params, "zwrt_apn_object", method, specs,
                             sizeof specs / sizeof specs[0], result, sizeof result, err, sizeof err);
@@ -857,7 +901,7 @@ struct control_result control_execute(const char *request_json,
             {"hostname", "hostname", PARAM_STRING, 1}
         };
         if (!param_value(params, "mac", mac, sizeof mac) || !valid_mac(mac)) {
-            snprintf(err, sizeof err, "invalid mac address");
+            set_invalid_error(err, sizeof err, "invalid mac address");
         } else {
             ok = call_specs(params, "zwrt_router.api", "router_modify_lan_hostname", specs, 2,
                             result, sizeof result, err, sizeof err);
@@ -879,8 +923,11 @@ struct control_result control_execute(const char *request_json,
     }
 
     if (!ok) {
-        write_error(response, response_len, action, "device_call_failed", err[0] ? err : "device call failed");
-        status.http_status = 502;
+        const int invalid = err[0] == '\1';
+        const char *message = invalid ? err + 1 : (err[0] ? err : "device call failed");
+        write_error(response, response_len, action,
+                    invalid ? "invalid_parameter" : "device_call_failed", message);
+        status.http_status = invalid ? 400 : 502;
         status.refresh_state = 0;
         return status;
     }

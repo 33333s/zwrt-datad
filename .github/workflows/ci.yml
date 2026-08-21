@@ -19,6 +19,12 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
             tests/json_test.c src/json.c -o json-test
           ./json-test
+      - name: Test command timeout
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
+            -DDEVICE_COMMAND_TIMEOUT_MS=150 -Iinclude \
+            tests/device_exec_test.c src/device_exec.c -o device-exec-test
+          ./device-exec-test
       - name: Validate one-shot snapshot
         run: |
           ./zwrt-datad-test --once | python3 -m json.tool >/dev/null

@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ -n "${MOCK_CALL_LOG:-}" ]; then
+    printf 'uci\t%s\n' "$*" >>"$MOCK_CALL_LOG"
+fi
+
+case "$*" in
+    *__mock_fail__*) exit 1 ;;
+esac
+
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     case "${3:-}" in
         wireless.main_2g.ssid) printf '%s\n' 'Fixture 2G' ;;
@@ -16,4 +24,8 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     exit 0
 fi
 
-exit 0
+case "${1:-}" in
+    set|commit|revert|add_list|del_list) exit 0 ;;
+esac
+
+exit 1

@@ -14,7 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef DEVICE_COMMAND_TIMEOUT_MS
 #define DEVICE_COMMAND_TIMEOUT_MS 5000
+#endif
 
 static int valid_command_name(const char *s)
 {
@@ -57,6 +59,7 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
     pid_t pid;
     size_t used = 0;
     int status = 0;
+    int timed_out = 0;
     long long deadline;
 
     if (!argv || !argv[0] || !out || outlen == 0) return -1;
@@ -90,6 +93,11 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
         char scratch[1024];
         char *dst = used + 1 < outlen ? out + used : scratch;
         size_t room = used + 1 < outlen ? outlen - 1 - used : sizeof scratch;
+        if (monotonic_ms() >= deadline) {
+            kill(pid, SIGKILL);
+            timed_out = 1;
+            break;
+        }
         ssize_t n = read(pipefd[0], dst, room);
         if (n > 0) {
             if (dst != scratch) used += (size_t)n;
@@ -101,6 +109,7 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
         long long remain = deadline - monotonic_ms();
         if (remain <= 0) {
             kill(pid, SIGKILL);
+            timed_out = 1;
             break;
         }
         fd_set rfds;
@@ -114,6 +123,11 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen)
     close(pipefd[0]);
     out[used] = 0;
 
+    if (timed_out) {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        errno = ETIMEDOUT;
+        return -1;
+    }
     if (wait_child(pid, &status, DEVICE_COMMAND_TIMEOUT_MS) != 0) return -1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
     return 0;
@@ -154,6 +168,19 @@ int device_uci_commit(const char *package_name)
     if (!uci || !*uci) uci = "uci";
     argv[0] = uci;
     argv[1] = "commit";
+    argv[2] = package_name;
+    argv[3] = NULL;
+    return device_run_quiet(argv);
+}
+
+int device_uci_revert(const char *package_name)
+{
+    const char *uci = getenv("ZWRT_DATAD_UCI_BIN");
+    const char *argv[4];
+    if (!valid_command_name(package_name)) return -1;
+    if (!uci || !*uci) uci = "uci";
+    argv[0] = uci;
+    argv[1] = "revert";
     argv[2] = package_name;
     argv[3] = NULL;
     return device_run_quiet(argv);

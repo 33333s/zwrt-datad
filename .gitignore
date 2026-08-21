@@ -6,6 +6,8 @@
 /zwrt-datad-hostcheck
 /zwrt-datad-aarch64-check
 /zwrt-datad-test
+/json-test
+/device-exec-test
 /json-test.exe
 /json-test.pdb
 /zwrt-datad-*.stripped

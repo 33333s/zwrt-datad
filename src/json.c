@@ -30,6 +30,116 @@ static const char *skip_ws_ptr(const char *p)
     return p;
 }
 
+static int is_hex_digit(char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+static const char *validate_json_string(const char *p)
+{
+    if (!p || *p != '"') return NULL;
+    for (p++; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"') return p + 1;
+        if (c < 0x20) return NULL;
+        if (c != '\\') continue;
+
+        p++;
+        if (!*p) return NULL;
+        if (*p == '"' || *p == '\\' || *p == '/' ||
+            *p == 'b' || *p == 'f' || *p == 'n' ||
+            *p == 'r' || *p == 't') {
+            continue;
+        }
+        if (*p != 'u') return NULL;
+        for (int i = 1; i <= 4; i++) {
+            if (!p[i] || !is_hex_digit(p[i])) return NULL;
+        }
+        p += 4;
+    }
+    return NULL;
+}
+
+static const char *validate_json_number(const char *p)
+{
+    if (*p == '-') p++;
+    if (*p == '0') {
+        p++;
+    } else {
+        if (*p < '1' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    return p;
+}
+
+static const char *validate_json_value(const char *p, unsigned depth)
+{
+    p = skip_ws_ptr(p);
+    if (!p || !*p || depth > 64) return NULL;
+
+    if (*p == '"') return validate_json_string(p);
+    if (*p == '-' || (*p >= '0' && *p <= '9')) return validate_json_number(p);
+    if (!strncmp(p, "true", 4)) return p + 4;
+    if (!strncmp(p, "false", 5)) return p + 5;
+    if (!strncmp(p, "null", 4)) return p + 4;
+
+    if (*p == '[') {
+        p = skip_ws_ptr(p + 1);
+        if (*p == ']') return p + 1;
+        for (;;) {
+            p = validate_json_value(p, depth + 1);
+            if (!p) return NULL;
+            p = skip_ws_ptr(p);
+            if (*p == ']') return p + 1;
+            if (*p != ',') return NULL;
+            p = skip_ws_ptr(p + 1);
+        }
+    }
+
+    if (*p == '{') {
+        p = skip_ws_ptr(p + 1);
+        if (*p == '}') return p + 1;
+        for (;;) {
+            p = validate_json_string(p);
+            if (!p) return NULL;
+            p = skip_ws_ptr(p);
+            if (*p != ':') return NULL;
+            p = validate_json_value(p + 1, depth + 1);
+            if (!p) return NULL;
+            p = skip_ws_ptr(p);
+            if (*p == '}') return p + 1;
+            if (*p != ',') return NULL;
+            p = skip_ws_ptr(p + 1);
+        }
+    }
+
+    return NULL;
+}
+
+int json_is_valid_object(const char *json)
+{
+    const char *start = skip_ws_ptr(json);
+    const char *end;
+    if (!start || *start != '{') return 0;
+    end = validate_json_value(start, 0);
+    if (!end) return 0;
+    end = skip_ws_ptr(end);
+    return *end == 0;
+}
+
 static const char *skip_json_value(const char *p)
 {
     char stack[64];
