@@ -189,6 +189,13 @@ SSE  /events
     "hostname": "zte-device",
     "fw": "OpenWrt 23.05.4 r24012-d8dd03c46f"
   },
+  "thermal": {
+    "cpu_celsius": 41,
+    "zones": [
+      { "name": "battery", "celsius": 30.000 },
+      { "name": "cpuss-0", "celsius": 41.250 }
+    ]
+  },
   "runtime": {
     "cpu_usage_tenths": 172,
     "cpu_cores": { "cpu0": 180, "cpu1": 164 },
@@ -234,6 +241,7 @@ SSE  /events
 - `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 和 `throughput` 单位分别为字节和字节/秒。
+- `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250 的 `thermal.zones` 来自 sysfs thermal zones，已过滤无效哨兵值、按名称排序并转换为摄氏度。其他模板当前返回空 `zones`。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。

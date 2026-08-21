@@ -147,9 +147,12 @@ static unsigned long long cpu_freq_khz(int core, const char *name)
 
 static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
 {
-    DIR *dir = opendir("/sys/class/thermal");
+    const char *root = getenv("ZWRT_DATAD_THERMAL_ROOT");
+    DIR *dir;
     struct dirent *ent;
     int count = 0;
+    if (!root || !*root) root = "/sys/class/thermal";
+    dir = opendir(root);
     if (!dir) return 0;
     while ((ent = readdir(dir)) != NULL && count < THERMAL_MAX) {
         char path[256];
@@ -157,7 +160,7 @@ static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
         long temp;
         size_t n;
         if (strncmp(ent->d_name, "thermal_zone", 12)) continue;
-        int path_len = snprintf(path, sizeof path, "/sys/class/thermal/%s/type", ent->d_name);
+        int path_len = snprintf(path, sizeof path, "%s/%s/type", root, ent->d_name);
         if (path_len < 0 || (size_t)path_len >= sizeof path) continue;
         fp = fopen(path, "r");
         if (!fp) continue;
@@ -167,7 +170,7 @@ static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
         fclose(fp);
         n = strlen(zones[count].type);
         while (n && isspace((unsigned char)zones[count].type[n - 1])) zones[count].type[--n] = 0;
-        path_len = snprintf(path, sizeof path, "/sys/class/thermal/%s/temp", ent->d_name);
+        path_len = snprintf(path, sizeof path, "%s/%s/temp", root, ent->d_name);
         if (path_len < 0 || (size_t)path_len >= sizeof path) continue;
         fp = fopen(path, "r");
         if (!fp) continue;
@@ -180,6 +183,29 @@ static int read_thermal(struct thermal_zone zones[THERMAL_MAX])
     }
     closedir(dir);
     return count;
+}
+
+static int compare_thermal_zone(const void *a, const void *b)
+{
+    const struct thermal_zone *za = a;
+    const struct thermal_zone *zb = b;
+    return strcmp(za->type, zb->type);
+}
+
+static void build_normalized_thermal_json(const struct thermal_zone *zones, int count,
+                                          char *out, size_t outlen)
+{
+    struct json_buf b = {out, outlen, 0};
+    if (!out || outlen == 0) return;
+    out[0] = 0;
+    add(&b, "[");
+    for (int i = 0; i < count; i++) {
+        if (i) add(&b, ",");
+        add(&b, "{\"name\":");
+        add_string(&b, zones[i].type);
+        add(&b, ",\"celsius\":%.3f}", (double)zones[i].temp_milli / 1000.0);
+    }
+    add(&b, "]");
 }
 
 static void read_mem(struct mem_values *m)
@@ -264,7 +290,8 @@ static void sample_speed(unsigned long long *rx_bps, unsigned long long *tx_bps,
     }
 }
 
-int system_ext_build_json(char *out, size_t outlen)
+int system_ext_build_json(char *out, size_t outlen,
+                          char *thermal_out, size_t thermal_outlen)
 {
     struct json_buf b = {out, outlen, 0};
     int usage[CPU_MAX];
@@ -281,6 +308,8 @@ int system_ext_build_json(char *out, size_t outlen)
 
     total_usage = sample_cpu(usage, &cores);
     zone_count = read_thermal(zones);
+    qsort(zones, (size_t)zone_count, sizeof zones[0], compare_thermal_zone);
+    build_normalized_thermal_json(zones, zone_count, thermal_out, thermal_outlen);
     read_mem(&mem);
     sample_speed(&rx_bps, &tx_bps, &speed_window_ms);
 

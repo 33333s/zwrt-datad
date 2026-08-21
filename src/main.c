@@ -154,6 +154,7 @@ struct device_template_spec {
     const char *label;
     int supported;
     int full_ubus;
+    int thermal_zones;
     enum wifi_source_mode wifi_mode;
     enum client_source_mode client_mode;
     enum temp_source_mode temp_mode;
@@ -164,6 +165,7 @@ struct device_template_spec {
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     "MU5250",
     "MU5250",
+    1,
     1,
     1,
     WIFI_SOURCE_U60_MAIN_2G,
@@ -178,6 +180,7 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     "MC8532B",
     1,
     1,
+    0,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
@@ -190,6 +193,7 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     "MU5252",
     1,
     1,
+    0,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_U60_UBUS_ONLY,
@@ -202,6 +206,7 @@ static const struct device_template_spec TEMPLATE_G5MAX_MC7523 = {
     "MC7523",
     1,
     1,
+    0,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
@@ -214,6 +219,7 @@ static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
     "Legacy compatibility fallback",
     0,
     1,
+    0,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
@@ -2037,7 +2043,7 @@ static void build_snapshot(char *out, size_t outlen,
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, cpu_usage_tenths, wifi_enabled;
-    char runtime_json[32768];
+    char runtime_json[32768], thermal_zones_json[16384];
     int qos_mcc, qos_mnc;
     struct qos_values qos;
     const struct device_template_spec *device_template;
@@ -2079,7 +2085,8 @@ static void build_snapshot(char *out, size_t outlen,
     chg_ua = read_long_file("/sys/class/power_supply/usb/current_now", 0);
     bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
     bat_ua = read_long_file("/sys/class/power_supply/battery/current_now", 0);
-    cpu_usage_tenths = system_ext_build_json(runtime_json, sizeof runtime_json);
+    cpu_usage_tenths = system_ext_build_json(runtime_json, sizeof runtime_json,
+                                             thermal_zones_json, sizeof thermal_zones_json);
     cpu_usage = cpu_usage_tenths >= 0 ? (cpu_usage_tenths + 5) / 10 : -1;
     cpu_temp = read_cpu_temp_for_template(device_template, therm);
     qos_mcc = json_get_int(net, "rmcc", 0);
@@ -2192,6 +2199,12 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "\"nfc\":{");
     emit_int(&b, "switch", nfc, "switch", 0);
     bappend(&b, "},");
+
+    /* Template-normalized thermal data; delivered in /state and SSE snapshots. */
+    bappend(&b, "\"thermal\":{\"cpu_celsius\":%ld,\"zones\":%s},",
+            cpu_temp,
+            device_template->thermal_zones && thermal_zones_json[0] ?
+                thermal_zones_json : "[]");
 
     /* Runtime interface state is refreshed at a lower cadence than radio data. */
     bappend(&b, "\"interfaces\":{");
