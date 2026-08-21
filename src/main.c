@@ -42,8 +42,20 @@
 
 #define HTTP_BIND_ADDR "127.0.0.1"
 #define HTTP_PORT 9460
+#define HTTP_LAN_PORT 9461
+#define HTTP_AUTH_TOKEN_FILE "/data/plugins/zwrt-datad/auth.token"
 #define HTTP_MAX_CLIENTS 16
 #define HTTP_REQ_MAX 65536
+#define HTTP_PATH_MAX 1024
+#define HTTP_TOKEN_MAX 256
+#define HTTP_AUTH_SUBJECT_MAX 64
+#define HTTP_AUTH_PARAM_MAX 256
+#define HTTP_AUTH_HEADER_MAX 512
+#define HTTP_AUTH_REPLY_MAX 1024
+#define HTTP_AUTH_ARG_MAX 768
+#define HTTP_AUTH_SESSIONS 16
+#define HTTP_SESSION_TOKEN_BYTES 24
+#define HTTP_SESSION_TTL_SEC (12 * 60 * 60)
 
 #define RAW_MAX 32768
 #define SMS_RESPONSE_MAX 1048576
@@ -59,7 +71,6 @@ static void on_signal(int s) { (void)s; g_run = 0; }
 static volatile sig_atomic_t g_qos_refresh_req = 0;
 static void on_qos_signal(int s) { (void)s; g_qos_refresh_req = 1; }
 static volatile sig_atomic_t g_state_refresh_req = 0;
-static char g_auth_token[512];
 
 static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
@@ -78,6 +89,24 @@ struct sse_client {
     int fd;
 };
 
+struct http_listener {
+    int fd;
+    int auth_required;
+    int lan_only;
+};
+
+struct auth_session {
+    int active;
+    time_t expires_at;
+    char token[HTTP_TOKEN_MAX];
+    char subject[HTTP_AUTH_SUBJECT_MAX];
+};
+
+struct auth_state {
+    char static_token[HTTP_TOKEN_MAX];
+    struct auth_session sessions[HTTP_AUTH_SESSIONS];
+};
+
 enum wifi_source_mode {
     WIFI_SOURCE_U60_MAIN_2G = 0,
     WIFI_SOURCE_COMPAT_AUTO = 1
@@ -93,6 +122,16 @@ enum temp_source_mode {
     TEMP_SOURCE_COMPAT_FALLBACK = 1
 };
 
+enum network_source_mode {
+    NETWORK_SOURCE_NWINFO_UBUS_ONLY = 0,
+    NETWORK_SOURCE_MU5252_UCI_FALLBACK = 1
+};
+
+enum traffic_source_mode {
+    TRAFFIC_SOURCE_CID1 = 0,
+    TRAFFIC_SOURCE_CID1_ACTIVE_SUBID = 1
+};
+
 struct device_template_spec {
     const char *id;
     const char *label;
@@ -100,6 +139,8 @@ struct device_template_spec {
     enum wifi_source_mode wifi_mode;
     enum client_source_mode client_mode;
     enum temp_source_mode temp_mode;
+    enum network_source_mode network_mode;
+    enum traffic_source_mode traffic_mode;
 };
 
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
@@ -108,7 +149,9 @@ static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     1,
     WIFI_SOURCE_U60_MAIN_2G,
     CLIENT_SOURCE_DHCP_ONLY,
-    TEMP_SOURCE_U60_UBUS_ONLY
+    TEMP_SOURCE_U60_UBUS_ONLY,
+    NETWORK_SOURCE_NWINFO_UBUS_ONLY,
+    TRAFFIC_SOURCE_CID1
 };
 
 static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
@@ -117,7 +160,20 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
-    TEMP_SOURCE_COMPAT_FALLBACK
+    TEMP_SOURCE_COMPAT_FALLBACK,
+    NETWORK_SOURCE_NWINFO_UBUS_ONLY,
+    TRAFFIC_SOURCE_CID1
+};
+
+static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
+    "MU5252",
+    "MU5252",
+    1,
+    WIFI_SOURCE_COMPAT_AUTO,
+    CLIENT_SOURCE_DHCP_THEN_ROUTER,
+    TEMP_SOURCE_U60_UBUS_ONLY,
+    NETWORK_SOURCE_MU5252_UCI_FALLBACK,
+    TRAFFIC_SOURCE_CID1_ACTIVE_SUBID
 };
 
 static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
@@ -126,7 +182,9 @@ static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
     0,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
-    TEMP_SOURCE_COMPAT_FALLBACK
+    TEMP_SOURCE_COMPAT_FALLBACK,
+    NETWORK_SOURCE_NWINFO_UBUS_ONLY,
+    TRAFFIC_SOURCE_CID1
 };
 
 /* Run `ubus call <svc> <method> [args]` and capture stdout. 0 on output. */
@@ -592,6 +650,10 @@ select_device_template(const char *model_name, const char *hardware_version)
     if ((model_name && !strcmp(model_name, "MC8532B")) ||
         has_prefix(hardware_version, "MC8532B")) {
         return &TEMPLATE_G5PRO_MC8532B;
+    }
+    if ((model_name && !strcmp(model_name, "MU5252")) ||
+        has_prefix(hardware_version, "MU5252_")) {
+        return &TEMPLATE_TOPFLOW_MU5252;
     }
     return &TEMPLATE_LEGACY_COMPAT;
 }
@@ -1086,6 +1148,8 @@ static void rescan_qos_cache(void)
     refresh_qos_cache();
 }
 
+static int g_active_subid = 1;
+
 static int read_sim_signature(char *out, size_t outlen)
 {
     char sim[RAW_MAX];
@@ -1100,6 +1164,13 @@ static int read_sim_signature(char *out, size_t outlen)
     if (!json_get(sim, "current_sim_slot", slot, sizeof slot)) slot[0] = 0;
     if (!json_get(sim, "sim_imsi", imsi, sizeof imsi)) imsi[0] = 0;
     if (!json_get(sim, "sim_states", state, sizeof state)) state[0] = 0;
+
+    if (slot[0]) {
+        char *end = NULL;
+        long subid = strtol(slot, &end, 10);
+        if (end != slot && !*end && subid >= 1 && subid <= 6)
+            g_active_subid = (int)subid;
+    }
 
     if (!iccid[0] && !slot[0] && !imsi[0] && !state[0]) return 0;
     snprintf(out, outlen, "slot=%s|iccid=%s|imsi=%s|state=%s",
@@ -1520,6 +1591,128 @@ static long read_cpu_temp_for_template(const struct device_template_spec *tpl, c
     return read_cpu_temp_value_compat(therm);
 }
 
+struct uci_net_field {
+    const char *json_key;
+    const char *primary_path;
+    const char *fallback_path;
+};
+
+static int uci_show_value(const char *show, const char *path, char *out, size_t outlen)
+{
+    size_t path_len;
+    const char *line;
+    if (!show || !path || !out || outlen < 2) return -1;
+    path_len = strlen(path);
+    line = show;
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_len > path_len && line[path_len] == '=' &&
+            !strncmp(line, path, path_len)) {
+            const char *value = line + path_len + 1;
+            size_t value_len = line_len - path_len - 1;
+            if (value_len >= 2 && value[0] == '\'' && value[value_len - 1] == '\'') {
+                value++;
+                value_len -= 2;
+            }
+            if (value_len >= outlen) value_len = outlen - 1;
+            memcpy(out, value, value_len);
+            out[value_len] = 0;
+            return 0;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    out[0] = 0;
+    return -1;
+}
+
+static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
+{
+    static const struct uci_net_field fields[] = {
+        {"network_type", "zte_nwinfo.sys_info.network_type", NULL},
+        {"signalbar", "zte_nwinfo.signal_strength.signalbar", NULL},
+        {"network_provider_fullname", "zte_nwinfo.plmn_info.network_provider_fullname", NULL},
+        {"wan_active_band", "zte_nwinfo.wan_active_band.GWLSA_band", "zte_nwinfo.wan_active_band.odu_nrband"},
+        {"nr5g_action_band", "zte_nwinfo.wan_active_band.odu_nrband", "zte_nwinfo.wan_active_band.GWLSA_band"},
+        {"nr5g_rsrp", "zte_nwinfo.signal_strength.nr5g_rsrp", NULL},
+        {"nr5g_rsrq", "zte_nwinfo.signal_strength.nr5g_rsrq", NULL},
+        {"nr5g_snr", "zte_nwinfo.signal_strength.nr5g_snr", NULL},
+        {"nr5g_rssi", "zte_nwinfo.signal_strength.nr5g_rssi", NULL},
+        {"lte_rsrp", "zte_nwinfo.signal_strength.lte_rsrp", NULL},
+        {"lte_rsrq", "zte_nwinfo.signal_strength.lte_rsrq", NULL},
+        {"lte_rssi", "zte_nwinfo.signal_strength.lte_rssi", NULL},
+        {"lte_snr", "zte_nwinfo.signal_strength.lte_snr", NULL},
+        {"rssi", "zte_nwinfo.signal_strength.rssi", NULL},
+        {"rmcc", "zte_nwinfo.plmn_info.rmcc", NULL},
+        {"rmnc", "zte_nwinfo.plmn_info.rmnc", NULL},
+        {"nr5g_pci", "zte_nwinfo.cell_info.nr5g_pci", NULL},
+        {"nr5g_cell_id", "zte_nwinfo.cell_info.nr5g_cellid", NULL},
+        {"nr5g_action_channel", "zte_nwinfo.cell_info.nr5g_action_channel", NULL},
+        {"nr5g_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth", NULL},
+        {"nrca", "zte_nwinfo.sys_info.nrca", "zte_nwinfo.sys_info.odu_nrca"},
+        {"lteca", "zte_nwinfo.sys_info.lteca", "zte_nwinfo.sys_info.odu_lteca"},
+        {"ltecasig", "zte_nwinfo.sys_info.ltecasig", NULL},
+        {"net_select", "zte_nwinfo.sys_info.net_select", NULL},
+        {"nr5g_sa_band_lock", "zte_nwinfo.band_lock.nr5g_sa_band_lock", NULL},
+        {"nr5g_nsa_band_lock", "zte_nwinfo.band_lock.nr5g_nsa_band_lock", NULL},
+        {"lte_band", "zte_nwinfo.band_lock.lte_ext_band_lock", NULL}
+    };
+    struct buf b = {out, outlen, 0};
+    char show[RAW_MAX];
+    int found = 0;
+
+    if (!out || outlen < 3) return -1;
+    out[0] = 0;
+    if (device_uci_show("zte_nwinfo", show, sizeof show) != 0) {
+        memcpy(out, "{}", 3);
+        return -1;
+    }
+    bappend(&b, "{");
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+        char value[256] = "";
+        if (uci_show_value(show, fields[i].primary_path, value, sizeof value) != 0 &&
+            fields[i].fallback_path)
+            (void)uci_show_value(show, fields[i].fallback_path, value, sizeof value);
+        if (i) bappend(&b, ",");
+        bappend(&b, "\"%s\":\"", fields[i].json_key);
+        bappend_json_esc(&b, value);
+        bappend(&b, "\"");
+        if (value[0]) found = 1;
+    }
+    bappend(&b, "}");
+    if (b.len >= b.cap || !found) {
+        memcpy(out, "{}", 3);
+        return -1;
+    }
+    return 0;
+}
+
+static int load_network_snapshot_for_template(const struct device_template_spec *tpl,
+                                              char *net, size_t net_n)
+{
+    if (run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, net_n) == 0)
+        return 0;
+    if (tpl->network_mode == NETWORK_SOURCE_MU5252_UCI_FALLBACK)
+        return load_network_snapshot_mu5252_uci(net, net_n);
+    return -1;
+}
+
+static int load_traffic_snapshot_for_template(const struct device_template_spec *tpl,
+                                              char *traffic, size_t traffic_n)
+{
+    char args[160];
+    if (tpl->traffic_mode == TRAFFIC_SOURCE_CID1_ACTIVE_SUBID) {
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1,\"subid\":%d}",
+                 g_active_subid);
+    } else {
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}");
+    }
+    return run_ubus("zwrt_data", "get_wwandst", args, traffic, traffic_n);
+}
+
 /* Poll everything and build the unified snapshot into `out`. */
 static void build_snapshot(char *out, size_t outlen,
                            int with_board, const char *board_cache,
@@ -1553,15 +1746,14 @@ static void build_snapshot(char *out, size_t outlen,
                            device_board_name, sizeof device_board_name);
     device_template = select_device_template(device_model_name, device_hw);
 
-    run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, sizeof net);
+    load_network_snapshot_for_template(device_template, net, sizeof net);
     run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
     run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
     load_thermal_snapshot_for_template(device_template, therm, sizeof therm);
     run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
     run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
     /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
-    run_ubus("zwrt_data", "get_wwandst",
-             "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1}", traf, sizeof traf);
+    load_traffic_snapshot_for_template(device_template, traf, sizeof traf);
     run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
     run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
     run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
@@ -1933,12 +2125,9 @@ static int read_http_request(int fd, char *buf, size_t cap, int timeout_ms)
 static int parse_request_line(const char *req, char *method, size_t method_cap,
                               char *path, size_t path_cap)
 {
-    if (sscanf(req, "%15s %255s", method, path) != 2) return -1;
+    if (sscanf(req, "%15s %1023s", method, path) != 2) return -1;
     method[method_cap - 1] = 0;
     path[path_cap - 1] = 0;
-
-    char *q = strchr(path, '?');
-    if (q) *q = 0;
     return 0;
 }
 
@@ -1952,6 +2141,17 @@ static void write_http_error(int fd, int code, const char *text)
                      "\r\n",
                      code, text);
     if (n > 0) (void)write_all(fd, buf, (size_t)n);
+}
+
+static void write_http_unauthorized(int fd)
+{
+    static const char resp[] =
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "WWW-Authenticate: Bearer realm=\"zwrt-datad-lan\"\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    (void)write_all(fd, resp, sizeof resp - 1);
 }
 
 static int write_http_json_status(int fd, int code, const char *status,
@@ -2007,19 +2207,464 @@ static int secure_equal(const char *a, const char *b)
     return diff == 0;
 }
 
-static int request_authorized(const char *req)
+static void trim_ascii_ws_inplace(char *s)
 {
-    char value[768];
-    const char *token;
-    if (!g_auth_token[0]) return 1;
-    if (http_header_value(req, "Authorization", value, sizeof value)) {
-        token = value;
-        if (!strncasecmp(token, "Bearer ", 7)) token += 7;
-        if (secure_equal(token, g_auth_token)) return 1;
+    size_t len;
+    char *start = s;
+    if (!s) return;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    len = strlen(s);
+    while (len && isspace((unsigned char)s[len - 1])) s[--len] = 0;
+}
+
+static int load_token_file(const char *path, char *out, size_t outlen)
+{
+    FILE *fp;
+    size_t n;
+    if (!path || !*path || !out || outlen < 2) return -1;
+    fp = fopen(path, "r");
+    if (!fp) return -1;
+    n = fread(out, 1, outlen - 1, fp);
+    fclose(fp);
+    out[n] = 0;
+    trim_ascii_ws_inplace(out);
+    return out[0] ? 0 : -1;
+}
+
+static int query_value(const char *query, const char *key, char *out, size_t outlen)
+{
+    size_t keylen;
+    const char *p;
+    if (!query || !*query || !key || !*key || !out || outlen < 2) return 0;
+    keylen = strlen(key);
+    p = query;
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t seglen = amp ? (size_t)(amp - p) : strlen(p);
+        if (seglen > keylen && p[keylen] == '=' && !strncmp(p, key, keylen)) {
+            size_t vlen = seglen - keylen - 1;
+            if (vlen >= outlen) vlen = outlen - 1;
+            memcpy(out, p + keylen + 1, vlen);
+            out[vlen] = 0;
+            return 1;
+        }
+        if (!amp) break;
+        p = amp + 1;
     }
-    if (http_header_value(req, "X-Auth-Token", value, sizeof value) &&
-        secure_equal(value, g_auth_token)) return 1;
     return 0;
+}
+
+static int request_header_bearer_token(const char *req, char *out, size_t outlen)
+{
+    char value[HTTP_AUTH_HEADER_MAX];
+    const char *token;
+    size_t token_len;
+    if (!http_header_value(req, "Authorization", value, sizeof value) ||
+        strncasecmp(value, "Bearer ", 7)) return 0;
+    token = value + 7;
+    while (*token && isspace((unsigned char)*token)) token++;
+    token_len = strlen(token);
+    while (token_len && isspace((unsigned char)token[token_len - 1])) token_len--;
+    if (!token_len) return 0;
+    if (token_len >= outlen) token_len = outlen - 1;
+    memcpy(out, token, token_len);
+    out[token_len] = 0;
+    return 1;
+}
+
+static int base64_value(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int base64_decode(const char *src, unsigned char *out, size_t outlen)
+{
+    unsigned int bits = 0;
+    int bit_count = 0;
+    size_t len = 0;
+    if (!src || !out || !outlen) return -1;
+    while (*src) {
+        int value;
+        unsigned char c = (unsigned char)*src++;
+        if (isspace(c)) continue;
+        if (c == '=') break;
+        value = base64_value(c);
+        if (value < 0) return -1;
+        bits = (bits << 6) | (unsigned int)value;
+        bit_count += 6;
+        while (bit_count >= 8) {
+            bit_count -= 8;
+            if (len >= outlen) return -1;
+            out[len++] = (unsigned char)((bits >> bit_count) & 0xffU);
+        }
+    }
+    return (int)len;
+}
+
+static int request_login_credentials(const char *req, const char *query,
+                                     char *username, size_t username_len,
+                                     char *password, size_t password_len)
+{
+    char value[HTTP_AUTH_HEADER_MAX];
+    unsigned char decoded[HTTP_AUTH_HEADER_MAX];
+    int decoded_len;
+    char *separator;
+    (void)query;
+    if (!username || username_len < 2 || !password || password_len < 2) return 0;
+    if (http_header_value(req, "Authorization", value, sizeof value) &&
+        !strncasecmp(value, "Basic ", 6)) {
+        decoded_len = base64_decode(value + 6, decoded, sizeof decoded - 1);
+        if (decoded_len <= 0) return 0;
+        decoded[decoded_len] = 0;
+        separator = strchr((char *)decoded, ':');
+        if (!separator) return 0;
+        *separator++ = 0;
+        snprintf(username, username_len, "%s", (char *)decoded);
+        snprintf(password, password_len, "%s", separator);
+        return username[0] != 0;
+    }
+    return 0;
+}
+
+static int request_vendor_webtoken(const char *req, const char *query,
+                                   char *webtoken, size_t webtoken_len,
+                                   char *tag, size_t tag_len, int *mode_out)
+{
+    char mode_buf[32];
+    (void)query;
+    if (!webtoken || webtoken_len < 2 || !tag || tag_len < 2 || !mode_out) return 0;
+    if (!http_header_value(req, "X-Web-Token", webtoken, webtoken_len) &&
+        !http_header_value(req, "X-ZTE-WebToken", webtoken, webtoken_len)) return 0;
+    if (!http_header_value(req, "X-Z-Tag", tag, tag_len))
+        snprintf(tag, tag_len, "zwrt-datad");
+    *mode_out = 0;
+    if (http_header_value(req, "X-Z-Mode", mode_buf, sizeof mode_buf)) {
+        char *end = NULL;
+        long value = strtol(mode_buf, &end, 10);
+        if (end && !*end) *mode_out = (int)value;
+    }
+    return webtoken[0] != 0;
+}
+
+static int fill_random_bytes(unsigned char *out, size_t outlen)
+{
+    size_t offset = 0;
+    int fd;
+    if (!out || !outlen) return -1;
+    fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    while (offset < outlen) {
+        ssize_t n = read(fd, out + offset, outlen - offset);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (!n) {
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
+
+static void auth_clear_session(struct auth_session *session)
+{
+    if (!session) return;
+    memset(session, 0, sizeof *session);
+}
+
+static void auth_state_init(struct auth_state *auth)
+{
+    if (auth) memset(auth, 0, sizeof *auth);
+}
+
+static int auth_load_static_token(struct auth_state *auth, const char *path)
+{
+    char token[HTTP_TOKEN_MAX];
+    if (!auth) return -1;
+    auth->static_token[0] = 0;
+    if (load_token_file(path, token, sizeof token) < 0) return -1;
+    snprintf(auth->static_token, sizeof auth->static_token, "%s", token);
+    return 0;
+}
+
+static void auth_expire_sessions(struct auth_state *auth)
+{
+    time_t now;
+    if (!auth) return;
+    now = time(NULL);
+    for (size_t i = 0; i < HTTP_AUTH_SESSIONS; i++) {
+        if (auth->sessions[i].active && auth->sessions[i].expires_at <= now)
+            auth_clear_session(&auth->sessions[i]);
+    }
+}
+
+static int auth_generate_token(char *out, size_t outlen)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char bytes[HTTP_SESSION_TOKEN_BYTES];
+    if (!out || outlen < sizeof bytes * 2 + 1) return -1;
+    if (fill_random_bytes(bytes, sizeof bytes) < 0) return -1;
+    for (size_t i = 0; i < sizeof bytes; i++) {
+        out[i * 2] = hex[bytes[i] >> 4];
+        out[i * 2 + 1] = hex[bytes[i] & 0x0f];
+    }
+    out[sizeof bytes * 2] = 0;
+    return 0;
+}
+
+static int auth_issue_session(struct auth_state *auth, const char *subject,
+                              char *token_out, size_t token_out_len,
+                              time_t *expires_at_out)
+{
+    size_t slot = 0;
+    int found = 0;
+    time_t now;
+    if (!auth || !token_out || token_out_len < HTTP_TOKEN_MAX) return -1;
+    auth_expire_sessions(auth);
+    now = time(NULL);
+    for (size_t i = 0; i < HTTP_AUTH_SESSIONS; i++) {
+        if (!auth->sessions[i].active) {
+            slot = i;
+            found = 1;
+            break;
+        }
+        if (!found || auth->sessions[i].expires_at < auth->sessions[slot].expires_at) {
+            slot = i;
+            found = 1;
+        }
+    }
+    if (!found || auth_generate_token(auth->sessions[slot].token,
+                                      sizeof auth->sessions[slot].token) < 0) return -1;
+    auth->sessions[slot].active = 1;
+    auth->sessions[slot].expires_at = now + HTTP_SESSION_TTL_SEC;
+    snprintf(auth->sessions[slot].subject, sizeof auth->sessions[slot].subject,
+             "%s", subject ? subject : "lan");
+    snprintf(token_out, token_out_len, "%s", auth->sessions[slot].token);
+    if (expires_at_out) *expires_at_out = auth->sessions[slot].expires_at;
+    return 0;
+}
+
+static int auth_token_is_valid(struct auth_state *auth, const char *token)
+{
+    time_t now;
+    if (!auth || !token || !*token) return 0;
+    if (auth->static_token[0] && secure_equal(auth->static_token, token)) return 1;
+    auth_expire_sessions(auth);
+    now = time(NULL);
+    for (size_t i = 0; i < HTTP_AUTH_SESSIONS; i++) {
+        if (!auth->sessions[i].active) continue;
+        if (secure_equal(auth->sessions[i].token, token)) {
+            auth->sessions[i].expires_at = now + HTTP_SESSION_TTL_SEC;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int request_presented_token(const char *req, const char *query,
+                                   char *out, size_t outlen)
+{
+    if (request_header_bearer_token(req, out, outlen)) return 1;
+    if (http_header_value(req, "X-Auth-Token", out, outlen)) return 1;
+    return query_value(query, "access_token", out, outlen);
+}
+
+static int ipv4_addr_is_lan(uint32_t addr_be)
+{
+    uint32_t ip = ntohl(addr_be);
+    if ((ip & 0xff000000U) == 0x0a000000U) return 1;
+    if ((ip & 0xfff00000U) == 0xac100000U) return 1;
+    if ((ip & 0xffff0000U) == 0xc0a80000U) return 1;
+    if ((ip & 0xffff0000U) == 0xa9fe0000U) return 1;
+    if ((ip & 0xffc00000U) == 0x64400000U) return 1;
+    return (ip & 0xff000000U) == 0x7f000000U;
+}
+
+static int peer_is_allowed_lan(const struct sockaddr_in *peer)
+{
+    return peer && ipv4_addr_is_lan(peer->sin_addr.s_addr);
+}
+
+static int peer_ipv4_string(const struct sockaddr_in *peer, char *out, size_t outlen)
+{
+    return peer && out && outlen >= INET_ADDRSTRLEN &&
+        inet_ntop(AF_INET, &peer->sin_addr, out, (socklen_t)outlen) != NULL;
+}
+
+static int auth_value_is_success_text(const char *value)
+{
+    if (!value || !*value) return 0;
+    return !strcasecmp(value, "success") || !strcasecmp(value, "ok") ||
+           !strcasecmp(value, "true") || !strcasecmp(value, "pass") ||
+           !strcasecmp(value, "passed") || !strcasecmp(value, "logged") ||
+           !strcasecmp(value, "logined") || !strcasecmp(value, "done");
+}
+
+static int auth_value_is_failure_text(const char *value)
+{
+    if (!value || !*value) return 0;
+    return !strcasecmp(value, "fail") || !strcasecmp(value, "failed") ||
+           !strcasecmp(value, "false") || !strcasecmp(value, "error") ||
+           !strcasecmp(value, "denied") || !strcasecmp(value, "forbidden") ||
+           !strcasecmp(value, "invalid") || !strcasecmp(value, "wrong") ||
+           !strcasecmp(value, "unauthorized");
+}
+
+static int auth_reply_field_string(const char *reply, const char *key,
+                                   char *out, size_t outlen)
+{
+    if (!json_get(reply, key, out, outlen)) return 0;
+    trim_ascii_ws_inplace(out);
+    return 1;
+}
+
+static int auth_reply_indicates_success(const char *reply)
+{
+    static const char *token_keys[] = {"webtoken", "token", "auth_token", "secondary_auth_token"};
+    char value[128];
+    if (!reply || !*reply) return 0;
+    for (size_t i = 0; i < sizeof token_keys / sizeof token_keys[0]; i++)
+        if (auth_reply_field_string(reply, token_keys[i], value, sizeof value) && value[0]) return 1;
+    if (auth_reply_field_string(reply, "success", value, sizeof value) ||
+        auth_reply_field_string(reply, "ok", value, sizeof value) ||
+        auth_reply_field_string(reply, "web_login_flag", value, sizeof value) ||
+        auth_reply_field_string(reply, "login_flag", value, sizeof value))
+        return !strcmp(value, "1") || auth_value_is_success_text(value);
+    if (auth_reply_field_string(reply, "code", value, sizeof value) ||
+        auth_reply_field_string(reply, "errno", value, sizeof value) ||
+        auth_reply_field_string(reply, "ret", value, sizeof value) ||
+        auth_reply_field_string(reply, "result", value, sizeof value)) {
+        char *end = NULL;
+        long numeric = strtol(value, &end, 10);
+        if (end && !*end) return numeric == 0;
+        if (auth_value_is_success_text(value)) return 1;
+        if (auth_value_is_failure_text(value)) return 0;
+    }
+    if (auth_reply_field_string(reply, "status", value, sizeof value) ||
+        auth_reply_field_string(reply, "state", value, sizeof value) ||
+        auth_reply_field_string(reply, "msg", value, sizeof value) ||
+        auth_reply_field_string(reply, "message", value, sizeof value)) {
+        if (auth_value_is_success_text(value)) return 1;
+        if (auth_value_is_failure_text(value)) return 0;
+    }
+    return (auth_reply_field_string(reply, "username", value, sizeof value) ||
+            auth_reply_field_string(reply, "user", value, sizeof value)) && value[0];
+}
+
+static int auth_verify_password_login(const char *username, const char *password)
+{
+    char args[HTTP_AUTH_ARG_MAX];
+    char reply[HTTP_AUTH_REPLY_MAX];
+    struct buf b = {args, sizeof args, 0};
+    if (!username || !*username || !password) return 0;
+    bappend(&b, "{\"username\":\""); bappend_json_esc(&b, username);
+    bappend(&b, "\",\"password\":\""); bappend_json_esc(&b, password); bappend(&b, "\"}");
+    return run_ubus("zwrt_web", "web_login", args, reply, sizeof reply) == 0 &&
+        auth_reply_indicates_success(reply);
+}
+
+static int auth_verify_vendor_webtoken(const char *webtoken, int mode,
+                                       const char *remote_addr, const char *tag)
+{
+    char args[HTTP_AUTH_ARG_MAX];
+    char reply[HTTP_AUTH_REPLY_MAX];
+    struct buf b = {args, sizeof args, 0};
+    if (!webtoken || !*webtoken || !remote_addr || !*remote_addr || !tag || !*tag) return 0;
+    bappend(&b, "{\"webtoken\":\""); bappend_json_esc(&b, webtoken);
+    bappend(&b, "\",\"zmode\":%d,\"web_remote_addr\":\"", mode);
+    bappend_json_esc(&b, remote_addr); bappend(&b, "\",\"z-tag\":\"");
+    bappend_json_esc(&b, tag); bappend(&b, "\"}");
+    if (run_ubus("zwrt_web", "webtoken_check", args, reply, sizeof reply) == 0 &&
+        auth_reply_indicates_success(reply)) return 1;
+    return run_ubus("zwrt_web", "web_security_check", args, reply, sizeof reply) == 0 &&
+        auth_reply_indicates_success(reply);
+}
+
+static int auth_route_is_open(const struct http_listener *listener,
+                              const char *method, const char *path)
+{
+    return listener && listener->lan_only && method && path && !strcmp(method, "POST") &&
+        (!strcmp(path, "/auth/login") || !strcmp(path, "/auth/exchange"));
+}
+
+static void write_auth_json(int fd, int code, const char *status, const char *body)
+{
+    (void)write_http_json_status(fd, code, status, body, strlen(body));
+}
+
+static void handle_auth_login(int fd, const char *req, const char *query,
+                              struct auth_state *auth)
+{
+    char username[HTTP_AUTH_PARAM_MAX], password[HTTP_AUTH_PARAM_MAX];
+    char access_token[HTTP_TOKEN_MAX], body[512];
+    time_t expires_at = 0;
+    if (!request_login_credentials(req, query, username, sizeof username,
+                                   password, sizeof password)) {
+        write_auth_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"missing_credentials\"}");
+        return;
+    }
+    if (!auth_verify_password_login(username, password)) {
+        write_auth_json(fd, 401, "Unauthorized", "{\"ok\":false,\"error\":\"invalid_credentials\"}");
+        return;
+    }
+    if (auth_issue_session(auth, username, access_token, sizeof access_token, &expires_at) < 0) {
+        write_auth_json(fd, 500, "Internal Server Error", "{\"ok\":false,\"error\":\"token_issue_failed\"}");
+        return;
+    }
+    snprintf(body, sizeof body,
+             "{\"ok\":true,\"token_type\":\"Bearer\",\"access_token\":\"%s\","
+             "\"expires_in\":%d,\"expires_at\":%lld}",
+             access_token, HTTP_SESSION_TTL_SEC, (long long)expires_at);
+    write_auth_json(fd, 200, "OK", body);
+}
+
+static void handle_auth_exchange(int fd, const char *req, const char *query,
+                                 const struct sockaddr_in *peer, struct auth_state *auth)
+{
+    char webtoken[HTTP_AUTH_HEADER_MAX], tag[HTTP_AUTH_PARAM_MAX];
+    char remote_addr[INET_ADDRSTRLEN], access_token[HTTP_TOKEN_MAX], body[512];
+    time_t expires_at = 0;
+    int mode = 0;
+    if (!request_vendor_webtoken(req, query, webtoken, sizeof webtoken,
+                                 tag, sizeof tag, &mode)) {
+        write_auth_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"missing_webtoken\"}");
+        return;
+    }
+    if (!peer_ipv4_string(peer, remote_addr, sizeof remote_addr)) {
+        write_auth_json(fd, 500, "Internal Server Error", "{\"ok\":false,\"error\":\"peer_addr_unavailable\"}");
+        return;
+    }
+    if (!auth_verify_vendor_webtoken(webtoken, mode, remote_addr, tag)) {
+        write_auth_json(fd, 401, "Unauthorized", "{\"ok\":false,\"error\":\"invalid_webtoken\"}");
+        return;
+    }
+    if (auth_issue_session(auth, "webtoken", access_token, sizeof access_token, &expires_at) < 0) {
+        write_auth_json(fd, 500, "Internal Server Error", "{\"ok\":false,\"error\":\"token_issue_failed\"}");
+        return;
+    }
+    snprintf(body, sizeof body,
+             "{\"ok\":true,\"token_type\":\"Bearer\",\"access_token\":\"%s\","
+             "\"expires_in\":%d,\"expires_at\":%lld}",
+             access_token, HTTP_SESSION_TTL_SEC, (long long)expires_at);
+    write_auth_json(fd, 200, "OK", body);
+}
+
+static int request_is_authorized(const char *req, const char *query,
+                                 struct auth_state *auth)
+{
+    char token[HTTP_TOKEN_MAX];
+    return request_presented_token(req, query, token, sizeof token) &&
+        auth_token_is_valid(auth, token);
 }
 
 static int write_sse_handshake(int fd)
@@ -2119,21 +2764,31 @@ static void broadcast_sse_snapshot(struct sse_client *clients, size_t nclients,
     }
 }
 
-static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, size_t nclients,
-                                      const char *snap, size_t snap_len)
+static void accept_ready_http_clients(const struct http_listener *listener,
+                                      struct sse_client *clients, size_t nclients,
+                                      const char *snap, size_t snap_len,
+                                      struct auth_state *auth)
 {
     char req[HTTP_REQ_MAX];
     char method[16];
-    char path[256];
+    char path[HTTP_PATH_MAX];
     char control_response[65536];
 
     for (;;) {
-        int cli_fd = accept(srv_fd, NULL, NULL);
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof peer;
+        int cli_fd = accept(listener->fd, (struct sockaddr *)&peer, &peer_len);
         if (cli_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             perror("accept");
             return;
+        }
+
+        if (listener->lan_only && !peer_is_allowed_lan(&peer)) {
+            write_http_error(cli_fd, 403, "Forbidden");
+            close(cli_fd);
+            continue;
         }
 
         int read_rc = read_http_request(cli_fd, req, sizeof req, 2000);
@@ -2144,6 +2799,14 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
             close(cli_fd);
             continue;
         }
+
+        char *query = strchr(path, '?');
+        int open_auth_route;
+        if (query) {
+            *query++ = 0;
+        }
+
+        open_auth_route = auth_route_is_open(listener, method, path);
 
         if (!strcmp(path, "/healthz")) {
             if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
@@ -2160,16 +2823,28 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
                                       "GET  /events       -> SSE state stream\n"
                                       "GET  /capabilities -> device control capabilities\n"
                                       "POST /control      -> allow-listed device control\n"
+                                      "POST /auth/login   -> Basic login on LAN listener\n"
+                                      "POST /auth/exchange -> vendor token exchange on LAN listener\n"
                                       "GET  /healthz      -> ok\n");
             close(cli_fd);
             continue;
         }
 
-        if (!request_authorized(req)) {
-            static const char unauthorized[] =
-                "{\"ok\":false,\"error\":{\"code\":\"unauthorized\",\"message\":\"missing or invalid token\"}}";
-            (void)write_http_json_status(cli_fd, 401, "Unauthorized", unauthorized,
-                                         sizeof unauthorized - 1);
+        if (listener->auth_required && !open_auth_route &&
+            !request_is_authorized(req, query, auth)) {
+            write_http_unauthorized(cli_fd);
+            close(cli_fd);
+            continue;
+        }
+
+        if (open_auth_route && !strcmp(path, "/auth/login")) {
+            handle_auth_login(cli_fd, req, query, auth);
+            close(cli_fd);
+            continue;
+        }
+
+        if (open_auth_route && !strcmp(path, "/auth/exchange")) {
+            handle_auth_exchange(cli_fd, req, query, &peer, auth);
             close(cli_fd);
             continue;
         }
@@ -2243,8 +2918,11 @@ static void accept_ready_http_clients(int srv_fd, struct sse_client *clients, si
     }
 }
 
-static void wait_with_http(int srv_fd, struct sse_client *clients, size_t nclients,
-                           const char *snap, size_t snap_len, int wait_ms)
+static void wait_with_http(const struct http_listener *local_listener,
+                           const struct http_listener *lan_listener,
+                           struct sse_client *clients, size_t nclients,
+                           const char *snap, size_t snap_len, int wait_ms,
+                           struct auth_state *auth)
 {
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -2269,10 +2947,17 @@ static void wait_with_http(int srv_fd, struct sse_client *clients, size_t nclien
 
         fd_set rfds;
         struct timeval tv;
-        int rc, maxfd = srv_fd;
+        int rc, maxfd = -1;
 
         FD_ZERO(&rfds);
-        FD_SET(srv_fd, &rfds);
+        if (local_listener && local_listener->fd >= 0) {
+            FD_SET(local_listener->fd, &rfds);
+            maxfd = local_listener->fd;
+        }
+        if (lan_listener && lan_listener->fd >= 0) {
+            FD_SET(lan_listener->fd, &rfds);
+            if (lan_listener->fd > maxfd) maxfd = lan_listener->fd;
+        }
         for (size_t i = 0; i < nclients; i++) {
             if (clients[i].fd < 0) continue;
             FD_SET(clients[i].fd, &rfds);
@@ -2291,8 +2976,10 @@ static void wait_with_http(int srv_fd, struct sse_client *clients, size_t nclien
         }
         if (rc == 0) continue;
 
-        if (FD_ISSET(srv_fd, &rfds))
-            accept_ready_http_clients(srv_fd, clients, nclients, snap, snap_len);
+        if (local_listener && local_listener->fd >= 0 && FD_ISSET(local_listener->fd, &rfds))
+            accept_ready_http_clients(local_listener, clients, nclients, snap, snap_len, auth);
+        if (lan_listener && lan_listener->fd >= 0 && FD_ISSET(lan_listener->fd, &rfds))
+            accept_ready_http_clients(lan_listener, clients, nclients, snap, snap_len, auth);
         for (size_t i = 0; i < nclients; i++) {
             if (clients[i].fd >= 0 && FD_ISSET(clients[i].fd, &rfds))
                 drain_or_close_sse_client(&clients[i]);
@@ -2323,29 +3010,15 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
     return p;
 }
 
-static int load_auth_token_file(const char *path)
-{
-    FILE *fp;
-    size_t n;
-    if (!path || !*path) return 0;
-    fp = fopen(path, "r");
-    if (!fp) return -1;
-    n = fread(g_auth_token, 1, sizeof g_auth_token - 1, fp);
-    fclose(fp);
-    g_auth_token[n] = 0;
-    while (n && isspace((unsigned char)g_auth_token[n - 1])) g_auth_token[--n] = 0;
-    while (*g_auth_token && isspace((unsigned char)*g_auth_token)) {
-        memmove(g_auth_token, g_auth_token + 1, strlen(g_auth_token));
-    }
-    return g_auth_token[0] ? 0 : -1;
-}
-
 int main(int argc, char **argv)
 {
     int once = 0, interval_ms = 1000;
     const char *bind_addr = HTTP_BIND_ADDR;
-    const char *auth_token_file = NULL;
+    const char *lan_bind_addr = NULL;
+    const char *auth_token_file = HTTP_AUTH_TOKEN_FILE;
+    int auth_token_file_explicit = 0;
     int port = HTTP_PORT;
+    int lan_port = HTTP_LAN_PORT;
     int sim_poll_every, interface_poll_every, qos_retry_every, qos_retry_left = 0;
     char sim_sig[160];
     int sim_sig_valid;
@@ -2356,10 +3029,17 @@ int main(int argc, char **argv)
             bind_addr = argv[++i];
         else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--port")) && i + 1 < argc)
             port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--auth-token-file") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--lan-bind") && i + 1 < argc)
+            lan_bind_addr = argv[++i];
+        else if (!strcmp(argv[i], "--lan-port") && i + 1 < argc)
+            lan_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--auth-token-file") && i + 1 < argc) {
             auth_token_file = argv[++i];
+            auth_token_file_explicit = 1;
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] [--auth-token-file path]");
+            puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] "
+                 "[--lan-bind addr] [--lan-port port] [--auth-token-file path]");
             return 0;
         } else {
             fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
@@ -2367,12 +3047,6 @@ int main(int argc, char **argv)
         }
     }
     if (interval_ms <= 0) interval_ms = 1000;
-    if (auth_token_file && load_auth_token_file(auth_token_file) != 0) {
-        fprintf(stderr, "cannot read a non-empty auth token from %s\n", auth_token_file);
-        return 1;
-    }
-    if (!once && strcmp(bind_addr, "127.0.0.1") && strcmp(bind_addr, "::1") && !g_auth_token[0])
-        fprintf(stderr, "warning: non-loopback HTTP binding without an auth token\n");
 
     sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
     interface_poll_every = sim_poll_every;
@@ -2386,13 +3060,37 @@ int main(int argc, char **argv)
     signal(SIGUSR1, on_qos_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    int srv_fd = -1;
+    struct http_listener local_listener = {-1, 0, 0};
+    struct http_listener lan_listener = {-1, 1, 1};
+    struct auth_state auth;
     struct sse_client clients[HTTP_MAX_CLIENTS];
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) clients[i].fd = -1;
+    auth_state_init(&auth);
 
     if (!once) {
-        srv_fd = open_server_socket(bind_addr, port);
-        if (srv_fd < 0) return 1;
+        int token_loaded = auth_load_static_token(&auth, auth_token_file) == 0;
+        if (lan_bind_addr && *lan_bind_addr) {
+            local_listener.auth_required = 0;
+        } else if (auth_token_file_explicit) {
+            if (!token_loaded) {
+                fprintf(stderr, "cannot read a non-empty auth token from %s\n", auth_token_file);
+                return 1;
+            }
+            local_listener.auth_required = 1;
+        }
+        if (strcmp(bind_addr, "127.0.0.1") && strcmp(bind_addr, "::1") &&
+            !local_listener.auth_required)
+            fprintf(stderr, "warning: non-loopback local binding without authentication\n");
+
+        local_listener.fd = open_server_socket(bind_addr, port);
+        if (local_listener.fd < 0) return 1;
+        if (lan_bind_addr && *lan_bind_addr) {
+            lan_listener.fd = open_server_socket(lan_bind_addr, lan_port);
+            if (lan_listener.fd < 0) {
+                close(local_listener.fd);
+                return 1;
+            }
+        }
     }
 
     /* board info changes rarely: fetch once, refresh hourly. */
@@ -2494,12 +3192,14 @@ int main(int argc, char **argv)
                 last_snap_len = snap_len;
             }
 
-            wait_with_http(srv_fd, clients, HTTP_MAX_CLIENTS, snap, snap_len, interval_ms);
+            wait_with_http(&local_listener, &lan_listener, clients, HTTP_MAX_CLIENTS,
+                           snap, snap_len, interval_ms, &auth);
         }
         cycle++;
     } while (g_run);
 
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
-    if (srv_fd >= 0) close(srv_fd);
+    if (lan_listener.fd >= 0) close(lan_listener.fd);
+    if (local_listener.fd >= 0) close(local_listener.fd);
     return 0;
 }

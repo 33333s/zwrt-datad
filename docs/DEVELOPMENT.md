@@ -23,6 +23,8 @@
   - 匹配 `model_name = MU5250`
   - `MC8532B`
   - 匹配 `model_name = MC8532B`
+  - `MU5252`
+  - 匹配 `model_name = MU5252`
 - 待后续拆分适配：
   - 其他机型
 
@@ -49,7 +51,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - 每核心 CPU 与频率按周期实时读取，吞吐使用 16 样本滚动窗口
 - 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
 - 后端根据 `device.model_name` 选择 `device.api_template`
-- 当前已把 `MU5250` / `MC8532B` 模板作为正式适配路径
+- 当前已把 `MU5250` / `MC8532B` / `MU5252` 模板作为正式适配路径
 - 原来为其他机型加的宽松回退收进兼容模板，不再算正式支持
 
 ## 传输层约定
@@ -100,6 +102,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - 模板索引：[`models/README.md`](models/README.md)
 - 当前已实现：[`models/MU5250.md`](models/MU5250.md)
 - 当前已实现：[`models/MC8532B.md`](models/MC8532B.md)
+- 当前已实现：[`models/MU5252.md`](models/MU5252.md)
 
 ## 已知约定
 

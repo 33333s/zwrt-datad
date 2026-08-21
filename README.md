@@ -12,15 +12,19 @@
 
 默认监听地址：
 
-- `http://127.0.0.1:9460`
-- `http://127.0.0.1:9460/state`
-- `http://127.0.0.1:9460/events`
+- 本机免鉴权口：`http://127.0.0.1:9460`
+- 内网鉴权口：`http://<设备内网IP>:9461`
+  - init 脚本默认开启；本机历史接口保持不变
+  - 只接受内网、CGNAT、link-local 和 loopback 来源
+  - 通过 `POST /auth/login` 或 `POST /auth/exchange` 换取 Bearer Token
+  - 支持 `Authorization`、`X-Auth-Token`，以及 SSE 使用的 `?access_token=`
+  - 非空 `auth.token` 继续作为兼容静态 Token
 
-> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。UUID、OTA、插件、数据库、短信转发和前端鉴权仍属于上层 UFI，不进入 datad。
+> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。内网 Token 只保护 datad 传输层；UUID、OTA、插件、数据库、短信转发和面向用户的前端会话鉴权仍属于上层 UFI。
 
 公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
 
-设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250` 和 `MC8532B` 两条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250`、`MC8532B` 和 `MU5252` 三条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
@@ -35,6 +39,9 @@
   - `MC8532B`
   - 匹配机型：`model_name = MC8532B`
   - 对应设备：`G5 Pro`
+  - `MU5252`
+  - 匹配机型：`model_name = MU5252`
+  - 对应设备：`TopFlow`
 - 待后续单独适配：
   - 其他机型
   - 不再继续复用现有模板冒充“通用支持”
@@ -86,10 +93,10 @@ nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
 ./zwrt-datad --once
 ```
 
-修改监听地址和端口：
+额外开启内网鉴权口：
 
 ```sh
-./zwrt-datad -b 0.0.0.0 -p 9460
+./zwrt-datad -i 1000 --lan-bind 0.0.0.0 --lan-port 9461
 ```
 
 作为 OpenWRT 服务安装：
@@ -100,6 +107,8 @@ adb shell 'chmod 755 /etc/init.d/zwrt-datad &&
            /etc/init.d/zwrt-datad enable &&
            /etc/init.d/zwrt-datad start'
 ```
+
+init 脚本会保留本机 `127.0.0.1:9460`，同时开启 `0.0.0.0:9461` 内网鉴权口。若静态 Token 文件不存在，内网口仍可通过动态登录发放临时 Token。
 
 ## 读取方式
 
@@ -123,14 +132,20 @@ es.addEventListener("state", (ev) => {
 });
 ```
 
-启用 Token 后，上层 UFI 使用请求头访问：
+内网调用方先登录获取 Token：
 
 ```sh
-curl -H 'Authorization: Bearer <token>' http://127.0.0.1:9460/state
+curl -s -u admin:your_web_password -X POST http://<设备内网IP>:9461/auth/login
+```
+
+随后使用请求头访问状态和控制接口：
+
+```sh
+curl -H 'Authorization: Bearer <token>' http://<设备内网IP>:9461/state
 curl -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"action":"band.set_nr_nsa","params":{"bands":"41,78"}}' \
-  http://127.0.0.1:9460/control
+  http://<设备内网IP>:9461/control
 ```
 
 控制接口只接受明确列入白名单的动作，不提供任意 `ubus` 或 Shell 透传。完整契约见 [`docs/CONTROL_API.md`](docs/CONTROL_API.md)。
@@ -166,6 +181,7 @@ kill -USR1 $(pidof zwrt-datad)
 - 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
 - MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
 - MC8532B 模板：[`docs/models/MC8532B.md`](docs/models/MC8532B.md)
+- MU5252 模板：[`docs/models/MU5252.md`](docs/models/MU5252.md)
 - 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## 许可

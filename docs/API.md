@@ -4,12 +4,15 @@
 
 ## Endpoint
 
-- Base URL：`http://127.0.0.1:9460`
-- TLS：默认不提供；推荐只监听回环地址
-- Auth：可通过 `--auth-token-file <path>` 启用
+- Local Base URL：`http://127.0.0.1:9460`
+- LAN Base URL：`http://<device-lan-ip>:9461`
+- LAN Source Filter：仅允许 `10/8`、`172.16/12`、`192.168/16`、`100.64/10`、`169.254/16` 和 `127/8`
+- TLS：默认不提供；如需跨设备安全传输，应在外层补 HTTPS
 - Content-Type：JSON 接口使用 `application/json; charset=utf-8`
 
-启用 Token 后，除 `/healthz` 和根路径说明外，接口要求以下任一请求头：
+本机端口保持免鉴权，供设备上的 UFI 和脚本使用。内网端口通过 `POST /auth/login` 或 `POST /auth/exchange` 获取临时 Token；若配置了非空静态 Token 文件，也兼容该 Token。
+
+需要鉴权的接口接受以下请求头：
 
 ```http
 Authorization: Bearer <token>
@@ -19,7 +22,36 @@ Authorization: Bearer <token>
 X-Auth-Token: <token>
 ```
 
+原生 `EventSource` 无法设置请求头时，也可以使用 `?access_token=<token>`。
+
 ## Routes
+
+### `POST /auth/login`
+
+仅内网鉴权端口提供。使用 HTTP Basic 传递中兴后台用户名和密码：
+
+```sh
+curl -s -u admin:your_web_password -X POST \
+  http://<device-lan-ip>:9461/auth/login
+```
+
+成功后返回有效期 12 小时的 Bearer Token；每次成功使用会刷新有效期：
+
+```json
+{"ok":true,"token_type":"Bearer","access_token":"...","expires_in":43200,"expires_at":1783500000}
+```
+
+### `POST /auth/exchange`
+
+使用 vendor webtoken 换取 datad Token：
+
+```sh
+curl -s -X POST \
+  -H 'X-Web-Token: <vendor_webtoken>' \
+  -H 'X-Z-Mode: 0' \
+  -H 'X-Z-Tag: zwrt-datad' \
+  http://<device-lan-ip>:9461/auth/exchange
+```
 
 ### `GET /state`
 
@@ -107,13 +139,23 @@ data: {"ts":1782396733,...}
 - `-i <ms>`：采样间隔，默认 `1000`
 - `-b <addr>` / `--bind <addr>`：监听地址，默认 `127.0.0.1`
 - `-p <port>` / `--port <port>`：监听端口，默认 `9460`
-- `--auth-token-file <path>`：从文件加载私有 API Token
+- `--lan-bind <addr>`：额外开启需要鉴权的内网监听口
+- `--lan-port <port>`：内网监听端口，默认 `9461`
+- `--auth-token-file <path>`：兼容静态 Token 文件
 
 ```sh
 ./zwrt-datad -i 1000 -b 127.0.0.1 -p 9460 \
+  --lan-bind 0.0.0.0 --lan-port 9461 \
   --auth-token-file /data/plugins/zwrt-datad/auth.token
 ```
 
 ## Integration Boundary
 
 上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、OTA、插件、数据库和业务逻辑。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
+
+内网读取与 SSE 示例：
+
+```sh
+curl -H 'Authorization: Bearer <token>' http://<device-lan-ip>:9461/state
+curl -N 'http://<device-lan-ip>:9461/events?access_token=<token>'
+```

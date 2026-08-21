@@ -22,15 +22,21 @@ case "$service:$method" in
         printf '%s\n' '{"uptime":123,"memory":{"total":1048576,"available":524288}}'
         ;;
     zwrt_zte_mdm.api:get_zwrt_common_info)
-        printf '%s\n' '{"manufacturer":"ZTE","model_name":"MU5250","hardware_version":"MU5250_HW1.0","device_market_name":"U60 Pro","wa_inner_version":"TEST-BUILD"}'
+        model="${MOCK_MODEL_NAME:-MU5250}"
+        market='U60 Pro'
+        [ "$model" = 'MU5252' ] && market='TopFlow'
+        printf '{"manufacturer":"ZTE","model_name":"%s","hardware_version":"%s_HW1.0","device_market_name":"%s","wa_inner_version":"TEST-BUILD"}\n' \
+            "$model" "$model" "$market"
         ;;
     zwrt_zte_mdm.api:get_imei)
         printf '%s\n' '{"imei":"860000000000001"}'
         ;;
     zwrt_zte_mdm.api:get_sim_info)
-        printf '%s\n' '{"sim_iccid":"8986000000000000000","sim_imsi":"460000000000001","msisdn":"10086","sim_states":"ready","current_sim_slot":1,"support_dual_sim":1}'
+        printf '{"sim_iccid":"8986000000000000000","sim_imsi":"460000000000001","msisdn":"10086","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
+            "${MOCK_SIM_SLOT:-1}"
         ;;
     zte_nwinfo_api:nwinfo_get_netinfo)
+        [ "${MOCK_NWINFO_FAIL:-0}" = '1' ] && exit 1
         printf '%s\n' '{"network_type":"SA","signalbar":4,"network_provider_fullname":"Fixture Mobile","wan_active_band":"n78","nr5g_action_band":"78","nr5g_rsrp":-90,"nr5g_rsrq":-11,"nr5g_snr":"18.0","rmcc":460,"rmnc":0,"net_select":"WL_AND_5G","nr5g_sa_band_lock":"78","nr5g_nsa_band_lock":"","lte_band":"1,3"}'
         ;;
     zwrt_wms:zwrt_wms_get_wms_capacity)

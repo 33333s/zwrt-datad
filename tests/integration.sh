@@ -4,17 +4,24 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${1:-$ROOT/zwrt-datad-test}"
 PORT="${ZWRT_DATAD_TEST_PORT:-19460}"
+LAN_LOCAL_PORT=$((PORT + 1))
+LAN_PORT=$((PORT + 2))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
+MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 PID=""
+LAN_PID=""
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
     [ -n "$PID" ] && wait "$PID" 2>/dev/null || true
-    rm -f "$TOKEN_FILE" "$CALL_LOG" "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
+    [ -n "$LAN_PID" ] && kill "$LAN_PID" 2>/dev/null || true
+    [ -n "$LAN_PID" ] && wait "$LAN_PID" 2>/dev/null || true
+    rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
+        "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
 }
 trap cleanup EXIT INT TERM
 
@@ -118,5 +125,72 @@ code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
     "http://127.0.0.1:$PORT/control")"
 [ "$code" = "502" ]
 grep -F "$(printf 'uci\trevert wireless')" "$CALL_LOG" >/dev/null
+
+: >"$MU5252_CALL_LOG"
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_SIM_SLOT=2 \
+MOCK_NWINFO_FAIL=1 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "MU5252"
+assert data["device"]["api_template_supported"] == 1
+assert data["net"]["type"] == "SA"
+assert data["net"]["operator"] == "Fixture TopFlow Mobile"
+assert data["net"]["nr_pci"] == 321
+'
+grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$CALL_LOG" \
+"$BIN" -i 200 -p "$LAN_LOCAL_PORT" \
+    --lan-bind 127.0.0.1 --lan-port "$LAN_PORT" >/dev/null 2>&1 &
+LAN_PID=$!
+
+i=0
+until curl -fsS "http://127.0.0.1:$LAN_LOCAL_PORT/healthz" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'LAN test server did not start' >&2; exit 1; }
+    sleep 0.1
+done
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LAN_LOCAL_PORT/state")"
+[ "$code" = "200" ]
+code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LAN_PORT/state")"
+[ "$code" = "401" ]
+
+login_json="$(curl -fsS -u admin:fixture-password -X POST \
+    "http://127.0.0.1:$LAN_PORT/auth/login")"
+access_token="$(printf '%s' "$login_json" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+[ "${#access_token}" = "48" ]
+
+curl -fsS -H "Authorization: Bearer $access_token" \
+    "http://127.0.0.1:$LAN_PORT/state" | python3 -m json.tool >/dev/null
+curl -fsS "http://127.0.0.1:$LAN_PORT/capabilities?access_token=$access_token" | \
+    python3 -m json.tool >/dev/null
+curl -fsS -H "Authorization: Bearer $access_token" \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.refresh","params":{}}' \
+    "http://127.0.0.1:$LAN_PORT/control" | python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$LAN_PORT/auth/login?username=admin&password=must-not-be-accepted")"
+[ "$code" = "400" ]
+
+exchange_json="$(curl -fsS -X POST \
+    -H 'X-Web-Token: fixture-vendor-token' \
+    -H 'X-Z-Mode: 0' \
+    -H 'X-Z-Tag: zwrt-datad' \
+    "http://127.0.0.1:$LAN_PORT/auth/exchange")"
+exchange_token="$(printf '%s' "$exchange_json" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+curl -fsS -H "Authorization: Bearer $exchange_token" \
+    "http://127.0.0.1:$LAN_PORT/capabilities" | python3 -m json.tool >/dev/null
 
 echo 'integration OK'

@@ -227,6 +227,20 @@ int device_uci_get(const char *path, char *out, size_t outlen)
     return out[0] ? 0 : -1;
 }
 
+int device_uci_show(const char *package_name, char *out, size_t outlen)
+{
+    const char *uci = getenv("ZWRT_DATAD_UCI_BIN");
+    const char *argv[5];
+    if (!valid_command_name(package_name) || !out || outlen == 0) return -1;
+    if (!uci || !*uci) uci = "uci";
+    argv[0] = uci;
+    argv[1] = "-q";
+    argv[2] = "show";
+    argv[3] = package_name;
+    argv[4] = NULL;
+    return device_run_capture(argv, out, outlen);
+}
+
 int device_uci_list(const char *operation, const char *path, const char *value)
 {
     const char *uci = getenv("ZWRT_DATAD_UCI_BIN");

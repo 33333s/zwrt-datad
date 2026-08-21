@@ -35,3 +35,4 @@ scripts/_*.sh
 .DS_Store
 /tests/auth.token
 /tests/mock-calls.log
+/tests/mu5252-calls.log

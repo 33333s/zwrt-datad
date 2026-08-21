@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.7.0",
+    "version": "0.8.0",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增私有控制 API、Token 鉴权、SIM/接口/流量状态和每核心实时系统数据"
+    "notes": "新增双端口 LAN 动态鉴权与 MU5252/TopFlow 设备模板"
   }
 }
