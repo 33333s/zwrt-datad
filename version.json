@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.8.0",
+    "version": "0.9.0",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增双端口 LAN 动态鉴权与 MU5252/TopFlow 设备模板"
+    "notes": "新增 MC7523/G5 Max WiFi 设备模板与模板级完整 ubus 能力"
   }
 }

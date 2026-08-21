@@ -12,7 +12,7 @@
 - 需要日志补充的字段也由同一个生产者统一读取
 - 消费者只走统一后端接口
 - 不把 `ubus` 压力和日志扫描扩散到每个 UI、网页或脚本
-- 通用控制写操作使用编译期白名单，不提供任意 Shell；MU5252 模板另有完整 ubus 传输入口，仍使用参数数组执行且只允许合法对象/方法标识符
+- 通用控制写操作使用编译期白名单，不提供任意 Shell；所有设备模板默认开放完整 ubus 传输入口，能力位保存在模板定义中，调用仍使用参数数组且只允许合法对象/方法标识符
 
 ## 机型范围
 
@@ -25,6 +25,8 @@
   - 匹配 `model_name = MC8532B`
   - `MU5252`
   - 匹配 `model_name = MU5252`
+  - `MC7523`
+  - 匹配 `model_name = MC7523`
 - 待后续拆分适配：
   - 其他机型
 
@@ -51,7 +53,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - 每核心 CPU 与频率按周期实时读取，吞吐使用 16 样本滚动窗口
 - 新增 `device.*` 机型识别层，适配优先看 `device.model_name`
 - 后端根据 `device.model_name` 选择 `device.api_template`
-- 当前已把 `MU5250` / `MC8532B` / `MU5252` 模板作为正式适配路径
+- 当前已把 `MU5250` / `MC8532B` / `MU5252` / `MC7523` 模板作为正式适配路径
 - 原来为其他机型加的宽松回退收进兼容模板，不再算正式支持
 
 ## 传输层约定
@@ -103,6 +105,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - 当前已实现：[`models/MU5250.md`](models/MU5250.md)
 - 当前已实现：[`models/MC8532B.md`](models/MC8532B.md)
 - 当前已实现：[`models/MU5252.md`](models/MU5252.md)
+- 当前已实现：[`models/MC7523.md`](models/MC7523.md)
 
 ## 已知约定
 

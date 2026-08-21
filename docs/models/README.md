@@ -15,6 +15,10 @@
   - 匹配：`model_name = MU5252`
   - 展示名称：`TopFlow`
   - 文档：[`MU5252.md`](MU5252.md)
+- `MC7523`
+  - 匹配：`model_name = MC7523`
+  - 展示名称：`G5 Max WiFi`
+  - 文档：[`MC7523.md`](MC7523.md)
 
 待后续补充：
 

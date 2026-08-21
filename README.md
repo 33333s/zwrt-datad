@@ -9,7 +9,7 @@
 - `GET /healthz`：返回 `ok`
 - `GET /capabilities`：返回允许的设备操作
 - `GET /ubus`：返回全部 ubus 对象；`?verbose=1` 同时返回方法签名
-- `POST /ubus/call`：MU5252 专属的完整 ubus 调用入口
+- `POST /ubus/call`：完整 ubus 调用入口（所有模板默认开放）
 - `POST /control`：执行白名单内的设备控制
 
 默认监听地址：
@@ -26,7 +26,7 @@
 
 公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
 
-设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250`、`MC8532B` 和 `MU5252` 三条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250`、`MC8532B`、`MU5252` 和 `MC7523` 四条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
 
 `2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
 
@@ -44,6 +44,9 @@
   - `MU5252`
   - 匹配机型：`model_name = MU5252`
   - 对应设备：`TopFlow`
+  - `MC7523`
+  - 匹配机型：`model_name = MC7523`
+  - 对应设备：`G5 Max WiFi`
 - 待后续单独适配：
   - 其他机型
   - 不再继续复用现有模板冒充“通用支持”
@@ -150,7 +153,7 @@ curl -H 'Authorization: Bearer <token>' \
   http://<设备内网IP>:9461/control
 ```
 
-通用 `/control` 仍只接受明确列入白名单的动作，不提供 Shell 透传。MU5252 因设备集成需求额外提供完整 `/ubus/call`；该入口只使用参数数组执行 `ubus`，但可以调用设备注册的写方法和危险方法，调用方必须自行约束。完整契约见 [`docs/CONTROL_API.md`](docs/CONTROL_API.md) 和 [`docs/API.md`](docs/API.md)。
+通用 `/control` 仍只接受明确列入白名单的动作，不提供 Shell 透传。所有设备模板默认提供完整 `/ubus/call`，能力位保存在模板定义中；该入口只使用参数数组执行 `ubus`，但可以调用设备注册的写方法和危险方法，调用方必须自行约束。完整契约见 [`docs/CONTROL_API.md`](docs/CONTROL_API.md) 和 [`docs/API.md`](docs/API.md)。
 
 后端会先根据 `state.device.model_name` 选择设备侧 API 模板，并把结果写进 `state.device.api_template`。如果前端还需要切自己的 UI 模板，优先使用 `state.device.model_name` 或 `state.device.api_template`，不要再用 `market_name` / `alias_name` 做判断。
 
@@ -184,6 +187,7 @@ kill -USR1 $(pidof zwrt-datad)
 - MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
 - MC8532B 模板：[`docs/models/MC8532B.md`](docs/models/MC8532B.md)
 - MU5252 模板：[`docs/models/MU5252.md`](docs/models/MU5252.md)
+- MC7523 模板：[`docs/models/MC7523.md`](docs/models/MC7523.md)
 - 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 
 ## 许可
