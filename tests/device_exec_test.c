@@ -35,5 +35,7 @@ int main(void)
     assert(out[0] == 0);
     assert(device_ubus_call("fixture", "empty", NULL, out, sizeof out) == -1);
     assert(unsetenv("ZWRT_DATAD_UBUS_BIN") == 0);
+    assert(device_adb_read_file("bad;serial", "/sys/device/temp", out, sizeof out) == -1);
+    assert(device_adb_read_file("fixture", "/tmp/not-sysfs", out, sizeof out) == -1);
     return 0;
 }
