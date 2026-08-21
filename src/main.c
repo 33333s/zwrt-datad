@@ -2631,8 +2631,8 @@ static int request_login_credentials(const char *req, const char *query,
         separator = strchr((char *)decoded, ':');
         if (!separator) return 0;
         *separator++ = 0;
-        snprintf(username, username_len, "%s", (char *)decoded);
-        snprintf(password, password_len, "%s", separator);
+        copy_text(username, username_len, (char *)decoded);
+        copy_text(password, password_len, separator);
         return username[0] != 0;
     }
     return 0;
