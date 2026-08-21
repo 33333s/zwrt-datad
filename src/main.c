@@ -65,6 +65,11 @@
 #define SMS_OBJECT_MAX (SMS_TEXT_HEX_MAX + 4096)
 #define CLIENT_LIST_MAX 16384
 #define SNAP_MAX 1048576
+#define UBUS_CATALOG_MAX 131072
+#define UBUS_CALL_RESULT_MAX 1048576
+#define UBUS_CALL_RESPONSE_MAX (UBUS_CALL_RESULT_MAX + 4096)
+#define TOPFLOW_MODEM_COUNT 3
+#define TOPFLOW_EXTERNAL_MODEM_COUNT 2
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -84,6 +89,17 @@ static char g_cellular_runtime[RAW_MAX];
 static char g_traffic_accounting[RAW_MAX];
 static char g_traffic_limit[4096];
 static char g_traffic_clear_day[4096];
+static int g_topflow_multimodem_enabled;
+static char g_topflow_msim_netinfo[RAW_MAX];
+static char g_topflow_v3t_sim[RAW_MAX];
+static char g_topflow_wwaniface[TOPFLOW_EXTERNAL_MODEM_COUNT][RAW_MAX];
+static char g_topflow_traffic[TOPFLOW_EXTERNAL_MODEM_COUNT][RAW_MAX];
+static char g_topflow_wan4[TOPFLOW_MODEM_COUNT][RAW_MAX];
+static char g_topflow_wan6[TOPFLOW_MODEM_COUNT][RAW_MAX];
+static char g_ubus_catalog[UBUS_CATALOG_MAX];
+static char g_ubus_call_args[HTTP_REQ_MAX];
+static char g_ubus_call_result[UBUS_CALL_RESULT_MAX];
+static char g_ubus_call_response[UBUS_CALL_RESPONSE_MAX];
 
 struct sse_client {
     int fd;
@@ -1713,6 +1729,273 @@ static int load_traffic_snapshot_for_template(const struct device_template_spec 
     return run_ubus("zwrt_data", "get_wwandst", args, traffic, traffic_n);
 }
 
+static int load_topflow_msim_netinfo_uci(char *out, size_t outlen)
+{
+    static const char *suffixes[] = {
+        "net_select", "network_type", "rplmn_num", "network_provider",
+        "domain_stat", "simcard_roam", "wan_active_band", "signalbar",
+        "cell_id", "wan_active_channel", "lte_pci", "lte_tac", "lac_code",
+        "lte_rsrp", "lte_rsrq", "lte_rssi", "lte_snr", "lte_band_lock",
+        "operate_mode", "lte_bandwidth"
+    };
+    char show[RAW_MAX];
+    struct buf b = {out, outlen, 0};
+    int fields = 0;
+
+    if (!out || outlen < 3) return -1;
+    out[0] = 0;
+    if (device_uci_show("zte_nwinfo", show, sizeof show) != 0) {
+        memcpy(out, "{}", 3);
+        return -1;
+    }
+    bappend(&b, "{");
+    for (int modem = 1; modem <= TOPFLOW_EXTERNAL_MODEM_COUNT; modem++) {
+        for (size_t i = 0; i < sizeof suffixes / sizeof suffixes[0]; i++) {
+            char path[160], key[128], value[256] = "";
+            snprintf(path, sizeof path, "zte_nwinfo.sys_info.msim_%d_0_%s",
+                     modem, suffixes[i]);
+            if (uci_show_value(show, path, value, sizeof value) != 0 || !value[0])
+                continue;
+            snprintf(key, sizeof key, "msim_%d_0_%s", modem, suffixes[i]);
+            if (fields++) bappend(&b, ",");
+            bappend(&b, "\"%s\":\"", key);
+            bappend_json_esc(&b, value);
+            bappend(&b, "\"");
+        }
+    }
+    bappend(&b, "}");
+    if (b.len >= b.cap || fields == 0) {
+        memcpy(out, "{}", 3);
+        return -1;
+    }
+    return 0;
+}
+
+static int topflow_external_subid(int index)
+{
+    char key[64];
+    long slot;
+    int base;
+
+    if (index < 0 || index >= TOPFLOW_EXTERNAL_MODEM_COUNT) return 0;
+    snprintf(key, sizeof key, "v3t_%d_st_slot", index + 1);
+    slot = json_get_int(g_topflow_v3t_sim, key, 0);
+    if (slot < 0 || slot > 1) slot = 0;
+    base = index == 0 ? 3 : 5;
+    return base + (int)slot;
+}
+
+static void update_topflow_multimodem_identity(const char *common)
+{
+    char model[128] = "", hardware[128] = "";
+    if (common && *common) {
+        (void)json_get(common, "model_name", model, sizeof model);
+        (void)json_get(common, "hardware_version", hardware, sizeof hardware);
+    }
+    g_topflow_multimodem_enabled = !strcmp(model, "MU5252") || has_prefix(hardware, "MU5252_");
+}
+
+static void refresh_topflow_multimodem_cache(void)
+{
+    static const char *wan4_services[TOPFLOW_MODEM_COUNT] = {
+        "network.interface.zte_mwan2",
+        "network.interface.zte_mwan3",
+        "network.interface.zte_mwan4"
+    };
+    static const char *wan6_services[TOPFLOW_MODEM_COUNT] = {
+        "network.interface.zte_mwan2_6",
+        "network.interface.zte_mwan3_6",
+        "network.interface.zte_mwan4_6"
+    };
+    char next[RAW_MAX];
+
+    if (!g_topflow_multimodem_enabled) return;
+
+    if (run_ubus("zte_nwinfo_api", "nwinfo_get_msim_netinfo", NULL,
+                 next, sizeof next) == 0) {
+        copy_text(g_topflow_msim_netinfo, sizeof g_topflow_msim_netinfo, next);
+    } else if (load_topflow_msim_netinfo_uci(next, sizeof next) == 0) {
+        copy_text(g_topflow_msim_netinfo, sizeof g_topflow_msim_netinfo, next);
+    }
+    if (run_ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", NULL,
+                 next, sizeof next) == 0)
+        copy_text(g_topflow_v3t_sim, sizeof g_topflow_v3t_sim, next);
+
+    for (int i = 1; i < TOPFLOW_MODEM_COUNT; i++) {
+        if (run_ubus(wan4_services[i], "status", NULL, next, sizeof next) == 0)
+            copy_text(g_topflow_wan4[i], sizeof g_topflow_wan4[i], next);
+        if (run_ubus(wan6_services[i], "status", NULL, next, sizeof next) == 0)
+            copy_text(g_topflow_wan6[i], sizeof g_topflow_wan6[i], next);
+    }
+
+    for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
+        char args[192];
+        int subid = topflow_external_subid(i);
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"deviceui\",\"cid\":1,\"subid\":%d}", subid);
+        if (run_ubus("zwrt_data", "get_wwaniface", args, next, sizeof next) == 0)
+            copy_text(g_topflow_wwaniface[i], sizeof g_topflow_wwaniface[i], next);
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"deviceui\",\"cid\":1,\"type\":1,\"subid\":%d}",
+                 subid);
+        if (run_ubus("zwrt_data", "get_wwandst", args, next, sizeof next) == 0)
+            copy_text(g_topflow_traffic[i], sizeof g_topflow_traffic[i], next);
+    }
+}
+
+static void prefixed_key(char *out, size_t outlen, const char *prefix, const char *suffix)
+{
+    snprintf(out, outlen, "%s%s", prefix ? prefix : "", suffix ? suffix : "");
+}
+
+static void emit_prefixed_str(struct buf *b, const char *key, const char *src,
+                              const char *prefix, const char *suffix)
+{
+    char source_key[128];
+    prefixed_key(source_key, sizeof source_key, prefix, suffix);
+    emit_str(b, key, src, source_key);
+}
+
+static void emit_prefixed_int(struct buf *b, const char *key, const char *src,
+                              const char *prefix, const char *suffix, long def)
+{
+    char source_key[128];
+    prefixed_key(source_key, sizeof source_key, prefix, suffix);
+    emit_int(b, key, src, source_key, def);
+}
+
+static void emit_realtime_traffic(struct buf *b, const char *src)
+{
+    emit_int(b, "rx_speed", src, "real_rx_speed", 0); bappend(b, ",");
+    emit_int(b, "tx_speed", src, "real_tx_speed", 0); bappend(b, ",");
+    emit_int(b, "max_rx_speed", src, "real_max_rx_speed", 0); bappend(b, ",");
+    emit_int(b, "max_tx_speed", src, "real_max_tx_speed", 0); bappend(b, ",");
+    emit_int(b, "rx_bytes", src, "real_rx_bytes", 0); bappend(b, ",");
+    emit_int(b, "tx_bytes", src, "real_tx_bytes", 0); bappend(b, ",");
+    emit_int(b, "session_time", src, "real_time", 0);
+}
+
+static void emit_topflow_external_modem(struct buf *b, int index)
+{
+    static const char *ids[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"v3e1", "v3e2"};
+    static const char *ifnames[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"V3E1net0", "V3E2net0"};
+    static const char *wan_names[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"zte_mwan3", "zte_mwan4"};
+    static const char *usb_paths[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"1-1", "1-2"};
+    static const char *usb_ids[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"19d2:0581", "19d2:1716"};
+    static const char *adb_serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"V3E1T12345", "V3E2T12345"};
+    char net_prefix[32], sim_prefix[32], path[256];
+    int subid = topflow_external_subid(index);
+    long carrier;
+    int usb_present, adb_available;
+
+    snprintf(net_prefix, sizeof net_prefix, "msim_%d_0_", index + 1);
+    snprintf(sim_prefix, sizeof sim_prefix, "v3t_%d_", index + 1);
+    snprintf(path, sizeof path, "/sys/class/net/%s/carrier", ifnames[index]);
+    carrier = read_long_file(path, 0);
+    snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/idVendor", usb_paths[index]);
+    usb_present = access(path, R_OK) == 0;
+    snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/%s:1.3", usb_paths[index], usb_paths[index]);
+    adb_available = access(path, F_OK) == 0;
+
+    bappend(b, "{");
+    emit_kv_str(b, "id", ids[index]); bappend(b, ",");
+    emit_kv_str(b, "role", "external_4g"); bappend(b, ",");
+    emit_kv_str(b, "transport", "cdc-ecm"); bappend(b, ",");
+    bappend(b, "\"subid\":%d,", subid);
+    emit_kv_str(b, "ifname", ifnames[index]); bappend(b, ",");
+    emit_kv_str(b, "wan_interface", wan_names[index]); bappend(b, ",");
+    bappend(b, "\"usb\":{");
+    emit_kv_str(b, "path", usb_paths[index]); bappend(b, ",");
+    emit_kv_str(b, "id", usb_ids[index]); bappend(b, ",");
+    bappend(b, "\"present\":%s,\"carrier\":%ld},", usb_present ? "true" : "false", carrier);
+    bappend(b, "\"debug\":{");
+    emit_kv_str(b, "transport", "adb"); bappend(b, ",");
+    emit_kv_str(b, "serial", adb_serials[index]); bappend(b, ",");
+    bappend(b, "\"available\":%s},", adb_available ? "true" : "false");
+    bappend(b, "\"net\":{");
+    emit_prefixed_str(b, "type", g_topflow_msim_netinfo, net_prefix, "network_type"); bappend(b, ",");
+    emit_prefixed_int(b, "bars", g_topflow_msim_netinfo, net_prefix, "signalbar", 0); bappend(b, ",");
+    emit_prefixed_str(b, "operator", g_topflow_msim_netinfo, net_prefix, "network_provider"); bappend(b, ",");
+    emit_prefixed_str(b, "plmn", g_topflow_msim_netinfo, net_prefix, "rplmn_num"); bappend(b, ",");
+    emit_prefixed_str(b, "band", g_topflow_msim_netinfo, net_prefix, "wan_active_band"); bappend(b, ",");
+    emit_prefixed_int(b, "lte_rsrp", g_topflow_msim_netinfo, net_prefix, "lte_rsrp", 0); bappend(b, ",");
+    emit_prefixed_int(b, "lte_rsrq", g_topflow_msim_netinfo, net_prefix, "lte_rsrq", 0); bappend(b, ",");
+    emit_prefixed_int(b, "lte_rssi", g_topflow_msim_netinfo, net_prefix, "lte_rssi", 0); bappend(b, ",");
+    emit_prefixed_str(b, "lte_snr", g_topflow_msim_netinfo, net_prefix, "lte_snr"); bappend(b, ",");
+    emit_prefixed_int(b, "lte_pci", g_topflow_msim_netinfo, net_prefix, "lte_pci", 0); bappend(b, ",");
+    emit_prefixed_int(b, "cell_id", g_topflow_msim_netinfo, net_prefix, "cell_id", 0); bappend(b, ",");
+    emit_prefixed_int(b, "channel", g_topflow_msim_netinfo, net_prefix, "wan_active_channel", 0); bappend(b, ",");
+    emit_prefixed_str(b, "bandwidth", g_topflow_msim_netinfo, net_prefix, "lte_bandwidth"); bappend(b, ",");
+    emit_prefixed_str(b, "mode", g_topflow_msim_netinfo, net_prefix, "net_select"); bappend(b, ",");
+    emit_prefixed_str(b, "operate_mode", g_topflow_msim_netinfo, net_prefix, "operate_mode");
+    bappend(b, "},\"sim\":{");
+    emit_prefixed_str(b, "state", g_topflow_v3t_sim, sim_prefix, "modem_main_state"); bappend(b, ",");
+    emit_prefixed_int(b, "slot", g_topflow_v3t_sim, sim_prefix, "st_slot", 0); bappend(b, ",");
+    emit_prefixed_str(b, "iccid", g_topflow_v3t_sim, sim_prefix, "sim_iccid"); bappend(b, ",");
+    emit_prefixed_str(b, "imsi", g_topflow_v3t_sim, sim_prefix, "sim_imsi"); bappend(b, ",");
+    emit_prefixed_str(b, "msisdn", g_topflow_v3t_sim, sim_prefix, "msisdn"); bappend(b, ",");
+    emit_prefixed_str(b, "imei", g_topflow_v3t_sim, sim_prefix, "imei");
+    bappend(b, "},\"wwan\":{");
+    emit_str(b, "status", g_topflow_wwaniface[index], "connect_status"); bappend(b, ",");
+    emit_str(b, "ipv4_ifname", g_topflow_wwaniface[index], "ipv4_dev_name"); bappend(b, ",");
+    emit_str(b, "ipv6_ifname", g_topflow_wwaniface[index], "ipv6_dev_name");
+    bappend(b, "},\"interfaces\":{");
+    emit_interface_status(b, "ipv4", g_topflow_wan4[index + 1]); bappend(b, ",");
+    emit_interface_status(b, "ipv6", g_topflow_wan6[index + 1]);
+    bappend(b, "},\"traffic\":{");
+    emit_realtime_traffic(b, g_topflow_traffic[index]);
+    bappend(b, "}}");
+}
+
+static void emit_topflow_modems(struct buf *b, const char *net, const char *traffic,
+                                const char *imei_cache)
+{
+    if (!g_topflow_multimodem_enabled) {
+        bappend(b, "[]");
+        return;
+    }
+
+    bappend(b, "[{");
+    emit_kv_str(b, "id", "x75"); bappend(b, ",");
+    emit_kv_str(b, "role", "integrated_5g"); bappend(b, ",");
+    emit_kv_str(b, "transport", "rmnet"); bappend(b, ",");
+    bappend(b, "\"subid\":%d,", g_active_subid);
+    emit_kv_str(b, "ifname", "rmnet_data0"); bappend(b, ",");
+    emit_kv_str(b, "wan_interface", "zte_mwan2"); bappend(b, ",");
+    bappend(b, "\"net\":{");
+    emit_str(b, "type", net, "network_type"); bappend(b, ",");
+    emit_int(b, "bars", net, "signalbar", 0); bappend(b, ",");
+    emit_str(b, "operator", net, "network_provider_fullname"); bappend(b, ",");
+    emit_str(b, "band", net, "wan_active_band"); bappend(b, ",");
+    emit_int(b, "nr_rsrp", net, "nr5g_rsrp", 0); bappend(b, ",");
+    emit_int(b, "nr_rsrq", net, "nr5g_rsrq", 0); bappend(b, ",");
+    emit_str(b, "nr_snr", net, "nr5g_snr"); bappend(b, ",");
+    emit_int(b, "lte_rsrp", net, "lte_rsrp", 0); bappend(b, ",");
+    emit_int(b, "lte_rsrq", net, "lte_rsrq", 0);
+    bappend(b, "},\"sim\":{");
+    emit_str(b, "state", g_sim_cache, "sim_states"); bappend(b, ",");
+    emit_int(b, "slot", g_sim_cache, "current_sim_slot", 0); bappend(b, ",");
+    emit_str(b, "iccid", g_sim_cache, "sim_iccid"); bappend(b, ",");
+    emit_str(b, "imsi", g_sim_cache, "sim_imsi"); bappend(b, ",");
+    emit_str(b, "msisdn", g_sim_cache, "msisdn"); bappend(b, ",");
+    emit_str(b, "imei", imei_cache, "imei");
+    bappend(b, "},\"wwan\":{");
+    emit_str(b, "status", g_cellular_runtime, "connect_status"); bappend(b, ",");
+    emit_str(b, "ipv4_ifname", g_cellular_runtime, "ipv4_dev_name"); bappend(b, ",");
+    emit_str(b, "ipv6_ifname", g_cellular_runtime, "ipv6_dev_name");
+    bappend(b, "},\"interfaces\":{");
+    emit_interface_status(b, "ipv4", g_topflow_wan4[0]); bappend(b, ",");
+    emit_interface_status(b, "ipv6", g_topflow_wan6[0]);
+    bappend(b, "},\"traffic\":{");
+    emit_realtime_traffic(b, traffic);
+    bappend(b, "}}");
+    for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
+        bappend(b, ",");
+        emit_topflow_external_modem(b, i);
+    }
+    bappend(b, "]");
+}
+
 /* Poll everything and build the unified snapshot into `out`. */
 static void build_snapshot(char *out, size_t outlen,
                            int with_board, const char *board_cache,
@@ -1909,6 +2192,11 @@ static void build_snapshot(char *out, size_t outlen,
     emit_int(&b, "sim2_provision", g_sim_cache, "sim2_provision_state", 0);
     bappend(&b, "},");
 
+    /* MU5252/TopFlow exposes one integrated X75 and two CDC-ECM LTE modems. */
+    bappend(&b, "\"modems\":");
+    emit_topflow_modems(&b, net, traf, imei_cache);
+    bappend(&b, ",");
+
     /* dhcp */
     bappend(&b, "\"dhcp\":{");
     bappend(&b, "\"ip\":\"");        bappend_json_esc(&b, dhcp_ip);    bappend(&b, "\",");
@@ -1980,30 +2268,48 @@ static void build_snapshot(char *out, size_t outlen,
 static void refresh_interface_cache(void)
 {
     char next[RAW_MAX];
+    char args[192];
     if (run_ubus("network.interface.lan", "status", NULL, next, sizeof next) == 0)
         copy_text(g_lan_interface, sizeof g_lan_interface, next);
-    if (run_ubus("network.interface.zte_wan", "status", NULL, next, sizeof next) == 0)
+    if (run_ubus(g_topflow_multimodem_enabled ? "network.interface.zte_mwan2" :
+                 "network.interface.zte_wan", "status", NULL, next, sizeof next) == 0)
         copy_text(g_wan4_interface, sizeof g_wan4_interface, next);
-    if (run_ubus("network.interface.zte_wan6", "status", NULL, next, sizeof next) == 0)
+    if (run_ubus(g_topflow_multimodem_enabled ? "network.interface.zte_mwan2_6" :
+                 "network.interface.zte_wan6", "status", NULL, next, sizeof next) == 0)
         copy_text(g_wan6_interface, sizeof g_wan6_interface, next);
+    if (g_topflow_multimodem_enabled) {
+        copy_text(g_topflow_wan4[0], sizeof g_topflow_wan4[0], g_wan4_interface);
+        copy_text(g_topflow_wan6[0], sizeof g_topflow_wan6[0], g_wan6_interface);
+    }
     if (run_ubus("zwrt_router.api", "router_get_lan_info", NULL, next, sizeof next) == 0)
         copy_text(g_lan_runtime, sizeof g_lan_runtime, next);
-    if (run_ubus("zwrt_data", "get_wwaniface",
-                 "{\"source_module\":\"web\",\"cid\":1,\"connect_status\":\"\"}",
-                 next, sizeof next) == 0)
+    if (g_topflow_multimodem_enabled)
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"web\",\"cid\":1,\"subid\":%d}", g_active_subid);
+    else
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"web\",\"cid\":1,\"connect_status\":\"\"}");
+    if (run_ubus("zwrt_data", "get_wwaniface", args, next, sizeof next) == 0)
         copy_text(g_cellular_runtime, sizeof g_cellular_runtime, next);
-    if (run_ubus("zwrt_data", "get_wwandst",
-                 "{\"source_module\":\"web\",\"cid\":1,\"type\":4}",
-                 next, sizeof next) == 0)
+    if (g_topflow_multimodem_enabled)
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"web\",\"cid\":1,\"type\":4,\"subid\":%d}",
+                 g_active_subid);
+    else
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"web\",\"cid\":1,\"type\":4}");
+    if (run_ubus("zwrt_data", "get_wwandst", args, next, sizeof next) == 0)
         copy_text(g_traffic_accounting, sizeof g_traffic_accounting, next);
-    if (run_ubus("zwrt_data", "get_wwandst_monthlimit",
-                 "{\"source_module\":\"web\",\"cid\":1}",
-                 next, sizeof next) == 0)
+    if (g_topflow_multimodem_enabled)
+        snprintf(args, sizeof args,
+                 "{\"source_module\":\"web\",\"cid\":1,\"subid\":%d}", g_active_subid);
+    else
+        snprintf(args, sizeof args, "{\"source_module\":\"web\",\"cid\":1}");
+    if (run_ubus("zwrt_data", "get_wwandst_monthlimit", args, next, sizeof next) == 0)
         copy_text(g_traffic_limit, sizeof g_traffic_limit, next);
-    if (run_ubus("zwrt_data", "get_wwandst_clearday",
-                 "{\"source_module\":\"web\",\"cid\":1}",
-                 next, sizeof next) == 0)
+    if (run_ubus("zwrt_data", "get_wwandst_clearday", args, next, sizeof next) == 0)
         copy_text(g_traffic_clear_day, sizeof g_traffic_clear_day, next);
+    refresh_topflow_multimodem_cache();
 }
 
 static int set_nonblock(int fd)
@@ -2495,6 +2801,14 @@ static int peer_is_allowed_lan(const struct sockaddr_in *peer)
     return peer && ipv4_addr_is_lan(peer->sin_addr.s_addr);
 }
 
+static int peer_is_loopback(const struct sockaddr_in *peer)
+{
+    uint32_t ip;
+    if (!peer) return 0;
+    ip = ntohl(peer->sin_addr.s_addr);
+    return (ip & 0xff000000U) == 0x7f000000U;
+}
+
 static int peer_ipv4_string(const struct sockaddr_in *peer, char *out, size_t outlen)
 {
     return peer && out && outlen >= INET_ADDRSTRLEN &&
@@ -2667,6 +2981,85 @@ static int request_is_authorized(const char *req, const char *query,
         auth_token_is_valid(auth, token);
 }
 
+static int valid_ubus_identifier(const char *value)
+{
+    if (!value || !*value) return 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') return 0;
+    }
+    return 1;
+}
+
+static void write_ubus_call_error(int fd, int status, const char *status_text,
+                                  const char *code, const char *message)
+{
+    char body[768];
+    struct buf b = {body, sizeof body, 0};
+    bappend(&b, "{\"ok\":false,\"error\":{\"code\":\"");
+    bappend_json_esc(&b, code ? code : "ubus_error");
+    bappend(&b, "\",\"message\":\"");
+    bappend_json_esc(&b, message ? message : "ubus call failed");
+    bappend(&b, "\"}}");
+    (void)write_http_json_status(fd, status, status_text, body, strlen(body));
+}
+
+static int handle_topflow_ubus_call(int fd, const char *body)
+{
+    char service[256], method[256];
+    const char *args = NULL;
+    struct buf response = {g_ubus_call_response, sizeof g_ubus_call_response, 0};
+
+    service[0] = method[0] = g_ubus_call_args[0] = g_ubus_call_result[0] = 0;
+    if (!g_topflow_multimodem_enabled) {
+        write_ubus_call_error(fd, 404, "Not Found", "unsupported_device",
+                              "full ubus calls are enabled only for the MU5252 template");
+        return 0;
+    }
+    if (!body || !json_is_valid_object(body)) {
+        write_ubus_call_error(fd, 400, "Bad Request", "invalid_request",
+                              "request body must be a complete JSON object");
+        return 0;
+    }
+    if (!json_get(body, "service", service, sizeof service) ||
+        !json_get(body, "method", method, sizeof method) ||
+        !valid_ubus_identifier(service) || !valid_ubus_identifier(method)) {
+        write_ubus_call_error(fd, 400, "Bad Request", "invalid_target",
+                              "service and method must be valid ubus identifiers");
+        return 0;
+    }
+    if (json_get(body, "args", g_ubus_call_args, sizeof g_ubus_call_args)) {
+        if (!json_is_valid_object(g_ubus_call_args)) {
+            write_ubus_call_error(fd, 400, "Bad Request", "invalid_args",
+                                  "args must be a JSON object");
+            return 0;
+        }
+        args = g_ubus_call_args;
+    }
+    if (device_ubus_call_raw(service, method, args,
+                             g_ubus_call_result, sizeof g_ubus_call_result) != 0) {
+        write_ubus_call_error(fd, 502, "Bad Gateway", "device_call_failed",
+                              "device ubus call failed");
+        return 0;
+    }
+
+    bappend(&response, "{\"ok\":true,\"service\":\"");
+    bappend_json_esc(&response, service);
+    bappend(&response, "\",\"method\":\"");
+    bappend_json_esc(&response, method);
+    if (!g_ubus_call_result[0]) {
+        bappend(&response, "\",\"result\":null}");
+    } else if (json_is_valid_object(g_ubus_call_result)) {
+        bappend(&response, "\",\"result\":%s}", g_ubus_call_result);
+    } else {
+        bappend(&response, "\",\"result_text\":\"");
+        bappend_json_esc(&response, g_ubus_call_result);
+        bappend(&response, "\"}");
+    }
+    (void)write_http_json_status(fd, 200, "OK", g_ubus_call_response,
+                                 strlen(g_ubus_call_response));
+    return 1;
+}
+
 static int write_sse_handshake(int fd)
 {
     static const char hdr[] =
@@ -2822,6 +3215,8 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                                       "GET  /state        -> current JSON snapshot\n"
                                       "GET  /events       -> SSE state stream\n"
                                       "GET  /capabilities -> device control capabilities\n"
+                                      "GET  /ubus         -> ubus object catalog (?verbose=1)\n"
+                                      "POST /ubus/call    -> MU5252 full ubus call\n"
                                       "POST /control      -> allow-listed device control\n"
                                       "POST /auth/login   -> Basic login on LAN listener\n"
                                       "POST /auth/exchange -> vendor token exchange on LAN listener\n"
@@ -2861,6 +3256,37 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
             else (void)write_http_json(cli_fd, body, strlen(body));
             close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/ubus") || !strcmp(path, "/ubus/list")) {
+            char verbose_value[16] = "";
+            int verbose = query_value(query, "verbose", verbose_value, sizeof verbose_value) &&
+                          (!strcmp(verbose_value, "1") || !strcmp(verbose_value, "true"));
+            if (strcmp(method, "GET") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+            } else if (device_ubus_list(verbose, g_ubus_catalog, sizeof g_ubus_catalog) != 0) {
+                write_http_error(cli_fd, 502, "Bad Gateway");
+            } else {
+                (void)write_http_text(cli_fd, "text/plain; charset=utf-8", g_ubus_catalog);
+            }
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/ubus/call")) {
+            char *body = strstr(req, "\r\n\r\n");
+            int called = 0;
+            if (strcmp(method, "POST") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+            } else if (!listener->auth_required && !peer_is_loopback(&peer)) {
+                write_http_error(cli_fd, 403, "Forbidden");
+            } else {
+                body = body ? body + 4 : NULL;
+                called = handle_topflow_ubus_call(cli_fd, body);
+            }
+            close(cli_fd);
+            if (called) g_state_refresh_req = 1;
             continue;
         }
 
@@ -3100,6 +3526,7 @@ int main(int argc, char **argv)
     run_ubus("system", "board", NULL, board, sizeof board);
     run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
+    update_topflow_multimodem_identity(common);
     clear_qos_cache();
     g_qos_floor_off = 0;
     scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
@@ -3120,6 +3547,7 @@ int main(int argc, char **argv)
             run_ubus("system", "board", NULL, board, sizeof board);
             run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
             run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
+            update_topflow_multimodem_identity(common);
         }
 
         if (cycle == 0 || cycle % sim_poll_every == 0) {

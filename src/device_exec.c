@@ -139,8 +139,8 @@ int device_run_quiet(const char *const argv[])
     return device_run_capture(argv, ignored, sizeof ignored);
 }
 
-int device_ubus_call(const char *service, const char *method, const char *args,
-                     char *out, size_t outlen)
+static int device_ubus_call_impl(const char *service, const char *method, const char *args,
+                                 char *out, size_t outlen, int require_output)
 {
     const char *ubus = getenv("ZWRT_DATAD_UBUS_BIN");
     const char *argv[8];
@@ -155,6 +155,34 @@ int device_ubus_call(const char *service, const char *method, const char *args,
     argv[n++] = service;
     argv[n++] = method;
     if (args && *args) argv[n++] = args;
+    argv[n] = NULL;
+    if (device_run_capture(argv, out, outlen) != 0) return -1;
+    return (!require_output || out[0]) ? 0 : -1;
+}
+
+int device_ubus_call(const char *service, const char *method, const char *args,
+                     char *out, size_t outlen)
+{
+    return device_ubus_call_impl(service, method, args, out, outlen, 1);
+}
+
+int device_ubus_call_raw(const char *service, const char *method, const char *args,
+                         char *out, size_t outlen)
+{
+    return device_ubus_call_impl(service, method, args, out, outlen, 0);
+}
+
+int device_ubus_list(int verbose, char *out, size_t outlen)
+{
+    const char *ubus = getenv("ZWRT_DATAD_UBUS_BIN");
+    const char *argv[4];
+    size_t n = 0;
+
+    if (!out || outlen == 0) return -1;
+    if (!ubus || !*ubus) ubus = "ubus";
+    argv[n++] = ubus;
+    if (verbose) argv[n++] = "-v";
+    argv[n++] = "list";
     argv[n] = NULL;
     if (device_run_capture(argv, out, outlen) != 0) return -1;
     return out[0] ? 0 : -1;

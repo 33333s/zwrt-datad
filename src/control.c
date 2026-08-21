@@ -635,7 +635,10 @@ const char *control_capabilities_json(void)
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
         "\"state.refresh\",\"qos.reload\",\"qos.clear\"],"
-        "\"events\":[\"state\"],\"transport\":[\"http\",\"sse\"]}";
+        "\"events\":[\"state\"],"
+        "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
+        "\"passthrough\":[\"ubus.call\"],"
+        "\"transport\":[\"http\",\"sse\"]}";
 }
 
 struct control_result control_execute(const char *request_json,
