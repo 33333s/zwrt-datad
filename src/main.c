@@ -2315,19 +2315,27 @@ static int request_login_credentials(const char *req, const char *query,
     unsigned char decoded[HTTP_AUTH_HEADER_MAX];
     int decoded_len;
     char *separator;
+    size_t username_size, password_size;
     (void)query;
     if (!username || username_len < 2 || !password || password_len < 2) return 0;
     if (http_header_value(req, "Authorization", value, sizeof value) &&
         !strncasecmp(value, "Basic ", 6)) {
         decoded_len = base64_decode(value + 6, decoded, sizeof decoded - 1);
         if (decoded_len <= 0) return 0;
+        if (memchr(decoded, 0, (size_t)decoded_len)) return 0;
         decoded[decoded_len] = 0;
-        separator = strchr((char *)decoded, ':');
+        separator = memchr(decoded, ':', (size_t)decoded_len);
         if (!separator) return 0;
-        *separator++ = 0;
-        snprintf(username, username_len, "%s", (char *)decoded);
-        snprintf(password, password_len, "%s", separator);
-        return username[0] != 0;
+        username_size = (size_t)(separator - (char *)decoded);
+        separator++;
+        password_size = (size_t)((char *)decoded + decoded_len - separator);
+        if (!username_size || username_size >= username_len || password_size >= password_len)
+            return 0;
+        memcpy(username, decoded, username_size);
+        username[username_size] = 0;
+        memcpy(password, separator, password_size);
+        password[password_size] = 0;
+        return 1;
     }
     return 0;
 }
