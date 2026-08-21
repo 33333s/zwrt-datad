@@ -224,6 +224,15 @@ access_token="$(printf '%s' "$login_json" | python3 -c \
     'import json,sys; print(json.load(sys.stdin)["access_token"])')"
 [ "${#access_token}" = "48" ]
 
+long_basic="$(python3 -c '
+import base64
+print(base64.b64encode(("u" * 300 + ":password").encode()).decode())
+')"
+code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Basic $long_basic" \
+    "http://127.0.0.1:$LAN_PORT/auth/login")"
+[ "$code" = "400" ]
+
 curl -fsS -H "Authorization: Bearer $access_token" \
     "http://127.0.0.1:$LAN_PORT/state" | python3 -m json.tool >/dev/null
 curl -fsS "http://127.0.0.1:$LAN_PORT/capabilities?access_token=$access_token" | \
