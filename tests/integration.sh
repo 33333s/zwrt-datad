@@ -7,6 +7,7 @@ PORT="${ZWRT_DATAD_TEST_PORT:-19460}"
 LAN_LOCAL_PORT=$((PORT + 1))
 LAN_PORT=$((PORT + 2))
 TOPFLOW_PORT=$((PORT + 3))
+MC7523_PORT=$((PORT + 4))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
@@ -16,6 +17,7 @@ INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 PID=""
 LAN_PID=""
 TOPFLOW_PID=""
+MC7523_PID=""
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
@@ -24,6 +26,8 @@ cleanup() {
     [ -n "$LAN_PID" ] && wait "$LAN_PID" 2>/dev/null || true
     [ -n "$TOPFLOW_PID" ] && kill "$TOPFLOW_PID" 2>/dev/null || true
     [ -n "$TOPFLOW_PID" ] && wait "$TOPFLOW_PID" 2>/dev/null || true
+    [ -n "$MC7523_PID" ] && kill "$MC7523_PID" 2>/dev/null || true
+    [ -n "$MC7523_PID" ] && wait "$MC7523_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
 }
@@ -60,12 +64,16 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$PORT/ubus?verbose=1" | grep -F 'nwinfo_get_msim_netinfo' >/dev/null
 
-code="$(curl -sS -o /dev/null -w '%{http_code}' \
+curl -fsS \
     -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"service":"system","method":"info","args":{}}' \
-    "http://127.0.0.1:$PORT/ubus/call")"
-[ "$code" = "404" ]
+    "http://127.0.0.1:$PORT/ubus/call" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["uptime"] == 123
+'
 
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
@@ -154,6 +162,7 @@ import json, sys
 data = json.load(sys.stdin)
 assert data["device"]["api_template"] == "MU5252"
 assert data["device"]["api_template_supported"] == 1
+assert data["device"]["full_ubus"] == 1
 assert data["net"]["type"] == "SA"
 assert data["net"]["operator"] == "Fixture TopFlow Mobile"
 assert data["net"]["nr_pci"] == 321
@@ -198,6 +207,41 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' \
     -d '{"service":"system;reboot","method":"info","args":{}}' \
     "http://127.0.0.1:$TOPFLOW_PORT/ubus/call")"
 [ "$code" = "400" ]
+
+MOCK_MODEL_NAME=MC7523 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "MC7523"
+assert data["device"]["api_template_supported"] == 1
+assert data["device"]["full_ubus"] == 1
+assert data["modems"] == []
+'
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MC7523 \
+"$BIN" -i 200 -p "$MC7523_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+MC7523_PID=$!
+
+i=0
+until curl -fsS "http://127.0.0.1:$MC7523_PORT/healthz" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'MC7523 test server did not start' >&2; exit 1; }
+    sleep 0.1
+done
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"service":"system","method":"info","args":{}}' \
+    "http://127.0.0.1:$MC7523_PORT/ubus/call" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["uptime"] == 123
+'
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \

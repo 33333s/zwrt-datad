@@ -90,6 +90,7 @@ static char g_traffic_accounting[RAW_MAX];
 static char g_traffic_limit[4096];
 static char g_traffic_clear_day[4096];
 static int g_topflow_multimodem_enabled;
+static int g_full_ubus_enabled;
 static char g_topflow_msim_netinfo[RAW_MAX];
 static char g_topflow_v3t_sim[RAW_MAX];
 static char g_topflow_wwaniface[TOPFLOW_EXTERNAL_MODEM_COUNT][RAW_MAX];
@@ -152,6 +153,7 @@ struct device_template_spec {
     const char *id;
     const char *label;
     int supported;
+    int full_ubus;
     enum wifi_source_mode wifi_mode;
     enum client_source_mode client_mode;
     enum temp_source_mode temp_mode;
@@ -162,6 +164,7 @@ struct device_template_spec {
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     "MU5250",
     "MU5250",
+    1,
     1,
     WIFI_SOURCE_U60_MAIN_2G,
     CLIENT_SOURCE_DHCP_ONLY,
@@ -174,6 +177,7 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     "MC8532B",
     "MC8532B",
     1,
+    1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
@@ -185,6 +189,7 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     "MU5252",
     "MU5252",
     1,
+    1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_U60_UBUS_ONLY,
@@ -192,10 +197,23 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     TRAFFIC_SOURCE_CID1_ACTIVE_SUBID
 };
 
+static const struct device_template_spec TEMPLATE_G5MAX_MC7523 = {
+    "MC7523",
+    "MC7523",
+    1,
+    1,
+    WIFI_SOURCE_COMPAT_AUTO,
+    CLIENT_SOURCE_DHCP_THEN_ROUTER,
+    TEMP_SOURCE_COMPAT_FALLBACK,
+    NETWORK_SOURCE_NWINFO_UBUS_ONLY,
+    TRAFFIC_SOURCE_CID1
+};
+
 static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
     "legacy_compat",
     "Legacy compatibility fallback",
     0,
+    1,
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
@@ -670,6 +688,10 @@ select_device_template(const char *model_name, const char *hardware_version)
     if ((model_name && !strcmp(model_name, "MU5252")) ||
         has_prefix(hardware_version, "MU5252_")) {
         return &TEMPLATE_TOPFLOW_MU5252;
+    }
+    if ((model_name && !strcmp(model_name, "MC7523")) ||
+        has_prefix(hardware_version, "MC7523")) {
+        return &TEMPLATE_G5MAX_MC7523;
     }
     return &TEMPLATE_LEGACY_COMPAT;
 }
@@ -1785,14 +1807,17 @@ static int topflow_external_subid(int index)
     return base + (int)slot;
 }
 
-static void update_topflow_multimodem_identity(const char *common)
+static void update_device_template_features(const char *common)
 {
     char model[128] = "", hardware[128] = "";
+    const struct device_template_spec *tpl;
     if (common && *common) {
         (void)json_get(common, "model_name", model, sizeof model);
         (void)json_get(common, "hardware_version", hardware, sizeof hardware);
     }
     g_topflow_multimodem_enabled = !strcmp(model, "MU5252") || has_prefix(hardware, "MU5252_");
+    tpl = select_device_template(model, hardware);
+    g_full_ubus_enabled = tpl->full_ubus;
 }
 
 static void refresh_topflow_multimodem_cache(void)
@@ -2212,6 +2237,7 @@ static void build_snapshot(char *out, size_t outlen,
     emit_kv_str(&b, "api_template", device_template->id);      bappend(&b, ",");
     emit_kv_str(&b, "api_template_label", device_template->label); bappend(&b, ",");
     bappend(&b, "\"api_template_supported\":%d,", device_template->supported);
+    bappend(&b, "\"full_ubus\":%d,", device_template->full_ubus);
     emit_kv_str(&b, "vendor", device_vendor);                  bappend(&b, ",");
     emit_kv_str(&b, "model_name", device_model_name);          bappend(&b, ",");
     emit_kv_str(&b, "hardware_version", device_hw);            bappend(&b, ",");
@@ -3011,16 +3037,16 @@ static void write_ubus_call_error(int fd, int status, const char *status_text,
     (void)write_http_json_status(fd, status, status_text, body, strlen(body));
 }
 
-static int handle_topflow_ubus_call(int fd, const char *body)
+static int handle_full_ubus_call(int fd, const char *body)
 {
     char service[256], method[256];
     const char *args = NULL;
     struct buf response = {g_ubus_call_response, sizeof g_ubus_call_response, 0};
 
     service[0] = method[0] = g_ubus_call_args[0] = g_ubus_call_result[0] = 0;
-    if (!g_topflow_multimodem_enabled) {
+    if (!g_full_ubus_enabled) {
         write_ubus_call_error(fd, 404, "Not Found", "unsupported_device",
-                              "full ubus calls are enabled only for the MU5252 template");
+                              "full ubus calls are not enabled for this device template");
         return 0;
     }
     if (!body || !json_is_valid_object(body)) {
@@ -3224,7 +3250,7 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                                       "GET  /events       -> SSE state stream\n"
                                       "GET  /capabilities -> device control capabilities\n"
                                       "GET  /ubus         -> ubus object catalog (?verbose=1)\n"
-                                      "POST /ubus/call    -> MU5252 full ubus call\n"
+                                      "POST /ubus/call    -> template-enabled full ubus call\n"
                                       "POST /control      -> allow-listed device control\n"
                                       "POST /auth/login   -> Basic login on LAN listener\n"
                                       "POST /auth/exchange -> vendor token exchange on LAN listener\n"
@@ -3291,7 +3317,7 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                 write_http_error(cli_fd, 403, "Forbidden");
             } else {
                 body = body ? body + 4 : NULL;
-                called = handle_topflow_ubus_call(cli_fd, body);
+                called = handle_full_ubus_call(cli_fd, body);
             }
             close(cli_fd);
             if (called) g_state_refresh_req = 1;
@@ -3534,7 +3560,7 @@ int main(int argc, char **argv)
     run_ubus("system", "board", NULL, board, sizeof board);
     run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
-    update_topflow_multimodem_identity(common);
+    update_device_template_features(common);
     clear_qos_cache();
     g_qos_floor_off = 0;
     scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
@@ -3555,7 +3581,7 @@ int main(int argc, char **argv)
             run_ubus("system", "board", NULL, board, sizeof board);
             run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
             run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
-            update_topflow_multimodem_identity(common);
+            update_device_template_features(common);
         }
 
         if (cycle == 0 || cycle % sim_poll_every == 0) {

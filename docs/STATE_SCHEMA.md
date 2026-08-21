@@ -168,6 +168,7 @@ SSE  /events
     "api_template": "MU5250",
     "api_template_label": "MU5250",
     "api_template_supported": 1,
+    "full_ubus": 1,
     "vendor": "ZTE",
     "model_name": "MU5250",
     "hardware_version": "MU5250_HW1.0",
@@ -211,6 +212,8 @@ SSE  /events
   - 见 [`models/MC8532B.md`](models/MC8532B.md)
 - `device.api_template = MU5252`
   - 见 [`models/MU5252.md`](models/MU5252.md)
+- `device.api_template = MC7523`
+  - 见 [`models/MC7523.md`](models/MC7523.md)
 - 其他模板
   - 待后续逐个补充
 
@@ -220,13 +223,14 @@ SSE  /events
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
 - 后端会优先根据 `device.model_name` 选择 `device.api_template`；设备侧接口选择已经由后端完成，不需要前端再猜设备应该打哪套 `ubus/uci/sysfs`。
 - `device.api_template_supported = 1` 表示当前机型已有明确模板；`0` 表示只落到了内部兼容模板，不应视为正式适配完成。
+- `device.full_ubus = 1` 表示当前模板开放 `POST /ubus/call`；现有模板默认均为 `1`。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
 - `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
 - `traffic.rx_speed/tx_speed` 和会话计数来自 `type:1`；日/月/累计值、限额与清零日由低频设备状态刷新补充。
 - `interfaces` 每 5 秒刷新一次，控制成功时强制立即刷新。地址数组沿用 OpenWrt `network.interface.* status` 的对象结构。
 - `sim` 每 5 秒刷新一次；检测到 ICCID、卡槽或 SIM 状态变化时同时刷新 QoS 缓存。
-- `modems` 是多基带设备的规范化列表。MU5252 固定包含 `x75`、`v3e1`、`v3e2` 三项；外挂基带的活动 `subid` 分别由 `3/4`、`5/6` 加当前基带卡槽计算。其他模板当前返回空数组。
+- `modems` 是多基带设备的规范化列表。MU5252 固定包含 `x75`、`v3e1`、`v3e2` 三项；外挂基带的活动 `subid` 分别由 `3/4`、`5/6` 加当前基带卡槽计算。MC7523 是单基带设备，和其他非 MU5252 模板一样返回空数组。
 - `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 和 `throughput` 单位分别为字节和字节/秒。
