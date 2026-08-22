@@ -104,8 +104,10 @@ nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
 作为 OpenWRT 服务安装：
 
 ```sh
+adb shell 'mkdir -p /data/zwrt-datad'
+adb push zwrt-datad-aarch64 /data/zwrt-datad/zwrt-datad
 adb push scripts/zwrt-datad.init /etc/init.d/zwrt-datad
-adb shell 'chmod 755 /etc/init.d/zwrt-datad &&
+adb shell 'chmod 755 /data/zwrt-datad/zwrt-datad /etc/init.d/zwrt-datad &&
            /etc/init.d/zwrt-datad enable &&
            /etc/init.d/zwrt-datad start'
 ```

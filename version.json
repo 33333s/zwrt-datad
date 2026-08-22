@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.5",
+    "version": "0.9.6",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MC8532B 全量 ubus 验证与规范化 sysfs thermal 温度输出"
+    "notes": "统一运行目录到 /data/zwrt-datad，并新增 UCI 持久状态与 SIM 身份回退"
   }
 }

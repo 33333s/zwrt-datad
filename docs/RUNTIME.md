@@ -7,8 +7,8 @@
 在 OpenWrt 上优先使用 [`scripts/zwrt-datad.init`](../scripts/zwrt-datad.init) 交给 `procd` 管理。临时后台启动可用：
 
 ```sh
-nohup /data/plugins/zwrt-datad/zwrt-datad -i 1000 \
-  --auth-token-file /data/plugins/zwrt-datad/auth.token \
+nohup /data/zwrt-datad/zwrt-datad -i 1000 \
+  --auth-token-file /data/zwrt-datad/auth.token \
   >/dev/null 2>&1 </dev/null &
 ```
 
@@ -28,7 +28,7 @@ Authorization: Bearer <token>
 
 ```sh
 curl -fsS http://127.0.0.1:9460/healthz
-curl -fsS -H "Authorization: Bearer $(cat /data/plugins/zwrt-datad/auth.token)" \
+curl -fsS -H "Authorization: Bearer $(cat /data/zwrt-datad/auth.token)" \
   http://127.0.0.1:9460/state
 ```
 

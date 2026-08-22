@@ -184,9 +184,9 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 - `--auth-token-file <path>`：兼容静态 Token 文件
 
 ```sh
-./zwrt-datad -i 1000 -b 127.0.0.1 -p 9460 \
+/data/zwrt-datad/zwrt-datad -i 1000 -b 127.0.0.1 -p 9460 \
   --lan-bind 0.0.0.0 --lan-port 9461 \
-  --auth-token-file /data/plugins/zwrt-datad/auth.token
+  --auth-token-file /data/zwrt-datad/auth.token
 ```
 
 ## Integration Boundary

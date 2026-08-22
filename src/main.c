@@ -43,7 +43,7 @@
 #define HTTP_BIND_ADDR "127.0.0.1"
 #define HTTP_PORT 9460
 #define HTTP_LAN_PORT 9461
-#define HTTP_AUTH_TOKEN_FILE "/data/plugins/zwrt-datad/auth.token"
+#define HTTP_AUTH_TOKEN_FILE "/data/zwrt-datad/auth.token"
 #define HTTP_MAX_CLIENTS 16
 #define HTTP_REQ_MAX 65536
 #define HTTP_PATH_MAX 1024
@@ -83,6 +83,7 @@ static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
 static long g_sms_unread_cache = 0;
 static char g_sim_cache[RAW_MAX];
+static char g_uci_device_info[RAW_MAX] = "{}";
 static char g_lan_interface[RAW_MAX];
 static char g_wan4_interface[RAW_MAX];
 static char g_wan6_interface[RAW_MAX];
@@ -1677,6 +1678,134 @@ static int uci_show_value(const char *show, const char *path, char *out, size_t 
     return -1;
 }
 
+struct uci_device_field {
+    const char *key;
+    const char *path;
+};
+
+/*
+ * UCI is the firmware's persistent cache/configuration plane. Keep it in the
+ * state snapshot so consumers retain useful fields if a vendor ubus getter is
+ * missing, stale, or masks privacy-sensitive values (as MU5252 does for SIM
+ * identities). Runtime counters and radio measurements still come from ubus.
+ */
+static void refresh_uci_device_info(void)
+{
+    static const struct uci_device_field fields[] = {
+        {"iccid", "zwrt_zte_mdm.sim_info.sim_iccid"},
+        {"imsi", "zwrt_zte_mdm.sim_info.sim_imsi"},
+        {"msisdn", "zwrt_zte_mdm.sim_info.msisdn"},
+        {"sim_slot", "zwrt_zte_mdm.sim_info.current_sim_slot"},
+        {"operator", "zwrt_zte_mdm.sim_info.Operator"},
+        {"sim_states", "zwrt_zte_mdm.sim_info.sim_states"},
+        {"modem_main_state", "zwrt_zte_mdm.sim_info.modem_main_state"},
+        {"pin_status", "zwrt_zte_mdm.sim_info.pin_status"},
+        {"mcc", "zwrt_zte_mdm.sim_info.mdm_mcc"},
+        {"mnc", "zwrt_zte_mdm.sim_info.mdm_mnc"},
+        {"imei", "zwrt_zte_mdm.device_info.imei"},
+        {"mac_address", "zwrt_zte_mdm.device_info.wlan_mac_address"},
+        {"modem_msn", "zwrt_zte_mdm.device_info.modem_msn"},
+        {"wa_inner_version", "zwrt_common_info.common_config.wa_inner_version"},
+        {"hardware_version_ci", "zwrt_common_info.common_config.hardware_version"},
+        {"integrate_version", "zwrt_common_info.common_config.integrate_version"},
+        {"common_model_name", "zwrt_common_info.common_config.model_name"},
+        {"device_alias_name", "zwrt_common_info.common_config.device_alias_name"},
+        {"device_market_name", "zwrt_common_info.common_config.device_market_name"},
+        {"lan_ipaddr", "network.lan.ipaddr"},
+        {"lan_netmask", "network.lan.netmask"},
+        {"wan_ipaddr", "network.zte_wan.ipaddr"},
+        {"wan_netmask", "network.zte_wan.netmask"},
+        {"wan_gateway", "network.zte_wan.gateway"},
+        {"wan_dns", "network.zte_wan.dns"},
+        {"wan6_addr", "network.zte_wan6.ip6addr"},
+        {"wan6_gateway", "network.zte_wan6.ip6gw"},
+        {"wan6_dns", "network.zte_wan6.dns"},
+        {"dhcpEnabled", "dhcp.lan.ignore"},
+        {"dhcpStart", "dhcp.lan.zte_start"},
+        {"dhcpEnd", "dhcp.lan.zte_end"},
+        {"dhcpLease_hour", "dhcp.lan.leasetime"},
+        {"day_tx_bytes", "zwrt_data_commit.wwancid1dst.day_tx_bytes"},
+        {"day_rx_bytes", "zwrt_data_commit.wwancid1dst.day_rx_bytes"},
+        {"day_time", "zwrt_data_commit.wwancid1dst.day_time"},
+        {"month_tx_bytes", "zwrt_data_commit.wwancid1dst.month_tx_bytes"},
+        {"month_rx_bytes", "zwrt_data_commit.wwancid1dst.month_rx_bytes"},
+        {"month_time", "zwrt_data_commit.wwancid1dst.month_time"},
+        {"total_tx_bytes", "zwrt_data_commit.wwancid1dst.total_tx_bytes"},
+        {"total_rx_bytes", "zwrt_data_commit.wwancid1dst.total_rx_bytes"},
+        {"total_time", "zwrt_data_commit.wwancid1dst.total_time"},
+        {"hostname", "system.@system[0].hostname"},
+        {"timezone", "system.@system[0].timezone"},
+        {"web_language", "zwrt_web.setting.web_language"},
+        {"login_timeout", "zwrt_web.config.login_timeout"},
+        {"login_fail_num", "zwrt_web.config.login_fail_num"},
+        {"login_fail_lock_timeout", "zwrt_web.config.login_fail_lock_timeout"},
+        {"device_model", "zwrt_tr069.DeviceInfo.ModelName"},
+        {"device_manufacturer", "zwrt_tr069.DeviceInfo.Manufacturer"},
+        {"hardware_version", "zwrt_tr069.DeviceInfo.HardwareVersion"},
+        {"software_version", "zwrt_tr069.DeviceInfo.SoftwareVersion"},
+        {"serial_number", "zwrt_tr069.DeviceInfo.SerialNumber"},
+        {"battery_percent", "zwrt_zte_mc_tmp.battery.bat_percent"},
+        {"battery_level", "zwrt_zte_mc_tmp.battery.bat_level"},
+        {"battery_voltage", "zwrt_zte_mc_tmp.battery.bat_voltage"},
+        {"battery_temperature", "zwrt_zte_mc_tmp.battery.bat_temperature"},
+        {"battery_charging", "zwrt_zte_mc_tmp.battery.bat_charging"},
+        {"battery_enable", "zwrt_zte_mc_tmp.battery.bat_enable"},
+        {"power_adapter", "zwrt_zte_mc_tmp.battery.power_adapter"},
+        {"mtu", "zwrt_router.network.mtu"},
+        {"mss", "zwrt_router.network.mss"}
+    };
+    static const char *packages[] = {
+        "zwrt_zte_mdm", "zwrt_common_info", "network", "dhcp",
+        "zwrt_data_commit", "system", "zwrt_web", "zwrt_tr069",
+        "zwrt_zte_mc_tmp", "zwrt_router"
+    };
+    struct buf b = {g_uci_device_info, sizeof g_uci_device_info, 0};
+    int emitted = 0;
+
+    bappend(&b, "{");
+    for (size_t p = 0; p < sizeof packages / sizeof packages[0]; p++) {
+        char show[RAW_MAX];
+        size_t package_len = strlen(packages[p]);
+        if (device_uci_show(packages[p], show, sizeof show) != 0) continue;
+        for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+            char value[512];
+            if (strncmp(fields[i].path, packages[p], package_len) ||
+                fields[i].path[package_len] != '.') continue;
+            if (uci_show_value(show, fields[i].path, value, sizeof value) != 0 || !value[0])
+                continue;
+            if (emitted++) bappend(&b, ",");
+            bappend(&b, "\"%s\":\"", fields[i].key);
+            bappend_json_esc(&b, value);
+            bappend(&b, "\"");
+        }
+    }
+    bappend(&b, "}");
+    if (b.len >= b.cap) copy_text(g_uci_device_info, sizeof g_uci_device_info, "{}");
+}
+
+static int is_decimal_identity(const char *value)
+{
+    if (!value || !*value) return 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (!isdigit(*p)) return 0;
+    }
+    return 1;
+}
+
+static void emit_sim_identity(struct buf *b, const char *key,
+                              const char *src, const char *src_key)
+{
+    char value[256], uci_value[256];
+    if (!json_get(src, src_key, value, sizeof value)) value[0] = 0;
+    if (!is_decimal_identity(value) &&
+        json_get(g_uci_device_info, key, uci_value, sizeof uci_value) &&
+        is_decimal_identity(uci_value))
+        copy_text(value, sizeof value, uci_value);
+    bappend(b, "\"%s\":\"", key);
+    bappend_json_esc(b, value);
+    bappend(b, "\"");
+}
+
 static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
 {
     static const struct uci_net_field fields[] = {
@@ -2074,8 +2203,8 @@ static void emit_topflow_modems(struct buf *b, const char *net, const char *traf
     emit_str(b, "state", g_sim_cache, "sim_states"); bappend(b, ",");
     emit_int(b, "slot", g_sim_cache, "current_sim_slot", 0); bappend(b, ",");
     emit_str(b, "iccid", g_sim_cache, "sim_iccid"); bappend(b, ",");
-    emit_str(b, "imsi", g_sim_cache, "sim_imsi"); bappend(b, ",");
-    emit_str(b, "msisdn", g_sim_cache, "msisdn"); bappend(b, ",");
+    emit_sim_identity(b, "imsi", g_sim_cache, "sim_imsi"); bappend(b, ",");
+    emit_sim_identity(b, "msisdn", g_sim_cache, "msisdn"); bappend(b, ",");
     emit_str(b, "imei", imei_cache, "imei");
     bappend(b, "},\"wwan\":{");
     emit_str(b, "status", g_cellular_runtime, "connect_status"); bappend(b, ",");
@@ -2286,11 +2415,15 @@ static void build_snapshot(char *out, size_t outlen,
             g_cellular_runtime[0] ? g_cellular_runtime : "{}");
     bappend(&b, "},");
 
+    /* Persistent UCI state complements the realtime ubus sections above. */
+    bappend(&b, "\"uci_device_info\":%s,",
+            g_uci_device_info[0] ? g_uci_device_info : "{}");
+
     /* SIM identity and provisioning state. Values remain device-local. */
     bappend(&b, "\"sim\":{");
     emit_str(&b, "iccid", g_sim_cache, "sim_iccid"); bappend(&b, ",");
-    emit_str(&b, "imsi", g_sim_cache, "sim_imsi"); bappend(&b, ",");
-    emit_str(&b, "msisdn", g_sim_cache, "msisdn"); bappend(&b, ",");
+    emit_sim_identity(&b, "imsi", g_sim_cache, "sim_imsi"); bappend(&b, ",");
+    emit_sim_identity(&b, "msisdn", g_sim_cache, "msisdn"); bappend(&b, ",");
     emit_str(&b, "state", g_sim_cache, "sim_states"); bappend(&b, ",");
     emit_str(&b, "modem_state", g_sim_cache, "modem_main_state"); bappend(&b, ",");
     emit_str(&b, "pin_status", g_sim_cache, "pin_status"); bappend(&b, ",");
@@ -2418,6 +2551,7 @@ static void refresh_interface_cache(void)
         copy_text(g_traffic_limit, sizeof g_traffic_limit, next);
     if (run_ubus("zwrt_data", "get_wwandst_clearday", args, next, sizeof next) == 0)
         copy_text(g_traffic_clear_day, sizeof g_traffic_clear_day, next);
+    refresh_uci_device_info();
     refresh_topflow_multimodem_cache();
 }
 
