@@ -81,7 +81,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 
 `2026-06-26` 已完成一轮真实设备联调，验证组合为：
 
-- `/data/plugins/zwrt-datad/zwrt-datad`：`HTTP + SSE` 版本
+- `/data/zwrt-datad/zwrt-datad`：`HTTP + SSE` 版本
 - `/data/plugins/u60pro-devui/u60pro-devui`：改为消费 `/state + /events` 的新版前端
 
 设备侧确认点：

@@ -44,8 +44,13 @@ case "$service:$method" in
         printf '%s\n' '{"imei":"860000000000001"}'
         ;;
     zwrt_zte_mdm.api:get_sim_info)
-        printf '{"sim_iccid":"8986000000000000000","sim_imsi":"460000000000001","msisdn":"10086","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
-            "${MOCK_SIM_SLOT:-1}"
+        if [ "${MOCK_ENCRYPTED_SIM:-0}" = '1' ]; then
+            printf '{"sim_iccid":"8986000000000000000","sim_imsi":"mfmROY/c1MUtLKr/TBqrpmuNTnYHpNc70Cgl0CWlaUVXuVyARQNas+V9SA==","msisdn":"rhy1F7ceRHu/QJNfxD+UH4QG8yUH2qnHraq5wLbZUqXYiQ31HbkQbal=","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
+                "${MOCK_SIM_SLOT:-1}"
+        else
+            printf '{"sim_iccid":"8986000000000000000","sim_imsi":"460000000000001","msisdn":"10086","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
+                "${MOCK_SIM_SLOT:-1}"
+        fi
         ;;
     zwrt_zte_mdm.api:get_v3t_sim_info)
         printf '%s\n' '{"v3t_1_modem_main_state":"modem_init_complete","v3t_1_sim_imsi":"460000000000003","v3t_1_sim_iccid":"8986000000000000003","v3t_1_msisdn":"10010","v3t_1_imei":"860000000000003","v3t_1_st_slot":"0","v3t_2_modem_main_state":"modem_init_complete","v3t_2_sim_imsi":"460000000000005","v3t_2_sim_iccid":"8986000000000000005","v3t_2_msisdn":"10011","v3t_2_imei":"860000000000005","v3t_2_st_slot":"0"}'

@@ -175,6 +175,7 @@ MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
+MOCK_ENCRYPTED_SIM=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 "$BIN" --once | python3 -c '
 import json, sys
@@ -185,6 +186,11 @@ assert data["device"]["full_ubus"] == 1
 assert data["net"]["type"] == "SA"
 assert data["net"]["operator"] == "Fixture TopFlow Mobile"
 assert data["net"]["nr_pci"] == 321
+assert data["sim"]["imsi"] == "460000000000001"
+assert data["sim"]["msisdn"] == "10086"
+assert data["uci_device_info"]["imsi"] == "460000000000001"
+assert data["uci_device_info"]["lan_ipaddr"] == "192.168.0.1"
+assert data["uci_device_info"]["month_rx_bytes"] == "1000"
 assert [modem["id"] for modem in data["modems"]] == ["x75", "v3e1", "v3e2"]
 assert [modem["subid"] for modem in data["modems"]] == [2, 3, 5]
 assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"

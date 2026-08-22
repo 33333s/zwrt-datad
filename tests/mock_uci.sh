@@ -32,6 +32,51 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
     exit 0
 fi
 
+if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ]; then
+    case "${3:-}" in
+        zwrt_zte_mdm)
+            printf '%s\n' \
+                "zwrt_zte_mdm.sim_info.sim_iccid='8986000000000000000'" \
+                "zwrt_zte_mdm.sim_info.sim_imsi='460000000000001'" \
+                "zwrt_zte_mdm.sim_info.msisdn='10086'" \
+                "zwrt_zte_mdm.sim_info.current_sim_slot='1'" \
+                "zwrt_zte_mdm.sim_info.sim_states='ready'" \
+                "zwrt_zte_mdm.sim_info.modem_main_state='online'" \
+                "zwrt_zte_mdm.sim_info.pin_status='disabled'" \
+                "zwrt_zte_mdm.device_info.imei='860000000000001'" \
+                "zwrt_zte_mdm.device_info.modem_msn='fixture-msn'"
+            exit 0
+            ;;
+        zwrt_common_info)
+            printf '%s\n' \
+                "zwrt_common_info.common_config.wa_inner_version='BD_FIXTURE'" \
+                "zwrt_common_info.common_config.model_name='MU5252'"
+            exit 0
+            ;;
+        network)
+            printf '%s\n' \
+                "network.lan.ipaddr='192.168.0.1'" \
+                "network.lan.netmask='255.255.255.0'"
+            exit 0
+            ;;
+        dhcp)
+            printf '%s\n' \
+                "dhcp.lan.ignore='0'" \
+                "dhcp.lan.zte_start='192.168.0.2'" \
+                "dhcp.lan.zte_end='192.168.0.253'" \
+                "dhcp.lan.leasetime='12h'"
+            exit 0
+            ;;
+        zwrt_data_commit)
+            printf '%s\n' \
+                "zwrt_data_commit.wwancid1dst.day_rx_bytes='100'" \
+                "zwrt_data_commit.wwancid1dst.month_rx_bytes='1000'" \
+                "zwrt_data_commit.wwancid1dst.total_rx_bytes='10000'"
+            exit 0
+            ;;
+    esac
+fi
+
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     case "${3:-}" in
         wireless.main_2g.ssid) printf '%s\n' 'Fixture 2G' ;;

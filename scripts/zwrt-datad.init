@@ -5,7 +5,7 @@
 
 START=96
 USE_PROCD=1
-DIR=/data/plugins/zwrt-datad
+DIR=/data/zwrt-datad
 PROG=$DIR/zwrt-datad
 LAN_PORT=9461
 TOKEN_FILE=$DIR/auth.token
