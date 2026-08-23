@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.9",
+    "version": "0.9.10",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 三基带状态与链路聚合、风扇、风扇曲线、液冷控制"
+    "notes": "MU5252 可视化多点自定义温度/PWM 曲线与实时线性插值控制"
   }
 }

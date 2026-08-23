@@ -268,6 +268,8 @@ assert data["uci_device_info"]["lan_ipaddr"] == "192.168.0.1"
 assert data["uci_device_info"]["month_rx_bytes"] == "1000"
 assert [modem["id"] for modem in data["modems"]] == ["x75", "v3e1", "v3e2"]
 assert [modem["subid"] for modem in data["modems"]] == [2, 3, 5]
+assert data["modems"][0]["net"]["nr_pci"] == 321
+assert data["modems"][0]["net"]["nr_cell_id"] == 123456
 assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
 assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
 assert data["thermal"]["cpu_celsius"] == 42
@@ -289,12 +291,13 @@ assert data["cooling"]["fan"]["enabled"] is True
 assert data["cooling"]["fan"]["mode"] == "manual"
 assert data["cooling"]["fan"]["pwm"] == 128
 assert data["cooling"]["fan"]["speed_percent"] == 50
+assert data["cooling"]["fan"]["manual_speed_percent"] == 0
 assert "rpm" not in data["cooling"]["fan"]
 assert data["cooling"]["liquid"]["enabled"] is False
 assert data["cooling"]["curve"] == [
-    {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4},
-    {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4},
-    {"level": 3, "temperature_celsius": 53, "hysteresis_celsius": 4},
+    {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4, "pwm": 76, "speed_percent": 30},
+    {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4, "pwm": 128, "speed_percent": 50},
+    {"level": 3, "temperature_celsius": 53, "hysteresis_celsius": 4, "pwm": 179, "speed_percent": 70},
 ]
 '
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
@@ -360,16 +363,48 @@ assert data["result"]["speed_percent"] == 65
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
-    -d '{"action":"cooling.fan.set_curve","params":{"temperature_1":42,"temperature_2":47,"temperature_3":52,"hysteresis_1":3,"hysteresis_2":3,"hysteresis_3":4}}' \
+    -d '{"action":"cooling.fan.set_curve","params":{"points":[{"temperature":40,"pwm":0},{"temperature":45,"pwm":0},{"temperature":50,"pwm":76},{"temperature":60,"pwm":128},{"temperature":70,"pwm":255}]}}' \
     "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 assert data["ok"] is True
-assert data["result"]["mode"] == "automatic"
+assert data["result"]["mode"] == "custom"
+assert len(data["result"]["points"]) == 5
 '
-[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
-[ "$(cat "$COOLING_TMP/zone/trip_point_0_temp")" = "42000" ]
-[ "$(cat "$COOLING_TMP/zone/trip_point_2_temp")" = "52000" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+[ "$(cat "$COOLING_TMP/pwm1")" = "30" ]
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "0" ]
+grep -F 'fan_mode=2' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'custom_curve_count=5' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'custom_temperature_5=70' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'custom_pwm_5=255' "$COOLING_TMP/cooling.conf" >/dev/null
+
+printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.refresh","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+sleep 0.3
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["cooling"]["fan"]["mode"] == "custom"
+assert data["cooling"]["fan"]["pwm"] == 255
+assert data["cooling"]["fan"]["manual_speed_percent"] == 65
+assert len(data["cooling"]["curve"]) == 5
+assert data["cooling"]["curve"][2] == {
+    "temperature_celsius": 50, "pwm": 76, "speed_percent": 30
+}
+'
+printf '%s\n' '47000' >"$COOLING_TMP/zone/temp"
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_curve","params":{"points":[{"temperature":50,"pwm":120},{"temperature":45,"pwm":150}]}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control")"
+[ "$code" = "400" ]
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \

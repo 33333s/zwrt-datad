@@ -77,6 +77,8 @@
 #define TOPFLOW_FAN_THERMAL_ENABLE_PATH "/sys/class/hwmon/hwmon0/device/thermal_enable"
 #define TOPFLOW_LIQUID_THERMAL_ENABLE_PATH "/sys/class/leds/aw_vibrator/thermal_enable"
 #define TOPFLOW_THERMAL_ROOT "/sys/class/thermal"
+#define TOPFLOW_COOLING_CONFIG "/data/zwrt-datad/cooling.conf"
+#define TOPFLOW_CUSTOM_CURVE_MAX 8
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -1374,15 +1376,76 @@ static int read_uci_flag(const char *path, int fallback)
     return parsed != 0;
 }
 
+static long normalize_temp_reading(long raw);
+
+struct topflow_curve_point {
+    int temperature;
+    int pwm;
+};
+
+static int load_topflow_custom_curve(int *fan_mode, int *manual_speed_percent,
+                                     struct topflow_curve_point *points, int *count)
+{
+    const char *config = runtime_path("ZWRT_DATAD_COOLING_CONFIG", TOPFLOW_COOLING_CONFIG);
+    FILE *fp = fopen(config, "r");
+    char line[128], key[64];
+    int value, curve_count = 0;
+    if (fan_mode) *fan_mode = 0;
+    if (manual_speed_percent) *manual_speed_percent = 0;
+    if (count) *count = 0;
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        int index;
+        if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
+        if (!strcmp(key, "fan_mode") && fan_mode) *fan_mode = value;
+        else if (!strcmp(key, "fan_speed_percent") && manual_speed_percent)
+            *manual_speed_percent = value;
+        else if (!strcmp(key, "custom_curve_count")) curve_count = value;
+        else if (sscanf(key, "custom_temperature_%d", &index) == 1 &&
+                 index >= 1 && index <= TOPFLOW_CUSTOM_CURVE_MAX)
+            points[index - 1].temperature = value;
+        else if (sscanf(key, "custom_pwm_%d", &index) == 1 &&
+                 index >= 1 && index <= TOPFLOW_CUSTOM_CURVE_MAX)
+            points[index - 1].pwm = value;
+    }
+    fclose(fp);
+    if (curve_count < 2 || curve_count > TOPFLOW_CUSTOM_CURVE_MAX) return 0;
+    if (count) *count = curve_count;
+    return 1;
+}
+
 static void emit_topflow_hardware_controls(struct buf *b)
 {
     char zone[PATH_MAX], path[PATH_MAX], mode[32] = "disabled";
     char aggregation_mode[32] = "";
-    long pwm, rpm, fan_thermal, liquid_thermal;
+    long pwm, rpm, fan_thermal, liquid_thermal, cooling_temp = -1;
     int fan_enabled, liquid_enabled, aggregation_enabled, automatic = 0;
+    int configured_fan_mode = 0, configured_manual_speed = 0, custom_curve_count = 0;
+    struct topflow_curve_point custom_curve[TOPFLOW_CUSTOM_CURVE_MAX] = {{0, 0}};
     long temperatures[3] = {44000, 48000, 53000};
     long hysteresis[3] = {4000, 4000, 4000};
+    if (device_uci_get("zwrt_router.network.opms_wan_mode",
+                       aggregation_mode, sizeof aggregation_mode) != 0)
+        aggregation_mode[0] = 0;
+    aggregation_enabled = !strcmp(aggregation_mode, "SMULTIWAN");
 
+    if (find_topflow_cooling_zone(zone, sizeof zone)) {
+        if (snprintf(path, sizeof path, "%s/mode", zone) < (int)sizeof path &&
+            read_line_file(path, mode, sizeof mode))
+            automatic = !strcmp(mode, "enabled");
+        if (snprintf(path, sizeof path, "%s/temp", zone) < (int)sizeof path)
+            cooling_temp = normalize_temp_reading(read_long_file(path, -1));
+        for (int i = 0; i < 3; i++) {
+            if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) < (int)sizeof path)
+                temperatures[i] = read_long_file(path, temperatures[i]);
+            if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) < (int)sizeof path)
+                hysteresis[i] = read_long_file(path, hysteresis[i]);
+        }
+    }
+    if (!load_topflow_custom_curve(&configured_fan_mode, &configured_manual_speed,
+                                   custom_curve, &custom_curve_count))
+        configured_fan_mode = 0;
+    control_cooling_tick(cooling_temp);
     pwm = read_long_file(runtime_path("ZWRT_DATAD_FAN_PWM_PATH", TOPFLOW_FAN_PWM_PATH), -1);
     rpm = read_long_file(runtime_path("ZWRT_DATAD_FAN_RPM_PATH", TOPFLOW_FAN_RPM_PATH), -1);
     fan_thermal = read_labeled_long_file(
@@ -1393,22 +1456,6 @@ static void emit_topflow_hardware_controls(struct buf *b)
         "thermal_enable", -1);
     fan_enabled = read_uci_flag("zwrt_deviceui.Device.fan_switch_status", pwm > 0);
     liquid_enabled = read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
-    if (device_uci_get("zwrt_router.network.opms_wan_mode",
-                       aggregation_mode, sizeof aggregation_mode) != 0)
-        aggregation_mode[0] = 0;
-    aggregation_enabled = !strcmp(aggregation_mode, "SMULTIWAN");
-
-    if (find_topflow_cooling_zone(zone, sizeof zone)) {
-        if (snprintf(path, sizeof path, "%s/mode", zone) < (int)sizeof path &&
-            read_line_file(path, mode, sizeof mode))
-            automatic = !strcmp(mode, "enabled");
-        for (int i = 0; i < 3; i++) {
-            if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) < (int)sizeof path)
-                temperatures[i] = read_long_file(path, temperatures[i]);
-            if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) < (int)sizeof path)
-                hysteresis[i] = read_long_file(path, hysteresis[i]);
-        }
-    }
 
     bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"",
             aggregation_enabled ? "true" : "false");
@@ -1416,19 +1463,35 @@ static void emit_topflow_hardware_controls(struct buf *b)
     bappend(b, "\"},");
     bappend(b, "\"cooling\":{\"fan\":{");
     bappend(b, "\"enabled\":%s,\"mode\":\"%s\",",
-            fan_enabled ? "true" : "false", automatic ? "automatic" : "manual");
+            fan_enabled ? "true" : "false",
+            configured_fan_mode == 2 ? "custom" : (automatic ? "automatic" : "manual"));
     bappend(b, "\"pwm\":%ld,\"max_pwm\":255,\"speed_percent\":%ld,",
             pwm, pwm >= 0 ? (pwm * 100 + 127) / 255 : -1);
+    bappend(b, "\"manual_speed_percent\":%d,", configured_manual_speed);
+    if (cooling_temp > 0) bappend(b, "\"temperature_celsius\":%ld,", cooling_temp);
+    bappend(b, "\"hard_full_speed_celsius\":80,");
     if (rpm >= 0) bappend(b, "\"rpm\":%ld,", rpm);
     bappend(b, "\"thermal_enabled\":%s,\"levels_percent\":[0,30,50,70]},",
             fan_thermal > 0 ? "true" : "false");
     bappend(b, "\"liquid\":{\"enabled\":%s,\"thermal_enabled\":%s},",
             liquid_enabled ? "true" : "false", liquid_thermal > 0 ? "true" : "false");
     bappend(b, "\"curve\":[");
-    for (int i = 0; i < 3; i++) {
-        if (i) bappend(b, ",");
-        bappend(b, "{\"level\":%d,\"temperature_celsius\":%ld,\"hysteresis_celsius\":%ld}",
-                i + 1, temperatures[i] / 1000, hysteresis[i] / 1000);
+    if (configured_fan_mode == 2 && custom_curve_count >= 2) {
+        for (int i = 0; i < custom_curve_count; i++) {
+            if (i) bappend(b, ",");
+            bappend(b, "{\"temperature_celsius\":%d,\"pwm\":%d,\"speed_percent\":%d}",
+                    custom_curve[i].temperature, custom_curve[i].pwm,
+                    (custom_curve[i].pwm * 100 + 127) / 255);
+        }
+    } else {
+        static const int kernel_pwm[3] = {76, 128, 179};
+        for (int i = 0; i < 3; i++) {
+            if (i) bappend(b, ",");
+            bappend(b, "{\"level\":%d,\"temperature_celsius\":%ld,"
+                    "\"hysteresis_celsius\":%ld,\"pwm\":%d,\"speed_percent\":%d}",
+                    i + 1, temperatures[i] / 1000, hysteresis[i] / 1000,
+                    kernel_pwm[i], (kernel_pwm[i] * 100 + 127) / 255);
+        }
     }
     bappend(b, "]},");
 }
@@ -2387,8 +2450,13 @@ static void emit_topflow_modems(struct buf *b, const char *net, const char *traf
     emit_int(b, "nr_rsrp", net, "nr5g_rsrp", 0); bappend(b, ",");
     emit_int(b, "nr_rsrq", net, "nr5g_rsrq", 0); bappend(b, ",");
     emit_str(b, "nr_snr", net, "nr5g_snr"); bappend(b, ",");
+    emit_int(b, "nr_pci", net, "nr5g_pci", 0); bappend(b, ",");
+    emit_int(b, "nr_cell_id", net, "nr5g_cell_id", 0); bappend(b, ",");
+    emit_int(b, "nr_channel", net, "nr5g_action_channel", 0); bappend(b, ",");
     emit_int(b, "lte_rsrp", net, "lte_rsrp", 0); bappend(b, ",");
-    emit_int(b, "lte_rsrq", net, "lte_rsrq", 0);
+    emit_int(b, "lte_rsrq", net, "lte_rsrq", 0); bappend(b, ",");
+    emit_int(b, "lte_pci", net, "lte_pci", 0); bappend(b, ",");
+    emit_int(b, "cell_id", net, "cell_id", 0);
     bappend(b, "},\"sim\":{");
     emit_str(b, "state", g_sim_cache, "sim_states"); bappend(b, ",");
     emit_int(b, "slot", g_sim_cache, "current_sim_slot", 0); bappend(b, ",");
@@ -4102,6 +4170,7 @@ int main(int argc, char **argv)
         cycle++;
     } while (g_run);
 
+    if (g_topflow_multimodem_enabled) control_release_cooling_state();
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
     if (lan_listener.fd >= 0) close(lan_listener.fd);
     if (local_listener.fd >= 0) close(local_listener.fd);

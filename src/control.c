@@ -54,14 +54,29 @@ static char g_device_password_hash[129];
 #define FAN_THERMAL_ENABLE_DEFAULT "/sys/class/hwmon/hwmon0/device/thermal_enable"
 #define LIQUID_DRIVE_DEFAULT "/sys/class/leds/aw_vibrator/atsin0"
 #define THERMAL_ROOT_DEFAULT "/sys/class/thermal"
+#define CUSTOM_CURVE_MAX_POINTS 8
+#define CUSTOM_CURVE_HARD_FULL_SPEED_C 80
+
+enum fan_control_mode {
+    FAN_MODE_MANUAL = 0,
+    FAN_MODE_KERNEL = 1,
+    FAN_MODE_CUSTOM = 2
+};
+
+struct fan_curve_point {
+    int temperature;
+    int pwm;
+};
 
 struct cooling_config {
     int fan_enabled;
-    int fan_auto;
+    int fan_mode;
     int fan_speed_percent;
     int liquid_enabled;
     int temperatures[3];
     int hysteresis[3];
+    int custom_curve_count;
+    struct fan_curve_point custom_curve[CUSTOM_CURVE_MAX_POINTS];
 };
 
 static const char *env_path(const char *name, const char *fallback)
@@ -136,12 +151,18 @@ static int find_cooling_zone(char *out, size_t outlen)
 static void cooling_config_defaults(struct cooling_config *cfg)
 {
     memset(cfg, 0, sizeof *cfg);
-    cfg->fan_auto = 0;
+    cfg->fan_mode = FAN_MODE_MANUAL;
     cfg->fan_speed_percent = 50;
     cfg->temperatures[0] = 44;
     cfg->temperatures[1] = 48;
     cfg->temperatures[2] = 53;
     cfg->hysteresis[0] = cfg->hysteresis[1] = cfg->hysteresis[2] = 4;
+    cfg->custom_curve_count = 5;
+    cfg->custom_curve[0] = (struct fan_curve_point){40, 0};
+    cfg->custom_curve[1] = (struct fan_curve_point){45, 0};
+    cfg->custom_curve[2] = (struct fan_curve_point){50, 76};
+    cfg->custom_curve[3] = (struct fan_curve_point){60, 128};
+    cfg->custom_curve[4] = (struct fan_curve_point){70, 255};
 }
 
 static int load_cooling_config(struct cooling_config *cfg)
@@ -149,14 +170,21 @@ static int load_cooling_config(struct cooling_config *cfg)
     const char *path = env_path("ZWRT_DATAD_COOLING_CONFIG", COOLING_CONFIG_DEFAULT);
     FILE *fp;
     char line[128], key[64];
-    int value, loaded = 0;
+    int value, loaded = 0, mode_seen = 0;
     cooling_config_defaults(cfg);
     fp = fopen(path, "r");
     if (!fp) return 0;
     while (fgets(line, sizeof line, fp)) {
         if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
         if (!strcmp(key, "fan_enabled")) cfg->fan_enabled = value != 0;
-        else if (!strcmp(key, "fan_auto")) cfg->fan_auto = value != 0;
+        else if (!strcmp(key, "fan_auto") && !mode_seen)
+            cfg->fan_mode = value ? FAN_MODE_KERNEL : FAN_MODE_MANUAL;
+        else if (!strcmp(key, "fan_mode")) {
+            if (value >= FAN_MODE_MANUAL && value <= FAN_MODE_CUSTOM) {
+                cfg->fan_mode = value;
+                mode_seen = 1;
+            }
+        }
         else if (!strcmp(key, "fan_speed_percent")) cfg->fan_speed_percent = value;
         else if (!strcmp(key, "liquid_enabled")) cfg->liquid_enabled = value != 0;
         else if (!strcmp(key, "temperature_1")) cfg->temperatures[0] = value;
@@ -165,6 +193,18 @@ static int load_cooling_config(struct cooling_config *cfg)
         else if (!strcmp(key, "hysteresis_1")) cfg->hysteresis[0] = value;
         else if (!strcmp(key, "hysteresis_2")) cfg->hysteresis[1] = value;
         else if (!strcmp(key, "hysteresis_3")) cfg->hysteresis[2] = value;
+        else if (!strcmp(key, "custom_curve_count")) {
+            if (value >= 2 && value <= CUSTOM_CURVE_MAX_POINTS)
+                cfg->custom_curve_count = value;
+        } else {
+            int index;
+            if (sscanf(key, "custom_temperature_%d", &index) == 1 &&
+                index >= 1 && index <= CUSTOM_CURVE_MAX_POINTS)
+                cfg->custom_curve[index - 1].temperature = value;
+            else if (sscanf(key, "custom_pwm_%d", &index) == 1 &&
+                     index >= 1 && index <= CUSTOM_CURVE_MAX_POINTS)
+                cfg->custom_curve[index - 1].pwm = value;
+        }
         loaded = 1;
     }
     fclose(fp);
@@ -181,14 +221,23 @@ static int save_cooling_config(const struct cooling_config *cfg)
     fp = fopen(temp, "w");
     if (!fp) return 0;
     if (fprintf(fp,
-                "fan_enabled=%d\nfan_auto=%d\nfan_speed_percent=%d\n"
+                "fan_enabled=%d\nfan_auto=%d\nfan_mode=%d\nfan_speed_percent=%d\n"
                 "liquid_enabled=%d\ntemperature_1=%d\ntemperature_2=%d\ntemperature_3=%d\n"
-                "hysteresis_1=%d\nhysteresis_2=%d\nhysteresis_3=%d\n",
-                cfg->fan_enabled, cfg->fan_auto, cfg->fan_speed_percent,
+                "hysteresis_1=%d\nhysteresis_2=%d\nhysteresis_3=%d\n"
+                "custom_curve_count=%d\n",
+                cfg->fan_enabled, cfg->fan_mode == FAN_MODE_KERNEL, cfg->fan_mode,
+                cfg->fan_speed_percent,
                 cfg->liquid_enabled,
                 cfg->temperatures[0], cfg->temperatures[1], cfg->temperatures[2],
-                cfg->hysteresis[0], cfg->hysteresis[1], cfg->hysteresis[2]) < 0)
+                cfg->hysteresis[0], cfg->hysteresis[1], cfg->hysteresis[2],
+                cfg->custom_curve_count) < 0)
         failed = 1;
+    for (int i = 0; !failed && i < cfg->custom_curve_count; i++) {
+        if (fprintf(fp, "custom_temperature_%d=%d\ncustom_pwm_%d=%d\n",
+                    i + 1, cfg->custom_curve[i].temperature,
+                    i + 1, cfg->custom_curve[i].pwm) < 0)
+            failed = 1;
+    }
     if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) failed = 1;
     if (fclose(fp) != 0) failed = 1;
     if (failed) {
@@ -210,14 +259,18 @@ static int set_vendor_switch_status(const char *key, int enabled)
     return device_uci_commit("zwrt_deviceui") == 0;
 }
 
-static int set_fan_pwm_percent(int percent)
+static int set_fan_pwm(int pwm)
 {
     char value[16];
-    int pwm;
-    if (percent < 0 || percent > 100) return 0;
-    pwm = (percent * 255 + 50) / 100;
+    if (pwm < 0 || pwm > 255) return 0;
     snprintf(value, sizeof value, "%d", pwm);
     return write_text_file(env_path("ZWRT_DATAD_FAN_PWM_PATH", FAN_PWM_DEFAULT), value);
+}
+
+static int set_fan_pwm_percent(int percent)
+{
+    if (percent < 0 || percent > 100) return 0;
+    return set_fan_pwm((percent * 255 + 50) / 100);
 }
 
 static int set_fan_thermal_enabled(int enabled)
@@ -258,14 +311,61 @@ static int apply_liquid_switch(int enabled)
                            enabled ? "1023 60 200" : "0 0 0");
 }
 
+static long read_custom_curve_temperature(void)
+{
+    char zone[PATH_MAX], path[PATH_MAX], line[64], *end;
+    long raw;
+    if (!find_cooling_zone(zone, sizeof zone)) return -1;
+    if (snprintf(path, sizeof path, "%s/temp", zone) >= (int)sizeof path) return -1;
+    if (!read_text_file(path, line, sizeof line)) return -1;
+    errno = 0;
+    raw = strtol(line, &end, 10);
+    if (errno || end == line || raw <= 0) return -1;
+    return raw >= 1000 ? (raw + 500) / 1000 : raw;
+}
+
+static int custom_curve_pwm(const struct cooling_config *cfg, long temperature)
+{
+    const struct fan_curve_point *points = cfg->custom_curve;
+    int count = cfg->custom_curve_count;
+    if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) return 255;
+    if (count < 2 || temperature <= 0) return -1;
+    if (temperature <= points[0].temperature) return points[0].pwm;
+    for (int i = 1; i < count; i++) {
+        long x0 = points[i - 1].temperature;
+        long x1 = points[i].temperature;
+        long y0 = points[i - 1].pwm;
+        long y1 = points[i].pwm;
+        if (temperature <= x1) {
+            long numerator = (temperature - x0) * (y1 - y0);
+            return (int)(y0 + (numerator + (x1 - x0) / 2) / (x1 - x0));
+        }
+    }
+    return points[count - 1].pwm;
+}
+
+static int apply_custom_curve(const struct cooling_config *cfg, long temperature)
+{
+    int pwm = custom_curve_pwm(cfg, temperature);
+    if (pwm < 0) return 0;
+    (void)set_cooling_zone_mode(0);
+    return set_fan_pwm(pwm);
+}
+
 static int apply_fan_config(const struct cooling_config *cfg)
 {
     if (!cfg->fan_enabled) {
         (void)set_cooling_zone_mode(0);
-        return set_fan_pwm_percent(0);
+        if (!set_fan_thermal_enabled(0)) return 0;
+        return set_fan_pwm(0);
     }
-    if (!set_fan_thermal_enabled(1)) return 0;
-    if (cfg->fan_auto) return apply_fan_curve(cfg);
+    if (cfg->fan_mode == FAN_MODE_KERNEL) {
+        if (!set_fan_thermal_enabled(1)) return 0;
+        return apply_fan_curve(cfg);
+    }
+    if (!set_fan_thermal_enabled(0)) return 0;
+    if (cfg->fan_mode == FAN_MODE_CUSTOM)
+        return apply_custom_curve(cfg, read_custom_curve_temperature());
     (void)set_cooling_zone_mode(0);
     return set_fan_pwm_percent(cfg->fan_speed_percent);
 }
@@ -276,6 +376,30 @@ void control_restore_cooling_state(void)
     if (!load_cooling_config(&cfg)) return;
     (void)apply_fan_config(&cfg);
     (void)apply_liquid_switch(cfg.liquid_enabled);
+}
+
+void control_cooling_tick(long temperature_celsius)
+{
+    struct cooling_config cfg;
+    int pwm;
+    if (temperature_celsius <= 0 || !load_cooling_config(&cfg) ||
+        !cfg.fan_enabled || cfg.fan_mode != FAN_MODE_CUSTOM)
+        return;
+    pwm = custom_curve_pwm(&cfg, temperature_celsius);
+    if (pwm < 0) return;
+    /* Vendor sleep/wakeup events may turn thermal_enable back on. Reassert
+     * custom ownership and the interpolated PWM every sampling tick. */
+    if (!set_fan_thermal_enabled(0)) return;
+    (void)set_fan_pwm(pwm);
+}
+
+void control_release_cooling_state(void)
+{
+    struct cooling_config cfg;
+    if (!load_cooling_config(&cfg) || cfg.fan_mode == FAN_MODE_KERNEL) return;
+    /* If datad is intentionally stopped, hand control back to the vendor
+     * thermal driver. A restarted datad will immediately restore custom mode. */
+    (void)set_fan_thermal_enabled(1);
 }
 
 static void jb_add(struct json_buf *b, const char *fmt, ...)
@@ -972,7 +1096,9 @@ static int control_fan_enabled(const char *params, char *result, size_t result_l
         return 0;
     }
     snprintf(result, result_len, "{\"enabled\":%s,\"mode\":\"%s\"}",
-             enabled ? "true" : "false", cfg.fan_auto ? "automatic" : "manual");
+             enabled ? "true" : "false",
+             cfg.fan_mode == FAN_MODE_CUSTOM ? "custom" :
+             (cfg.fan_mode == FAN_MODE_KERNEL ? "automatic" : "manual"));
     return 1;
 }
 
@@ -983,7 +1109,7 @@ static int control_fan_speed(const char *params, char *result, size_t result_len
     int percent;
     (void)load_cooling_config(&cfg);
     if (!required_range_param(params, "percent", 0, 100, &percent, err, errlen)) return 0;
-    cfg.fan_auto = 0;
+    cfg.fan_mode = FAN_MODE_MANUAL;
     cfg.fan_speed_percent = percent;
     cfg.fan_enabled = percent > 0;
     if (!apply_fan_config(&cfg)) {
@@ -1001,30 +1127,89 @@ static int control_fan_speed(const char *params, char *result, size_t result_len
     return 1;
 }
 
+static int parse_custom_curve(const char *params, struct cooling_config *cfg,
+                              char *err, size_t errlen)
+{
+    char array[4096];
+    const char *p;
+    int count = 0;
+    if (!json_get(params, "points", array, sizeof array) || array[0] != '[') {
+        set_invalid_error(err, errlen, "points must be an array");
+        return 0;
+    }
+    p = array + 1;
+    while (*p) {
+        const char *start;
+        int depth = 0, in_string = 0, escaped = 0;
+        char object[256];
+        size_t len;
+        long temperature, pwm;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ',') { p++; continue; }
+        if (*p == ']') break;
+        if (*p != '{' || count >= CUSTOM_CURVE_MAX_POINTS) {
+            set_invalid_error(err, errlen, "points must contain 2 to %d objects",
+                              CUSTOM_CURVE_MAX_POINTS);
+            return 0;
+        }
+        start = p;
+        for (; *p; p++) {
+            char c = *p;
+            if (in_string) {
+                if (escaped) escaped = 0;
+                else if (c == '\\') escaped = 1;
+                else if (c == '"') in_string = 0;
+                continue;
+            }
+            if (c == '"') in_string = 1;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) { p++; break; }
+        }
+        if (depth != 0 || (len = (size_t)(p - start)) >= sizeof object) {
+            set_invalid_error(err, errlen, "invalid curve point object");
+            return 0;
+        }
+        memcpy(object, start, len);
+        object[len] = 0;
+        temperature = json_get_int(object, "temperature", LONG_MIN);
+        pwm = json_get_int(object, "pwm", LONG_MIN);
+        if (temperature < 20 || temperature > CUSTOM_CURVE_HARD_FULL_SPEED_C ||
+            pwm < 0 || pwm > 255) {
+            set_invalid_error(err, errlen,
+                              "curve temperature must be 20..%d and pwm must be 0..255",
+                              CUSTOM_CURVE_HARD_FULL_SPEED_C);
+            return 0;
+        }
+        if (count > 0 &&
+            (temperature <= cfg->custom_curve[count - 1].temperature ||
+             pwm < cfg->custom_curve[count - 1].pwm)) {
+            set_invalid_error(err, errlen,
+                              "curve temperatures must increase and pwm must not decrease");
+            return 0;
+        }
+        cfg->custom_curve[count].temperature = (int)temperature;
+        cfg->custom_curve[count].pwm = (int)pwm;
+        count++;
+    }
+    if (count < 2) {
+        set_invalid_error(err, errlen, "curve requires at least 2 points");
+        return 0;
+    }
+    cfg->custom_curve_count = count;
+    return 1;
+}
+
 static int control_fan_curve(const char *params, char *result, size_t result_len,
                              char *err, size_t errlen)
 {
     struct cooling_config cfg;
+    struct json_buf response = {result, result_len, 0};
     (void)load_cooling_config(&cfg);
-    if (!required_range_param(params, "temperature_1", 20, 80, &cfg.temperatures[0], err, errlen) ||
-        !required_range_param(params, "temperature_2", 20, 80, &cfg.temperatures[1], err, errlen) ||
-        !required_range_param(params, "temperature_3", 20, 80, &cfg.temperatures[2], err, errlen))
-        return 0;
-    if (!(cfg.temperatures[0] < cfg.temperatures[1] &&
-          cfg.temperatures[1] < cfg.temperatures[2])) {
-        set_invalid_error(err, errlen, "curve temperatures must be strictly increasing");
-        return 0;
-    }
-    for (int i = 0; i < 3; i++) {
-        char name[32];
-        snprintf(name, sizeof name, "hysteresis_%d", i + 1);
-        if (!required_range_param(params, name, 0, 15, &cfg.hysteresis[i], err, errlen))
-            return 0;
-    }
-    cfg.fan_auto = 1;
+    if (!parse_custom_curve(params, &cfg, err, errlen)) return 0;
+    cfg.fan_mode = FAN_MODE_CUSTOM;
     cfg.fan_enabled = 1;
     if (!apply_fan_config(&cfg)) {
-        snprintf(err, errlen, "automatic fan curve is unavailable");
+        snprintf(err, errlen, "custom fan curve is unavailable");
         return 0;
     }
     if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", 1) ||
@@ -1032,11 +1217,15 @@ static int control_fan_curve(const char *params, char *result, size_t result_len
         snprintf(err, errlen, "failed to persist fan curve");
         return 0;
     }
-    snprintf(result, result_len,
-             "{\"enabled\":true,\"mode\":\"automatic\",\"temperature_1\":%d,"
-             "\"temperature_2\":%d,\"temperature_3\":%d}",
-             cfg.temperatures[0], cfg.temperatures[1], cfg.temperatures[2]);
-    return 1;
+    result[0] = 0;
+    jb_add(&response, "{\"enabled\":true,\"mode\":\"custom\",\"points\":[");
+    for (int i = 0; i < cfg.custom_curve_count; i++) {
+        if (i) jb_add(&response, ",");
+        jb_add(&response, "{\"temperature\":%d,\"pwm\":%d}",
+               cfg.custom_curve[i].temperature, cfg.custom_curve[i].pwm);
+    }
+    jb_add(&response, "]}");
+    return response.len + 1 < response.cap;
 }
 
 static int control_liquid_enabled(const char *params, char *result, size_t result_len,
