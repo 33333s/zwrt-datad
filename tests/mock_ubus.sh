@@ -71,6 +71,15 @@ case "$service:$method" in
     zwrt_web:web_login)
         printf '%s\n' '{"result":0,"ubus_rpc_session":"fixture-session"}'
         ;;
+    zwrt_web:web_login_info)
+        printf '%s\n' '{"zte_web_sault":"fixture-salt","login_fail_num":0}'
+        ;;
+    zwrt_router.api:router_get_wifi_isolate)
+        printf '%s\n' '{"wifimain24_wifimain5_enable":1,"other_option":7}'
+        ;;
+    zwrt_router.api:router_set_wifi_isolate|zwrt_router.api:router_set_wan_mtu)
+        printf '%s\n' '{"result":"success"}'
+        ;;
     zwrt_data:get_wwaniface)
         printf '%s\n' '{"enable":1,"roam_enable":0,"connect_mode":"auto","connect_status":"ipv4_ipv6_connected","ipv4_dev_name":"fixture0","ipv6_dev_name":"fixture0","pdp_type":"IPV4V6","profile_id":7}'
         ;;

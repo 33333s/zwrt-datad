@@ -22,6 +22,14 @@ TOPFLOW_PID=""
 MC7523_PID=""
 MC8532B_PID=""
 
+sh -n "$ROOT/scripts/service.sh"
+grep -F 'SERVICE_DIR="${ZWRT_DATAD_DIR:-/data/zwrt-datad}"' "$ROOT/scripts/service.sh" >/dev/null
+grep -F 'PID_FILE="${ZWRT_DATAD_PID_FILE:-$SERVICE_DIR/zwrt-datad.pid}"' "$ROOT/scripts/service.sh" >/dev/null
+if grep -F '/etc/init.d' "$ROOT/scripts/service.sh" >/dev/null; then
+    echo 'service.sh must not use /etc/init.d' >&2
+    exit 1
+fi
+
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
     [ -n "$PID" ] && wait "$PID" 2>/dev/null || true
@@ -118,6 +126,43 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -d '{"action":"wifi.status","params":{}}' \
     "http://127.0.0.1:$PORT/control" | python3 -c \
     'import json,sys; data=json.load(sys.stdin); assert data["result"]["main_2g"]["ssid"] == "Fixture 2G"'
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"device.login_info","params":{}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["zte_web_sault"] == "fixture-salt"'
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"device.login","params":{"password_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"device.session_status","params":{}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["logged_in"] is True'
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.dual_band_status","params":{}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["WiFiDualBandEnabled"] == "1"'
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.set_dual_band","params":{"enabled":false}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+grep -F 'router_set_wifi_isolate' "$CALL_LOG" | grep -F '"wifimain24_wifimain5_enable":0' | grep -F '"other_option":7' >/dev/null
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"lan.set_mtu","params":{"mtu":"1500"}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+grep -F 'router_set_wan_mtu' "$CALL_LOG" | grep -F '"wan_mtu":"1500"' >/dev/null
 
 code="$(curl -sS -o "$INVALID_JSON_OUT" -w '%{http_code}' \
     -H 'Authorization: Bearer fixture-private-token' \

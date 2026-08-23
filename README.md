@@ -101,18 +101,25 @@ nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
 ./zwrt-datad -i 1000 --lan-bind 0.0.0.0 --lan-port 9461
 ```
 
-作为 OpenWRT 服务安装：
+作为 OpenWRT 常驻服务安装：
 
 ```sh
 adb shell 'mkdir -p /data/zwrt-datad'
 adb push zwrt-datad-aarch64 /data/zwrt-datad/zwrt-datad
-adb push scripts/zwrt-datad.init /etc/init.d/zwrt-datad
-adb shell 'chmod 755 /data/zwrt-datad/zwrt-datad /etc/init.d/zwrt-datad &&
-           /etc/init.d/zwrt-datad enable &&
-           /etc/init.d/zwrt-datad start'
+adb push scripts/service.sh /data/zwrt-datad/service.sh
+adb shell 'chmod 755 /data/zwrt-datad/zwrt-datad /data/zwrt-datad/service.sh &&
+           sh /data/zwrt-datad/service.sh start'
 ```
 
-init 脚本会保留本机 `127.0.0.1:9460`，同时开启 `0.0.0.0:9461` 内网鉴权口。若静态 Token 文件不存在，内网口仍可通过动态登录发放临时 Token。
+`service.sh` 会保留本机 `127.0.0.1:9460`，同时开启 `0.0.0.0:9461` 内网鉴权口。若静态 Token 文件不存在，内网口仍可通过动态登录发放临时 Token。PID 与日志分别写在 `/data/zwrt-datad/zwrt-datad.pid` 和 `/data/zwrt-datad/zwrt-datad.log`。
+
+开机自启只修改 `/etc/rc.local`，在原有 `exit 0` 之前加入：
+
+```sh
+sh /data/zwrt-datad/service.sh start
+```
+
+不要把 datad 启动脚本放进 `/etc/init.d`。除 `/etc/rc.local` 外，datad 的安装和运行文件全部放在 `/data/zwrt-datad`；如果同机还运行 UFI，应让 `rc.local` 先启动 datad，再调用 `/data/ufi-tools/service.sh start`。
 
 ## 读取方式
 

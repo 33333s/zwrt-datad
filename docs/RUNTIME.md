@@ -4,7 +4,16 @@
 
 ## 推荐启动方式
 
-在 OpenWrt 上优先使用 [`scripts/zwrt-datad.init`](../scripts/zwrt-datad.init) 交给 `procd` 管理。临时后台启动可用：
+正式启动脚本是项目内的 [`scripts/service.sh`](../scripts/service.sh)，部署后固定放在 `/data/zwrt-datad/service.sh`：
+
+```sh
+sh /data/zwrt-datad/service.sh start
+sh /data/zwrt-datad/service.sh status
+```
+
+开机自启只允许在 `/etc/rc.local` 的 `exit 0` 之前调用 `sh /data/zwrt-datad/service.sh start`，不向 `/etc/init.d` 安装 datad 脚本。除 `rc.local` 外，二进制、脚本、PID、日志、Token 与配置全部留在 `/data/zwrt-datad`。
+
+临时调试若确实需要绕过正式脚本，可用：
 
 ```sh
 nohup /data/zwrt-datad/zwrt-datad -i 1000 \
