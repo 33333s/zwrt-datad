@@ -10,6 +10,7 @@ struct control_result {
 };
 
 const char *control_capabilities_json(void);
+void control_restore_cooling_state(void);
 struct control_result control_execute(const char *request_json,
                                       char *response, size_t response_len);
 

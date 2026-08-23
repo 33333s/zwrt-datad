@@ -12,7 +12,10 @@
 #include "json.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -45,6 +48,235 @@ struct json_buf {
 
 static char g_device_session[256];
 static char g_device_password_hash[129];
+
+#define COOLING_CONFIG_DEFAULT "/data/zwrt-datad/cooling.conf"
+#define FAN_PWM_DEFAULT "/sys/class/hwmon/hwmon0/pwm1"
+#define FAN_THERMAL_ENABLE_DEFAULT "/sys/class/hwmon/hwmon0/device/thermal_enable"
+#define LIQUID_DRIVE_DEFAULT "/sys/class/leds/aw_vibrator/atsin0"
+#define THERMAL_ROOT_DEFAULT "/sys/class/thermal"
+
+struct cooling_config {
+    int fan_enabled;
+    int fan_auto;
+    int fan_speed_percent;
+    int liquid_enabled;
+    int temperatures[3];
+    int hysteresis[3];
+};
+
+static const char *env_path(const char *name, const char *fallback)
+{
+    const char *value = getenv(name);
+    return value && *value ? value : fallback;
+}
+
+static int read_text_file(const char *path, char *out, size_t outlen)
+{
+    FILE *fp;
+    if (!path || !out || outlen < 2) return 0;
+    fp = fopen(path, "r");
+    if (!fp) return 0;
+    if (!fgets(out, outlen, fp)) {
+        fclose(fp);
+        out[0] = 0;
+        return 0;
+    }
+    fclose(fp);
+    out[strcspn(out, "\r\n")] = 0;
+    return 1;
+}
+
+static int write_text_file(const char *path, const char *value)
+{
+    int fd;
+    size_t len, written = 0;
+    if (!path || !value) return 0;
+    fd = open(path, O_WRONLY | O_CLOEXEC | O_TRUNC);
+    if (fd < 0) return 0;
+    len = strlen(value);
+    while (written < len) {
+        ssize_t n = write(fd, value + written, len - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(fd);
+            return 0;
+        }
+        written += (size_t)n;
+    }
+    close(fd);
+    return 1;
+}
+
+static int find_cooling_zone(char *out, size_t outlen)
+{
+    const char *fixed = getenv("ZWRT_DATAD_COOLING_ZONE_PATH");
+    const char *root = env_path("ZWRT_DATAD_COOLING_THERMAL_ROOT", THERMAL_ROOT_DEFAULT);
+    DIR *dir;
+    struct dirent *entry;
+    if (fixed && *fixed) {
+        snprintf(out, outlen, "%s", fixed);
+        return access(out, F_OK) == 0;
+    }
+    dir = opendir(root);
+    if (!dir) return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[PATH_MAX], type[64];
+        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
+        if (snprintf(path, sizeof path, "%s/%s/type", root, entry->d_name) >= (int)sizeof path)
+            continue;
+        if (!read_text_file(path, type, sizeof type) || strcmp(type, "sys-therm-4")) continue;
+        snprintf(out, outlen, "%s/%s", root, entry->d_name);
+        closedir(dir);
+        return 1;
+    }
+    closedir(dir);
+    return 0;
+}
+
+static void cooling_config_defaults(struct cooling_config *cfg)
+{
+    memset(cfg, 0, sizeof *cfg);
+    cfg->fan_auto = 0;
+    cfg->fan_speed_percent = 50;
+    cfg->temperatures[0] = 44;
+    cfg->temperatures[1] = 48;
+    cfg->temperatures[2] = 53;
+    cfg->hysteresis[0] = cfg->hysteresis[1] = cfg->hysteresis[2] = 4;
+}
+
+static int load_cooling_config(struct cooling_config *cfg)
+{
+    const char *path = env_path("ZWRT_DATAD_COOLING_CONFIG", COOLING_CONFIG_DEFAULT);
+    FILE *fp;
+    char line[128], key[64];
+    int value, loaded = 0;
+    cooling_config_defaults(cfg);
+    fp = fopen(path, "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
+        if (!strcmp(key, "fan_enabled")) cfg->fan_enabled = value != 0;
+        else if (!strcmp(key, "fan_auto")) cfg->fan_auto = value != 0;
+        else if (!strcmp(key, "fan_speed_percent")) cfg->fan_speed_percent = value;
+        else if (!strcmp(key, "liquid_enabled")) cfg->liquid_enabled = value != 0;
+        else if (!strcmp(key, "temperature_1")) cfg->temperatures[0] = value;
+        else if (!strcmp(key, "temperature_2")) cfg->temperatures[1] = value;
+        else if (!strcmp(key, "temperature_3")) cfg->temperatures[2] = value;
+        else if (!strcmp(key, "hysteresis_1")) cfg->hysteresis[0] = value;
+        else if (!strcmp(key, "hysteresis_2")) cfg->hysteresis[1] = value;
+        else if (!strcmp(key, "hysteresis_3")) cfg->hysteresis[2] = value;
+        loaded = 1;
+    }
+    fclose(fp);
+    return loaded;
+}
+
+static int save_cooling_config(const struct cooling_config *cfg)
+{
+    const char *path = env_path("ZWRT_DATAD_COOLING_CONFIG", COOLING_CONFIG_DEFAULT);
+    char temp[PATH_MAX];
+    FILE *fp;
+    int failed = 0;
+    if (snprintf(temp, sizeof temp, "%s.tmp", path) >= (int)sizeof temp) return 0;
+    fp = fopen(temp, "w");
+    if (!fp) return 0;
+    if (fprintf(fp,
+                "fan_enabled=%d\nfan_auto=%d\nfan_speed_percent=%d\n"
+                "liquid_enabled=%d\ntemperature_1=%d\ntemperature_2=%d\ntemperature_3=%d\n"
+                "hysteresis_1=%d\nhysteresis_2=%d\nhysteresis_3=%d\n",
+                cfg->fan_enabled, cfg->fan_auto, cfg->fan_speed_percent,
+                cfg->liquid_enabled,
+                cfg->temperatures[0], cfg->temperatures[1], cfg->temperatures[2],
+                cfg->hysteresis[0], cfg->hysteresis[1], cfg->hysteresis[2]) < 0)
+        failed = 1;
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) failed = 1;
+    if (fclose(fp) != 0) failed = 1;
+    if (failed) {
+        (void)unlink(temp);
+        return 0;
+    }
+    if (rename(temp, path) != 0) {
+        (void)unlink(temp);
+        return 0;
+    }
+    return 1;
+}
+
+static int set_vendor_switch_status(const char *key, int enabled)
+{
+    char value[2];
+    snprintf(value, sizeof value, "%d", enabled ? 1 : 0);
+    if (device_uci_set(key, value) != 0) return 0;
+    return device_uci_commit("zwrt_deviceui") == 0;
+}
+
+static int set_fan_pwm_percent(int percent)
+{
+    char value[16];
+    int pwm;
+    if (percent < 0 || percent > 100) return 0;
+    pwm = (percent * 255 + 50) / 100;
+    snprintf(value, sizeof value, "%d", pwm);
+    return write_text_file(env_path("ZWRT_DATAD_FAN_PWM_PATH", FAN_PWM_DEFAULT), value);
+}
+
+static int set_fan_thermal_enabled(int enabled)
+{
+    return write_text_file(
+        env_path("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH", FAN_THERMAL_ENABLE_DEFAULT),
+        enabled ? "1" : "0");
+}
+
+static int set_cooling_zone_mode(int enabled)
+{
+    char zone[PATH_MAX], path[PATH_MAX];
+    if (!find_cooling_zone(zone, sizeof zone)) return 0;
+    if (snprintf(path, sizeof path, "%s/mode", zone) >= (int)sizeof path) return 0;
+    return write_text_file(path, enabled ? "enabled" : "disabled");
+}
+
+static int apply_fan_curve(const struct cooling_config *cfg)
+{
+    char zone[PATH_MAX], path[PATH_MAX], value[32];
+    if (!find_cooling_zone(zone, sizeof zone)) return 0;
+    for (int i = 0; i < 3; i++) {
+        if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) >= (int)sizeof path)
+            return 0;
+        snprintf(value, sizeof value, "%d", cfg->temperatures[i] * 1000);
+        if (!write_text_file(path, value)) return 0;
+        if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) >= (int)sizeof path)
+            return 0;
+        snprintf(value, sizeof value, "%d", cfg->hysteresis[i] * 1000);
+        if (!write_text_file(path, value)) return 0;
+    }
+    return set_cooling_zone_mode(1);
+}
+
+static int apply_liquid_switch(int enabled)
+{
+    return write_text_file(env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT),
+                           enabled ? "1023 60 200" : "0 0 0");
+}
+
+static int apply_fan_config(const struct cooling_config *cfg)
+{
+    if (!cfg->fan_enabled) {
+        (void)set_cooling_zone_mode(0);
+        return set_fan_pwm_percent(0);
+    }
+    if (!set_fan_thermal_enabled(1)) return 0;
+    if (cfg->fan_auto) return apply_fan_curve(cfg);
+    (void)set_cooling_zone_mode(0);
+    return set_fan_pwm_percent(cfg->fan_speed_percent);
+}
+
+void control_restore_cooling_state(void)
+{
+    struct cooling_config cfg;
+    if (!load_cooling_config(&cfg)) return;
+    (void)apply_fan_config(&cfg);
+    (void)apply_liquid_switch(cfg.liquid_enabled);
+}
 
 static void jb_add(struct json_buf *b, const char *fmt, ...)
 {
@@ -659,6 +891,175 @@ static int clear_qos_logs(char *result, size_t result_len, char *err, size_t err
     return 1;
 }
 
+static int required_bool_param(const char *params, const char *name, int *value,
+                               char *err, size_t errlen)
+{
+    char raw[32];
+    if (!param_value(params, name, raw, sizeof raw)) {
+        set_invalid_error(err, errlen, "missing parameter: %s", name);
+        return 0;
+    }
+    if (!strcmp(raw, "1") || !strcmp(raw, "true")) *value = 1;
+    else if (!strcmp(raw, "0") || !strcmp(raw, "false")) *value = 0;
+    else {
+        set_invalid_error(err, errlen, "%s must be boolean", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int required_range_param(const char *params, const char *name,
+                                long min, long max, int *value,
+                                char *err, size_t errlen)
+{
+    char raw[32];
+    long parsed;
+    if (!param_value(params, name, raw, sizeof raw)) {
+        set_invalid_error(err, errlen, "missing parameter: %s", name);
+        return 0;
+    }
+    if (!normalized_int(raw, &parsed) || parsed < min || parsed > max) {
+        set_invalid_error(err, errlen, "%s must be between %ld and %ld", name, min, max);
+        return 0;
+    }
+    *value = (int)parsed;
+    return 1;
+}
+
+static int control_aggregation_set(const char *params, char *result, size_t result_len,
+                                   char *err, size_t errlen)
+{
+    int enabled;
+    char args[192], ignored[CONTROL_UBUS_RESPONSE_MAX];
+    if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
+    ignored[0] = 0;
+    if (enabled) {
+        snprintf(args, sizeof args,
+                 "{\"opms_wan_mode\":\"SMULTIWAN\",\"wan_ippass_device_type\":\"\","
+                 "\"wan_ippass_device_mac\":\"\"}");
+        if (device_ubus_call_raw("zwrt_router.api", "router_set_wan_mode", args,
+                                 ignored, sizeof ignored) != 0) {
+            snprintf(err, errlen, "zwrt_router.api.router_set_wan_mode failed");
+            return 0;
+        }
+    } else {
+        snprintf(args, sizeof args, "{\"agg_mode_switch\":0}");
+        if (device_ubus_call_raw("zwrt_router.api", "router_stop_agg_mode", args,
+                                 ignored, sizeof ignored) != 0) {
+            snprintf(err, errlen, "zwrt_router.api.router_stop_agg_mode failed");
+            return 0;
+        }
+    }
+    snprintf(result, result_len, "{\"enabled\":%s}", enabled ? "true" : "false");
+    return 1;
+}
+
+static int control_fan_enabled(const char *params, char *result, size_t result_len,
+                               char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    int enabled;
+    (void)load_cooling_config(&cfg);
+    if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
+    cfg.fan_enabled = enabled;
+    if (!apply_fan_config(&cfg)) {
+        snprintf(err, errlen, "fan control is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", enabled) ||
+        !save_cooling_config(&cfg)) {
+        snprintf(err, errlen, "failed to persist fan state");
+        return 0;
+    }
+    snprintf(result, result_len, "{\"enabled\":%s,\"mode\":\"%s\"}",
+             enabled ? "true" : "false", cfg.fan_auto ? "automatic" : "manual");
+    return 1;
+}
+
+static int control_fan_speed(const char *params, char *result, size_t result_len,
+                             char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    int percent;
+    (void)load_cooling_config(&cfg);
+    if (!required_range_param(params, "percent", 0, 100, &percent, err, errlen)) return 0;
+    cfg.fan_auto = 0;
+    cfg.fan_speed_percent = percent;
+    cfg.fan_enabled = percent > 0;
+    if (!apply_fan_config(&cfg)) {
+        snprintf(err, errlen, "fan PWM control is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", cfg.fan_enabled) ||
+        !save_cooling_config(&cfg)) {
+        snprintf(err, errlen, "failed to persist fan speed");
+        return 0;
+    }
+    snprintf(result, result_len,
+             "{\"enabled\":%s,\"mode\":\"manual\",\"speed_percent\":%d}",
+             cfg.fan_enabled ? "true" : "false", percent);
+    return 1;
+}
+
+static int control_fan_curve(const char *params, char *result, size_t result_len,
+                             char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    (void)load_cooling_config(&cfg);
+    if (!required_range_param(params, "temperature_1", 20, 80, &cfg.temperatures[0], err, errlen) ||
+        !required_range_param(params, "temperature_2", 20, 80, &cfg.temperatures[1], err, errlen) ||
+        !required_range_param(params, "temperature_3", 20, 80, &cfg.temperatures[2], err, errlen))
+        return 0;
+    if (!(cfg.temperatures[0] < cfg.temperatures[1] &&
+          cfg.temperatures[1] < cfg.temperatures[2])) {
+        set_invalid_error(err, errlen, "curve temperatures must be strictly increasing");
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "hysteresis_%d", i + 1);
+        if (!required_range_param(params, name, 0, 15, &cfg.hysteresis[i], err, errlen))
+            return 0;
+    }
+    cfg.fan_auto = 1;
+    cfg.fan_enabled = 1;
+    if (!apply_fan_config(&cfg)) {
+        snprintf(err, errlen, "automatic fan curve is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", 1) ||
+        !save_cooling_config(&cfg)) {
+        snprintf(err, errlen, "failed to persist fan curve");
+        return 0;
+    }
+    snprintf(result, result_len,
+             "{\"enabled\":true,\"mode\":\"automatic\",\"temperature_1\":%d,"
+             "\"temperature_2\":%d,\"temperature_3\":%d}",
+             cfg.temperatures[0], cfg.temperatures[1], cfg.temperatures[2]);
+    return 1;
+}
+
+static int control_liquid_enabled(const char *params, char *result, size_t result_len,
+                                  char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    int enabled;
+    (void)load_cooling_config(&cfg);
+    if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
+    cfg.liquid_enabled = enabled;
+    if (!apply_liquid_switch(enabled)) {
+        snprintf(err, errlen, "liquid cooling control is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.liquid_cooling_switch_status", enabled) ||
+        !save_cooling_config(&cfg)) {
+        snprintf(err, errlen, "failed to persist liquid cooling state");
+        return 0;
+    }
+    snprintf(result, result_len, "{\"enabled\":%s}", enabled ? "true" : "false");
+    return 1;
+}
+
 const char *control_capabilities_json(void)
 {
     return
@@ -674,6 +1075,7 @@ const char *control_capabilities_json(void)
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
+        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_speed\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\","
         "\"state.refresh\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
@@ -966,6 +1368,16 @@ struct control_result control_execute(const char *request_json,
             ok = call_specs(params, "zwrt_router.api", "router_modify_lan_hostname", specs, 2,
                             result, sizeof result, err, sizeof err);
         }
+    } else if (!strcmp(action, "aggregation.set")) {
+        ok = control_aggregation_set(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.fan.set_enabled")) {
+        ok = control_fan_enabled(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.fan.set_speed")) {
+        ok = control_fan_speed(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.fan.set_curve")) {
+        ok = control_fan_curve(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.liquid.set_enabled")) {
+        ok = control_liquid_enabled(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "state.refresh")) {
         snprintf(result, sizeof result, "{\"queued\":true}");
         ok = 1;

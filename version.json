@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.8",
+    "version": "0.9.9",
     "asset": "zwrt-datad-aarch64",
-    "notes": "按模板省略不支持状态块，实时上报设备频段，并固定统计 /data 空间"
+    "notes": "MU5252 三基带状态与链路聚合、风扇、风扇曲线、液冷控制"
   }
 }

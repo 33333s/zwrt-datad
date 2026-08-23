@@ -167,6 +167,10 @@ curl -H 'Authorization: Bearer <token>' \
 设备不会输出 `nfc`；不会用 `-1`、`0` 或空对象冒充“不支持”。调用方应根据
 块/字段是否存在决定是否显示功能，同时把 `0%`、关闭状态和 `0mA` 视为有效值。
 
+MU5252 模板还会输出三路 `modems`、`aggregation` 和 `cooling`。聚合、风扇、
+手动 PWM、内核风扇曲线和液冷都通过语义化 `/control` 动作操作；散热配置只保存到
+`/data/zwrt-datad/cooling.conf`，启动时由 datad 恢复，不安装额外 init 脚本。
+
 ## QoS / 短信说明
 
 QoS 相关有一个容易踩的点：`qci` / `session_ambr` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：
