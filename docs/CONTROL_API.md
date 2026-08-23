@@ -111,6 +111,20 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 `sms.send_raw` 接受已经编码的 UCS-2 hex。文本编码、转发、黑名单和业务去重继续由 UFI 负责。
 
+## MU5252 Aggregation And Cooling
+
+以下动作只应在 `/state` 实际输出 `aggregation` / `cooling` 的 MU5252 模板上显示：
+
+| action | params | 说明 |
+|---|---|---|
+| `aggregation.set` | `enabled` | 开启时通过 `router_set_wan_mode` 切到 `SMULTIWAN`；关闭时调用 `router_stop_agg_mode` |
+| `cooling.fan.set_enabled` | `enabled` | 风扇总开关；同步厂商 `fan_switch_status` |
+| `cooling.fan.set_speed` | `percent`，`0..100` | 切到手动模式并直接设置 PWM |
+| `cooling.fan.set_curve` | `temperature_1..3`, `hysteresis_1..3` | 启用 `sys-therm-4` 内核曲线；温度点必须递增 |
+| `cooling.liquid.set_enabled` | `enabled` | 驱动压电液冷并同步厂商 `liquid_cooling_switch_status` |
+
+风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。自动曲线使用设备内核现有的四档 cooling level（约 `0/30/50/70%`），接口只调整三个温度点和回差，不另装 `/etc/init.d` 或外部风扇脚本。
+
 ## Safety
 
 - 所有动作必须存在于编译期白名单。
@@ -118,3 +132,4 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 - `ubus/uci` 使用 `fork/exec` 参数数组执行，不经过 Shell。
 - WiFi、APN 和密码字段不得写入运行日志。
 - 重启、关机和密码修改应由 UFI 再做用户确认。
+- 切换 `SMULTIWAN` 会重配 WAN，远程设备可能短暂断线；UFI 应明确提示用户。

@@ -16,6 +16,9 @@ INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 THERMAL_FIXTURE="$ROOT/tests/fixtures/thermal"
+COOLING_FIXTURE="$ROOT/tests/fixtures/cooling"
+COOLING_TMP="$(mktemp -d)"
+cp -R "$COOLING_FIXTURE/." "$COOLING_TMP/"
 PID=""
 LAN_PID=""
 TOPFLOW_PID=""
@@ -44,6 +47,7 @@ cleanup() {
     [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
+    rm -rf "$COOLING_TMP"
 }
 trap cleanup EXIT INT TERM
 
@@ -242,6 +246,12 @@ MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
 MOCK_ENCRYPTED_SIM=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
+ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
+ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
+ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
+ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
 "$BIN" --once | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -274,6 +284,18 @@ assert data["thermal"]["modems"][1]["celsius"] == 47
 assert data["thermal"]["modems"][2]["id"] == "v3e2"
 assert data["thermal"]["modems"][2]["available"] is True
 assert data["thermal"]["modems"][2]["celsius"] == 46
+assert data["aggregation"] == {"enabled": True, "mode": "SMULTIWAN"}
+assert data["cooling"]["fan"]["enabled"] is True
+assert data["cooling"]["fan"]["mode"] == "manual"
+assert data["cooling"]["fan"]["pwm"] == 128
+assert data["cooling"]["fan"]["speed_percent"] == 50
+assert "rpm" not in data["cooling"]["fan"]
+assert data["cooling"]["liquid"]["enabled"] is False
+assert data["cooling"]["curve"] == [
+    {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4},
+    {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4},
+    {"level": 3, "temperature_celsius": 53, "hysteresis_celsius": 4},
+]
 '
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
@@ -284,6 +306,12 @@ ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
+ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
+ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
+ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
+ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
 
@@ -312,6 +340,69 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' \
     -d '{"service":"system;reboot","method":"info","args":{}}' \
     "http://127.0.0.1:$TOPFLOW_PORT/ubus/call")"
 [ "$code" = "400" ]
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
+    grep -F 'cooling.fan.set_curve' >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_speed","params":{"percent":65}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["mode"] == "manual"
+assert data["result"]["speed_percent"] == 65
+'
+[ "$(cat "$COOLING_TMP/pwm1")" = "166" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_curve","params":{"temperature_1":42,"temperature_2":47,"temperature_3":52,"hysteresis_1":3,"hysteresis_2":3,"hysteresis_3":4}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["mode"] == "automatic"
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+[ "$(cat "$COOLING_TMP/zone/trip_point_0_temp")" = "42000" ]
+[ "$(cat "$COOLING_TMP/zone/trip_point_2_temp")" = "52000" ]
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.liquid.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["enabled"] is True
+'
+[ "$(cat "$COOLING_TMP/liquid_drive")" = "1023 60 200" ]
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"aggregation.set","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["enabled"] is True
+'
+grep -F 'router_set_wan_mode' "$MU5252_CALL_LOG" | grep -F '"opms_wan_mode":"SMULTIWAN"' >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"aggregation.set","params":{"enabled":false}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["enabled"] is False
+'
+grep -F 'router_stop_agg_mode' "$MU5252_CALL_LOG" | grep -F '"agg_mode_switch":0' >/dev/null
 
 MOCK_MODEL_NAME=MC7523 \
 MOCK_NO_NFC=1 \

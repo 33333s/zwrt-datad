@@ -105,6 +105,18 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
         zte_nwinfo.band_lock.nr5g_sa_band_lock) printf '%s\n' '78' ;;
         zte_nwinfo.band_lock.nr5g_nsa_band_lock) printf '%s\n' '' ;;
         zte_nwinfo.band_lock.lte_ext_band_lock) printf '%s\n' '1,3' ;;
+        zwrt_deviceui.Device.fan_switch_status)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' '1'
+            ;;
+        zwrt_deviceui.Device.liquid_cooling_switch_status)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' '0'
+            ;;
+        zwrt_router.network.opms_wan_mode)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' 'SMULTIWAN'
+            ;;
         *) exit 1 ;;
     esac
     exit 0

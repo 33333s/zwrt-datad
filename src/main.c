@@ -72,6 +72,11 @@
 #define TOPFLOW_EXTERNAL_MODEM_COUNT 2
 #define TOPFLOW_THERMAL_POLL_SEC 30
 #define TOPFLOW_V3E_TEMP_PATH "/sys/devices/virtual/power/zte_power/adc2_temp"
+#define TOPFLOW_FAN_PWM_PATH "/sys/class/hwmon/hwmon0/pwm1"
+#define TOPFLOW_FAN_RPM_PATH "/sys/class/hwmon/hwmon0/fan1_input"
+#define TOPFLOW_FAN_THERMAL_ENABLE_PATH "/sys/class/hwmon/hwmon0/device/thermal_enable"
+#define TOPFLOW_LIQUID_THERMAL_ENABLE_PATH "/sys/class/leds/aw_vibrator/thermal_enable"
+#define TOPFLOW_THERMAL_ROOT "/sys/class/thermal"
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -1311,6 +1316,123 @@ static int read_line_file(const char *path, char *out, size_t outlen)
     return 1;
 }
 
+static const char *runtime_path(const char *name, const char *fallback)
+{
+    const char *value = getenv(name);
+    return value && *value ? value : fallback;
+}
+
+static long read_labeled_long_file(const char *path, const char *label, long def)
+{
+    char line[256], *start, *end;
+    long value;
+    if (!read_line_file(path, line, sizeof line)) return def;
+    start = label && *label ? strstr(line, label) : line;
+    if (!start) return def;
+    start += label && *label ? strlen(label) : 0;
+    while (*start == ':' || *start == '=' || isspace((unsigned char)*start)) start++;
+    errno = 0;
+    value = strtol(start, &end, 10);
+    if (errno || end == start) return def;
+    return value;
+}
+
+static int find_topflow_cooling_zone(char *out, size_t outlen)
+{
+    const char *fixed = getenv("ZWRT_DATAD_COOLING_ZONE_PATH");
+    const char *root = runtime_path("ZWRT_DATAD_COOLING_THERMAL_ROOT", TOPFLOW_THERMAL_ROOT);
+    DIR *dir;
+    struct dirent *entry;
+    if (fixed && *fixed) {
+        snprintf(out, outlen, "%s", fixed);
+        return access(out, F_OK) == 0;
+    }
+    dir = opendir(root);
+    if (!dir) return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[PATH_MAX], type[64];
+        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
+        if (snprintf(path, sizeof path, "%s/%s/type", root, entry->d_name) >= (int)sizeof path)
+            continue;
+        if (!read_line_file(path, type, sizeof type) || strcmp(type, "sys-therm-4")) continue;
+        snprintf(out, outlen, "%s/%s", root, entry->d_name);
+        closedir(dir);
+        return 1;
+    }
+    closedir(dir);
+    return 0;
+}
+
+static int read_uci_flag(const char *path, int fallback)
+{
+    char value[32];
+    char *end;
+    long parsed;
+    if (device_uci_get(path, value, sizeof value) != 0 || !value[0]) return fallback;
+    parsed = strtol(value, &end, 10);
+    if (end == value) return fallback;
+    return parsed != 0;
+}
+
+static void emit_topflow_hardware_controls(struct buf *b)
+{
+    char zone[PATH_MAX], path[PATH_MAX], mode[32] = "disabled";
+    char aggregation_mode[32] = "";
+    long pwm, rpm, fan_thermal, liquid_thermal;
+    int fan_enabled, liquid_enabled, aggregation_enabled, automatic = 0;
+    long temperatures[3] = {44000, 48000, 53000};
+    long hysteresis[3] = {4000, 4000, 4000};
+
+    pwm = read_long_file(runtime_path("ZWRT_DATAD_FAN_PWM_PATH", TOPFLOW_FAN_PWM_PATH), -1);
+    rpm = read_long_file(runtime_path("ZWRT_DATAD_FAN_RPM_PATH", TOPFLOW_FAN_RPM_PATH), -1);
+    fan_thermal = read_labeled_long_file(
+        runtime_path("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH", TOPFLOW_FAN_THERMAL_ENABLE_PATH),
+        "thermal_enable", -1);
+    liquid_thermal = read_labeled_long_file(
+        runtime_path("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH", TOPFLOW_LIQUID_THERMAL_ENABLE_PATH),
+        "thermal_enable", -1);
+    fan_enabled = read_uci_flag("zwrt_deviceui.Device.fan_switch_status", pwm > 0);
+    liquid_enabled = read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
+    if (device_uci_get("zwrt_router.network.opms_wan_mode",
+                       aggregation_mode, sizeof aggregation_mode) != 0)
+        aggregation_mode[0] = 0;
+    aggregation_enabled = !strcmp(aggregation_mode, "SMULTIWAN");
+
+    if (find_topflow_cooling_zone(zone, sizeof zone)) {
+        if (snprintf(path, sizeof path, "%s/mode", zone) < (int)sizeof path &&
+            read_line_file(path, mode, sizeof mode))
+            automatic = !strcmp(mode, "enabled");
+        for (int i = 0; i < 3; i++) {
+            if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) < (int)sizeof path)
+                temperatures[i] = read_long_file(path, temperatures[i]);
+            if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) < (int)sizeof path)
+                hysteresis[i] = read_long_file(path, hysteresis[i]);
+        }
+    }
+
+    bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"",
+            aggregation_enabled ? "true" : "false");
+    bappend_json_esc(b, aggregation_mode);
+    bappend(b, "\"},");
+    bappend(b, "\"cooling\":{\"fan\":{");
+    bappend(b, "\"enabled\":%s,\"mode\":\"%s\",",
+            fan_enabled ? "true" : "false", automatic ? "automatic" : "manual");
+    bappend(b, "\"pwm\":%ld,\"max_pwm\":255,\"speed_percent\":%ld,",
+            pwm, pwm >= 0 ? (pwm * 100 + 127) / 255 : -1);
+    if (rpm >= 0) bappend(b, "\"rpm\":%ld,", rpm);
+    bappend(b, "\"thermal_enabled\":%s,\"levels_percent\":[0,30,50,70]},",
+            fan_thermal > 0 ? "true" : "false");
+    bappend(b, "\"liquid\":{\"enabled\":%s,\"thermal_enabled\":%s},",
+            liquid_enabled ? "true" : "false", liquid_thermal > 0 ? "true" : "false");
+    bappend(b, "\"curve\":[");
+    for (int i = 0; i < 3; i++) {
+        if (i) bappend(b, ",");
+        bappend(b, "{\"level\":%d,\"temperature_celsius\":%ld,\"hysteresis_celsius\":%ld}",
+                i + 1, temperatures[i] / 1000, hysteresis[i] / 1000);
+    }
+    bappend(b, "]},");
+}
+
 static long normalize_temp_reading(long raw)
 {
     if (raw <= 0) return 0;
@@ -2499,6 +2621,11 @@ static void build_snapshot(char *out, size_t outlen,
     if (g_topflow_multimodem_enabled) emit_topflow_thermal_modems(&b, cpu_temp);
     else bappend(&b, "[]");
     bappend(&b, "},");
+
+    /* MU5252-only aggregation and active cooling controls. Unsupported models
+     * omit these blocks entirely so consumers can hide the corresponding UI. */
+    if (g_topflow_multimodem_enabled)
+        emit_topflow_hardware_controls(&b);
 
     /* Runtime interface state is refreshed at a lower cadence than radio data. */
     bappend(&b, "\"interfaces\":{");
@@ -3875,6 +4002,7 @@ int main(int argc, char **argv)
     run_ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", NULL, common, sizeof common);
     run_ubus("zwrt_zte_mdm.api", "get_imei", NULL, imei, sizeof imei);
     update_device_template_features(common);
+    if (g_topflow_multimodem_enabled) control_restore_cooling_state();
     clear_qos_cache();
     g_qos_floor_off = 0;
     scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
