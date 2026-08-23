@@ -338,7 +338,7 @@ int system_ext_build_json(char *out, size_t outlen,
         mem.total_kb, mem.free_kb, mem.available_kb, mem.buffers_kb, mem.cached_kb,
         mem.swap_total_kb, mem.swap_free_kb);
 
-    if (statvfs("/", &disk) == 0) {
+    if (statvfs("/data", &disk) == 0) {
         unsigned long long block = disk.f_frsize ? disk.f_frsize : disk.f_bsize;
         unsigned long long total = block * disk.f_blocks;
         unsigned long long avail = block * disk.f_bavail;

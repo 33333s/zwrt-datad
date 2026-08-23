@@ -29,6 +29,7 @@ if grep -F '/etc/init.d' "$ROOT/scripts/service.sh" >/dev/null; then
     echo 'service.sh must not use /etc/init.d' >&2
     exit 1
 fi
+grep -F 'statvfs("/data", &disk)' "$ROOT/src/system_ext.c" >/dev/null
 
 cleanup() {
     [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
@@ -75,11 +76,30 @@ assert data["device"]["api_template"] == "MU5250"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
+assert data["net"]["lte_supported_bands"] == "1,3"
+assert data["net"]["nr_sa_supported_bands"] == "78"
+assert data["net"]["nr_nsa_supported_bands"] == ""
+assert data["battery"]["percent"] == 0
+assert data["nfc"]["switch"] == 0
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
     {"name": "cpuss-0", "celsius": 41.25},
 ]
+'
+
+MOCK_MODEL_NAME=CPE_FIXTURE \
+MOCK_NO_BATTERY=1 \
+MOCK_NO_NFC=1 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "legacy_compat"
+assert data["device"]["api_template_supported"] == 0
+assert "battery" not in data
+assert "nfc" not in data
 '
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
@@ -294,6 +314,7 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' \
 [ "$code" = "400" ]
 
 MOCK_MODEL_NAME=MC7523 \
+MOCK_NO_NFC=1 \
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 "$BIN" --once | python3 -c '
@@ -303,6 +324,8 @@ assert data["device"]["api_template"] == "MC7523"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
+assert "battery" not in data
+assert "nfc" not in data
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
