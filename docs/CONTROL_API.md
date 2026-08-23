@@ -118,12 +118,11 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | action | params | 说明 |
 |---|---|---|
 | `aggregation.set` | `enabled` | 开启时通过 `router_set_wan_mode` 切到 `SMULTIWAN`；关闭时调用 `router_stop_agg_mode` |
-| `cooling.fan.set_enabled` | `enabled` | 风扇总开关；同步厂商 `fan_switch_status` |
-| `cooling.fan.set_speed` | `percent`，`0..100` | 切到手动模式并直接设置 PWM |
-| `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 启用 datad 自定义曲线；2–8 点，温度严格递增、PWM 不递减 |
-| `cooling.liquid.set_enabled` | `enabled` | 驱动压电液冷并同步厂商 `liquid_cooling_switch_status` |
+| `cooling.fan.set_enabled` | `enabled` | 兼容 action 名；实际控制“风扇常开”。`true` 固定厂商 PWM 128，`false` 恢复保存的自定义曲线 |
+| `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 保存并启用 datad 自定义曲线，同时退出常开；2–8 点，温度严格递增、PWM 不递减 |
+| `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；实际控制“液冷常开”。`true` 固定厂商参数 `1023 60 200`，`false` 解除强制并交还 thermal 控制 |
 
-风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。未启用自定义曲线时仍上报设备内核现有四档（约 `0/30/50/70%`）和三个阈值；手动/自定义模式关闭并持续压制厂商 `thermal_enable`，否则厂商控制器会把 PWM 0 拉回最低档 76。datad 每秒读取 `sys-therm-4` 温度、在控制点之间线性插值并直接写 PWM；80℃ 始终强制 PWM 255。datad 正常退出时会把 `thermal_enable` 交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
+风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。状态中的 `always_on` 是新字段，`enabled` 仅作为同值兼容别名。风扇常开持续写 PWM 128；关闭常开时使用保存的曲线。MU5252 的风扇 `thermal_enable` 是硬件供电开关，datad 控制时必须保持为 1；它只禁用 `sys-therm-4` thermal zone，并动态找到 `pwm-fan` cooling device 清零其锁存 state，之后每秒按温度曲线写 PWM。这样 PWM 0 能真正停转，非零 PWM 也能实际驱动风扇；80℃ 始终强制 PWM 255。液冷常开关闭时先写 `0 0 0`，再恢复其 `thermal_enable`。datad 正常退出时会重新启用风扇 thermal zone，并把风扇和液冷 thermal 控制交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
 
 示例：
 

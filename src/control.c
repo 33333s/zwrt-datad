@@ -53,9 +53,11 @@ static char g_device_password_hash[129];
 #define FAN_PWM_DEFAULT "/sys/class/hwmon/hwmon0/pwm1"
 #define FAN_THERMAL_ENABLE_DEFAULT "/sys/class/hwmon/hwmon0/device/thermal_enable"
 #define LIQUID_DRIVE_DEFAULT "/sys/class/leds/aw_vibrator/atsin0"
+#define LIQUID_THERMAL_ENABLE_DEFAULT "/sys/class/leds/aw_vibrator/thermal_enable"
 #define THERMAL_ROOT_DEFAULT "/sys/class/thermal"
 #define CUSTOM_CURVE_MAX_POINTS 8
 #define CUSTOM_CURVE_HARD_FULL_SPEED_C 80
+#define FAN_ALWAYS_ON_PWM 128
 
 enum fan_control_mode {
     FAN_MODE_MANUAL = 0,
@@ -70,9 +72,10 @@ struct fan_curve_point {
 
 struct cooling_config {
     int fan_enabled;
+    int fan_always_on;
     int fan_mode;
     int fan_speed_percent;
-    int liquid_enabled;
+    int liquid_always_on;
     int temperatures[3];
     int hysteresis[3];
     int custom_curve_count;
@@ -151,6 +154,8 @@ static int find_cooling_zone(char *out, size_t outlen)
 static void cooling_config_defaults(struct cooling_config *cfg)
 {
     memset(cfg, 0, sizeof *cfg);
+    cfg->fan_always_on = -1;
+    cfg->liquid_always_on = -1;
     cfg->fan_mode = FAN_MODE_MANUAL;
     cfg->fan_speed_percent = 50;
     cfg->temperatures[0] = 44;
@@ -173,10 +178,15 @@ static int load_cooling_config(struct cooling_config *cfg)
     int value, loaded = 0, mode_seen = 0;
     cooling_config_defaults(cfg);
     fp = fopen(path, "r");
-    if (!fp) return 0;
+    if (!fp) {
+        cfg->fan_always_on = 0;
+        cfg->liquid_always_on = 0;
+        return 0;
+    }
     while (fgets(line, sizeof line, fp)) {
         if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
         if (!strcmp(key, "fan_enabled")) cfg->fan_enabled = value != 0;
+        else if (!strcmp(key, "fan_always_on")) cfg->fan_always_on = value != 0;
         else if (!strcmp(key, "fan_auto") && !mode_seen)
             cfg->fan_mode = value ? FAN_MODE_KERNEL : FAN_MODE_MANUAL;
         else if (!strcmp(key, "fan_mode")) {
@@ -186,7 +196,9 @@ static int load_cooling_config(struct cooling_config *cfg)
             }
         }
         else if (!strcmp(key, "fan_speed_percent")) cfg->fan_speed_percent = value;
-        else if (!strcmp(key, "liquid_enabled")) cfg->liquid_enabled = value != 0;
+        else if (!strcmp(key, "liquid_enabled") && cfg->liquid_always_on < 0)
+            cfg->liquid_always_on = value != 0;
+        else if (!strcmp(key, "liquid_always_on")) cfg->liquid_always_on = value != 0;
         else if (!strcmp(key, "temperature_1")) cfg->temperatures[0] = value;
         else if (!strcmp(key, "temperature_2")) cfg->temperatures[1] = value;
         else if (!strcmp(key, "temperature_3")) cfg->temperatures[2] = value;
@@ -208,6 +220,14 @@ static int load_cooling_config(struct cooling_config *cfg)
         loaded = 1;
     }
     fclose(fp);
+    /* 0.9.10 wrote fan_switch_status=1 while a custom curve was active.
+     * Never migrate that legacy value to always-on or the saved curve would
+     * unexpectedly become a fixed PWM 128 after upgrade. */
+    if (cfg->fan_always_on < 0)
+        cfg->fan_always_on = cfg->fan_mode == FAN_MODE_KERNEL ? cfg->fan_enabled : 0;
+    if (!cfg->fan_always_on && cfg->fan_mode != FAN_MODE_CUSTOM)
+        cfg->fan_mode = FAN_MODE_CUSTOM;
+    if (cfg->liquid_always_on < 0) cfg->liquid_always_on = 0;
     return loaded;
 }
 
@@ -221,13 +241,14 @@ static int save_cooling_config(const struct cooling_config *cfg)
     fp = fopen(temp, "w");
     if (!fp) return 0;
     if (fprintf(fp,
-                "fan_enabled=%d\nfan_auto=%d\nfan_mode=%d\nfan_speed_percent=%d\n"
-                "liquid_enabled=%d\ntemperature_1=%d\ntemperature_2=%d\ntemperature_3=%d\n"
+                "fan_enabled=1\nfan_always_on=%d\nfan_auto=%d\nfan_mode=%d\nfan_speed_percent=%d\n"
+                "liquid_enabled=%d\nliquid_always_on=%d\n"
+                "temperature_1=%d\ntemperature_2=%d\ntemperature_3=%d\n"
                 "hysteresis_1=%d\nhysteresis_2=%d\nhysteresis_3=%d\n"
                 "custom_curve_count=%d\n",
-                cfg->fan_enabled, cfg->fan_mode == FAN_MODE_KERNEL, cfg->fan_mode,
+                cfg->fan_always_on, cfg->fan_mode == FAN_MODE_KERNEL, cfg->fan_mode,
                 cfg->fan_speed_percent,
-                cfg->liquid_enabled,
+                cfg->liquid_always_on, cfg->liquid_always_on,
                 cfg->temperatures[0], cfg->temperatures[1], cfg->temperatures[2],
                 cfg->hysteresis[0], cfg->hysteresis[1], cfg->hysteresis[2],
                 cfg->custom_curve_count) < 0)
@@ -280,6 +301,13 @@ static int set_fan_thermal_enabled(int enabled)
         enabled ? "1" : "0");
 }
 
+static int set_liquid_thermal_enabled(int enabled)
+{
+    return write_text_file(
+        env_path("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH", LIQUID_THERMAL_ENABLE_DEFAULT),
+        enabled ? "1" : "0");
+}
+
 static int set_cooling_zone_mode(int enabled)
 {
     char zone[PATH_MAX], path[PATH_MAX];
@@ -288,27 +316,97 @@ static int set_cooling_zone_mode(int enabled)
     return write_text_file(path, enabled ? "enabled" : "disabled");
 }
 
+static int clear_fan_cooling_state(void)
+{
+    const char *fixed = getenv("ZWRT_DATAD_FAN_COOLING_STATE_PATH");
+    const char *root = env_path("ZWRT_DATAD_COOLING_THERMAL_ROOT", THERMAL_ROOT_DEFAULT);
+    DIR *dir;
+    struct dirent *entry;
+    if (fixed && *fixed) return write_text_file(fixed, "0");
+    dir = opendir(root);
+    if (!dir) return 1;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[PATH_MAX], type[64];
+        if (strncmp(entry->d_name, "cooling_device", 14) != 0) continue;
+        if (snprintf(path, sizeof path, "%s/%s/type", root, entry->d_name) >= (int)sizeof path)
+            continue;
+        if (!read_text_file(path, type, sizeof type) || strcmp(type, "pwm-fan")) continue;
+        if (snprintf(path, sizeof path, "%s/%s/cur_state", root, entry->d_name) >=
+            (int)sizeof path) {
+            closedir(dir);
+            return 0;
+        }
+        closedir(dir);
+        return write_text_file(path, "0");
+    }
+    closedir(dir);
+    return 1;
+}
+
+static int prepare_fan_pwm_control(void)
+{
+    /* On MU5252 thermal_enable powers the fan hardware. Keep it enabled;
+     * disable only sys-therm-4 and clear pwm-fan's latched cooling state. */
+    if (!set_fan_thermal_enabled(1)) return 0;
+    if (!set_cooling_zone_mode(0)) return 0;
+    if (clear_fan_cooling_state()) return 1;
+    (void)set_cooling_zone_mode(1);
+    return 0;
+}
+
+static int apply_datad_fan_pwm(int pwm)
+{
+    if (!prepare_fan_pwm_control()) return 0;
+    if (set_fan_pwm(pwm)) return 1;
+    /* Never leave automatic cooling disabled if userspace could not write
+     * the requested PWM. */
+    (void)set_cooling_zone_mode(1);
+    return 0;
+}
+
 static int apply_fan_curve(const struct cooling_config *cfg)
 {
     char zone[PATH_MAX], path[PATH_MAX], value[32];
+    int ok = 1;
     if (!find_cooling_zone(zone, sizeof zone)) return 0;
     for (int i = 0; i < 3; i++) {
-        if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) >= (int)sizeof path)
-            return 0;
+        if (snprintf(path, sizeof path, "%s/trip_point_%d_temp", zone, i) >= (int)sizeof path) {
+            ok = 0;
+            break;
+        }
         snprintf(value, sizeof value, "%d", cfg->temperatures[i] * 1000);
-        if (!write_text_file(path, value)) return 0;
-        if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) >= (int)sizeof path)
-            return 0;
+        if (!write_text_file(path, value)) {
+            ok = 0;
+            break;
+        }
+        if (snprintf(path, sizeof path, "%s/trip_point_%d_hyst", zone, i) >= (int)sizeof path) {
+            ok = 0;
+            break;
+        }
         snprintf(value, sizeof value, "%d", cfg->hysteresis[i] * 1000);
-        if (!write_text_file(path, value)) return 0;
+        if (!write_text_file(path, value)) {
+            ok = 0;
+            break;
+        }
     }
-    return set_cooling_zone_mode(1);
+    if (!set_cooling_zone_mode(1)) ok = 0;
+    return ok;
 }
 
-static int apply_liquid_switch(int enabled)
+static int apply_liquid_switch(int always_on)
 {
-    return write_text_file(env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT),
-                           enabled ? "1023 60 200" : "0 0 0");
+    const char *drive = env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT);
+    if (always_on) {
+        if (!set_liquid_thermal_enabled(0)) return 0;
+        if (write_text_file(drive, "1023 60 200")) return 1;
+        (void)set_liquid_thermal_enabled(1);
+        return 0;
+    }
+    {
+        int drive_ok = write_text_file(drive, "0 0 0");
+        int thermal_ok = set_liquid_thermal_enabled(1);
+        return drive_ok && thermal_ok;
+    }
 }
 
 static long read_custom_curve_temperature(void)
@@ -348,26 +446,27 @@ static int apply_custom_curve(const struct cooling_config *cfg, long temperature
 {
     int pwm = custom_curve_pwm(cfg, temperature);
     if (pwm < 0) return 0;
-    (void)set_cooling_zone_mode(0);
-    return set_fan_pwm(pwm);
+    return apply_datad_fan_pwm(pwm);
 }
 
 static int apply_fan_config(const struct cooling_config *cfg)
 {
-    if (!cfg->fan_enabled) {
-        (void)set_cooling_zone_mode(0);
-        if (!set_fan_thermal_enabled(0)) return 0;
-        return set_fan_pwm(0);
+    long temperature = read_custom_curve_temperature();
+    if (cfg->fan_always_on) {
+        return apply_datad_fan_pwm(temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C
+                                   ? 255 : FAN_ALWAYS_ON_PWM);
     }
     if (cfg->fan_mode == FAN_MODE_KERNEL) {
         if (!set_fan_thermal_enabled(1)) return 0;
         return apply_fan_curve(cfg);
     }
-    if (!set_fan_thermal_enabled(0)) return 0;
     if (cfg->fan_mode == FAN_MODE_CUSTOM)
-        return apply_custom_curve(cfg, read_custom_curve_temperature());
-    (void)set_cooling_zone_mode(0);
-    return set_fan_pwm_percent(cfg->fan_speed_percent);
+        return apply_custom_curve(cfg, temperature);
+    if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) return apply_datad_fan_pwm(255);
+    if (!prepare_fan_pwm_control()) return 0;
+    if (set_fan_pwm_percent(cfg->fan_speed_percent)) return 1;
+    (void)set_cooling_zone_mode(1);
+    return 0;
 }
 
 void control_restore_cooling_state(void)
@@ -375,31 +474,50 @@ void control_restore_cooling_state(void)
     struct cooling_config cfg;
     if (!load_cooling_config(&cfg)) return;
     (void)apply_fan_config(&cfg);
-    (void)apply_liquid_switch(cfg.liquid_enabled);
+    (void)apply_liquid_switch(cfg.liquid_always_on);
+    (void)set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status",
+                                   cfg.fan_always_on);
+    (void)set_vendor_switch_status("zwrt_deviceui.Device.liquid_cooling_switch_status",
+                                   cfg.liquid_always_on);
+    (void)save_cooling_config(&cfg);
 }
 
 void control_cooling_tick(long temperature_celsius)
 {
     struct cooling_config cfg;
     int pwm;
-    if (temperature_celsius <= 0 || !load_cooling_config(&cfg) ||
-        !cfg.fan_enabled || cfg.fan_mode != FAN_MODE_CUSTOM)
+    if (!load_cooling_config(&cfg)) return;
+    if (cfg.liquid_always_on) (void)apply_liquid_switch(1);
+    if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
+        pwm = 255;
+    } else if (cfg.fan_always_on) {
+        pwm = FAN_ALWAYS_ON_PWM;
+    } else if (cfg.fan_mode == FAN_MODE_CUSTOM && temperature_celsius > 0) {
+        pwm = custom_curve_pwm(&cfg, temperature_celsius);
+    } else {
         return;
-    pwm = custom_curve_pwm(&cfg, temperature_celsius);
+    }
     if (pwm < 0) return;
-    /* Vendor sleep/wakeup events may turn thermal_enable back on. Reassert
-     * custom ownership and the interpolated PWM every sampling tick. */
-    if (!set_fan_thermal_enabled(0)) return;
-    (void)set_fan_pwm(pwm);
+    /* Vendor sleep/wakeup events may re-enable the kernel zone or latch a
+     * cooling state. Reassert userspace PWM ownership every sampling tick. */
+    (void)apply_datad_fan_pwm(pwm);
 }
 
 void control_release_cooling_state(void)
 {
     struct cooling_config cfg;
-    if (!load_cooling_config(&cfg) || cfg.fan_mode == FAN_MODE_KERNEL) return;
+    if (!load_cooling_config(&cfg)) return;
+    if (cfg.fan_mode != FAN_MODE_KERNEL || cfg.fan_always_on) {
+        (void)set_fan_thermal_enabled(1);
+        (void)apply_fan_curve(&cfg);
+    }
+    if (cfg.liquid_always_on) {
+        (void)write_text_file(env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT),
+                              "0 0 0");
+        (void)set_liquid_thermal_enabled(1);
+    }
     /* If datad is intentionally stopped, hand control back to the vendor
      * thermal driver. A restarted datad will immediately restore custom mode. */
-    (void)set_fan_thermal_enabled(1);
 }
 
 static void jb_add(struct json_buf *b, const char *fmt, ...)
@@ -1032,24 +1150,6 @@ static int required_bool_param(const char *params, const char *name, int *value,
     return 1;
 }
 
-static int required_range_param(const char *params, const char *name,
-                                long min, long max, int *value,
-                                char *err, size_t errlen)
-{
-    char raw[32];
-    long parsed;
-    if (!param_value(params, name, raw, sizeof raw)) {
-        set_invalid_error(err, errlen, "missing parameter: %s", name);
-        return 0;
-    }
-    if (!normalized_int(raw, &parsed) || parsed < min || parsed > max) {
-        set_invalid_error(err, errlen, "%s must be between %ld and %ld", name, min, max);
-        return 0;
-    }
-    *value = (int)parsed;
-    return 1;
-}
-
 static int control_aggregation_set(const char *params, char *result, size_t result_len,
                                    char *err, size_t errlen)
 {
@@ -1085,7 +1185,9 @@ static int control_fan_enabled(const char *params, char *result, size_t result_l
     int enabled;
     (void)load_cooling_config(&cfg);
     if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
-    cfg.fan_enabled = enabled;
+    cfg.fan_enabled = 1;
+    cfg.fan_always_on = enabled;
+    if (!enabled) cfg.fan_mode = FAN_MODE_CUSTOM;
     if (!apply_fan_config(&cfg)) {
         snprintf(err, errlen, "fan control is unavailable");
         return 0;
@@ -1095,35 +1197,12 @@ static int control_fan_enabled(const char *params, char *result, size_t result_l
         snprintf(err, errlen, "failed to persist fan state");
         return 0;
     }
-    snprintf(result, result_len, "{\"enabled\":%s,\"mode\":\"%s\"}",
-             enabled ? "true" : "false",
-             cfg.fan_mode == FAN_MODE_CUSTOM ? "custom" :
-             (cfg.fan_mode == FAN_MODE_KERNEL ? "automatic" : "manual"));
-    return 1;
-}
-
-static int control_fan_speed(const char *params, char *result, size_t result_len,
-                             char *err, size_t errlen)
-{
-    struct cooling_config cfg;
-    int percent;
-    (void)load_cooling_config(&cfg);
-    if (!required_range_param(params, "percent", 0, 100, &percent, err, errlen)) return 0;
-    cfg.fan_mode = FAN_MODE_MANUAL;
-    cfg.fan_speed_percent = percent;
-    cfg.fan_enabled = percent > 0;
-    if (!apply_fan_config(&cfg)) {
-        snprintf(err, errlen, "fan PWM control is unavailable");
-        return 0;
-    }
-    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", cfg.fan_enabled) ||
-        !save_cooling_config(&cfg)) {
-        snprintf(err, errlen, "failed to persist fan speed");
-        return 0;
-    }
     snprintf(result, result_len,
-             "{\"enabled\":%s,\"mode\":\"manual\",\"speed_percent\":%d}",
-             cfg.fan_enabled ? "true" : "false", percent);
+             "{\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\"}",
+             enabled ? "true" : "false",
+             enabled ? "true" : "false",
+             enabled ? "always_on" : (cfg.fan_mode == FAN_MODE_CUSTOM ? "custom" :
+             (cfg.fan_mode == FAN_MODE_KERNEL ? "automatic" : "manual")));
     return 1;
 }
 
@@ -1208,17 +1287,19 @@ static int control_fan_curve(const char *params, char *result, size_t result_len
     if (!parse_custom_curve(params, &cfg, err, errlen)) return 0;
     cfg.fan_mode = FAN_MODE_CUSTOM;
     cfg.fan_enabled = 1;
+    cfg.fan_always_on = 0;
     if (!apply_fan_config(&cfg)) {
         snprintf(err, errlen, "custom fan curve is unavailable");
         return 0;
     }
-    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", 1) ||
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", 0) ||
         !save_cooling_config(&cfg)) {
         snprintf(err, errlen, "failed to persist fan curve");
         return 0;
     }
     result[0] = 0;
-    jb_add(&response, "{\"enabled\":true,\"mode\":\"custom\",\"points\":[");
+    jb_add(&response,
+           "{\"enabled\":false,\"always_on\":false,\"mode\":\"custom\",\"points\":[");
     for (int i = 0; i < cfg.custom_curve_count; i++) {
         if (i) jb_add(&response, ",");
         jb_add(&response, "{\"temperature\":%d,\"pwm\":%d}",
@@ -1235,7 +1316,7 @@ static int control_liquid_enabled(const char *params, char *result, size_t resul
     int enabled;
     (void)load_cooling_config(&cfg);
     if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
-    cfg.liquid_enabled = enabled;
+    cfg.liquid_always_on = enabled;
     if (!apply_liquid_switch(enabled)) {
         snprintf(err, errlen, "liquid cooling control is unavailable");
         return 0;
@@ -1245,7 +1326,8 @@ static int control_liquid_enabled(const char *params, char *result, size_t resul
         snprintf(err, errlen, "failed to persist liquid cooling state");
         return 0;
     }
-    snprintf(result, result_len, "{\"enabled\":%s}", enabled ? "true" : "false");
+    snprintf(result, result_len, "{\"enabled\":%s,\"always_on\":%s}",
+             enabled ? "true" : "false", enabled ? "true" : "false");
     return 1;
 }
 
@@ -1264,7 +1346,7 @@ const char *control_capabilities_json(void)
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
-        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_speed\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\","
+        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\","
         "\"state.refresh\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
@@ -1561,8 +1643,6 @@ struct control_result control_execute(const char *request_json,
         ok = control_aggregation_set(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_enabled")) {
         ok = control_fan_enabled(params, result, sizeof result, err, sizeof err);
-    } else if (!strcmp(action, "cooling.fan.set_speed")) {
-        ok = control_fan_speed(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_curve")) {
         ok = control_fan_curve(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.liquid.set_enabled")) {

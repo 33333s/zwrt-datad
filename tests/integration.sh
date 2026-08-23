@@ -248,6 +248,7 @@ MOCK_ENCRYPTED_SIM=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
 ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
@@ -288,12 +289,14 @@ assert data["thermal"]["modems"][2]["available"] is True
 assert data["thermal"]["modems"][2]["celsius"] == 46
 assert data["aggregation"] == {"enabled": True, "mode": "SMULTIWAN"}
 assert data["cooling"]["fan"]["enabled"] is True
-assert data["cooling"]["fan"]["mode"] == "manual"
+assert data["cooling"]["fan"]["always_on"] is True
+assert data["cooling"]["fan"]["mode"] == "always_on"
 assert data["cooling"]["fan"]["pwm"] == 128
 assert data["cooling"]["fan"]["speed_percent"] == 50
 assert data["cooling"]["fan"]["manual_speed_percent"] == 0
 assert "rpm" not in data["cooling"]["fan"]
 assert data["cooling"]["liquid"]["enabled"] is False
+assert data["cooling"]["liquid"]["always_on"] is False
 assert data["cooling"]["curve"] == [
     {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4, "pwm": 76, "speed_percent": 30},
     {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4, "pwm": 128, "speed_percent": 50},
@@ -304,6 +307,14 @@ grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
 
+# Legacy manual/off configurations are no longer a valid steady state: an
+# upgrade must move them to the saved custom curve before exposing the switch.
+printf '%s\n' \
+    'fan_enabled=0' 'fan_auto=0' 'fan_mode=0' 'fan_speed_percent=0' \
+    'liquid_enabled=0' 'custom_curve_count=2' \
+    'custom_temperature_1=40' 'custom_pwm_1=0' \
+    'custom_temperature_2=70' 'custom_pwm_2=255' \
+    >"$COOLING_TMP/cooling.conf"
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
@@ -311,6 +322,45 @@ MOCK_MODEL_NAME=MU5252 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
+ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
+ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
+ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
+ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+"$BIN" --once | python3 -c '
+import json, sys
+fan = json.load(sys.stdin)["cooling"]["fan"]
+assert fan["always_on"] is False
+assert fan["mode"] == "custom"
+'
+grep -F 'fan_mode=2' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
+
+# Simulate the exact 0.9.10 shape: custom mode incorrectly persisted the
+# vendor fan switch as enabled and had no explicit always-on key. Startup must
+# preserve the user's curve while migrating the switch to always-on=false.
+printf '%s\n' \
+    'fan_enabled=1' \
+    'fan_auto=0' \
+    'fan_mode=2' \
+    'fan_speed_percent=54' \
+    'liquid_enabled=0' \
+    'custom_curve_count=5' \
+    'custom_temperature_1=40' 'custom_pwm_1=0' \
+    'custom_temperature_2=46' 'custom_pwm_2=17' \
+    'custom_temperature_3=53' 'custom_pwm_3=59' \
+    'custom_temperature_4=59' 'custom_pwm_4=128' \
+    'custom_temperature_5=70' 'custom_pwm_5=255' \
+    >"$COOLING_TMP/cooling.conf"
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_MODEL_NAME=MU5252 \
+ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
+ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
 ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
@@ -347,19 +397,52 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' \
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'cooling.fan.set_curve' >/dev/null
+! curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
+    grep -F 'cooling.fan.set_speed' >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
-    -H 'Content-Type: application/json' \
-    -d '{"action":"cooling.fan.set_speed","params":{"percent":65}}' \
-    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
-assert data["ok"] is True
-assert data["result"]["mode"] == "manual"
-assert data["result"]["speed_percent"] == 65
+fan = data["cooling"]["fan"]
+assert fan["enabled"] is False
+assert fan["always_on"] is False
+assert fan["mode"] == "custom"
+assert fan["pwm"] == 23
+assert data["cooling"]["curve"] == [
+    {"temperature_celsius": 40, "pwm": 0, "speed_percent": 0},
+    {"temperature_celsius": 46, "pwm": 17, "speed_percent": 7},
+    {"temperature_celsius": 53, "pwm": 59, "speed_percent": 23},
+    {"temperature_celsius": 59, "pwm": 128, "speed_percent": 50},
+    {"temperature_celsius": 70, "pwm": 255, "speed_percent": 100},
+]
 '
-[ "$(cat "$COOLING_TMP/pwm1")" = "166" ]
-[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F "$(printf 'uci\tset zwrt_deviceui.Device.fan_switch_status=0')" \
+    "$MU5252_CALL_LOG" >/dev/null
+
+rm -f "$COOLING_TMP/fan_cooling_state"
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control")"
+[ "$code" = "502" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+printf '%s\n' '1' >"$COOLING_TMP/fan_cooling_state"
+sleep 0.3
+
+rm -f "$COOLING_TMP/pwm1"
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control")"
+[ "$code" = "502" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+printf '%s\n' '0' >"$COOLING_TMP/pwm1"
+sleep 0.3
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
@@ -373,11 +456,55 @@ assert len(data["result"]["points"]) == 5
 '
 [ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
 [ "$(cat "$COOLING_TMP/pwm1")" = "30" ]
-[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "0" ]
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
+[ "$(cat "$COOLING_TMP/fan_cooling_state")" = "0" ]
 grep -F 'fan_mode=2' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_curve_count=5' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_temperature_5=70' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_pwm_5=255' "$COOLING_TMP/cooling.conf" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["always_on"] is True
+assert data["result"]["mode"] == "always_on"
+'
+[ "$(cat "$COOLING_TMP/pwm1")" = "128" ]
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
+[ "$(cat "$COOLING_TMP/fan_cooling_state")" = "0" ]
+grep -F 'fan_always_on=1' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F "$(printf 'uci\tset zwrt_deviceui.Device.fan_switch_status=1')" \
+    "$MU5252_CALL_LOG" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["cooling"]["fan"]["always_on"] is True
+assert data["cooling"]["fan"]["mode"] == "always_on"
+assert data["cooling"]["fan"]["pwm"] == 128
+assert len(data["cooling"]["curve"]) == 5
+'
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_enabled","params":{"enabled":false}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["always_on"] is False
+assert data["result"]["mode"] == "custom"
+'
+[ "$(cat "$COOLING_TMP/pwm1")" = "30" ]
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
+[ "$(cat "$COOLING_TMP/fan_cooling_state")" = "0" ]
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
 
 printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
@@ -390,8 +517,9 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
 import json, sys
 data = json.load(sys.stdin)
 assert data["cooling"]["fan"]["mode"] == "custom"
+assert data["cooling"]["fan"]["always_on"] is False
 assert data["cooling"]["fan"]["pwm"] == 255
-assert data["cooling"]["fan"]["manual_speed_percent"] == 65
+assert data["cooling"]["fan"]["manual_speed_percent"] == 54
 assert len(data["cooling"]["curve"]) == 5
 assert data["cooling"]["curve"][2] == {
     "temperature_celsius": 50, "pwm": 76, "speed_percent": 30
@@ -414,8 +542,24 @@ import json, sys
 data = json.load(sys.stdin)
 assert data["ok"] is True
 assert data["result"]["enabled"] is True
+assert data["result"]["always_on"] is True
 '
 [ "$(cat "$COOLING_TMP/liquid_drive")" = "1023 60 200" ]
+[ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "0" ]
+grep -F 'liquid_always_on=1' "$COOLING_TMP/cooling.conf" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.liquid.set_enabled","params":{"enabled":false}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["always_on"] is False
+'
+[ "$(cat "$COOLING_TMP/liquid_drive")" = "0 0 0" ]
+[ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "1" ]
+grep -F 'liquid_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
@@ -438,6 +582,20 @@ assert data["ok"] is True
 assert data["result"]["enabled"] is False
 '
 grep -F 'router_stop_agg_mode' "$MU5252_CALL_LOG" | grep -F '"agg_mode_switch":0' >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.liquid.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+[ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "0" ]
+
+kill "$TOPFLOW_PID"
+wait "$TOPFLOW_PID" || true
+TOPFLOW_PID=""
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+[ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "1" ]
+[ "$(cat "$COOLING_TMP/liquid_drive")" = "0 0 0" ]
 
 MOCK_MODEL_NAME=MC7523 \
 MOCK_NO_NFC=1 \

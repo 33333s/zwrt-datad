@@ -1383,13 +1383,16 @@ struct topflow_curve_point {
     int pwm;
 };
 
-static int load_topflow_custom_curve(int *fan_mode, int *manual_speed_percent,
+static int load_topflow_custom_curve(int *fan_always_on, int *liquid_always_on,
+                                     int *fan_mode, int *manual_speed_percent,
                                      struct topflow_curve_point *points, int *count)
 {
     const char *config = runtime_path("ZWRT_DATAD_COOLING_CONFIG", TOPFLOW_COOLING_CONFIG);
     FILE *fp = fopen(config, "r");
     char line[128], key[64];
-    int value, curve_count = 0;
+    int value, curve_count = 0, legacy_fan_enabled = -1, legacy_liquid_enabled = -1;
+    if (fan_always_on) *fan_always_on = -1;
+    if (liquid_always_on) *liquid_always_on = -1;
     if (fan_mode) *fan_mode = 0;
     if (manual_speed_percent) *manual_speed_percent = 0;
     if (count) *count = 0;
@@ -1397,7 +1400,13 @@ static int load_topflow_custom_curve(int *fan_mode, int *manual_speed_percent,
     while (fgets(line, sizeof line, fp)) {
         int index;
         if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
-        if (!strcmp(key, "fan_mode") && fan_mode) *fan_mode = value;
+        if (!strcmp(key, "fan_enabled")) legacy_fan_enabled = value != 0;
+        else if (!strcmp(key, "fan_always_on") && fan_always_on)
+            *fan_always_on = value != 0;
+        else if (!strcmp(key, "liquid_enabled")) legacy_liquid_enabled = value != 0;
+        else if (!strcmp(key, "liquid_always_on") && liquid_always_on)
+            *liquid_always_on = value != 0;
+        else if (!strcmp(key, "fan_mode") && fan_mode) *fan_mode = value;
         else if (!strcmp(key, "fan_speed_percent") && manual_speed_percent)
             *manual_speed_percent = value;
         else if (!strcmp(key, "custom_curve_count")) curve_count = value;
@@ -1409,8 +1418,14 @@ static int load_topflow_custom_curve(int *fan_mode, int *manual_speed_percent,
             points[index - 1].pwm = value;
     }
     fclose(fp);
-    if (curve_count < 2 || curve_count > TOPFLOW_CUSTOM_CURVE_MAX) return 0;
-    if (count) *count = curve_count;
+    if (fan_always_on && *fan_always_on < 0) {
+        if (fan_mode && *fan_mode != 1) *fan_always_on = 0;
+        else if (legacy_fan_enabled >= 0) *fan_always_on = legacy_fan_enabled;
+    }
+    if (liquid_always_on && *liquid_always_on < 0 && legacy_liquid_enabled >= 0)
+        *liquid_always_on = legacy_liquid_enabled;
+    if (count && curve_count >= 2 && curve_count <= TOPFLOW_CUSTOM_CURVE_MAX)
+        *count = curve_count;
     return 1;
 }
 
@@ -1420,6 +1435,7 @@ static void emit_topflow_hardware_controls(struct buf *b)
     char aggregation_mode[32] = "";
     long pwm, rpm, fan_thermal, liquid_thermal, cooling_temp = -1;
     int fan_enabled, liquid_enabled, aggregation_enabled, automatic = 0;
+    int configured_fan_always_on = -1, configured_liquid_always_on = -1;
     int configured_fan_mode = 0, configured_manual_speed = 0, custom_curve_count = 0;
     struct topflow_curve_point custom_curve[TOPFLOW_CUSTOM_CURVE_MAX] = {{0, 0}};
     long temperatures[3] = {44000, 48000, 53000};
@@ -1442,7 +1458,9 @@ static void emit_topflow_hardware_controls(struct buf *b)
                 hysteresis[i] = read_long_file(path, hysteresis[i]);
         }
     }
-    if (!load_topflow_custom_curve(&configured_fan_mode, &configured_manual_speed,
+    if (!load_topflow_custom_curve(&configured_fan_always_on,
+                                   &configured_liquid_always_on,
+                                   &configured_fan_mode, &configured_manual_speed,
                                    custom_curve, &custom_curve_count))
         configured_fan_mode = 0;
     control_cooling_tick(cooling_temp);
@@ -1454,17 +1472,23 @@ static void emit_topflow_hardware_controls(struct buf *b)
     liquid_thermal = read_labeled_long_file(
         runtime_path("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH", TOPFLOW_LIQUID_THERMAL_ENABLE_PATH),
         "thermal_enable", -1);
-    fan_enabled = read_uci_flag("zwrt_deviceui.Device.fan_switch_status", pwm > 0);
-    liquid_enabled = read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
+    fan_enabled = configured_fan_always_on >= 0
+        ? configured_fan_always_on
+        : read_uci_flag("zwrt_deviceui.Device.fan_switch_status", 0);
+    liquid_enabled = configured_liquid_always_on >= 0
+        ? configured_liquid_always_on
+        : read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
 
     bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"",
             aggregation_enabled ? "true" : "false");
     bappend_json_esc(b, aggregation_mode);
     bappend(b, "\"},");
     bappend(b, "\"cooling\":{\"fan\":{");
-    bappend(b, "\"enabled\":%s,\"mode\":\"%s\",",
+    bappend(b, "\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\",",
             fan_enabled ? "true" : "false",
-            configured_fan_mode == 2 ? "custom" : (automatic ? "automatic" : "manual"));
+            fan_enabled ? "true" : "false",
+            fan_enabled ? "always_on" :
+            (configured_fan_mode == 2 ? "custom" : (automatic ? "automatic" : "manual")));
     bappend(b, "\"pwm\":%ld,\"max_pwm\":255,\"speed_percent\":%ld,",
             pwm, pwm >= 0 ? (pwm * 100 + 127) / 255 : -1);
     bappend(b, "\"manual_speed_percent\":%d,", configured_manual_speed);
@@ -1473,10 +1497,11 @@ static void emit_topflow_hardware_controls(struct buf *b)
     if (rpm >= 0) bappend(b, "\"rpm\":%ld,", rpm);
     bappend(b, "\"thermal_enabled\":%s,\"levels_percent\":[0,30,50,70]},",
             fan_thermal > 0 ? "true" : "false");
-    bappend(b, "\"liquid\":{\"enabled\":%s,\"thermal_enabled\":%s},",
+    bappend(b, "\"liquid\":{\"enabled\":%s,\"always_on\":%s,\"thermal_enabled\":%s},",
+            liquid_enabled ? "true" : "false",
             liquid_enabled ? "true" : "false", liquid_thermal > 0 ? "true" : "false");
     bappend(b, "\"curve\":[");
-    if (configured_fan_mode == 2 && custom_curve_count >= 2) {
+    if (custom_curve_count >= 2) {
         for (int i = 0; i < custom_curve_count; i++) {
             if (i) bappend(b, ",");
             bappend(b, "{\"temperature_celsius\":%d,\"pwm\":%d,\"speed_percent\":%d}",

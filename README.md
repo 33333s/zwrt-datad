@@ -167,11 +167,12 @@ curl -H 'Authorization: Bearer <token>' \
 设备不会输出 `nfc`；不会用 `-1`、`0` 或空对象冒充“不支持”。调用方应根据
 块/字段是否存在决定是否显示功能，同时把 `0%`、关闭状态和 `0mA` 视为有效值。
 
-MU5252 模板还会输出三路 `modems`、`aggregation` 和 `cooling`。聚合、风扇、
-手动 PWM、多点自定义温度/PWM 曲线和液冷都通过语义化 `/control` 动作操作；散热配置
+MU5252 模板还会输出三路 `modems`、`aggregation` 和 `cooling`。聚合、风扇常开、
+多点自定义温度/PWM 曲线和液冷常开都通过语义化 `/control` 动作操作；散热配置
 只保存到 `/data/zwrt-datad/cooling.conf`，启动时由 datad 恢复，不安装额外 init 脚本。
 自定义曲线允许 2–8 个控制点，datad 每秒按 `sys-therm-4` 温度线性插值 PWM；80℃
-硬保护始终强制 PWM 255。
+硬保护始终强制 PWM 255。风扇常开使用厂商固定 PWM 128，关闭常开时恢复自定义
+曲线；液冷常开使用厂商固定参数 `1023 60 200`，关闭后把 thermal 控制交还厂商。
 
 ## QoS / 短信说明
 
