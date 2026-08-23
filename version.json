@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.10",
+    "version": "0.9.11",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 可视化多点自定义温度/PWM 曲线与实时线性插值控制"
+    "notes": "MU5252 风扇/液冷常开语义、旧曲线无损迁移与厂商 thermal 控制交接"
   }
 }
