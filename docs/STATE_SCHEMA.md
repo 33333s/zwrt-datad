@@ -256,7 +256,7 @@ SSE  /events
 - `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
 - MU5252 的 `thermal.modems` 固定包含 `x75`、`v3e1`、`v3e2`。X75 温度来自主机 thermal ubus；V3E1/V3E2 每 30 秒通过固定 ADB serial 读取外挂系统的 `zte_power/adc2_temp` 并缓存。`available=false` 时 `celsius=null`；其他模板当前返回空 `modems`。
 - MU5252 额外输出 `aggregation` 与 `cooling`；其他模板完全省略这两个块。`aggregation.enabled` 仅在 `zwrt_router.network.opms_wan_mode == SMULTIWAN` 时为 `true`，`aggregation.mode` 保留厂商当前模式文本。
-- `cooling.fan` 输出总开关、`manual/automatic` 模式、当前 PWM/百分比、可选 RPM 和固定 cooling level；`cooling.curve` 输出三个可调温度点与回差。`cooling.liquid` 输出厂商开关与驱动 thermal 状态。消费者应根据整个块是否存在决定是否显示，不得给其他机型补默认值。
+- `cooling.fan` 输出总开关、`manual/automatic/custom` 模式、当前温度、实际 PWM/百分比、`manual_speed_percent` 用户手动配置值、80℃ 满速保护、可选 RPM 和固定 cooling level。内核模式下 `cooling.curve` 是三个阈值并附对应 PWM；`custom` 模式下为 2–8 个 `{temperature_celsius,pwm,speed_percent}` 控制点，datad 每秒线性插值并保持厂商 `thermal_enable` 关闭，使 PWM 0 能真正停转。`cooling.liquid` 输出厂商开关与驱动 thermal 状态。消费者应根据整个块是否存在决定是否显示，不得给其他机型补默认值。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
