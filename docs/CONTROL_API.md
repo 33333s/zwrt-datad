@@ -18,8 +18,10 @@ Content-Type: application/json
 
 | action | params | 说明 |
 |---|---|---|
+| `device.login_info` | 无 | 获取设备登录 challenge |
 | `device.login` | `password_hash` | 64 位 SHA-256 hex，调用 `zwrt_web.web_login` |
 | `device.logout` | 无 | 清除 datad 内存中的设备会话 |
+| `device.session_status` | 无 | 返回 datad 当前设备会话状态 |
 | `device.change_password` | `old_hash`, `new_hash` | 修改某兴后台密码 |
 | `device.reboot` | 无 | 重启设备 |
 | `device.poweroff` | 无 | 关闭设备 |
@@ -49,10 +51,13 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | action | params |
 |---|---|
 | `wifi.status` | 无，返回 `main_2g/main_5g` 配置 |
+| `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
+| `wifi.set_dual_band` | `enabled`，布尔值 |
 | `wifi.set_module` | `enabled`，`0/1` |
 | `wifi.set_chip` | `chip`, `guest_enabled?` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
 | `lan.set` | `ip/netmask/dhcp_disabled/dhcp_start/dhcp_end/lease_seconds` |
+| `lan.set_mtu` | `mtu` |
 | `dns.set` | `primary/secondary/manual_ipv4/manual_ipv6` |
 | `client.access` | 无，返回访问策略和设备列表 |
 | `client.block` | `mac` |

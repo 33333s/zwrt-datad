@@ -363,6 +363,46 @@ static int control_lan(const char *params, char *result, size_t result_len,
     return 1;
 }
 
+static int control_wifi_dual_band_status(char *result, size_t result_len,
+                                         char *err, size_t errlen)
+{
+    char current[CONTROL_UBUS_RESPONSE_MAX];
+    int enabled;
+    if (!ubus_call("zwrt_router.api", "router_get_wifi_isolate", "{}",
+                   current, sizeof current, err, errlen)) return 0;
+    enabled = json_get_int(current, "wifimain24_wifimain5_enable", 0) ? 1 : 0;
+    snprintf(result, result_len,
+             "{\"WiFiDualBandSupported\":\"1\",\"WiFiDualBandEnabled\":\"%d\",\"BandSteeringSwitch\":\"%d\"}",
+             enabled, enabled);
+    return 1;
+}
+
+static int control_wifi_set_dual_band(const char *params, char *result, size_t result_len,
+                                      char *err, size_t errlen)
+{
+    char raw[32], current[CONTROL_UBUS_RESPONSE_MAX], override[128], args[CONTROL_UBUS_ARGS_MAX];
+    int enabled;
+    if (!param_value(params, "enabled", raw, sizeof raw)) {
+        set_invalid_error(err, errlen, "missing parameter: enabled");
+        return 0;
+    }
+    if (!strcmp(raw, "1") || !strcmp(raw, "true")) enabled = 1;
+    else if (!strcmp(raw, "0") || !strcmp(raw, "false")) enabled = 0;
+    else {
+        set_invalid_error(err, errlen, "enabled must be boolean");
+        return 0;
+    }
+    if (!ubus_call("zwrt_router.api", "router_get_wifi_isolate", "{}",
+                   current, sizeof current, err, errlen)) return 0;
+    snprintf(override, sizeof override, "{\"wifimain24_wifimain5_enable\":%d}", enabled);
+    if (!json_merge_objects(current, override, args, sizeof args)) {
+        snprintf(err, errlen, "invalid router_get_wifi_isolate response");
+        return 0;
+    }
+    return ubus_call("zwrt_router.api", "router_set_wifi_isolate", args,
+                     result, result_len, err, errlen);
+}
+
 static int control_cell_unlock(char *result, size_t result_len, char *err, size_t errlen)
 {
     char ignored[CONTROL_UBUS_RESPONSE_MAX];
@@ -623,12 +663,12 @@ const char *control_capabilities_json(void)
 {
     return
         "{\"schema_version\":1,\"control\":["
-        "\"device.login\",\"device.logout\",\"device.change_password\","
+        "\"device.login_info\",\"device.login\",\"device.logout\",\"device.session_status\",\"device.change_password\","
         "\"device.reboot\",\"device.poweroff\","
         "\"cellular.connect\",\"cellular.disconnect\",\"cellular.set\","
         "\"network.set_mode\",\"band.set_lte\",\"band.set_nr_sa\",\"band.set_nr_nsa\","
         "\"cell.lock_lte\",\"cell.lock_nr\",\"cell.unlock_all\",\"sim.set_slot\","
-        "\"wifi.status\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\",\"lan.set\",\"dns.set\","
+        "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\",\"lan.set\",\"lan.set_mtu\",\"dns.set\","
         "\"usb.status\",\"usb.set\",\"sleep.status\",\"sleep.set\",\"nfc.set\","
         "\"apn.list\",\"apn.set_mode\",\"apn.add\",\"apn.modify\",\"apn.delete\",\"apn.enable\","
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
@@ -670,12 +710,20 @@ struct control_result control_execute(const char *request_json,
     }
     result[0] = err[0] = 0;
 
-    if (!strcmp(action, "device.login")) {
+    if (!strcmp(action, "device.login_info")) {
+        ok = simple_fixed_call("zwrt_web", "web_login_info", "{}",
+                               result, sizeof result, err, sizeof err);
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "device.login")) {
         ok = control_login(params, result, sizeof result, err, sizeof err);
         status.refresh_state = 0;
     } else if (!strcmp(action, "device.logout")) {
         g_device_session[0] = g_device_password_hash[0] = 0;
         snprintf(result, sizeof result, "{\"logged_in\":false}");
+        ok = 1;
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "device.session_status")) {
+        snprintf(result, sizeof result, "{\"logged_in\":%s}", g_device_session[0] ? "true" : "false");
         ok = 1;
         status.refresh_state = 0;
     } else if (!strcmp(action, "device.change_password")) {
@@ -750,6 +798,11 @@ struct control_result control_execute(const char *request_json,
         ok = control_wifi_status(result, sizeof result);
         if (!ok) snprintf(err, sizeof err, "wifi status response too large");
         status.refresh_state = 0;
+    } else if (!strcmp(action, "wifi.dual_band_status")) {
+        ok = control_wifi_dual_band_status(result, sizeof result, err, sizeof err);
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "wifi.set_dual_band")) {
+        ok = control_wifi_set_dual_band(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "wifi.set_module")) {
         static const struct param_spec specs[] = {{"enabled", "SwitchOption", PARAM_INT, 1}};
         ok = call_specs(params, "zwrt_wlan", "set", specs, 1,
@@ -765,6 +818,10 @@ struct control_result control_execute(const char *request_json,
         ok = control_wifi_configure(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "lan.set")) {
         ok = control_lan(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "lan.set_mtu")) {
+        static const struct param_spec specs[] = {{"mtu", "wan_mtu", PARAM_STRING, 1}};
+        ok = call_specs(params, "zwrt_router.api", "router_set_wan_mtu", specs, 1,
+                        result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "dns.set")) {
         static const struct param_spec specs[] = {
             {"primary", "dns1", PARAM_STRING, 0},

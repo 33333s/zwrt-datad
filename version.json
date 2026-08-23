@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.6",
+    "version": "0.9.7",
     "asset": "zwrt-datad-aarch64",
-    "notes": "统一运行目录到 /data/zwrt-datad，并新增 UCI 持久状态与 SIM 身份回退"
+    "notes": "补齐 UFI datad-only 控制动作，并改用项目目录 service.sh 与 rc.local 启动"
   }
 }
