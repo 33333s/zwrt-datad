@@ -9,6 +9,11 @@ SSE  /events
 
 消费者不应直接打 `ubus`，也不应自己扫 `key.log`。
 
+状态块是可选的。设备模板只输出当前设备支持的块；例如无电池的 CPE
+不会输出 `battery`，而不是用 `percent:-1`、`temp:0` 伪装成有效数据。
+消费者必须用 JSON key 是否存在判断能力，不能用数值真假判断，因为
+`battery.percent=0`、`charging=0` 和 `wlan.enabled=0` 都是合法状态。
+
 ## Shape
 
 ```json
@@ -40,12 +45,14 @@ SSE  /events
     "sa_bands": "1,28,41,78",
     "nsa_bands": "1,28,41,78",
     "lte_bands": "1,3,8,40,41",
+    "lte_supported_bands": "1,3,8,40,41",
+    "nr_sa_supported_bands": "1,28,41,78",
+    "nr_nsa_supported_bands": "1,28,41,78",
     "wan_status": "ipv4_ipv6_connected",
     "HSR": false
   },
   "wlan": {
     "ssid": "MyWiFi",
-    "key": "password123",
     "enc": "sae-mixed",
     "enabled": 1
   },
@@ -231,6 +238,9 @@ SSE  /events
 - `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
 - 后端会优先根据 `device.model_name` 选择 `device.api_template`；设备侧接口选择已经由后端完成，不需要前端再猜设备应该打哪套 `ubus/uci/sysfs`。
 - `device.api_template_supported = 1` 表示当前机型已有明确模板；`0` 表示只落到了内部兼容模板，不应视为正式适配完成。
+- `battery`、`wlan`、`nfc`、`sms` 等可选块由模板决定是否输出；兼容模板会按实际接口探测结果输出。缺少整个块表示该接口不可用，块存在而字段值为 `0` 表示有效零值。
+- 当模板不输出 `battery` 时，`uci_device_info` 内的 `battery_*` 与 `power_adapter` 厂商占位字段也会同步过滤，避免消费者从兼容缓存重新推断出不存在的电池。
+- `/state.wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取。
 - `device.full_ubus = 1` 表示当前模板开放 `POST /ubus/call`；现有模板默认均为 `1`。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
@@ -241,7 +251,8 @@ SSE  /events
 - `modems` 是多基带设备的规范化列表。MU5252 固定包含 `x75`、`v3e1`、`v3e2` 三项；外挂基带的活动 `subid` 分别由 `3/4`、`5/6` 加当前基带卡槽计算。MC7523 是单基带设备，和其他非 MU5252 模板一样返回空数组。
 - `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
-- `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 和 `throughput` 单位分别为字节和字节/秒。
+- `net.lte_supported_bands`、`net.nr_sa_supported_bands`、`net.nr_nsa_supported_bands` 直接来自本轮 `nwinfo_get_netinfo`，消费者必须用它们生成锁频候选，不得合并其他机型的静态频段目录。
+- `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 固定统计 `/data` 文件系统，`storage` 和 `throughput` 单位分别为字节和字节/秒。
 - `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
 - MU5252 的 `thermal.modems` 固定包含 `x75`、`v3e1`、`v3e2`。X75 温度来自主机 thermal ubus；V3E1/V3E2 每 30 秒通过固定 ADB serial 读取外挂系统的 `zte_power/adc2_temp` 并缓存。`available=false` 时 `celsius=null`；其他模板当前返回空 `modems`。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。

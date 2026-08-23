@@ -81,9 +81,11 @@ static volatile sig_atomic_t g_state_refresh_req = 0;
 
 static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
+static int g_sms_interface_detected;
 static long g_sms_unread_cache = 0;
 static char g_sim_cache[RAW_MAX];
 static char g_uci_device_info[RAW_MAX] = "{}";
+static char g_uci_device_info_no_battery[RAW_MAX] = "{}";
 static char g_lan_interface[RAW_MAX];
 static char g_wan4_interface[RAW_MAX];
 static char g_wan6_interface[RAW_MAX];
@@ -156,6 +158,12 @@ enum traffic_source_mode {
     TRAFFIC_SOURCE_CID1_ACTIVE_SUBID = 1
 };
 
+enum optional_section_mode {
+    OPTIONAL_SECTION_AUTO = -1,
+    OPTIONAL_SECTION_HIDDEN = 0,
+    OPTIONAL_SECTION_VISIBLE = 1
+};
+
 struct device_template_spec {
     const char *id;
     const char *label;
@@ -167,6 +175,10 @@ struct device_template_spec {
     enum temp_source_mode temp_mode;
     enum network_source_mode network_mode;
     enum traffic_source_mode traffic_mode;
+    enum optional_section_mode battery_section;
+    enum optional_section_mode wifi_section;
+    enum optional_section_mode nfc_section;
+    enum optional_section_mode sms_section;
 };
 
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
@@ -179,7 +191,11 @@ static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     CLIENT_SOURCE_DHCP_ONLY,
     TEMP_SOURCE_U60_UBUS_ONLY,
     NETWORK_SOURCE_NWINFO_UBUS_ONLY,
-    TRAFFIC_SOURCE_CID1
+    TRAFFIC_SOURCE_CID1,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO
 };
 
 static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
@@ -192,7 +208,11 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
     NETWORK_SOURCE_NWINFO_UBUS_ONLY,
-    TRAFFIC_SOURCE_CID1
+    TRAFFIC_SOURCE_CID1,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO
 };
 
 static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
@@ -205,7 +225,11 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_U60_UBUS_ONLY,
     NETWORK_SOURCE_MU5252_UCI_FALLBACK,
-    TRAFFIC_SOURCE_CID1_ACTIVE_SUBID
+    TRAFFIC_SOURCE_CID1_ACTIVE_SUBID,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO
 };
 
 static const struct device_template_spec TEMPLATE_G5MAX_MC7523 = {
@@ -218,7 +242,11 @@ static const struct device_template_spec TEMPLATE_G5MAX_MC7523 = {
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
     NETWORK_SOURCE_NWINFO_UBUS_ONLY,
-    TRAFFIC_SOURCE_CID1
+    TRAFFIC_SOURCE_CID1,
+    OPTIONAL_SECTION_HIDDEN,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO
 };
 
 static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
@@ -231,8 +259,30 @@ static const struct device_template_spec TEMPLATE_LEGACY_COMPAT = {
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
     NETWORK_SOURCE_NWINFO_UBUS_ONLY,
-    TRAFFIC_SOURCE_CID1
+    TRAFFIC_SOURCE_CID1,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO,
+    OPTIONAL_SECTION_AUTO
 };
+
+static int optional_section_enabled(enum optional_section_mode mode, int detected)
+{
+    if (mode == OPTIONAL_SECTION_VISIBLE) return 1;
+    if (mode == OPTIONAL_SECTION_HIDDEN) return 0;
+    return detected != 0;
+}
+
+static int json_has_any_key(const char *json, const char *const *keys, size_t key_count)
+{
+    char value[128];
+    size_t i;
+    if (!json || !*json) return 0;
+    for (i = 0; i < key_count; i++) {
+        if (json_get(json, keys[i], value, sizeof value)) return 1;
+    }
+    return 0;
+}
 
 /* Run `ubus call <svc> <method> [args]` and capture stdout. 0 on output. */
 static int run_ubus(const char *svc, const char *method, const char *args,
@@ -506,6 +556,7 @@ static int read_sms_unread_count(long fallback)
 
     if (run_ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", NULL, cap, sizeof cap) != 0)
         return fallback;
+    g_sms_interface_detected = 1;
     if (json_get(cap, "sms_dev_unread_num", v, sizeof v)) dev = strtol(v, NULL, 10);
     if (json_get(cap, "sms_sim_unread_num", v, sizeof v)) sim = strtol(v, NULL, 10);
     return dev + sim;
@@ -520,6 +571,7 @@ static int refresh_sms_cache(void)
                  list_resp, sizeof list_resp) != 0) {
         return 0;
     }
+    g_sms_interface_detected = 1;
     if (!parse_sms_list(list_resp, next_cache, sizeof next_cache)) {
         return 0;
     }
@@ -1760,9 +1812,14 @@ static void refresh_uci_device_info(void)
         "zwrt_zte_mc_tmp", "zwrt_router"
     };
     struct buf b = {g_uci_device_info, sizeof g_uci_device_info, 0};
+    struct buf without_battery = {
+        g_uci_device_info_no_battery, sizeof g_uci_device_info_no_battery, 0
+    };
     int emitted = 0;
+    int emitted_without_battery = 0;
 
     bappend(&b, "{");
+    bappend(&without_battery, "{");
     for (size_t p = 0; p < sizeof packages / sizeof packages[0]; p++) {
         char show[RAW_MAX];
         size_t package_len = strlen(packages[p]);
@@ -1777,10 +1834,21 @@ static void refresh_uci_device_info(void)
             bappend(&b, "\"%s\":\"", fields[i].key);
             bappend_json_esc(&b, value);
             bappend(&b, "\"");
+            if (strncmp(fields[i].key, "battery_", 8) &&
+                strcmp(fields[i].key, "power_adapter")) {
+                if (emitted_without_battery++) bappend(&without_battery, ",");
+                bappend(&without_battery, "\"%s\":\"", fields[i].key);
+                bappend_json_esc(&without_battery, value);
+                bappend(&without_battery, "\"");
+            }
         }
     }
     bappend(&b, "}");
+    bappend(&without_battery, "}");
     if (b.len >= b.cap) copy_text(g_uci_device_info, sizeof g_uci_device_info, "{}");
+    if (without_battery.len >= without_battery.cap)
+        copy_text(g_uci_device_info_no_battery,
+                  sizeof g_uci_device_info_no_battery, "{}");
 }
 
 static int is_decimal_identity(const char *value)
@@ -2239,6 +2307,7 @@ static void build_snapshot(char *out, size_t outlen,
     char client_list[CLIENT_LIST_MAX];
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
     int cpu_usage, cpu_usage_tenths, wifi_enabled;
+    int show_battery, show_wifi, show_nfc, show_sms;
     char runtime_json[32768], thermal_zones_json[16384];
     int qos_mcc, qos_mnc;
     struct qos_values qos;
@@ -2285,6 +2354,22 @@ static void build_snapshot(char *out, size_t outlen,
                                              thermal_zones_json, sizeof thermal_zones_json);
     cpu_usage = cpu_usage_tenths >= 0 ? (cpu_usage_tenths + 5) / 10 : -1;
     cpu_temp = read_cpu_temp_for_template(device_template, therm);
+    {
+        static const char *const battery_keys[] = {
+            "battery_capacity", "battery_online", "battery_health", "battery_temperature"
+        };
+        static const char *const nfc_keys[] = {"switch", "ap", "wifi_ap"};
+        int battery_detected = json_has_any_key(
+            batt, battery_keys, sizeof battery_keys / sizeof battery_keys[0]) ||
+            bat_uv > 0 || bat_ua != 0;
+        int wifi_detected = wifi_ssid[0] || wifi_key[0] || wifi_enc[0];
+        int nfc_detected = json_has_any_key(
+            nfc, nfc_keys, sizeof nfc_keys / sizeof nfc_keys[0]);
+        show_battery = optional_section_enabled(device_template->battery_section, battery_detected);
+        show_wifi = optional_section_enabled(device_template->wifi_section, wifi_detected);
+        show_nfc = optional_section_enabled(device_template->nfc_section, nfc_detected);
+        show_sms = optional_section_enabled(device_template->sms_section, g_sms_interface_detected);
+    }
     qos_mcc = json_get_int(net, "rmcc", 0);
     qos_mnc = json_get_int(net, "rmnc", 0);
     select_qos_for_plmn(qos_mcc, qos_mnc, &qos);
@@ -2321,23 +2406,28 @@ static void build_snapshot(char *out, size_t outlen,
     emit_str(&b, "sa_bands", net, "nr5g_sa_band_lock"); bappend(&b, ",");
     emit_str(&b, "nsa_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
     emit_str(&b, "lte_bands", net, "lte_band");      bappend(&b, ",");
+    emit_str(&b, "lte_supported_bands", net, "lte_band"); bappend(&b, ",");
+    emit_str(&b, "nr_sa_supported_bands", net, "nr5g_sa_band_lock"); bappend(&b, ",");
+    emit_str(&b, "nr_nsa_supported_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
     emit_str(&b, "wan_status", rstat, "current_wan_status"); bappend(&b, ",");
     bappend(&b, "\"HSR\":false");
     bappend(&b, "},");
 
     /* battery / charger */
-    bappend(&b, "\"battery\":{");
-    emit_int(&b, "percent", batt, "battery_capacity", -1);   bappend(&b, ",");
-    emit_int(&b, "temp", batt, "battery_temperature", 0);     bappend(&b, ",");
-    emit_int(&b, "online", batt, "battery_online", 0);        bappend(&b, ",");
-    emit_int(&b, "health", batt, "battery_health", 0);        bappend(&b, ",");
-    emit_int(&b, "time_to_full", batt, "battery_time_to_full", -1); bappend(&b, ",");
-    emit_int(&b, "charging", chg, "charge_status", 0);        bappend(&b, ",");
-    emit_int(&b, "charger_connect", chg, "charger_connect", 0); bappend(&b, ",");
-    emit_int(&b, "charger_type", chg, "charger_type", 0);     bappend(&b, ",");
-    bappend(&b, "\"chg_uv\":%ld,\"chg_ua\":%ld,\"bat_uv\":%ld,\"bat_ua\":%ld",
-            chg_uv, chg_ua, bat_uv, bat_ua);
-    bappend(&b, "},");
+    if (show_battery) {
+        bappend(&b, "\"battery\":{");
+        emit_int(&b, "percent", batt, "battery_capacity", -1);   bappend(&b, ",");
+        emit_int(&b, "temp", batt, "battery_temperature", 0);     bappend(&b, ",");
+        emit_int(&b, "online", batt, "battery_online", 0);        bappend(&b, ",");
+        emit_int(&b, "health", batt, "battery_health", 0);        bappend(&b, ",");
+        emit_int(&b, "time_to_full", batt, "battery_time_to_full", -1); bappend(&b, ",");
+        emit_int(&b, "charging", chg, "charge_status", 0);        bappend(&b, ",");
+        emit_int(&b, "charger_connect", chg, "charger_connect", 0); bappend(&b, ",");
+        emit_int(&b, "charger_type", chg, "charger_type", 0);     bappend(&b, ",");
+        bappend(&b, "\"chg_uv\":%ld,\"chg_ua\":%ld,\"bat_uv\":%ld,\"bat_ua\":%ld",
+                chg_uv, chg_ua, bat_uv, bat_ua);
+        bappend(&b, "},");
+    }
 
     /* connected clients */
     bappend(&b, "\"clients\":{");
@@ -2348,10 +2438,12 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "},");
 
     /* sms */
-    bappend(&b, "\"sms\":{");
-    bappend(&b, "\"unread\":%ld,", g_sms_unread_cache);
-    bappend(&b, "\"list\":%s", g_sms_list_valid ? g_sms_list_cache : "[]");
-    bappend(&b, "},");
+    if (show_sms) {
+        bappend(&b, "\"sms\":{");
+        bappend(&b, "\"unread\":%ld,", g_sms_unread_cache);
+        bappend(&b, "\"list\":%s", g_sms_list_valid ? g_sms_list_cache : "[]");
+        bappend(&b, "},");
+    }
 
     /* traffic: realtime session counters + speeds (bytes/s). */
     bappend(&b, "\"traffic\":{");
@@ -2384,17 +2476,20 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "},");
 
     /* wlan */
-    bappend(&b, "\"wlan\":{");
-    bappend(&b, "\"ssid\":\""); bappend_json_esc(&b, wifi_ssid); bappend(&b, "\",");
-    bappend(&b, "\"key\":\"");  bappend_json_esc(&b, wifi_key);  bappend(&b, "\",");
-    bappend(&b, "\"enc\":\"");  bappend_json_esc(&b, wifi_enc);  bappend(&b, "\",");
-    bappend(&b, "\"enabled\":%d", wifi_enabled);
-    bappend(&b, "},");
+    if (show_wifi) {
+        bappend(&b, "\"wlan\":{");
+        bappend(&b, "\"ssid\":\""); bappend_json_esc(&b, wifi_ssid); bappend(&b, "\",");
+        bappend(&b, "\"enc\":\"");  bappend_json_esc(&b, wifi_enc);  bappend(&b, "\",");
+        bappend(&b, "\"enabled\":%d", wifi_enabled);
+        bappend(&b, "},");
+    }
 
     /* nfc */
-    bappend(&b, "\"nfc\":{");
-    emit_int(&b, "switch", nfc, "switch", 0);
-    bappend(&b, "},");
+    if (show_nfc) {
+        bappend(&b, "\"nfc\":{");
+        emit_int(&b, "switch", nfc, "switch", 0);
+        bappend(&b, "},");
+    }
 
     /* Template-normalized thermal data; delivered in /state and SSE snapshots. */
     bappend(&b, "\"thermal\":{\"cpu_celsius\":%ld,\"zones\":%s,\"modems\":",
@@ -2417,7 +2512,9 @@ static void build_snapshot(char *out, size_t outlen,
 
     /* Persistent UCI state complements the realtime ubus sections above. */
     bappend(&b, "\"uci_device_info\":%s,",
-            g_uci_device_info[0] ? g_uci_device_info : "{}");
+            show_battery ?
+                (g_uci_device_info[0] ? g_uci_device_info : "{}") :
+                (g_uci_device_info_no_battery[0] ? g_uci_device_info_no_battery : "{}"));
 
     /* SIM identity and provisioning state. Values remain device-local. */
     bappend(&b, "\"sim\":{");
