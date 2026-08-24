@@ -1385,6 +1385,7 @@ struct topflow_curve_point {
 };
 
 static int load_topflow_custom_curve(int *fan_always_on, int *liquid_always_on,
+                                     int *liquid_level,
                                      int *fan_mode, int *manual_speed_percent,
                                      struct topflow_curve_point *points, int *count)
 {
@@ -1394,6 +1395,7 @@ static int load_topflow_custom_curve(int *fan_always_on, int *liquid_always_on,
     int value, curve_count = 0, legacy_fan_enabled = -1, legacy_liquid_enabled = -1;
     if (fan_always_on) *fan_always_on = -1;
     if (liquid_always_on) *liquid_always_on = -1;
+    if (liquid_level) *liquid_level = 1;
     if (fan_mode) *fan_mode = 0;
     if (manual_speed_percent) *manual_speed_percent = 0;
     if (count) *count = 0;
@@ -1407,6 +1409,8 @@ static int load_topflow_custom_curve(int *fan_always_on, int *liquid_always_on,
         else if (!strcmp(key, "liquid_enabled")) legacy_liquid_enabled = value != 0;
         else if (!strcmp(key, "liquid_always_on") && liquid_always_on)
             *liquid_always_on = value != 0;
+        else if (!strcmp(key, "liquid_level") && liquid_level && value >= 1 && value <= 2)
+            *liquid_level = value;
         else if (!strcmp(key, "fan_mode") && fan_mode) *fan_mode = value;
         else if (!strcmp(key, "fan_speed_percent") && manual_speed_percent)
             *manual_speed_percent = value;
@@ -1437,6 +1441,7 @@ static void emit_topflow_hardware_controls(struct buf *b)
     long pwm, rpm, fan_thermal, liquid_thermal, cooling_temp = -1;
     int fan_enabled, liquid_enabled, aggregation_enabled, automatic = 0;
     int configured_fan_always_on = -1, configured_liquid_always_on = -1;
+    int configured_liquid_level = 1;
     int configured_fan_mode = 0, configured_manual_speed = 0, custom_curve_count = 0;
     struct topflow_curve_point custom_curve[TOPFLOW_CUSTOM_CURVE_MAX] = {{0, 0}};
     long temperatures[3] = {44000, 48000, 53000};
@@ -1461,6 +1466,7 @@ static void emit_topflow_hardware_controls(struct buf *b)
     }
     if (!load_topflow_custom_curve(&configured_fan_always_on,
                                    &configured_liquid_always_on,
+                                   &configured_liquid_level,
                                    &configured_fan_mode, &configured_manual_speed,
                                    custom_curve, &custom_curve_count))
         configured_fan_mode = 0;
@@ -1498,9 +1504,14 @@ static void emit_topflow_hardware_controls(struct buf *b)
     if (rpm >= 0) bappend(b, "\"rpm\":%ld,", rpm);
     bappend(b, "\"thermal_enabled\":%s,\"levels_percent\":[0,30,50,70]},",
             fan_thermal > 0 ? "true" : "false");
-    bappend(b, "\"liquid\":{\"enabled\":%s,\"always_on\":%s,\"thermal_enabled\":%s},",
+    bappend(b, "\"liquid\":{\"enabled\":%s,\"always_on\":%s,\"thermal_enabled\":%s,",
             liquid_enabled ? "true" : "false",
             liquid_enabled ? "true" : "false", liquid_thermal > 0 ? "true" : "false");
+    bappend(b, "\"mode\":\"%s\",\"level\":%d,\"speed_percent\":%d,\"amplitude\":%d,\"levels_percent\":[30,100]},",
+            liquid_enabled ? (configured_liquid_level >= 2 ? "high" : "low") : "automatic",
+            liquid_enabled ? configured_liquid_level : 0,
+            liquid_enabled ? (configured_liquid_level >= 2 ? 100 : 30) : 0,
+            liquid_enabled ? (configured_liquid_level >= 2 ? 200 : 60) : 0);
     bappend(b, "\"curve\":[");
     if (custom_curve_count >= 2) {
         for (int i = 0; i < custom_curve_count; i++) {
