@@ -2369,6 +2369,36 @@ static void emit_prefixed_int(struct buf *b, const char *key, const char *src,
     emit_int(b, key, src, source_key, def);
 }
 
+static int get_prefixed_lte_bandwidth(const char *src, const char *prefix,
+                                      const char *suffix, char *out, size_t outlen)
+{
+    char source_key[128], raw[64], *start, *end, *parsed_end;
+    const char *canonical = NULL;
+    double mhz;
+    prefixed_key(source_key, sizeof source_key, prefix, suffix);
+    if (!json_get(src, source_key, raw, sizeof raw)) return 0;
+    start = raw;
+    while (*start && isspace((unsigned char)*start)) start++;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    if (end - start >= 3 && !strncasecmp(end - 3, "MHz", 3)) {
+        end -= 3;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+    }
+    *end = 0;
+    errno = 0;
+    mhz = strtod(start, &parsed_end);
+    if (errno || parsed_end == start || *parsed_end) return 0;
+    if (mhz > 1.39 && mhz < 1.41) canonical = "1.4";
+    else if (mhz == 3.0) canonical = "3";
+    else if (mhz == 5.0) canonical = "5";
+    else if (mhz == 10.0) canonical = "10";
+    else if (mhz == 15.0) canonical = "15";
+    else if (mhz == 20.0) canonical = "20";
+    if (!canonical || snprintf(out, outlen, "%s", canonical) >= (int)outlen) return 0;
+    return 1;
+}
+
 static void emit_realtime_traffic(struct buf *b, const char *src)
 {
     emit_int(b, "rx_speed", src, "real_rx_speed", 0); bappend(b, ",");
@@ -2388,13 +2418,16 @@ static void emit_topflow_external_modem(struct buf *b, int index)
     static const char *usb_paths[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"1-1", "1-2"};
     static const char *usb_ids[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"19d2:0581", "19d2:1716"};
     static const char *adb_serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"V3E1T12345", "V3E2T12345"};
-    char net_prefix[32], sim_prefix[32], path[256];
+    char net_prefix[32], sim_prefix[32], path[256], bandwidth[8];
     int subid = topflow_external_subid(index);
+    int has_bandwidth;
     long carrier;
     int usb_present, adb_available;
 
     snprintf(net_prefix, sizeof net_prefix, "msim_%d_0_", index + 1);
     snprintf(sim_prefix, sizeof sim_prefix, "v3t_%d_", index + 1);
+    has_bandwidth = get_prefixed_lte_bandwidth(
+        g_topflow_msim_netinfo, net_prefix, "lte_bandwidth", bandwidth, sizeof bandwidth);
     snprintf(path, sizeof path, "/sys/class/net/%s/carrier", ifnames[index]);
     carrier = read_long_file(path, 0);
     snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/idVendor", usb_paths[index]);
@@ -2429,8 +2462,12 @@ static void emit_topflow_external_modem(struct buf *b, int index)
     emit_prefixed_str(b, "lte_snr", g_topflow_msim_netinfo, net_prefix, "lte_snr"); bappend(b, ",");
     emit_prefixed_int(b, "lte_pci", g_topflow_msim_netinfo, net_prefix, "lte_pci", 0); bappend(b, ",");
     emit_prefixed_int(b, "cell_id", g_topflow_msim_netinfo, net_prefix, "cell_id", 0); bappend(b, ",");
-    emit_prefixed_int(b, "channel", g_topflow_msim_netinfo, net_prefix, "wan_active_channel", 0); bappend(b, ",");
-    emit_prefixed_str(b, "bandwidth", g_topflow_msim_netinfo, net_prefix, "lte_bandwidth"); bappend(b, ",");
+    emit_prefixed_int(b, "channel", g_topflow_msim_netinfo, net_prefix, "wan_active_channel", 0);
+    if (has_bandwidth) {
+        bappend(b, ",");
+        emit_kv_str(b, "bandwidth", bandwidth);
+    }
+    bappend(b, ",");
     emit_prefixed_str(b, "mode", g_topflow_msim_netinfo, net_prefix, "net_select"); bappend(b, ",");
     emit_prefixed_str(b, "operate_mode", g_topflow_msim_netinfo, net_prefix, "operate_mode");
     bappend(b, "},\"sim\":{");

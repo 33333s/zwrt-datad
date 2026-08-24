@@ -273,6 +273,8 @@ assert data["modems"][0]["net"]["nr_pci"] == 321
 assert data["modems"][0]["net"]["nr_cell_id"] == 123456
 assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
 assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
+assert "bandwidth" not in data["modems"][1]["net"]
+assert data["modems"][2]["net"]["bandwidth"] == "20"
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
