@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.16",
+    "version": "0.9.17",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 输出结构化 mwan3 配置，安全编辑探测、成员权重、策略与规则，并明确 ICG/MULTIWAN 互斥模式"
+    "notes": "MU5252 从厂商落盘 UCI 读取 ICG 剩余流量与当日用量，实时接口超时时仍输出明确的字节值"
   }
 }

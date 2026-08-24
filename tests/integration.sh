@@ -309,7 +309,10 @@ assert data["aggregation"]["tcp_tunnel_count"] == 2
 assert data["aggregation"]["path_count"] == 3
 assert data["aggregation"]["online_path_count"] == 2
 assert data["aggregation"]["traffic"] == {
-    "remaining_raw": "10240", "today_used_raw": "512"
+    "remaining_bytes": 51943409341,
+    "remaining_raw": "51943409341",
+    "today_used_bytes": 32386704,
+    "today_used_raw": "32386704",
 }
 paths = {path["id"]: path for path in data["aggregation"]["paths"]}
 assert paths["x75"]["latency_ms"] == 18.5
