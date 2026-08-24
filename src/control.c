@@ -11,6 +11,7 @@
 #include "device_exec.h"
 #include "json.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1179,6 +1180,11 @@ static int control_aggregation_set(const char *params, char *result, size_t resu
             snprintf(err, errlen, "zwrt_router.api.router_set_wan_mode failed");
             return 0;
         }
+        {
+            const char *init = env_path("ZWRT_DATAD_MWAN3_INIT", "/etc/init.d/mwan3");
+            const char *argv[] = {init, "stop", NULL};
+            (void)device_run_quiet(argv);
+        }
     } else {
         snprintf(args, sizeof args, "{\"agg_mode_switch\":0}");
         if (device_ubus_call_raw("zwrt_router.api", "router_stop_agg_mode", args,
@@ -1186,9 +1192,242 @@ static int control_aggregation_set(const char *params, char *result, size_t resu
             snprintf(err, errlen, "zwrt_router.api.router_stop_agg_mode failed");
             return 0;
         }
+        snprintf(args, sizeof args,
+                 "{\"opms_wan_mode\":\"MULTIWAN\",\"wan_ippass_device_type\":\"\","
+                 "\"wan_ippass_device_mac\":\"\"}");
+        if (device_ubus_call_raw("zwrt_router.api", "router_set_wan_mode", args,
+                                 ignored, sizeof ignored) != 0) {
+            snprintf(err, errlen, "aggregation stopped but MULTIWAN mode switch failed");
+            return 0;
+        }
+        {
+            const char *init = env_path("ZWRT_DATAD_MWAN3_INIT", "/etc/init.d/mwan3");
+            const char *argv[] = {init, "restart", NULL};
+            if (device_run_quiet(argv) != 0) {
+                snprintf(err, errlen, "aggregation disabled but mwan3 restart failed");
+                return 0;
+            }
+        }
     }
     snprintf(result, result_len, "{\"enabled\":%s}", enabled ? "true" : "false");
     return 1;
+}
+
+static int valid_uci_section_name(const char *value)
+{
+    if (!value || !*value || strlen(value) > 63) return 0;
+    for (; *value; value++)
+        if (!isalnum((unsigned char)*value) && *value != '_' && *value != '-') return 0;
+    return 1;
+}
+
+static int mwan3_section_is(const char *section, const char *type)
+{
+    char path[96], actual[64];
+    if (!valid_uci_section_name(section)) return 0;
+    snprintf(path, sizeof path, "mwan3.%s", section);
+    return device_uci_get(path, actual, sizeof actual) == 0 && !strcmp(actual, type);
+}
+
+static int set_mwan3_option(const char *section, const char *option, const char *value,
+                            char *err, size_t errlen)
+{
+    char path[160];
+    snprintf(path, sizeof path, "mwan3.%s.%s", section, option);
+    if (device_uci_set(path, value) == 0) return 1;
+    snprintf(err, errlen, "failed to set mwan3 option: %s", option);
+    return 0;
+}
+
+static int set_mwan3_int_option(const char *params, const char *section,
+                                const char *option, long minimum, long maximum,
+                                int *changed, char *err, size_t errlen)
+{
+    char raw[64], normalized[32];
+    long value;
+    if (!json_get(params, option, raw, sizeof raw)) return 1;
+    if (!normalized_int(raw, &value) || value < minimum || value > maximum) {
+        set_invalid_error(err, errlen, "%s must be between %ld and %ld",
+                          option, minimum, maximum);
+        return 0;
+    }
+    snprintf(normalized, sizeof normalized, "%ld", value);
+    if (!set_mwan3_option(section, option, normalized, err, errlen)) return 0;
+    *changed = 1;
+    return 1;
+}
+
+static int replace_mwan3_list(const char *section, const char *option, const char *csv,
+                              const char *item_type, char *err, size_t errlen)
+{
+    char copy[4096], path[160], *save = NULL, *token;
+    int count = 0;
+    if (strlen(csv) >= sizeof copy) {
+        set_invalid_error(err, errlen, "%s is too long", option);
+        return 0;
+    }
+    strcpy(copy, csv);
+    snprintf(path, sizeof path, "mwan3.%s.%s", section, option);
+    (void)device_uci_delete(path);
+    for (token = strtok_r(copy, ", \t\r\n", &save); token;
+         token = strtok_r(NULL, ", \t\r\n", &save)) {
+        if (++count > 16) {
+            set_invalid_error(err, errlen, "too many %s entries", option);
+            return 0;
+        }
+        if (!strcmp(item_type, "address")) {
+            unsigned char address[sizeof(struct in6_addr)];
+            if (inet_pton(AF_INET, token, address) != 1 &&
+                inet_pton(AF_INET6, token, address) != 1) {
+                set_invalid_error(err, errlen, "invalid tracking address");
+                return 0;
+            }
+        } else if (!mwan3_section_is(token, item_type)) {
+            set_invalid_error(err, errlen, "unknown mwan3 %s: %s", item_type, token);
+            return 0;
+        }
+        if (device_uci_list("add_list", path, token) != 0) {
+            snprintf(err, errlen, "failed to update mwan3 list: %s", option);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int apply_mwan3_if_active(int *applied)
+{
+    char mode[32];
+    const char *init, *argv[3];
+    *applied = 0;
+    if (device_uci_get("zwrt_router.network.opms_wan_mode", mode, sizeof mode) != 0 ||
+        strcmp(mode, "MULTIWAN")) return 1;
+    init = env_path("ZWRT_DATAD_MWAN3_INIT", "/etc/init.d/mwan3");
+    argv[0] = init; argv[1] = "restart"; argv[2] = NULL;
+    if (device_run_quiet(argv) != 0) return 0;
+    *applied = 1;
+    return 1;
+}
+
+static int finish_mwan3_update(const char *section, int changed,
+                               char *result, size_t result_len,
+                               char *err, size_t errlen)
+{
+    int applied;
+    if (!changed) {
+        set_invalid_error(err, errlen, "no mwan3 fields supplied");
+        return 0;
+    }
+    if (device_uci_commit("mwan3") != 0) {
+        (void)device_uci_revert("mwan3");
+        snprintf(err, errlen, "failed to commit mwan3 configuration");
+        return 0;
+    }
+    if (!apply_mwan3_if_active(&applied)) {
+        snprintf(err, errlen, "mwan3 configuration committed but restart failed");
+        return 0;
+    }
+    snprintf(result, result_len, "{\"section\":\"%s\",\"applied\":%s}",
+             section, applied ? "true" : "false");
+    return 1;
+}
+
+static int control_multiwan_interface_set(const char *params, char *result, size_t result_len,
+                                          char *err, size_t errlen)
+{
+    char section[64], track_ip[4096], method[32];
+    int changed = 0;
+    static const struct { const char *name; long min, max; } fields[] = {
+        {"enabled", 0, 1}, {"reliability", 0, 16}, {"count", 1, 16},
+        {"size", 1, 4096}, {"max_ttl", 1, 255}, {"check_quality", 0, 1},
+        {"timeout", 1, 60}, {"interval", 1, 3600},
+        {"failure_interval", 1, 3600}, {"recovery_interval", 1, 3600},
+        {"down", 1, 100}, {"up", 1, 100}
+    };
+    if (!param_value(params, "section", section, sizeof section) ||
+        !mwan3_section_is(section, "interface")) {
+        set_invalid_error(err, errlen, "unknown mwan3 interface");
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++)
+        if (!set_mwan3_int_option(params, section, fields[i].name, fields[i].min,
+                                  fields[i].max, &changed, err, errlen)) goto fail;
+    if (json_get(params, "track_method", method, sizeof method)) {
+        if (strcmp(method, "ping")) {
+            set_invalid_error(err, errlen, "only ping tracking is supported");
+            goto fail;
+        }
+        if (!set_mwan3_option(section, "track_method", method, err, errlen)) goto fail;
+        changed = 1;
+    }
+    if (json_get(params, "track_ip", track_ip, sizeof track_ip)) {
+        if (!replace_mwan3_list(section, "track_ip", track_ip, "address", err, errlen)) goto fail;
+        changed = 1;
+    }
+    return finish_mwan3_update(section, changed, result, result_len, err, errlen);
+fail:
+    (void)device_uci_revert("mwan3");
+    return 0;
+}
+
+static int control_multiwan_member_set(const char *params, char *result, size_t result_len,
+                                       char *err, size_t errlen)
+{
+    char section[64]; int changed = 0;
+    if (!param_value(params, "section", section, sizeof section) ||
+        !mwan3_section_is(section, "member")) {
+        set_invalid_error(err, errlen, "unknown mwan3 member"); return 0;
+    }
+    if (!set_mwan3_int_option(params, section, "metric", 1, 65535, &changed, err, errlen) ||
+        !set_mwan3_int_option(params, section, "weight", 1, 1000, &changed, err, errlen)) {
+        (void)device_uci_revert("mwan3"); return 0;
+    }
+    return finish_mwan3_update(section, changed, result, result_len, err, errlen);
+}
+
+static int control_multiwan_policy_set(const char *params, char *result, size_t result_len,
+                                       char *err, size_t errlen)
+{
+    char section[64], members[4096], last[32]; int changed = 0;
+    if (!param_value(params, "section", section, sizeof section) ||
+        !mwan3_section_is(section, "policy")) {
+        set_invalid_error(err, errlen, "unknown mwan3 policy"); return 0;
+    }
+    if (json_get(params, "last_resort", last, sizeof last)) {
+        if (strcmp(last, "default") && strcmp(last, "unreachable") && strcmp(last, "blackhole")) {
+            set_invalid_error(err, errlen, "invalid last_resort"); goto fail;
+        }
+        if (!set_mwan3_option(section, "last_resort", last, err, errlen)) goto fail;
+        changed = 1;
+    }
+    if (json_get(params, "use_member", members, sizeof members)) {
+        if (!replace_mwan3_list(section, "use_member", members, "member", err, errlen)) goto fail;
+        changed = 1;
+    }
+    return finish_mwan3_update(section, changed, result, result_len, err, errlen);
+fail:
+    (void)device_uci_revert("mwan3"); return 0;
+}
+
+static int control_multiwan_rule_set(const char *params, char *result, size_t result_len,
+                                     char *err, size_t errlen)
+{
+    char section[64], policy[64]; int changed = 0;
+    if (!param_value(params, "section", section, sizeof section) ||
+        !mwan3_section_is(section, "rule")) {
+        set_invalid_error(err, errlen, "unknown mwan3 rule"); return 0;
+    }
+    if (json_get(params, "use_policy", policy, sizeof policy)) {
+        if (!mwan3_section_is(policy, "policy")) {
+            set_invalid_error(err, errlen, "unknown mwan3 policy"); goto fail;
+        }
+        if (!set_mwan3_option(section, "use_policy", policy, err, errlen)) goto fail;
+        changed = 1;
+    }
+    if (!set_mwan3_int_option(params, section, "sticky", 0, 1, &changed, err, errlen) ||
+        !set_mwan3_int_option(params, section, "logging", 0, 1, &changed, err, errlen)) goto fail;
+    return finish_mwan3_update(section, changed, result, result_len, err, errlen);
+fail:
+    (void)device_uci_revert("mwan3"); return 0;
 }
 
 static int control_fan_enabled(const char *params, char *result, size_t result_len,
@@ -1422,7 +1661,8 @@ const char *control_capabilities_json(void)
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
-        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\",\"cooling.liquid.set_mode\","
+        "\"aggregation.set\",\"multiwan.interface.set\",\"multiwan.member.set\",\"multiwan.policy.set\",\"multiwan.rule.set\","
+        "\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\",\"cooling.liquid.set_mode\","
         "\"state.refresh\",\"state.set_interval\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
@@ -1717,6 +1957,14 @@ struct control_result control_execute(const char *request_json,
         }
     } else if (!strcmp(action, "aggregation.set")) {
         ok = control_aggregation_set(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "multiwan.interface.set")) {
+        ok = control_multiwan_interface_set(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "multiwan.member.set")) {
+        ok = control_multiwan_member_set(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "multiwan.policy.set")) {
+        ok = control_multiwan_policy_set(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "multiwan.rule.set")) {
+        ok = control_multiwan_rule_set(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_enabled")) {
         ok = control_fan_enabled(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_curve")) {

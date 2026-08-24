@@ -336,6 +336,19 @@ int device_uci_list(const char *operation, const char *path, const char *value)
     return device_run_quiet(argv);
 }
 
+int device_uci_delete(const char *path)
+{
+    const char *uci = getenv("ZWRT_DATAD_UCI_BIN");
+    const char *argv[4];
+    if (!valid_uci_path(path)) return -1;
+    if (!uci || !*uci) uci = "uci";
+    argv[0] = uci;
+    argv[1] = "delete";
+    argv[2] = path;
+    argv[3] = NULL;
+    return device_run_quiet(argv);
+}
+
 int device_wifi_reload(void)
 {
     char out[512];
