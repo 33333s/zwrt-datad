@@ -152,6 +152,14 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
             [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
             printf '%s\n' 'fixture-icg-id'
             ;;
+        zwrt_router.icgmwan.residual_flow)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' '51943409341'
+            ;;
+        zwrt_router.icgmwan.count_flow_today)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' '32386704'
+            ;;
         mwan3.zte_mwan2) printf '%s\n' 'interface' ;;
         mwan3.zte_mwan2_m1) printf '%s\n' 'member' ;;
         mwan3.balanced) printf '%s\n' 'policy' ;;

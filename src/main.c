@@ -1708,6 +1708,36 @@ static int count_topflow_icg_tcp_tunnels(void)
     return count;
 }
 
+static int topflow_decimal_bytes(const char *value)
+{
+    const unsigned char *cursor = (const unsigned char *)value;
+    if (!cursor || !*cursor) return 0;
+    while (*cursor) {
+        if (!isdigit(*cursor)) return 0;
+        cursor++;
+    }
+    return 1;
+}
+
+static int load_topflow_aggregation_traffic_uci(void)
+{
+    char remaining[128] = "", today_used[128] = "";
+    int has_remaining =
+        device_uci_get("zwrt_router.icgmwan.residual_flow", remaining,
+                       sizeof remaining) == 0 &&
+        topflow_decimal_bytes(remaining);
+    int has_today_used =
+        device_uci_get("zwrt_router.icgmwan.count_flow_today", today_used,
+                       sizeof today_used) == 0 &&
+        topflow_decimal_bytes(today_used);
+
+    if (!has_remaining && !has_today_used) return 0;
+    snprintf(g_topflow_aggregation_flow, sizeof g_topflow_aggregation_flow,
+             "{\"residual_flow\":\"%s\",\"count_flow_today\":\"%s\",\"source\":\"uci\"}",
+             has_remaining ? remaining : "", has_today_used ? today_used : "");
+    return 1;
+}
+
 static void refresh_topflow_aggregation_cache(void)
 {
     char next[RAW_MAX], mode[32] = "", icg_id[128] = "";
@@ -1733,6 +1763,7 @@ static void refresh_topflow_aggregation_cache(void)
     if (device_uci_get("zwrt_router.network.opms_wan_mode", mode, sizeof mode) != 0)
         mode[0] = 0;
     enabled = !strcmp(mode, "SMULTIWAN");
+    (void)load_topflow_aggregation_traffic_uci();
     if (!enabled || !g_topflow_icg_provisioned ||
         now < g_topflow_aggregation_traffic_next_at) return;
     g_topflow_aggregation_traffic_next_at = now + TOPFLOW_AGGREGATION_TRAFFIC_POLL_SEC;
@@ -1745,6 +1776,7 @@ static void refresh_topflow_aggregation_cache(void)
             json_get(next, "count_flow_today", value, sizeof value))
             copy_text(g_topflow_aggregation_flow, sizeof g_topflow_aggregation_flow, next);
     }
+    (void)load_topflow_aggregation_traffic_uci();
 }
 
 static int mwan3_config_value(const char *section, const char *option,
@@ -2045,14 +2077,25 @@ static void emit_topflow_aggregation(struct buf *b, int enabled,
     (void)json_get(g_topflow_aggregation_flow, "residual_flow", remaining, sizeof remaining);
     (void)json_get(g_topflow_aggregation_flow, "count_flow_today", today_used, sizeof today_used);
     if (remaining[0] || today_used[0]) {
+        int has_field = 0;
         bappend(b, ",\"traffic\":{");
         if (remaining[0]) {
-            bappend(b, "\"remaining_raw\":\"");
+            if (topflow_decimal_bytes(remaining)) {
+                bappend(b, "\"remaining_bytes\":%s", remaining);
+                has_field = 1;
+            }
+            bappend(b, "%s\"remaining_raw\":\"", has_field ? "," : "");
             bappend_json_esc(b, remaining);
             bappend(b, "\"");
+            has_field = 1;
         }
         if (today_used[0]) {
-            bappend(b, "%s\"today_used_raw\":\"", remaining[0] ? "," : "");
+            if (topflow_decimal_bytes(today_used)) {
+                bappend(b, "%s\"today_used_bytes\":%s",
+                        has_field ? "," : "", today_used);
+                has_field = 1;
+            }
+            bappend(b, "%s\"today_used_raw\":\"", has_field ? "," : "");
             bappend_json_esc(b, today_used);
             bappend(b, "\"");
         }
