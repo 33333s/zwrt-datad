@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.11",
+    "version": "0.9.12",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 风扇/液冷常开语义、旧曲线无损迁移与厂商 thermal 控制交接"
+    "notes": "MU5252 外挂 4G 基带频宽字段校验，过滤厂商误报的非 MHz 状态字符串"
   }
 }
