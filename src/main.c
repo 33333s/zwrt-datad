@@ -85,6 +85,7 @@ static void on_signal(int s) { (void)s; g_run = 0; }
 static volatile sig_atomic_t g_qos_refresh_req = 0;
 static void on_qos_signal(int s) { (void)s; g_qos_refresh_req = 1; }
 static volatile sig_atomic_t g_state_refresh_req = 0;
+static int g_sample_interval_ms = 1000;
 
 static char g_sms_list_cache[SMS_LIST_MAX] = "[]";
 static int g_sms_list_valid;
@@ -2857,6 +2858,7 @@ static void build_snapshot(char *out, size_t outlen,
     }
     bappend(&b, "},");
 
+    bappend(&b, "\"sample_interval_ms\":%d,", g_sample_interval_ms);
     /* Realtime system details that are intentionally sampled once per daemon cycle. */
     bappend(&b, "\"runtime\":%s}", runtime_json[0] ? runtime_json : "{}");
 }
@@ -4078,6 +4080,7 @@ int main(int argc, char **argv)
         }
     }
     if (interval_ms <= 0) interval_ms = 1000;
+    g_sample_interval_ms = interval_ms;
 
     sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
     interface_poll_every = sim_poll_every;
@@ -4147,6 +4150,21 @@ int main(int argc, char **argv)
     if (last_sms_unread >= 0) g_sms_unread_cache = last_sms_unread;
 
     do {
+        int requested_interval_ms = control_take_requested_interval_ms();
+        if (requested_interval_ms >= 500 && requested_interval_ms <= 5000 &&
+            requested_interval_ms != interval_ms) {
+            interval_ms = requested_interval_ms;
+            g_sample_interval_ms = interval_ms;
+            sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
+            interface_poll_every = sim_poll_every;
+            qos_retry_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
+            if (sim_poll_every < 1) sim_poll_every = 1;
+            if (interface_poll_every < 1) interface_poll_every = 1;
+            if (qos_retry_every < 1) qos_retry_every = 1;
+            if (qos_retry_left > 0)
+                qos_retry_left = (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
+            cycle = 0;
+        }
         int force_refresh = g_state_refresh_req;
         g_state_refresh_req = 0;
         if (cycle % 3600 == 0 && cycle != 0) {
