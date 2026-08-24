@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.14",
+    "version": "0.9.15",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 液冷按原厂驱动档位提供自动、低档常开和高档常开控制"
+    "notes": "MU5252 聚合状态按 ICG 进程实际 socket 统计运行时隧道，并区分 mwan3 控制层与底层接口状态"
   }
 }

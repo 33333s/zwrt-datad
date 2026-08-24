@@ -117,6 +117,10 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
             [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
             printf '%s\n' 'SMULTIWAN'
             ;;
+        zwrt_router.icgmwan.IcgDevId)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' 'fixture-icg-id'
+            ;;
         *) exit 1 ;;
     esac
     exit 0

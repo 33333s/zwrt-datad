@@ -79,6 +79,14 @@
 #define TOPFLOW_THERMAL_ROOT "/sys/class/thermal"
 #define TOPFLOW_COOLING_CONFIG "/data/zwrt-datad/cooling.conf"
 #define TOPFLOW_CUSTOM_CURVE_MAX 8
+#define TOPFLOW_ICG_CONFIG "/home/icg/icg.conf"
+#define TOPFLOW_PROC_ROOT "/proc"
+#define TOPFLOW_PROC_NET_TCP "/proc/net/tcp"
+#define TOPFLOW_AGGREGATION_TRAFFIC_POLL_SEC 60
+#define TOPFLOW_AGGREGATION_FLOW_TIMEOUT_MS 1500
+#define TOPFLOW_AGGREGATION_MAX_PATHS 4
+#define TOPFLOW_ICG_MAX_SOCKETS 256
+#define TOPFLOW_ICG_MAX_TCP_ENTRIES 512
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -114,6 +122,17 @@ static long g_topflow_external_temp[TOPFLOW_EXTERNAL_MODEM_COUNT];
 static int g_topflow_external_temp_valid[TOPFLOW_EXTERNAL_MODEM_COUNT];
 static time_t g_topflow_external_temp_sampled_at[TOPFLOW_EXTERNAL_MODEM_COUNT];
 static time_t g_topflow_thermal_next_at;
+static char g_topflow_mwan3_status[RAW_MAX];
+static char g_topflow_aggregation_flow[4096];
+static char g_topflow_icg_server_ip[64];
+static int g_topflow_icg_tcp_port;
+static int g_topflow_icg_udp_start_port;
+static int g_topflow_icg_tcp_tunnel_count;
+static int g_topflow_icg_provisioned;
+static int g_topflow_icg_process_running;
+static int g_topflow_mwan3_running;
+static int g_topflow_icg_server_runtime;
+static time_t g_topflow_aggregation_traffic_next_at;
 static char g_ubus_catalog[UBUS_CATALOG_MAX];
 static char g_ubus_call_args[HTTP_REQ_MAX];
 static char g_ubus_call_result[UBUS_CALL_RESULT_MAX];
@@ -1434,6 +1453,460 @@ static int load_topflow_custom_curve(int *fan_always_on, int *liquid_always_on,
     return 1;
 }
 
+static int json_bool_or(const char *json, const char *key, int fallback)
+{
+    char value[16];
+    if (!json_get(json, key, value, sizeof value)) return fallback;
+    if (!strcasecmp(value, "true") || !strcmp(value, "1")) return 1;
+    if (!strcasecmp(value, "false") || !strcmp(value, "0")) return 0;
+    return fallback;
+}
+
+static double json_double_or(const char *json, const char *key, double fallback)
+{
+    char value[64], *end;
+    double parsed;
+    if (!json_get(json, key, value, sizeof value)) return fallback;
+    errno = 0;
+    parsed = strtod(value, &end);
+    if (errno || end == value) return fallback;
+    return parsed;
+}
+
+static const char *copy_next_json_object(const char *cursor, char *out, size_t outlen)
+{
+    const char *start;
+    int depth = 0, in_string = 0, escaped = 0;
+    size_t length;
+
+    if (!cursor || !out || outlen == 0) return NULL;
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == '[' || *cursor == ','))
+        cursor++;
+    if (*cursor == ']' || *cursor != '{') return NULL;
+    start = cursor;
+    for (; *cursor; cursor++) {
+        char c = *cursor;
+        if (in_string) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') in_string = 0;
+            continue;
+        }
+        if (c == '"') in_string = 1;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) {
+            cursor++;
+            length = (size_t)(cursor - start);
+            if (length >= outlen) length = outlen - 1;
+            memcpy(out, start, length);
+            out[length] = 0;
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
+static void trim_ascii(char *text)
+{
+    char *start;
+    size_t length;
+    if (!text) return;
+    start = text;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != text) memmove(text, start, strlen(start) + 1);
+    length = strlen(text);
+    while (length && isspace((unsigned char)text[length - 1])) text[--length] = 0;
+}
+
+static void load_topflow_icg_config(void)
+{
+    const char *path = runtime_path("ZWRT_DATAD_ICG_CONFIG", TOPFLOW_ICG_CONFIG);
+    FILE *fp = fopen(path, "r");
+    char line[256], key[128], value[128];
+
+    g_topflow_icg_server_ip[0] = 0;
+    g_topflow_icg_tcp_port = 0;
+    g_topflow_icg_udp_start_port = 0;
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if (sscanf(line, " %127[^=]=%127[^\r\n]", key, value) != 2) continue;
+        trim_ascii(key);
+        trim_ascii(value);
+        if (!strcmp(key, "AggregationServerIP"))
+            copy_text(g_topflow_icg_server_ip, sizeof g_topflow_icg_server_ip, value);
+        else if (!strcmp(key, "AggregationServerTcpPort"))
+            g_topflow_icg_tcp_port = atoi(value);
+        else if (!strcmp(key, "AggregationServerUdpStartPort"))
+            g_topflow_icg_udp_start_port = atoi(value);
+    }
+    fclose(fp);
+}
+
+struct topflow_tcp_entry {
+    uint32_t local_address;
+    uint32_t remote_address;
+    unsigned int local_port;
+    unsigned int remote_port;
+    unsigned int state;
+    unsigned long inode;
+};
+
+static int proc_find_command(const char *command)
+{
+    const char *root = runtime_path("ZWRT_DATAD_PROC_ROOT", TOPFLOW_PROC_ROOT);
+    DIR *dir = opendir(root);
+    struct dirent *entry;
+    if (!dir) return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[PATH_MAX], comm[128] = "";
+        FILE *fp;
+        char *end = NULL;
+        long pid = strtol(entry->d_name, &end, 10);
+        if (pid <= 0 || !end || *end) continue;
+        snprintf(path, sizeof path, "%s/%ld/comm", root, pid);
+        fp = fopen(path, "r");
+        if (!fp) continue;
+        if (fgets(comm, sizeof comm, fp)) trim_ascii(comm);
+        fclose(fp);
+        if (!strcmp(comm, command)) {
+            closedir(dir);
+            return (int)pid;
+        }
+    }
+    closedir(dir);
+    return 0;
+}
+
+static int socket_inode_owned(unsigned long inode, const unsigned long *owned,
+                              size_t owned_count)
+{
+    for (size_t i = 0; i < owned_count; i++)
+        if (owned[i] == inode) return 1;
+    return 0;
+}
+
+static size_t load_topflow_icg_socket_inodes(unsigned long *owned, size_t cap)
+{
+    const char *fixture = getenv("ZWRT_DATAD_ICG_SOCKET_INODES");
+    const char *root = runtime_path("ZWRT_DATAD_PROC_ROOT", TOPFLOW_PROC_ROOT);
+    size_t count = 0;
+    int pid;
+    if (fixture && *fixture) {
+        const char *cursor = fixture;
+        while (*cursor && count < cap) {
+            char *end = NULL;
+            unsigned long inode = strtoul(cursor, &end, 10);
+            if (end == cursor) break;
+            owned[count++] = inode;
+            cursor = *end ? end + 1 : end;
+        }
+        return count;
+    }
+    pid = proc_find_command("zte_icg_agg");
+    if (pid > 0) {
+        char directory[PATH_MAX];
+        DIR *dir;
+        struct dirent *entry;
+        snprintf(directory, sizeof directory, "%s/%d/fd", root, pid);
+        dir = opendir(directory);
+        if (!dir) return 0;
+        while ((entry = readdir(dir)) != NULL && count < cap) {
+            char target[128];
+            ssize_t length;
+            unsigned long inode;
+            if (entry->d_name[0] == '.') continue;
+            length = readlinkat(dirfd(dir), entry->d_name, target, sizeof target - 1);
+            if (length <= 0) continue;
+            target[length] = 0;
+            if (sscanf(target, "socket:[%lu]", &inode) == 1)
+                owned[count++] = inode;
+        }
+        closedir(dir);
+    }
+    return count;
+}
+
+static int parse_topflow_tcp_entry(const char *line, struct topflow_tcp_entry *entry)
+{
+    return sscanf(line,
+                  " %*u: %8x:%4x %8x:%4x %2x %*s %*s %*s %*u %*u %lu",
+                  &entry->local_address, &entry->local_port,
+                  &entry->remote_address, &entry->remote_port,
+                  &entry->state, &entry->inode) == 6;
+}
+
+static void proc_ipv4_text(uint32_t value, char *out, size_t outlen)
+{
+    struct in_addr address;
+    address.s_addr = value;
+    if (!inet_ntop(AF_INET, &address, out, outlen)) out[0] = 0;
+}
+
+static int count_topflow_icg_tcp_tunnels(void)
+{
+    const char *path = runtime_path("ZWRT_DATAD_PROC_NET_TCP", TOPFLOW_PROC_NET_TCP);
+    struct topflow_tcp_entry entries[TOPFLOW_ICG_MAX_TCP_ENTRIES];
+    unsigned long owned[TOPFLOW_ICG_MAX_SOCKETS];
+    unsigned int listeners[32];
+    uint32_t peers_address[TOPFLOW_ICG_MAX_TCP_ENTRIES];
+    unsigned int peers_port[TOPFLOW_ICG_MAX_TCP_ENTRIES];
+    int peers_count[TOPFLOW_ICG_MAX_TCP_ENTRIES];
+    size_t owned_count, entry_count = 0, listener_count = 0, peer_count = 0;
+    FILE *fp;
+    char line[512];
+    int count = 0, best_peer = -1;
+
+    g_topflow_icg_server_runtime = 0;
+    owned_count = load_topflow_icg_socket_inodes(owned, TOPFLOW_ICG_MAX_SOCKETS);
+    g_topflow_icg_process_running = owned_count > 0 || proc_find_command("zte_icg_agg") > 0;
+    if (!owned_count) return 0;
+    fp = fopen(path, "r");
+    if (!fp) return 0;
+    while (entry_count < TOPFLOW_ICG_MAX_TCP_ENTRIES &&
+           fgets(line, sizeof line, fp)) {
+        if (parse_topflow_tcp_entry(line, &entries[entry_count])) entry_count++;
+    }
+    fclose(fp);
+    for (size_t i = 0; i < entry_count; i++) {
+        if (entries[i].state == 0x0a &&
+            socket_inode_owned(entries[i].inode, owned, owned_count) &&
+            listener_count < sizeof listeners / sizeof listeners[0])
+            listeners[listener_count++] = entries[i].local_port;
+    }
+    for (size_t i = 0; i < entry_count; i++) {
+        int inbound = 0;
+        if (entries[i].state != 0x01 ||
+            !socket_inode_owned(entries[i].inode, owned, owned_count)) continue;
+        for (size_t j = 0; j < listener_count; j++)
+            if (entries[i].local_port == listeners[j]) inbound = 1;
+        if (inbound) continue;
+        count++;
+        size_t peer;
+        for (peer = 0; peer < peer_count; peer++)
+            if (peers_address[peer] == entries[i].remote_address &&
+                peers_port[peer] == entries[i].remote_port) break;
+        if (peer == peer_count && peer_count < TOPFLOW_ICG_MAX_TCP_ENTRIES) {
+            peers_address[peer] = entries[i].remote_address;
+            peers_port[peer] = entries[i].remote_port;
+            peers_count[peer] = 0;
+            peer_count++;
+        }
+        if (peer < peer_count) {
+            peers_count[peer]++;
+            if (best_peer < 0 || peers_count[peer] > peers_count[best_peer])
+                best_peer = (int)peer;
+        }
+    }
+    if (best_peer >= 0) {
+        proc_ipv4_text(peers_address[best_peer], g_topflow_icg_server_ip,
+                       sizeof g_topflow_icg_server_ip);
+        g_topflow_icg_tcp_port = (int)peers_port[best_peer];
+        g_topflow_icg_server_runtime = 1;
+    }
+    return count;
+}
+
+static void refresh_topflow_aggregation_cache(void)
+{
+    char next[RAW_MAX], mode[32] = "", icg_id[128] = "";
+    time_t now = time(NULL);
+    int enabled;
+
+    if (run_ubus("mwan3", "status", NULL, next, sizeof next) == 0)
+        copy_text(g_topflow_mwan3_status, sizeof g_topflow_mwan3_status, next);
+    load_topflow_icg_config();
+    g_topflow_mwan3_running = proc_find_command("mwan3track") > 0;
+    if (getenv("ZWRT_DATAD_MWAN3_RUNNING"))
+        g_topflow_mwan3_running = atoi(getenv("ZWRT_DATAD_MWAN3_RUNNING")) != 0;
+    g_topflow_icg_tcp_tunnel_count = count_topflow_icg_tcp_tunnels();
+    g_topflow_icg_provisioned =
+        device_uci_get("zwrt_router.icgmwan.IcgDevId", icg_id, sizeof icg_id) == 0 &&
+        icg_id[0] != 0;
+
+    if (device_uci_get("zwrt_router.network.opms_wan_mode", mode, sizeof mode) != 0)
+        mode[0] = 0;
+    enabled = !strcmp(mode, "SMULTIWAN");
+    if (!enabled || !g_topflow_icg_provisioned ||
+        now < g_topflow_aggregation_traffic_next_at) return;
+    g_topflow_aggregation_traffic_next_at = now + TOPFLOW_AGGREGATION_TRAFFIC_POLL_SEC;
+    if (device_ubus_call_timeout("zwrt_icg_mdc.manager", "get_residual_flow", NULL,
+                                 next, sizeof next,
+                                 TOPFLOW_AGGREGATION_FLOW_TIMEOUT_MS) == 0 &&
+        json_get_int(next, "error_code", 0) == 0) {
+        char value[128];
+        if (json_get(next, "residual_flow", value, sizeof value) ||
+            json_get(next, "count_flow_today", value, sizeof value))
+            copy_text(g_topflow_aggregation_flow, sizeof g_topflow_aggregation_flow, next);
+    }
+}
+
+static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
+                                           int *online_path_count)
+{
+    static const struct {
+        const char *id;
+        const char *label;
+        const char *interface_name;
+    } paths[TOPFLOW_AGGREGATION_MAX_PATHS] = {
+        {"x75", "X75", "zte_mwan2"},
+        {"v3e1", "V3E1", "zte_mwan3"},
+        {"v3e2", "V3E2", "zte_mwan4"},
+        {"ethernet", "Ethernet", "waneth"}
+    };
+    char interfaces[RAW_MAX];
+    int emitted = 0;
+
+    *path_count = 0;
+    *online_path_count = 0;
+    bappend(b, "\"paths\":[");
+    if (!json_get(g_topflow_mwan3_status, "interfaces", interfaces, sizeof interfaces)) {
+        bappend(b, "]");
+        return;
+    }
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        char path[8192], status[64] = "unknown", tracking[64] = "down";
+        char targets[4096], target[1024], first_target[1024] = "";
+        const char *cursor;
+        int enabled, running, up, mwan_up, online, interface_up = 0;
+        int interface_available = 0, interface_pending = 0;
+        long uptime;
+        double latency = -1.0, packet_loss = -1.0;
+
+        if (!json_get(interfaces, paths[i].interface_name, path, sizeof path)) continue;
+        enabled = json_bool_or(path, "enabled", 0);
+        running = json_bool_or(path, "running", 0);
+        mwan_up = json_bool_or(path, "up", 0);
+        up = mwan_up;
+        if (i < TOPFLOW_MODEM_COUNT) {
+            interface_up = json_bool_or(g_topflow_wan4[i], "up", 0);
+            interface_available = json_bool_or(g_topflow_wan4[i], "available", 0);
+            interface_pending = json_bool_or(g_topflow_wan4[i], "pending", 0);
+            if (interface_up) up = 1;
+        }
+        (void)json_get(path, "status", status, sizeof status);
+        (void)json_get(path, "tracking", tracking, sizeof tracking);
+        if (!enabled && !running && !up) continue;
+        online = !strcasecmp(status, "online") || (running && mwan_up);
+        uptime = json_get_int(path, "uptime", 0);
+        if (json_get(path, "track_ip", targets, sizeof targets)) {
+            cursor = copy_next_json_object(targets, first_target, sizeof first_target);
+            (void)cursor;
+            if (first_target[0]) {
+                latency = json_double_or(first_target, "latency", -1.0);
+                packet_loss = json_double_or(first_target, "packetloss", -1.0);
+            }
+        } else {
+            targets[0] = 0;
+        }
+
+        if (emitted++) bappend(b, ",");
+        bappend(b, "{\"id\":\"");
+        bappend_json_esc(b, paths[i].id);
+        bappend(b, "\",\"label\":\"");
+        bappend_json_esc(b, paths[i].label);
+        bappend(b, "\",\"interface\":\"");
+        bappend_json_esc(b, paths[i].interface_name);
+        bappend(b, "\",\"enabled\":%s,\"running\":%s,\"up\":%s,\"online\":%s,",
+                enabled ? "true" : "false", running ? "true" : "false",
+                up ? "true" : "false", online ? "true" : "false");
+        bappend(b, "\"interface_up\":%s,\"interface_available\":%s,"
+                "\"interface_pending\":%s,",
+                interface_up ? "true" : "false",
+                interface_available ? "true" : "false",
+                interface_pending ? "true" : "false");
+        bappend(b, "\"status\":\"");
+        bappend_json_esc(b, status);
+        bappend(b, "\",\"tracking\":\"");
+        bappend_json_esc(b, tracking);
+        bappend(b, "\",\"uptime_seconds\":%ld", uptime);
+        if (latency >= 0) bappend(b, ",\"latency_ms\":%.2f", latency);
+        if (packet_loss >= 0) bappend(b, ",\"packet_loss_percent\":%.2f", packet_loss);
+        bappend(b, ",\"targets\":[");
+        cursor = targets;
+        int target_emitted = 0;
+        while ((cursor = copy_next_json_object(cursor, target, sizeof target)) != NULL) {
+            char ip[128] = "", target_status[64] = "unknown";
+            double target_latency = json_double_or(target, "latency", -1.0);
+            double target_loss = json_double_or(target, "packetloss", -1.0);
+            (void)json_get(target, "ip", ip, sizeof ip);
+            (void)json_get(target, "status", target_status, sizeof target_status);
+            if (target_emitted++) bappend(b, ",");
+            bappend(b, "{\"ip\":\"");
+            bappend_json_esc(b, ip);
+            bappend(b, "\",\"status\":\"");
+            bappend_json_esc(b, target_status);
+            bappend(b, "\",\"online\":%s", !strcasecmp(target_status, "online") ? "true" : "false");
+            if (target_latency >= 0) bappend(b, ",\"latency_ms\":%.2f", target_latency);
+            if (target_loss >= 0) bappend(b, ",\"packet_loss_percent\":%.2f", target_loss);
+            bappend(b, "}");
+        }
+        bappend(b, "]}");
+        (*path_count)++;
+        if (online) (*online_path_count)++;
+    }
+    bappend(b, "]");
+}
+
+static void emit_topflow_aggregation(struct buf *b, int enabled,
+                                     const char *aggregation_mode)
+{
+    char remaining[128] = "", today_used[128] = "";
+    int path_count, online_path_count;
+    const char *state = !enabled ? "disabled" :
+        (!g_topflow_icg_provisioned ? "unprovisioned" :
+         (g_topflow_icg_tcp_tunnel_count > 0 ? "online" : "waiting"));
+
+    bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"",
+            enabled ? "true" : "false");
+    bappend_json_esc(b, aggregation_mode);
+    bappend(b, "\",\"state\":\"%s\",\"provisioned\":%s,\"online\":%s,",
+            state, g_topflow_icg_provisioned ? "true" : "false",
+            g_topflow_icg_tcp_tunnel_count > 0 ? "true" : "false");
+    bappend(b, "\"controller\":{\"icg_process_running\":%s,"
+            "\"mwan3_running\":%s},",
+            g_topflow_icg_process_running ? "true" : "false",
+            g_topflow_mwan3_running ? "true" : "false");
+    bappend(b, "\"tcp_tunnel_count\":%d,\"server\":{",
+            g_topflow_icg_tcp_tunnel_count);
+    if (g_topflow_icg_server_ip[0]) {
+        bappend(b, "\"ip\":\"");
+        bappend_json_esc(b, g_topflow_icg_server_ip);
+        bappend(b, "\"");
+    }
+    if (g_topflow_icg_tcp_port > 0)
+        bappend(b, "%s\"tcp_port\":%d", g_topflow_icg_server_ip[0] ? "," : "",
+                g_topflow_icg_tcp_port);
+    if (g_topflow_icg_udp_start_port > 0)
+        bappend(b, "%s\"udp_start_port\":%d",
+                (g_topflow_icg_server_ip[0] || g_topflow_icg_tcp_port > 0) ? "," : "",
+                g_topflow_icg_udp_start_port);
+    bappend(b, "%s\"source\":\"%s\"",
+            (g_topflow_icg_server_ip[0] || g_topflow_icg_tcp_port > 0 ||
+             g_topflow_icg_udp_start_port > 0) ? "," : "",
+            g_topflow_icg_server_runtime ? "runtime" : "config");
+    bappend(b, "},");
+    emit_topflow_aggregation_paths(b, &path_count, &online_path_count);
+    bappend(b, ",\"path_count\":%d,\"online_path_count\":%d",
+            path_count, online_path_count);
+    (void)json_get(g_topflow_aggregation_flow, "residual_flow", remaining, sizeof remaining);
+    (void)json_get(g_topflow_aggregation_flow, "count_flow_today", today_used, sizeof today_used);
+    if (remaining[0] || today_used[0]) {
+        bappend(b, ",\"traffic\":{");
+        if (remaining[0]) {
+            bappend(b, "\"remaining_raw\":\"");
+            bappend_json_esc(b, remaining);
+            bappend(b, "\"");
+        }
+        if (today_used[0]) {
+            bappend(b, "%s\"today_used_raw\":\"", remaining[0] ? "," : "");
+            bappend_json_esc(b, today_used);
+            bappend(b, "\"");
+        }
+        bappend(b, "}");
+    }
+    bappend(b, "},");
+}
+
 static void emit_topflow_hardware_controls(struct buf *b)
 {
     char zone[PATH_MAX], path[PATH_MAX], mode[32] = "disabled";
@@ -1486,10 +1959,7 @@ static void emit_topflow_hardware_controls(struct buf *b)
         ? configured_liquid_always_on
         : read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
 
-    bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"",
-            aggregation_enabled ? "true" : "false");
-    bappend_json_esc(b, aggregation_mode);
-    bappend(b, "\"},");
+    emit_topflow_aggregation(b, aggregation_enabled, aggregation_mode);
     bappend(b, "\"cooling\":{\"fan\":{");
     bappend(b, "\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\",",
             fan_enabled ? "true" : "false",
@@ -2920,6 +3390,7 @@ static void refresh_interface_cache(void)
         copy_text(g_traffic_clear_day, sizeof g_traffic_clear_day, next);
     refresh_uci_device_info();
     refresh_topflow_multimodem_cache();
+    if (g_topflow_multimodem_enabled) refresh_topflow_aggregation_cache();
 }
 
 static int set_nonblock(int fd)

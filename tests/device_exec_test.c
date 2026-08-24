@@ -34,6 +34,10 @@ int main(void)
     assert(device_ubus_call_raw("fixture", "empty", NULL, out, sizeof out) == 0);
     assert(out[0] == 0);
     assert(device_ubus_call("fixture", "empty", NULL, out, sizeof out) == -1);
+    assert(setenv("ZWRT_DATAD_UBUS_BIN", "/bin/echo", 1) == 0);
+    assert(device_ubus_call_timeout("fixture", "status", NULL, out, sizeof out, 150) == 0);
+    assert(strstr(out, "-t 1 call") != NULL);
+    assert(device_ubus_call_timeout("fixture", "status", NULL, out, sizeof out, 99) == -1);
     assert(unsetenv("ZWRT_DATAD_UBUS_BIN") == 0);
     assert(device_adb_read_file("bad;serial", "/sys/device/temp", out, sizeof out) == -1);
     assert(device_adb_read_file("fixture", "/tmp/not-sysfs", out, sizeof out) == -1);
