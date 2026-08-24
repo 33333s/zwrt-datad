@@ -102,7 +102,13 @@ case "$service:$method" in
         printf '%s\n' '{"cpuss_temp":42}'
         ;;
     network.interface.zte_mwan2:status|network.interface.zte_mwan2_6:status|network.interface.zte_mwan3:status|network.interface.zte_mwan3_6:status|network.interface.zte_mwan4:status|network.interface.zte_mwan4_6:status)
-        printf '%s\n' '{"up":true,"proto":"dhcp","l3_device":"fixture0","ipv4-address":[],"ipv6-address":[],"dns-server":[]}'
+        printf '%s\n' '{"up":true,"pending":false,"available":true,"proto":"dhcp","l3_device":"fixture0","ipv4-address":[],"ipv6-address":[],"dns-server":[]}'
+        ;;
+    mwan3:status)
+        printf '%s\n' '{"interfaces":{"zte_mwan2":{"age":18,"uptime":7200,"status":"online","enabled":true,"running":true,"tracking":"active","up":true,"track_ip":[{"ip":"1.1.1.1","status":"online","latency":18.5,"packetloss":0}]},"zte_mwan3":{"age":35,"uptime":7100,"status":"online","enabled":true,"running":true,"tracking":"active","up":true,"track_ip":[{"ip":"8.8.8.8","status":"online","latency":35,"packetloss":1}]},"zte_mwan4":{"age":9,"uptime":120,"status":"offline","enabled":true,"running":true,"tracking":"active","up":false,"track_ip":[{"ip":"9.9.9.9","status":"offline","latency":90,"packetloss":100}]},"waneth":{"age":0,"uptime":0,"status":"unknown","enabled":false,"running":false,"tracking":"down","up":false,"track_ip":[]}},"connected":{"ipv4":[],"ipv6":[]},"policies":{"ipv4":{},"ipv6":{}}}'
+        ;;
+    zwrt_icg_mdc.manager:get_residual_flow)
+        printf '%s\n' '{"error_code":0,"residual_flow":"10240","count_flow_today":"512"}'
         ;;
     *)
         printf '%s\n' '{"result":"success"}'

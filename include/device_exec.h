@@ -15,6 +15,8 @@ int device_run_capture(const char *const argv[], char *out, size_t outlen);
 int device_run_quiet(const char *const argv[]);
 int device_ubus_call(const char *service, const char *method, const char *args,
                      char *out, size_t outlen);
+int device_ubus_call_timeout(const char *service, const char *method, const char *args,
+                             char *out, size_t outlen, int timeout_ms);
 int device_ubus_call_raw(const char *service, const char *method, const char *args,
                          char *out, size_t outlen);
 int device_ubus_list(int verbose, char *out, size_t outlen);

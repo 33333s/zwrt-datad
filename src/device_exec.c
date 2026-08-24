@@ -146,36 +146,50 @@ int device_run_quiet(const char *const argv[])
 }
 
 static int device_ubus_call_impl(const char *service, const char *method, const char *args,
-                                 char *out, size_t outlen, int require_output)
+                                 char *out, size_t outlen, int require_output,
+                                 int timeout_ms, int ubus_timeout_seconds)
 {
     const char *ubus = getenv("ZWRT_DATAD_UBUS_BIN");
     const char *argv[8];
+    char ubus_timeout[16];
     size_t n = 0;
 
     if (!valid_command_name(service) || !valid_command_name(method)) return -1;
+    if (timeout_ms < 100 || timeout_ms > 30000 ||
+        ubus_timeout_seconds < 1 || ubus_timeout_seconds > 30) return -1;
     if (!ubus || !*ubus) ubus = "ubus";
+    snprintf(ubus_timeout, sizeof ubus_timeout, "%d", ubus_timeout_seconds);
     argv[n++] = ubus;
     argv[n++] = "-t";
-    argv[n++] = "3";
+    argv[n++] = ubus_timeout;
     argv[n++] = "call";
     argv[n++] = service;
     argv[n++] = method;
     if (args && *args) argv[n++] = args;
     argv[n] = NULL;
-    if (device_run_capture(argv, out, outlen) != 0) return -1;
+    if (device_run_capture_timeout(argv, out, outlen, timeout_ms) != 0) return -1;
     return (!require_output || out[0]) ? 0 : -1;
 }
 
 int device_ubus_call(const char *service, const char *method, const char *args,
                      char *out, size_t outlen)
 {
-    return device_ubus_call_impl(service, method, args, out, outlen, 1);
+    return device_ubus_call_impl(service, method, args, out, outlen, 1,
+                                 DEVICE_COMMAND_TIMEOUT_MS, 3);
+}
+
+int device_ubus_call_timeout(const char *service, const char *method, const char *args,
+                             char *out, size_t outlen, int timeout_ms)
+{
+    return device_ubus_call_impl(service, method, args, out, outlen, 1, timeout_ms,
+                                 (timeout_ms + 999) / 1000);
 }
 
 int device_ubus_call_raw(const char *service, const char *method, const char *args,
                          char *out, size_t outlen)
 {
-    return device_ubus_call_impl(service, method, args, out, outlen, 0);
+    return device_ubus_call_impl(service, method, args, out, outlen, 0,
+                                 DEVICE_COMMAND_TIMEOUT_MS, 3);
 }
 
 int device_ubus_list(int verbose, char *out, size_t outlen)

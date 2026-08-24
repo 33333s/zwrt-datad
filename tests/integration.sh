@@ -253,6 +253,10 @@ ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
 ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+ZWRT_DATAD_ICG_CONFIG="$ROOT/tests/fixtures/icg.conf" \
+ZWRT_DATAD_PROC_NET_TCP="$ROOT/tests/fixtures/proc_net_tcp" \
+ZWRT_DATAD_ICG_SOCKET_INODES='1,2,3,900,901' \
+ZWRT_DATAD_MWAN3_RUNNING=1 \
 "$BIN" --once | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -289,7 +293,33 @@ assert data["thermal"]["modems"][1]["celsius"] == 47
 assert data["thermal"]["modems"][2]["id"] == "v3e2"
 assert data["thermal"]["modems"][2]["available"] is True
 assert data["thermal"]["modems"][2]["celsius"] == 46
-assert data["aggregation"] == {"enabled": True, "mode": "SMULTIWAN"}
+assert data["aggregation"]["enabled"] is True
+assert data["aggregation"]["mode"] == "SMULTIWAN"
+assert data["aggregation"]["state"] == "online"
+assert data["aggregation"]["provisioned"] is True
+assert data["aggregation"]["online"] is True
+assert data["aggregation"]["controller"] == {
+    "icg_process_running": True, "mwan3_running": True
+}
+assert data["aggregation"]["server"] == {
+    "ip": "198.51.100.44", "tcp_port": 10036,
+    "udp_start_port": 20000, "source": "runtime"
+}
+assert data["aggregation"]["tcp_tunnel_count"] == 2
+assert data["aggregation"]["path_count"] == 3
+assert data["aggregation"]["online_path_count"] == 2
+assert data["aggregation"]["traffic"] == {
+    "remaining_raw": "10240", "today_used_raw": "512"
+}
+paths = {path["id"]: path for path in data["aggregation"]["paths"]}
+assert paths["x75"]["latency_ms"] == 18.5
+assert paths["x75"]["packet_loss_percent"] == 0
+assert paths["x75"]["interface_up"] is True
+assert paths["v3e1"]["latency_ms"] == 35
+assert paths["v3e1"]["packet_loss_percent"] == 1
+assert paths["v3e2"]["online"] is False
+assert paths["v3e2"]["packet_loss_percent"] == 100
+assert "ethernet" not in paths
 assert data["cooling"]["fan"]["enabled"] is True
 assert data["cooling"]["fan"]["always_on"] is True
 assert data["cooling"]["fan"]["mode"] == "always_on"

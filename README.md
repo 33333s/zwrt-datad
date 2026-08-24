@@ -171,7 +171,7 @@ curl -H 'Authorization: Bearer <token>' \
 设备不会输出 `nfc`；不会用 `-1`、`0` 或空对象冒充“不支持”。调用方应根据
 块/字段是否存在决定是否显示功能，同时把 `0%`、关闭状态和 `0mA` 视为有效值。
 
-MU5252 模板还会输出三路 `modems`、`aggregation` 和 `cooling`。聚合、风扇常开、
+MU5252 模板还会输出三路 `modems`、`aggregation` 和 `cooling`。聚合状态会区分开关、ICG 配置是否下发、ICG/mwan3 控制进程、实际 TCP 隧道和 mwan3 各承载链路质量；实际隧道从 `zte_icg_agg` 进程持有的 socket 反查，不依赖可能滞后的静态服务器配置。云端剩余流量只做短超时低频缓存，不阻塞 SSE 主循环。聚合、风扇常开、
 多点自定义温度/PWM 曲线和液冷模式都通过语义化 `/control` 动作操作；散热配置
 只保存到 `/data/zwrt-datad/cooling.conf`，启动时由 datad 恢复，不安装额外 init 脚本。
 自定义曲线允许 2–8 个控制点，datad 每秒按 `sys-therm-4` 温度线性插值 PWM；80℃
