@@ -320,6 +320,13 @@ assert paths["v3e1"]["packet_loss_percent"] == 1
 assert paths["v3e2"]["online"] is False
 assert paths["v3e2"]["packet_loss_percent"] == 100
 assert "ethernet" not in paths
+assert data["multiwan"]["mode"] == "SMULTIWAN"
+assert data["multiwan"]["active"] is False
+sections = {section["id"]: section for section in data["multiwan"]["sections"]}
+assert sections["zte_mwan2"]["track_ip"] == ["1.1.1.1", "8.8.8.8"]
+assert sections["zte_mwan2_m1"]["weight"] == "3"
+assert sections["balanced"]["use_member"] == ["zte_mwan2_m1"]
+assert sections["default_rule_v4"]["use_policy"] == "balanced"
 assert data["cooling"]["fan"]["enabled"] is True
 assert data["cooling"]["fan"]["always_on"] is True
 assert data["cooling"]["fan"]["mode"] == "always_on"
@@ -401,6 +408,7 @@ ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
 ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+ZWRT_DATAD_MWAN3_INIT=/usr/bin/true \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
 
@@ -639,6 +647,33 @@ assert data["ok"] is True
 assert data["result"]["enabled"] is False
 '
 grep -F 'router_stop_agg_mode' "$MU5252_CALL_LOG" | grep -F '"agg_mode_switch":0' >/dev/null
+grep -F 'router_set_wan_mode' "$MU5252_CALL_LOG" | grep -F '"opms_wan_mode":"MULTIWAN"' >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"multiwan.interface.set","params":{"section":"zte_mwan2","enabled":1,"track_ip":"1.1.1.1,8.8.8.8","reliability":0,"timeout":5}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["section"] == "zte_mwan2"
+assert data["result"]["applied"] is False
+'
+grep -F "uci$(printf '\t')delete mwan3.zte_mwan2.track_ip" "$MU5252_CALL_LOG" >/dev/null
+grep -F "uci$(printf '\t')add_list mwan3.zte_mwan2.track_ip=1.1.1.1" "$MU5252_CALL_LOG" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"multiwan.member.set","params":{"section":"zte_mwan2_m1","metric":20,"weight":4}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"multiwan.policy.set","params":{"section":"balanced","last_resort":"default","use_member":"zte_mwan2_m1"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_policy":"balanced","sticky":0,"logging":1}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \

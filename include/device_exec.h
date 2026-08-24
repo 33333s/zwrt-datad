@@ -26,6 +26,7 @@ int device_uci_set(const char *path, const char *value);
 int device_uci_get(const char *path, char *out, size_t outlen);
 int device_uci_show(const char *package_name, char *out, size_t outlen);
 int device_uci_list(const char *operation, const char *path, const char *value);
+int device_uci_delete(const char *path);
 int device_uci_commit(const char *package_name);
 int device_uci_revert(const char *package_name);
 int device_wifi_reload(void);

@@ -74,6 +74,37 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ]; then
                 "zwrt_data_commit.wwancid1dst.total_rx_bytes='10000'"
             exit 0
             ;;
+        mwan3)
+            [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
+            printf '%s\n' \
+                "mwan3.globals=globals" \
+                "mwan3.globals.mmx_mask='0x3F00'" \
+                "mwan3.zte_mwan2=interface" \
+                "mwan3.zte_mwan2.enabled='1'" \
+                "mwan3.zte_mwan2.family='ipv4'" \
+                "mwan3.zte_mwan2.track_method='ping'" \
+                "mwan3.zte_mwan2.track_ip='1.1.1.1' '8.8.8.8'" \
+                "mwan3.zte_mwan2.reliability='1'" \
+                "mwan3.zte_mwan2.timeout='4'" \
+                "mwan3.zte_mwan2.interval='3'" \
+                "mwan3.zte_mwan2.down='5'" \
+                "mwan3.zte_mwan2.up='2'" \
+                "mwan3.zte_mwan2_m1=member" \
+                "mwan3.zte_mwan2_m1.interface='zte_mwan2'" \
+                "mwan3.zte_mwan2_m1.metric='10'" \
+                "mwan3.zte_mwan2_m1.weight='3'" \
+                "mwan3.balanced=policy" \
+                "mwan3.balanced.last_resort='default'" \
+                "mwan3.balanced.use_member='zte_mwan2_m1'" \
+                "mwan3.default_rule_v4=rule" \
+                "mwan3.default_rule_v4.family='ipv4'" \
+                "mwan3.default_rule_v4.proto='all'" \
+                "mwan3.default_rule_v4.dest_ip='0.0.0.0/0'" \
+                "mwan3.default_rule_v4.use_policy='balanced'" \
+                "mwan3.default_rule_v4.sticky='0'" \
+                "mwan3.default_rule_v4.logging='1'"
+            exit 0
+            ;;
     esac
 fi
 
@@ -121,13 +152,17 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
             [ "${MOCK_MODEL_NAME:-}" = 'MU5252' ] || exit 1
             printf '%s\n' 'fixture-icg-id'
             ;;
+        mwan3.zte_mwan2) printf '%s\n' 'interface' ;;
+        mwan3.zte_mwan2_m1) printf '%s\n' 'member' ;;
+        mwan3.balanced) printf '%s\n' 'policy' ;;
+        mwan3.default_rule_v4) printf '%s\n' 'rule' ;;
         *) exit 1 ;;
     esac
     exit 0
 fi
 
 case "${1:-}" in
-    set|commit|revert|add_list|del_list) exit 0 ;;
+    set|commit|revert|add_list|del_list|delete) exit 0 ;;
 esac
 
 exit 1

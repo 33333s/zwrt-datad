@@ -123,6 +123,8 @@ static int g_topflow_external_temp_valid[TOPFLOW_EXTERNAL_MODEM_COUNT];
 static time_t g_topflow_external_temp_sampled_at[TOPFLOW_EXTERNAL_MODEM_COUNT];
 static time_t g_topflow_thermal_next_at;
 static char g_topflow_mwan3_status[RAW_MAX];
+static char g_topflow_mwan3_config[RAW_MAX];
+static time_t g_topflow_mwan3_config_next_at;
 static char g_topflow_aggregation_flow[4096];
 static char g_topflow_icg_server_ip[64];
 static int g_topflow_icg_tcp_port;
@@ -1714,6 +1716,11 @@ static void refresh_topflow_aggregation_cache(void)
 
     if (run_ubus("mwan3", "status", NULL, next, sizeof next) == 0)
         copy_text(g_topflow_mwan3_status, sizeof g_topflow_mwan3_status, next);
+    if (now >= g_topflow_mwan3_config_next_at) {
+        g_topflow_mwan3_config_next_at = now + 5;
+        if (device_uci_show("mwan3", next, sizeof next) == 0)
+            copy_text(g_topflow_mwan3_config, sizeof g_topflow_mwan3_config, next);
+    }
     load_topflow_icg_config();
     g_topflow_mwan3_running = proc_find_command("mwan3track") > 0;
     if (getenv("ZWRT_DATAD_MWAN3_RUNNING"))
@@ -1738,6 +1745,152 @@ static void refresh_topflow_aggregation_cache(void)
             json_get(next, "count_flow_today", value, sizeof value))
             copy_text(g_topflow_aggregation_flow, sizeof g_topflow_aggregation_flow, next);
     }
+}
+
+static int mwan3_config_value(const char *section, const char *option,
+                              char *out, size_t outlen)
+{
+    char key[256];
+    const char *line = g_topflow_mwan3_config;
+    size_t key_len;
+    if (!section || !*section || !out || outlen < 2) return 0;
+    if (option && *option)
+        snprintf(key, sizeof key, "mwan3.%s.%s=", section, option);
+    else
+        snprintf(key, sizeof key, "mwan3.%s=", section);
+    key_len = strlen(key);
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_len >= key_len && !strncmp(line, key, key_len)) {
+            const char *value = line + key_len;
+            size_t value_len = line_len - key_len;
+            if (value_len >= 2 && value[0] == '\'' && value[value_len - 1] == '\'') {
+                value++;
+                value_len -= 2;
+            }
+            if (value_len >= outlen) value_len = outlen - 1;
+            memcpy(out, value, value_len);
+            out[value_len] = 0;
+            return 1;
+        }
+        line = end ? end + 1 : NULL;
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static void emit_mwan3_string_option(struct buf *b, const char *section,
+                                     const char *option, int *emitted)
+{
+    char value[2048];
+    if (!mwan3_config_value(section, option, value, sizeof value)) return;
+    bappend(b, "%s\"%s\":\"", (*emitted)++ ? "," : "", option);
+    bappend_json_esc(b, value);
+    bappend(b, "\"");
+}
+
+static void emit_mwan3_list_option(struct buf *b, const char *section,
+                                   const char *option, int *emitted)
+{
+    char value[4096], token[512];
+    const char *p;
+    int item = 0;
+    if (!mwan3_config_value(section, option, value, sizeof value)) return;
+    bappend(b, "%s\"%s\":[", (*emitted)++ ? "," : "", option);
+    p = value;
+    while (*p) {
+        size_t n = 0;
+        while (*p && (isspace((unsigned char)*p) || *p == '\'')) p++;
+        while (*p && *p != '\'' && !isspace((unsigned char)*p)) {
+            if (n + 1 < sizeof token) token[n++] = *p;
+            p++;
+        }
+        token[n] = 0;
+        while (*p == '\'') p++;
+        if (!n) continue;
+        if (item++) bappend(b, ",");
+        bappend(b, "\"");
+        bappend_json_esc(b, token);
+        bappend(b, "\"");
+    }
+    bappend(b, "]");
+}
+
+static void emit_mwan3_section(struct buf *b, const char *section, const char *type,
+                               int *emitted)
+{
+    static const char *interface_options[] = {
+        "enabled", "family", "track_method", "reliability", "count", "size",
+        "max_ttl", "check_quality", "timeout", "interval", "failure_interval",
+        "recovery_interval", "down", "up"
+    };
+    static const char *member_options[] = {"interface", "metric", "weight"};
+    static const char *rule_options[] = {
+        "family", "proto", "src_ip", "dest_ip", "src_port", "dest_port",
+        "sticky", "logging", "use_policy"
+    };
+    int field = 0;
+    if ((*emitted)++) bappend(b, ",");
+    bappend(b, "{\"id\":\"");
+    bappend_json_esc(b, section);
+    bappend(b, "\",\"type\":\"");
+    bappend_json_esc(b, type);
+    bappend(b, "\"");
+    field = 2;
+    if (!strcmp(type, "interface")) {
+        for (size_t i = 0; i < sizeof interface_options / sizeof interface_options[0]; i++)
+            emit_mwan3_string_option(b, section, interface_options[i], &field);
+        emit_mwan3_list_option(b, section, "track_ip", &field);
+    } else if (!strcmp(type, "member")) {
+        for (size_t i = 0; i < sizeof member_options / sizeof member_options[0]; i++)
+            emit_mwan3_string_option(b, section, member_options[i], &field);
+    } else if (!strcmp(type, "policy")) {
+        emit_mwan3_string_option(b, section, "last_resort", &field);
+        emit_mwan3_list_option(b, section, "use_member", &field);
+    } else if (!strcmp(type, "rule")) {
+        for (size_t i = 0; i < sizeof rule_options / sizeof rule_options[0]; i++)
+            emit_mwan3_string_option(b, section, rule_options[i], &field);
+    } else if (!strcmp(type, "globals")) {
+        emit_mwan3_string_option(b, section, "mmx_mask", &field);
+    }
+    bappend(b, "}");
+}
+
+static void emit_topflow_multiwan(struct buf *b, const char *mode)
+{
+    const char *line = g_topflow_mwan3_config;
+    int emitted = 0;
+    bappend(b, "\"multiwan\":{\"mode\":\"");
+    bappend_json_esc(b, mode ? mode : "");
+    bappend(b, "\",\"active\":%s,\"service_running\":%s,\"sections\":[",
+            mode && !strcmp(mode, "MULTIWAN") ? "true" : "false",
+            g_topflow_mwan3_running ? "true" : "false");
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_len > 6 && !strncmp(line, "mwan3.", 6)) {
+            const char *eq = memchr(line, '=', line_len);
+            const char *dot = memchr(line + 6, '.', line_len - 6);
+            if (eq && (!dot || dot > eq)) {
+                char section[128], type[64];
+                size_t sn = (size_t)(eq - (line + 6));
+                size_t tn = line_len - (size_t)(eq - line) - 1;
+                const char *tv = eq + 1;
+                if (tn >= 2 && tv[0] == '\'' && tv[tn - 1] == '\'') { tv++; tn -= 2; }
+                if (sn < sizeof section && tn < sizeof type) {
+                    memcpy(section, line + 6, sn); section[sn] = 0;
+                    memcpy(type, tv, tn); type[tn] = 0;
+                    if (!strcmp(type, "interface") || !strcmp(type, "member") ||
+                        !strcmp(type, "policy") || !strcmp(type, "rule") ||
+                        !strcmp(type, "globals"))
+                        emit_mwan3_section(b, section, type, &emitted);
+                }
+            }
+        }
+        line = end ? end + 1 : NULL;
+    }
+    bappend(b, "]},");
 }
 
 static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
@@ -1786,7 +1939,8 @@ static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
         (void)json_get(path, "status", status, sizeof status);
         (void)json_get(path, "tracking", tracking, sizeof tracking);
         if (!enabled && !running && !up) continue;
-        online = !strcasecmp(status, "online") || (running && mwan_up);
+        online = !strcasecmp(status, "online") || (running && mwan_up) ||
+            (!g_topflow_mwan3_running && interface_up);
         uptime = json_get_int(path, "uptime", 0);
         if (json_get(path, "track_ip", targets, sizeof targets)) {
             cursor = copy_next_json_object(targets, first_target, sizeof first_target);
@@ -1960,6 +2114,7 @@ static void emit_topflow_hardware_controls(struct buf *b)
         : read_uci_flag("zwrt_deviceui.Device.liquid_cooling_switch_status", 0);
 
     emit_topflow_aggregation(b, aggregation_enabled, aggregation_mode);
+    emit_topflow_multiwan(b, aggregation_mode);
     bappend(b, "\"cooling\":{\"fan\":{");
     bappend(b, "\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\",",
             fan_enabled ? "true" : "false",
