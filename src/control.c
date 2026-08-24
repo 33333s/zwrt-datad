@@ -48,6 +48,7 @@ struct json_buf {
 
 static char g_device_session[256];
 static char g_device_password_hash[129];
+static volatile sig_atomic_t g_requested_interval_ms;
 
 #define COOLING_CONFIG_DEFAULT "/data/zwrt-datad/cooling.conf"
 #define FAN_PWM_DEFAULT "/sys/class/hwmon/hwmon0/pwm1"
@@ -1331,6 +1332,26 @@ static int control_liquid_enabled(const char *params, char *result, size_t resul
     return 1;
 }
 
+static int control_state_set_interval(const char *params, char *result, size_t result_len,
+                                      char *err, size_t errlen)
+{
+    long milliseconds = json_get_int(params, "milliseconds", LONG_MIN);
+    if (milliseconds < 500 || milliseconds > 5000) {
+        set_invalid_error(err, errlen, "milliseconds must be between 500 and 5000");
+        return 0;
+    }
+    g_requested_interval_ms = (sig_atomic_t)milliseconds;
+    snprintf(result, result_len, "{\"sample_interval_ms\":%ld}", milliseconds);
+    return 1;
+}
+
+int control_take_requested_interval_ms(void)
+{
+    int value = (int)g_requested_interval_ms;
+    g_requested_interval_ms = 0;
+    return value;
+}
+
 const char *control_capabilities_json(void)
 {
     return
@@ -1347,7 +1368,7 @@ const char *control_capabilities_json(void)
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
         "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\","
-        "\"state.refresh\",\"qos.reload\",\"qos.clear\"],"
+        "\"state.refresh\",\"state.set_interval\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
         "\"passthrough\":[\"ubus.call\"],"
@@ -1650,6 +1671,8 @@ struct control_result control_execute(const char *request_json,
     } else if (!strcmp(action, "state.refresh")) {
         snprintf(result, sizeof result, "{\"queued\":true}");
         ok = 1;
+    } else if (!strcmp(action, "state.set_interval")) {
+        ok = control_state_set_interval(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "qos.reload")) {
         raise(SIGUSR1);
         snprintf(result, sizeof result, "{\"queued\":true}");

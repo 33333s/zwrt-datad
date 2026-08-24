@@ -399,6 +399,9 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' \
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'cooling.fan.set_curve' >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
+    grep -F 'state.set_interval' >/dev/null
 ! curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'cooling.fan.set_speed' >/dev/null
@@ -584,6 +587,28 @@ assert data["ok"] is True
 assert data["result"]["enabled"] is False
 '
 grep -F 'router_stop_agg_mode' "$MU5252_CALL_LOG" | grep -F '"agg_mode_switch":0' >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.set_interval","params":{"milliseconds":5000}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["sample_interval_ms"] == 5000
+'
+sleep 0.3
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["sample_interval_ms"] == 5000
+'
+code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.set_interval","params":{"milliseconds":499}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control")"
+[ "$code" = "400" ]
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \

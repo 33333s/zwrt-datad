@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.12",
+    "version": "0.9.13",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 外挂 4G 基带频宽字段校验，过滤厂商误报的非 MHz 状态字符串"
+    "notes": "运行时切换 500–5000ms 全局采样与 SSE 推送周期，无需重启服务"
   }
 }

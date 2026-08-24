@@ -143,6 +143,10 @@ es.addEventListener("state", (ev) => {
 });
 ```
 
+采样/SSE 周期默认由启动参数 `-i` 决定；运行中可调用
+`state.set_interval` 在 `500..5000` 毫秒范围内切换，无需重启服务。`/state` 顶层
+`sample_interval_ms` 返回当前实际周期。
+
 内网调用方先登录获取 Token：
 
 ```sh

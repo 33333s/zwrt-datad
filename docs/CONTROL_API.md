@@ -100,6 +100,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `qos.reload` | 无，重新扫描 QoS 日志 |
 | `qos.clear` | 无，截断已有的 `key.log/key.log.0` 并重读；轮转文件不存在不算失败 |
 | `state.refresh` | 无，立即重采样 |
+| `state.set_interval` | `milliseconds`，`500..5000`；运行时切换全局采样/SSE 推送周期，不重启 datad |
 
 ## SMS
 
