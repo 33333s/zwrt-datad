@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.13",
+    "version": "0.9.14",
     "asset": "zwrt-datad-aarch64",
-    "notes": "运行时切换 500–5000ms 全局采样与 SSE 推送周期，无需重启服务"
+    "notes": "MU5252 液冷按原厂驱动档位提供自动、低档常开和高档常开控制"
   }
 }

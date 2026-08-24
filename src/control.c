@@ -59,6 +59,10 @@ static volatile sig_atomic_t g_requested_interval_ms;
 #define CUSTOM_CURVE_MAX_POINTS 8
 #define CUSTOM_CURVE_HARD_FULL_SPEED_C 80
 #define FAN_ALWAYS_ON_PWM 128
+#define LIQUID_DRIVE_DURATION 1023
+#define LIQUID_DRIVE_FREQUENCY 200
+#define LIQUID_LOW_AMPLITUDE 60
+#define LIQUID_HIGH_AMPLITUDE 200
 
 enum fan_control_mode {
     FAN_MODE_MANUAL = 0,
@@ -77,6 +81,7 @@ struct cooling_config {
     int fan_mode;
     int fan_speed_percent;
     int liquid_always_on;
+    int liquid_level;
     int temperatures[3];
     int hysteresis[3];
     int custom_curve_count;
@@ -157,6 +162,7 @@ static void cooling_config_defaults(struct cooling_config *cfg)
     memset(cfg, 0, sizeof *cfg);
     cfg->fan_always_on = -1;
     cfg->liquid_always_on = -1;
+    cfg->liquid_level = 1;
     cfg->fan_mode = FAN_MODE_MANUAL;
     cfg->fan_speed_percent = 50;
     cfg->temperatures[0] = 44;
@@ -200,6 +206,8 @@ static int load_cooling_config(struct cooling_config *cfg)
         else if (!strcmp(key, "liquid_enabled") && cfg->liquid_always_on < 0)
             cfg->liquid_always_on = value != 0;
         else if (!strcmp(key, "liquid_always_on")) cfg->liquid_always_on = value != 0;
+        else if (!strcmp(key, "liquid_level") && value >= 1 && value <= 2)
+            cfg->liquid_level = value;
         else if (!strcmp(key, "temperature_1")) cfg->temperatures[0] = value;
         else if (!strcmp(key, "temperature_2")) cfg->temperatures[1] = value;
         else if (!strcmp(key, "temperature_3")) cfg->temperatures[2] = value;
@@ -243,13 +251,13 @@ static int save_cooling_config(const struct cooling_config *cfg)
     if (!fp) return 0;
     if (fprintf(fp,
                 "fan_enabled=1\nfan_always_on=%d\nfan_auto=%d\nfan_mode=%d\nfan_speed_percent=%d\n"
-                "liquid_enabled=%d\nliquid_always_on=%d\n"
+                "liquid_enabled=%d\nliquid_always_on=%d\nliquid_level=%d\n"
                 "temperature_1=%d\ntemperature_2=%d\ntemperature_3=%d\n"
                 "hysteresis_1=%d\nhysteresis_2=%d\nhysteresis_3=%d\n"
                 "custom_curve_count=%d\n",
                 cfg->fan_always_on, cfg->fan_mode == FAN_MODE_KERNEL, cfg->fan_mode,
                 cfg->fan_speed_percent,
-                cfg->liquid_always_on, cfg->liquid_always_on,
+                cfg->liquid_always_on, cfg->liquid_always_on, cfg->liquid_level,
                 cfg->temperatures[0], cfg->temperatures[1], cfg->temperatures[2],
                 cfg->hysteresis[0], cfg->hysteresis[1], cfg->hysteresis[2],
                 cfg->custom_curve_count) < 0)
@@ -394,12 +402,16 @@ static int apply_fan_curve(const struct cooling_config *cfg)
     return ok;
 }
 
-static int apply_liquid_switch(int always_on)
+static int apply_liquid_switch(int always_on, int level)
 {
     const char *drive = env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT);
     if (always_on) {
+        char value[48];
+        int amplitude = level >= 2 ? LIQUID_HIGH_AMPLITUDE : LIQUID_LOW_AMPLITUDE;
         if (!set_liquid_thermal_enabled(0)) return 0;
-        if (write_text_file(drive, "1023 60 200")) return 1;
+        snprintf(value, sizeof value, "%d %d %d", LIQUID_DRIVE_DURATION,
+                 amplitude, LIQUID_DRIVE_FREQUENCY);
+        if (write_text_file(drive, value)) return 1;
         (void)set_liquid_thermal_enabled(1);
         return 0;
     }
@@ -475,7 +487,7 @@ void control_restore_cooling_state(void)
     struct cooling_config cfg;
     if (!load_cooling_config(&cfg)) return;
     (void)apply_fan_config(&cfg);
-    (void)apply_liquid_switch(cfg.liquid_always_on);
+    (void)apply_liquid_switch(cfg.liquid_always_on, cfg.liquid_level);
     (void)set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status",
                                    cfg.fan_always_on);
     (void)set_vendor_switch_status("zwrt_deviceui.Device.liquid_cooling_switch_status",
@@ -488,7 +500,7 @@ void control_cooling_tick(long temperature_celsius)
     struct cooling_config cfg;
     int pwm;
     if (!load_cooling_config(&cfg)) return;
-    if (cfg.liquid_always_on) (void)apply_liquid_switch(1);
+    if (cfg.liquid_always_on) (void)apply_liquid_switch(1, cfg.liquid_level);
     if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
         pwm = 255;
     } else if (cfg.fan_always_on) {
@@ -1318,7 +1330,7 @@ static int control_liquid_enabled(const char *params, char *result, size_t resul
     (void)load_cooling_config(&cfg);
     if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
     cfg.liquid_always_on = enabled;
-    if (!apply_liquid_switch(enabled)) {
+    if (!apply_liquid_switch(enabled, cfg.liquid_level)) {
         snprintf(err, errlen, "liquid cooling control is unavailable");
         return 0;
     }
@@ -1329,6 +1341,49 @@ static int control_liquid_enabled(const char *params, char *result, size_t resul
     }
     snprintf(result, result_len, "{\"enabled\":%s,\"always_on\":%s}",
              enabled ? "true" : "false", enabled ? "true" : "false");
+    return 1;
+}
+
+static int control_liquid_mode(const char *params, char *result, size_t result_len,
+                               char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    char mode[24];
+    (void)load_cooling_config(&cfg);
+    if (!param_value(params, "mode", mode, sizeof mode)) {
+        set_invalid_error(err, errlen, "mode must be automatic, low, or high");
+        return 0;
+    }
+    if (!strcmp(mode, "automatic")) {
+        cfg.liquid_always_on = 0;
+    } else if (!strcmp(mode, "low")) {
+        cfg.liquid_always_on = 1;
+        cfg.liquid_level = 1;
+    } else if (!strcmp(mode, "high")) {
+        cfg.liquid_always_on = 1;
+        cfg.liquid_level = 2;
+    } else {
+        set_invalid_error(err, errlen, "mode must be automatic, low, or high");
+        return 0;
+    }
+    if (!apply_liquid_switch(cfg.liquid_always_on, cfg.liquid_level)) {
+        snprintf(err, errlen, "liquid cooling control is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.liquid_cooling_switch_status",
+                                  cfg.liquid_always_on) ||
+        !save_cooling_config(&cfg)) {
+        snprintf(err, errlen, "failed to persist liquid cooling mode");
+        return 0;
+    }
+    snprintf(result, result_len,
+             "{\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\",\"level\":%d,\"amplitude\":%d,\"speed_percent\":%d}",
+             cfg.liquid_always_on ? "true" : "false",
+             cfg.liquid_always_on ? "true" : "false",
+             cfg.liquid_always_on ? (cfg.liquid_level >= 2 ? "high" : "low") : "automatic",
+             cfg.liquid_always_on ? cfg.liquid_level : 0,
+             cfg.liquid_always_on ? (cfg.liquid_level >= 2 ? LIQUID_HIGH_AMPLITUDE : LIQUID_LOW_AMPLITUDE) : 0,
+             cfg.liquid_always_on ? (cfg.liquid_level >= 2 ? 100 : 30) : 0);
     return 1;
 }
 
@@ -1367,7 +1422,7 @@ const char *control_capabilities_json(void)
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
-        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\","
+        "\"aggregation.set\",\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\",\"cooling.liquid.set_mode\","
         "\"state.refresh\",\"state.set_interval\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
@@ -1668,6 +1723,8 @@ struct control_result control_execute(const char *request_json,
         ok = control_fan_curve(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.liquid.set_enabled")) {
         ok = control_liquid_enabled(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.liquid.set_mode")) {
+        ok = control_liquid_mode(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "state.refresh")) {
         snprintf(result, sizeof result, "{\"queued\":true}");
         ok = 1;

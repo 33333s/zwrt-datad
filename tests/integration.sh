@@ -299,6 +299,10 @@ assert data["cooling"]["fan"]["manual_speed_percent"] == 0
 assert "rpm" not in data["cooling"]["fan"]
 assert data["cooling"]["liquid"]["enabled"] is False
 assert data["cooling"]["liquid"]["always_on"] is False
+assert data["cooling"]["liquid"]["mode"] == "automatic"
+assert data["cooling"]["liquid"]["level"] == 0
+assert data["cooling"]["liquid"]["speed_percent"] == 0
+assert data["cooling"]["liquid"]["levels_percent"] == [30, 100]
 assert data["cooling"]["curve"] == [
     {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4, "pwm": 76, "speed_percent": 30},
     {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4, "pwm": 128, "speed_percent": 50},
@@ -402,6 +406,9 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'state.set_interval' >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
+    grep -F 'cooling.liquid.set_mode' >/dev/null
 ! curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'cooling.fan.set_speed' >/dev/null
@@ -552,6 +559,21 @@ assert data["result"]["always_on"] is True
 [ "$(cat "$COOLING_TMP/liquid_drive")" = "1023 60 200" ]
 [ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "0" ]
 grep -F 'liquid_always_on=1' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'liquid_level=1' "$COOLING_TMP/cooling.conf" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.liquid.set_mode","params":{"mode":"high"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["mode"] == "high"
+assert data["result"]["level"] == 2
+assert data["result"]["speed_percent"] == 100
+'
+[ "$(cat "$COOLING_TMP/liquid_drive")" = "1023 200 200" ]
+grep -F 'liquid_level=2' "$COOLING_TMP/cooling.conf" >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
