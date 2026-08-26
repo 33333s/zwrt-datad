@@ -3,6 +3,6 @@
   "datad": {
     "version": "0.9.19",
     "asset": "zwrt-datad-aarch64",
-    "notes": "TopFlow 外挂基带网络状态按各自活动卡槽读取 msim 字段，并在 UBus 与 UCI fallback 路径保持一致"
+    "notes": "修复 TopFlow 外挂基带活动卡槽读取、SSE 多行快照截断，以及外部命令继承监听端口导致服务重启失败"
   }
 }
