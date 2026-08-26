@@ -1,6 +1,23 @@
 #!/bin/sh
 set -eu
 
+if [ "${MOCK_ASSERT_NO_SOCKET_FDS:-0}" = '1' ]; then
+    for fd_path in /proc/$$/fd/*; do
+        case "$(readlink "$fd_path" 2>/dev/null || true)" in
+            socket:*)
+                echo "inherited socket fd: $fd_path" >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
+if [ -n "${MOCK_ADB_KEEPALIVE_PID_FILE:-}" ] &&
+   [ ! -s "$MOCK_ADB_KEEPALIVE_PID_FILE" ]; then
+    sleep 30 </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" >"$MOCK_ADB_KEEPALIVE_PID_FILE"
+fi
+
 [ "$1" = "-s" ]
 serial="$2"
 [ "$3" = "shell" ]

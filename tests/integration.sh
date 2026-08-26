@@ -12,6 +12,7 @@ MC8532B_PORT=$((PORT + 5))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
+ADB_KEEPALIVE_PID_FILE="$ROOT/tests/mock-adb-keepalive.pid"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
@@ -45,8 +46,12 @@ cleanup() {
     [ -n "$MC7523_PID" ] && wait "$MC7523_PID" 2>/dev/null || true
     [ -n "$MC8532B_PID" ] && kill "$MC8532B_PID" 2>/dev/null || true
     [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
+    if [ -s "$ADB_KEEPALIVE_PID_FILE" ]; then
+        kill "$(cat "$ADB_KEEPALIVE_PID_FILE")" 2>/dev/null || true
+    fi
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
-        "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
+        "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT" \
+        "$ADB_KEEPALIVE_PID_FILE"
     rm -rf "$COOLING_TMP"
 }
 trap cleanup EXIT INT TERM
@@ -245,6 +250,7 @@ MOCK_MODEL_NAME=MU5252 \
 MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
 MOCK_ENCRYPTED_SIM=1 \
+MOCK_ASSERT_NO_SOCKET_FDS=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
@@ -433,6 +439,7 @@ ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
+MOCK_ASSERT_NO_SOCKET_FDS=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
@@ -471,6 +478,7 @@ ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
+MOCK_ASSERT_NO_SOCKET_FDS=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
@@ -479,6 +487,7 @@ ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
 ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+MOCK_ADB_KEEPALIVE_PID_FILE="$ADB_KEEPALIVE_PID_FILE" \
 ZWRT_DATAD_MWAN3_INIT=/usr/bin/true \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
@@ -610,6 +619,8 @@ assert data["cooling"]["fan"]["always_on"] is True
 assert data["cooling"]["fan"]["mode"] == "always_on"
 assert data["cooling"]["fan"]["pwm"] == 128
 assert len(data["cooling"]["curve"]) == 5
+assert data["thermal"]["modems"][1]["celsius"] == 47
+assert data["thermal"]["modems"][2]["celsius"] == 46
 '
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
@@ -777,10 +788,28 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
 kill "$TOPFLOW_PID"
 wait "$TOPFLOW_PID" || true
 TOPFLOW_PID=""
+[ -s "$ADB_KEEPALIVE_PID_FILE" ]
+kill -0 "$(cat "$ADB_KEEPALIVE_PID_FILE")"
 [ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
 [ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
 [ "$(cat "$COOLING_TMP/liquid_thermal_enable")" = "1" ]
 [ "$(cat "$COOLING_TMP/liquid_drive")" = "0 0 0" ]
+
+# A long-lived child launched by a device command must not retain the HTTP
+# listener after zwrt-datad exits. The same port should be immediately reusable.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+TOPFLOW_PID=$!
+i=0
+until curl -fsS "http://127.0.0.1:$TOPFLOW_PORT/healthz" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'server restart after ADB child did not start' >&2; exit 1; }
+    sleep 0.1
+done
+kill "$TOPFLOW_PID"
+wait "$TOPFLOW_PID" || true
+TOPFLOW_PID=""
 
 MOCK_MODEL_NAME=MC7523 \
 MOCK_NO_NFC=1 \

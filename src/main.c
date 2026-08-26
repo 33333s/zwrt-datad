@@ -3803,6 +3803,13 @@ static int set_nonblock(int fd)
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+static int set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
 static int wait_readable(int fd, int timeout_ms)
 {
     fd_set rfds;
@@ -4590,6 +4597,11 @@ static int open_server_socket(const char *bind_addr, int port)
         perror("socket");
         return -1;
     }
+    if (set_cloexec(fd) < 0) {
+        perror("fcntl");
+        close(fd);
+        return -1;
+    }
 
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0) {
         perror("setsockopt");
@@ -4668,6 +4680,11 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             perror("accept");
             return;
+        }
+        if (set_cloexec(cli_fd) < 0) {
+            perror("fcntl");
+            close(cli_fd);
+            continue;
         }
 
         if (listener->lan_only && !peer_is_allowed_lan(&peer)) {
