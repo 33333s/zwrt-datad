@@ -267,4 +267,4 @@ SSE  /events
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
 - `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
-- `sms.unread` 每轮刷新；`sms.list` 每 10 轮重读一次，或在未读数变化时立即重读，最多 32 条。发送、删除和标记已读通过私有 [`CONTROL_API.md`](CONTROL_API.md) 执行。
+- `sms.unread` 默认每 5 秒读取一次；`sms.list` 启动时按 NV/SIM 各最多 32 条完整同步，之后未读数变化时各取最新 8 条并按消息 ID 合并。发送、删除和标记已读成功后会使缓存失效并在下一轮完整同步。TopFlow 厂商密文由 datad 使用设备 OpenSSL 3 解密，输出到该字段的号码和正文均为 UTF-8 明文；消费者不应再实现厂商会话密钥或解密逻辑。相关写操作通过私有 [`CONTROL_API.md`](CONTROL_API.md) 执行。

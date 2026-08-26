@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.17",
+    "version": "0.9.18",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 从厂商落盘 UCI 读取 ICG 剩余流量与当日用量，实时接口超时时仍输出明确的字节值"
+    "notes": "TopFlow 短信由 datad 通过设备 OpenSSL 3 解密为 UTF-8，并采用分层状态采样与增量短信缓存降低刷新负载"
   }
 }

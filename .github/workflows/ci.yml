@@ -12,8 +12,8 @@ jobs:
       - name: Build with strict warnings
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            src/json.c src/device_exec.c src/system_ext.c src/control.c src/main.c \
-            -o zwrt-datad-test
+            src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/main.c \
+            -ldl -o zwrt-datad-test
       - name: Test JSON helpers
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \

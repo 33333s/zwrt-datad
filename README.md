@@ -199,6 +199,15 @@ kill -USR1 $(pidof zwrt-datad)
 
 这会立刻触发一次 QoS 日志重读，供 DevUI 的“刷新 AMBR 缓存”按钮复用。
 
+短信读取和厂商 Web 接口加密也由 datad 统一处理：启动后的第一次读取会分别从
+NV/SIM 存储取最多 32 条并解密为 UTF-8；之后每 5 秒只检查未读计数，发生变化时
+各取最新 8 条并合并进缓存。发送、删除或标记已读后才重新做一次完整同步。上层
+UFI 只读取 `state.sms.list` 的明文，不再持有厂商 Web 会话密钥或处理密文。
+
+TopFlow 的短信密文使用设备自带 OpenSSL 3 的 AES-256-GCM 解密。datad 运行时动态
+加载 `/usr/lib/libcrypto.so.3`，不链接任何厂商私有库；缺少该标准库时不会把无法
+认证的密文作为短信正文输出。
+
 ## 文档
 
 - 接口说明：[`docs/API.md`](docs/API.md)
