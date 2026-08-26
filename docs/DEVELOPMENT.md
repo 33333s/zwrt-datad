@@ -115,7 +115,8 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - `qos` 日志缓存策略仍然是：启动按 `key.log.0` -> `key.log` 全量扫一次，之后只显示缓存；`key.log` 是当前轮转文件，具有高于 `key.log.0` 的候选优先级，旧日志仅在当前日志缺少对应字段时补缺；同一文件内再优先采用当前 `rmcc/rmnc` 匹配的 APN 承载。非 IMS `dnn=` 可作为数据承载候选，IMS / emergency 不覆盖主数据 AMBR。
 - 手动刷新通过 `SIGUSR1` 触发
 - 换卡检测基于 `sim_iccid/current_sim_slot`
-- 短信列表一次最多取 32 条，并缓存解码后的列表
+- 短信首次按 NV/SIM 各最多 32 条同步；未读数变化后各增量取最新 8 条并合并缓存，短信控制操作后才重新全量同步
+- 厂商 Web 加密短信在 datad 内通过设备 OpenSSL 3 解密成 UTF-8；UFI 等消费者只接收明文
 - `device.api_template_supported = 1` 才代表当前机型已有明确模板；`0` 只表示落到了内部兼容模板
 
 ## 构建

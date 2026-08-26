@@ -12,6 +12,7 @@
 #include "control.h"
 #include "device_exec.h"
 #include "system_ext.h"
+#include "web_crypto.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -38,7 +39,9 @@
 #define KEY_LOG_ROTATED_PATH "/data/logfs/key.log.0"
 #define SIM_POLL_MS 5000
 #define QOS_RETRY_MS 120000
-#define SMS_REFRESH_EVERY 10
+#define SMS_UNREAD_POLL_MS 5000
+#define POWER_POLL_SEC 2
+#define SLOW_STATE_POLL_SEC 5
 
 #define HTTP_BIND_ADDR "127.0.0.1"
 #define HTTP_PORT 9460
@@ -320,6 +323,31 @@ static int run_ubus(const char *svc, const char *method, const char *args,
     return device_ubus_call(svc, method, args, out, outlen);
 }
 
+static int setup_sms_crypto(void)
+{
+    char certificate_reply[8192];
+    char certificate[8192];
+    char enstr[2048];
+    char args[2304];
+    char reply[1024];
+
+    if (web_crypto_session_ready()) return 1;
+    if (!web_crypto_init()) return 0;
+    if (run_ubus("zwrt_web", "web_crt_get", NULL,
+                 certificate_reply, sizeof certificate_reply) != 0 ||
+        !json_get(certificate_reply, "result", certificate, sizeof certificate) ||
+        !web_crypto_prepare_registration(certificate, enstr, sizeof enstr)) {
+        web_crypto_reset();
+        return 0;
+    }
+    snprintf(args, sizeof args, "{\"web_enstr\":\"%s\"}", enstr);
+    if (run_ubus("zwrt_web", "web_http_enstr_set", args, reply, sizeof reply) != 0) {
+        web_crypto_reset();
+        return 0;
+    }
+    return 1;
+}
+
 static void copy_text(char *dst, size_t dstlen, const char *src)
 {
     size_t n;
@@ -460,7 +488,8 @@ static void format_sms_date(const char *raw, char *out, size_t outlen)
         out[0] = 0;
 }
 
-static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
+static int parse_sms_list(const char *sms_reply, char *out, size_t outlen,
+                          int *crypto_failed)
 {
     const char *arr = strstr(sms_reply, "\"list\"");
     const char *begin = arr ? strchr(arr, '[') : strchr(sms_reply, '[');
@@ -532,18 +561,22 @@ static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
         sms_obj[len] = 0;
         {
             char id_raw[64];
-            char num[64];
+            char num_raw[4096];
+            char num_decrypted[4096];
+            char num[512];
             char date_raw[64];
             char date[32];
             char tag[16];
+            char text_raw[SMS_TEXT_HEX_MAX];
             char text_hex[SMS_TEXT_HEX_MAX];
             char text[SMS_TEXT_UTF8_MAX];
             long id = 0;
             int unread = 0;
+            int num_crypto, text_crypto;
 
             if (!json_get(sms_obj, "id", id_raw, sizeof id_raw)) continue;
-            if (!json_get(sms_obj, "num", num, sizeof num) &&
-                !json_get(sms_obj, "number", num, sizeof num)) num[0] = 0;
+            if (!json_get(sms_obj, "num", num_raw, sizeof num_raw) &&
+                !json_get(sms_obj, "number", num_raw, sizeof num_raw)) num_raw[0] = 0;
             if (!json_get(sms_obj, "date", date_raw, sizeof date_raw)) date_raw[0] = 0;
             if (!json_get(sms_obj, "tag", tag, sizeof tag)) {
                 long t = json_get_int(sms_obj, "tag", 0);
@@ -551,11 +584,24 @@ static int parse_sms_list(const char *sms_reply, char *out, size_t outlen)
             } else {
                 unread = (tag[0] == '1') ? 1 : 0;
             }
-            if (!json_get(sms_obj, "text", text_hex, sizeof text_hex) &&
-                !json_get(sms_obj, "content", text_hex, sizeof text_hex)) text_hex[0] = 0;
+            if (!json_get(sms_obj, "text", text_raw, sizeof text_raw) &&
+                !json_get(sms_obj, "content", text_raw, sizeof text_raw)) text_raw[0] = 0;
 
             id = strtol(id_raw, NULL, 10);
             format_sms_date(date_raw, date, sizeof date);
+
+            num_crypto = web_crypto_decrypt_envelope(num_raw, num_decrypted, sizeof num_decrypted);
+            text_crypto = web_crypto_decrypt_envelope(text_raw, text_hex, sizeof text_hex);
+            if (num_crypto < 0 || text_crypto < 0) {
+                if (crypto_failed) *crypto_failed = 1;
+                continue;
+            }
+            if (num_crypto > 0)
+                utf16be_hex_to_utf8(num_decrypted, num, sizeof num);
+            else
+                copy_text(num, sizeof num, num_raw);
+            if (text_crypto == 0)
+                snprintf(text_hex, sizeof text_hex, "%s", text_raw);
             utf16be_hex_to_utf8(text_hex, text, sizeof text);
 
             if (items) bappend(&outb, ",");
@@ -591,19 +637,148 @@ static int read_sms_unread_count(long fallback)
     return dev + sim;
 }
 
-static int refresh_sms_cache(void)
+static int join_sms_arrays(const char *left, const char *right,
+                           char *out, size_t outlen)
 {
-    char list_resp[SMS_RESPONSE_MAX];
+    size_t left_len = left ? strlen(left) : 0;
+    size_t right_len = right ? strlen(right) : 0;
+    const char *left_body = left_len >= 2 ? left + 1 : "";
+    const char *right_body = right_len >= 2 ? right + 1 : "";
+    size_t left_body_len = left_len >= 2 ? left_len - 2 : 0;
+    size_t right_body_len = right_len >= 2 ? right_len - 2 : 0;
+    int comma = left_body_len > 0 && right_body_len > 0;
+    if (left_body_len + right_body_len + (size_t)comma + 3 > outlen) return 0;
+    out[0] = '[';
+    memcpy(out + 1, left_body, left_body_len);
+    size_t pos = 1 + left_body_len;
+    if (comma) out[pos++] = ',';
+    memcpy(out + pos, right_body, right_body_len);
+    pos += right_body_len;
+    out[pos++] = ']';
+    out[pos] = 0;
+    return 1;
+}
+
+static const char *next_sms_object(const char *cursor, char *out, size_t outlen)
+{
+    const char *start;
+    int depth = 0, in_string = 0, escaped = 0;
+    size_t length;
+
+    if (!cursor || !out || outlen == 0) return NULL;
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == '[' || *cursor == ','))
+        cursor++;
+    if (*cursor == ']' || *cursor != '{') return NULL;
+    start = cursor;
+    for (; *cursor; cursor++) {
+        char c = *cursor;
+        if (in_string) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') in_string = 0;
+            continue;
+        }
+        if (c == '"') in_string = 1;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) {
+            cursor++;
+            length = (size_t)(cursor - start);
+            if (length >= outlen) return NULL;
+            memcpy(out, start, length);
+            out[length] = 0;
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
+static int merge_sms_page(const char *page, const char *cached,
+                          char *out, size_t outlen)
+{
+    long seen[32];
+    int seen_count = 0;
+    int item_count = 0;
+    char object[SMS_OBJECT_MAX];
+    struct buf outb = { out, outlen, 0 };
+    const char *sources[2] = { page, cached };
+
+    bappend(&outb, "[");
+    for (size_t source = 0; source < 2 && item_count < 32; source++) {
+        const char *cursor = sources[source];
+        while (item_count < 32 &&
+               (cursor = next_sms_object(cursor, object, sizeof object)) != NULL) {
+            long id = json_get_int(object, "id", LONG_MIN);
+            int duplicate = 0;
+            if (id != LONG_MIN) {
+                for (int i = 0; i < seen_count; i++) {
+                    if (seen[i] == id) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+            }
+            if (duplicate) continue;
+            if (id != LONG_MIN && seen_count < (int)(sizeof seen / sizeof seen[0]))
+                seen[seen_count++] = id;
+            if (item_count) bappend(&outb, ",");
+            bappend(&outb, "%s", object);
+            item_count++;
+        }
+    }
+    bappend(&outb, "]");
+    return outb.len < outb.cap;
+}
+
+static int refresh_sms_cache(int full_refresh)
+{
+    static char nv_resp[SMS_RESPONSE_MAX];
+    static char sim_resp[SMS_RESPONSE_MAX];
+    static char nv_cache[SMS_LIST_MAX] = "[]";
+    static char sim_cache[SMS_LIST_MAX] = "[]";
+    static char nv_page[SMS_LIST_MAX];
+    static char sim_page[SMS_LIST_MAX];
+    static char next_nv[SMS_LIST_MAX];
+    static char next_sim[SMS_LIST_MAX];
     static char next_cache[SMS_LIST_MAX];
+    char nv_args[160];
+    char sim_args[160];
+    int page_size = full_refresh ? 32 : 8;
+    int crypto_failed = 0;
+
+    (void)setup_sms_crypto();
+    snprintf(nv_args, sizeof nv_args,
+             "{\"page\":0,\"data_per_page\":%d,\"mem_store\":1,\"tags\":10,\"order_by\":\"order by id desc\"}",
+             page_size);
+    snprintf(sim_args, sizeof sim_args,
+             "{\"page\":0,\"data_per_page\":%d,\"mem_store\":0,\"tags\":10,\"order_by\":\"order by id desc\"}",
+             page_size);
     if (run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
-                 "{\"page\":0,\"data_per_page\":32,\"mem_store\":1,\"tags\":10,\"order_by\":\"order by id desc\"}",
-                 list_resp, sizeof list_resp) != 0) {
+                 nv_args,
+                 nv_resp, sizeof nv_resp) != 0 ||
+        run_ubus("zwrt_wms", "zte_libwms_get_sms_data",
+                 sim_args,
+                 sim_resp, sizeof sim_resp) != 0) {
         return 0;
     }
     g_sms_interface_detected = 1;
-    if (!parse_sms_list(list_resp, next_cache, sizeof next_cache)) {
+    if (!parse_sms_list(nv_resp, nv_page, sizeof nv_page, &crypto_failed) ||
+        !parse_sms_list(sim_resp, sim_page, sizeof sim_page, &crypto_failed)) {
         return 0;
     }
+    if (crypto_failed) {
+        web_crypto_reset();
+        return 0;
+    }
+    if (full_refresh) {
+        copy_text(next_nv, sizeof next_nv, nv_page);
+        copy_text(next_sim, sizeof next_sim, sim_page);
+    } else if (!merge_sms_page(nv_page, nv_cache, next_nv, sizeof next_nv) ||
+               !merge_sms_page(sim_page, sim_cache, next_sim, sizeof next_sim)) {
+        return 0;
+    }
+    if (!join_sms_arrays(next_nv, next_sim, next_cache, sizeof next_cache)) return 0;
+    copy_text(nv_cache, sizeof nv_cache, next_nv);
+    copy_text(sim_cache, sizeof sim_cache, next_sim);
     size_t list_len = strnlen(next_cache, sizeof next_cache);
     memcpy(g_sms_list_cache, next_cache, list_len + 1);
     g_sms_list_cache[sizeof(g_sms_list_cache) - 1] = 0;
@@ -3227,18 +3402,24 @@ static void emit_topflow_modems(struct buf *b, const char *net, const char *traf
 static void build_snapshot(char *out, size_t outlen,
                            int with_board, const char *board_cache,
                            int with_common, const char *common_cache,
-                           int with_imei, const char *imei_cache)
+                           int with_imei, const char *imei_cache,
+                           int force_refresh)
 {
-    char net[RAW_MAX], batt[RAW_MAX], chg[RAW_MAX], therm[1024];
-    char rnum[1024], rstat[1024], traf[RAW_MAX], sysinfo[2048], usb[1024], nfc[1024];
-    char wifi_ssid[128], wifi_key[128], wifi_enc[64];
-    char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
+    char net[RAW_MAX], traf[RAW_MAX];
+    static char batt[RAW_MAX], chg[RAW_MAX], therm[1024];
+    static char rnum[1024], rstat[1024], sysinfo[2048], usb[1024], nfc[1024];
+    static char wifi_ssid[128], wifi_key[128], wifi_enc[64];
+    static char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
     char device_profile[64], device_profile_source[64];
     char device_vendor[64], device_model_name[128], device_hw[128];
     char device_market_name[128], device_alias_name[128], device_board_name[128];
-    char client_list[CLIENT_LIST_MAX];
+    static char client_list[CLIENT_LIST_MAX] = "[]";
+    static int wifi_enabled;
+    static time_t power_next_at;
+    static time_t slow_state_next_at;
+    time_t poll_now = time(NULL);
     long chg_uv, chg_ua, bat_uv, bat_ua, cpu_temp;
-    int cpu_usage, cpu_usage_tenths, wifi_enabled;
+    int cpu_usage, cpu_usage_tenths;
     int show_battery, show_wifi, show_nfc, show_sms;
     char runtime_json[32768], thermal_zones_json[16384];
     int qos_mcc, qos_mnc;
@@ -3258,26 +3439,32 @@ static void build_snapshot(char *out, size_t outlen,
     device_template = select_device_template(device_model_name, device_hw);
 
     load_network_snapshot_for_template(device_template, net, sizeof net);
-    run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
-    run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
-    load_thermal_snapshot_for_template(device_template, therm, sizeof therm);
-    run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
-    run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
+    if (force_refresh || power_next_at == 0 || poll_now >= power_next_at) {
+        run_ubus("zwrt_bsp.battery", "list", NULL, batt, sizeof batt);
+        run_ubus("zwrt_bsp.charger", "list", NULL, chg, sizeof chg);
+        load_thermal_snapshot_for_template(device_template, therm, sizeof therm);
+        power_next_at = poll_now + POWER_POLL_SEC;
+    }
     /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
     load_traffic_snapshot_for_template(device_template, traf, sizeof traf);
-    run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
-    run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
-    run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
-    load_wifi_dhcp_for_template(device_template,
-                                wifi_ssid, sizeof wifi_ssid,
-                                wifi_key, sizeof wifi_key,
-                                wifi_enc, sizeof wifi_enc,
-                                &wifi_enabled,
-                                dhcp_ip, sizeof dhcp_ip,
-                                dhcp_start, sizeof dhcp_start,
-                                dhcp_limit, sizeof dhcp_limit,
-                                dhcp_lease, sizeof dhcp_lease);
-    build_client_list_json_for_template(device_template, client_list, sizeof client_list);
+    if (force_refresh || slow_state_next_at == 0 || poll_now >= slow_state_next_at) {
+        run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
+        run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
+        run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
+        run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
+        run_ubus("zwrt_nfc", "zwrt_nfc_wifi_get", NULL, nfc, sizeof nfc);
+        load_wifi_dhcp_for_template(device_template,
+                                    wifi_ssid, sizeof wifi_ssid,
+                                    wifi_key, sizeof wifi_key,
+                                    wifi_enc, sizeof wifi_enc,
+                                    &wifi_enabled,
+                                    dhcp_ip, sizeof dhcp_ip,
+                                    dhcp_start, sizeof dhcp_start,
+                                    dhcp_limit, sizeof dhcp_limit,
+                                    dhcp_lease, sizeof dhcp_lease);
+        build_client_list_json_for_template(device_template, client_list, sizeof client_list);
+        slow_state_next_at = poll_now + SLOW_STATE_POLL_SEC;
+    }
     chg_uv = read_long_file("/sys/class/power_supply/usb/voltage_now", 0);
     chg_ua = read_long_file("/sys/class/power_supply/usb/current_now", 0);
     bat_uv = read_long_file("/sys/class/power_supply/battery/voltage_now", 0);
@@ -4564,16 +4751,21 @@ static void accept_ready_http_clients(const struct http_listener *listener,
         if (!strcmp(path, "/ubus/call")) {
             char *body = strstr(req, "\r\n\r\n");
             int called = 0;
+            int refresh_state = 1;
+            char refresh_value[16];
             if (strcmp(method, "POST") != 0) {
                 write_http_error(cli_fd, 405, "Method Not Allowed");
             } else if (!listener->auth_required && !peer_is_loopback(&peer)) {
                 write_http_error(cli_fd, 403, "Forbidden");
             } else {
                 body = body ? body + 4 : NULL;
+                if (body && json_get(body, "refresh_state", refresh_value, sizeof refresh_value) &&
+                    (!strcmp(refresh_value, "false") || !strcmp(refresh_value, "0")))
+                    refresh_state = 0;
                 called = handle_full_ubus_call(cli_fd, body);
             }
             close(cli_fd);
-            if (called) g_state_refresh_req = 1;
+            if (called && refresh_state) g_state_refresh_req = 1;
             continue;
         }
 
@@ -4581,12 +4773,14 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             char *body = strstr(req, "\r\n\r\n");
             struct control_result control_status;
             const char *http_status = "OK";
+            char action[128] = "";
             if (strcmp(method, "POST") != 0) {
                 write_http_error(cli_fd, 405, "Method Not Allowed");
                 close(cli_fd);
                 continue;
             }
             body = body ? body + 4 : NULL;
+            if (body) (void)json_get(body, "action", action, sizeof action);
             control_status = control_execute(body, control_response, sizeof control_response);
             if (control_status.http_status == 400) http_status = "Bad Request";
             else if (control_status.http_status == 404) http_status = "Not Found";
@@ -4594,6 +4788,9 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             (void)write_http_json_status(cli_fd, control_status.http_status, http_status,
                                          control_response, strlen(control_response));
             close(cli_fd);
+            if (control_status.http_status >= 200 && control_status.http_status < 300 &&
+                !strncmp(action, "sms.", 4))
+                g_sms_list_valid = 0;
             if (control_status.refresh_state) g_state_refresh_req = 1;
             continue;
         }
@@ -4732,7 +4929,8 @@ int main(int argc, char **argv)
     int auth_token_file_explicit = 0;
     int port = HTTP_PORT;
     int lan_port = HTTP_LAN_PORT;
-    int sim_poll_every, interface_poll_every, qos_retry_every, qos_retry_left = 0;
+    int sim_poll_every, interface_poll_every, sms_poll_every;
+    int qos_retry_every, qos_retry_left = 0;
     char sim_sig[160];
     int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
@@ -4764,9 +4962,11 @@ int main(int argc, char **argv)
 
     sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
     interface_poll_every = sim_poll_every;
+    sms_poll_every = (SMS_UNREAD_POLL_MS + interval_ms - 1) / interval_ms;
     qos_retry_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
     if (sim_poll_every < 1) sim_poll_every = 1;
     if (interface_poll_every < 1) interface_poll_every = 1;
+    if (sms_poll_every < 1) sms_poll_every = 1;
     if (qos_retry_every < 1) qos_retry_every = 1;
 
     signal(SIGINT, on_signal);
@@ -4837,9 +5037,11 @@ int main(int argc, char **argv)
             g_sample_interval_ms = interval_ms;
             sim_poll_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
             interface_poll_every = sim_poll_every;
+            sms_poll_every = (SMS_UNREAD_POLL_MS + interval_ms - 1) / interval_ms;
             qos_retry_every = (SIM_POLL_MS + interval_ms - 1) / interval_ms;
             if (sim_poll_every < 1) sim_poll_every = 1;
             if (interface_poll_every < 1) interface_poll_every = 1;
+            if (sms_poll_every < 1) sms_poll_every = 1;
             if (qos_retry_every < 1) qos_retry_every = 1;
             if (qos_retry_left > 0)
                 qos_retry_left = (QOS_RETRY_MS + interval_ms - 1) / interval_ms;
@@ -4883,11 +5085,12 @@ int main(int argc, char **argv)
             else qos_retry_left--;
         }
 
-        {
+        if (!g_sms_list_valid || cycle == 0 || cycle % sms_poll_every == 0) {
             long cur_sms_unread = read_sms_unread_count(g_sms_unread_cache);
             if (cur_sms_unread >= 0) g_sms_unread_cache = cur_sms_unread;
-            if (!g_sms_list_valid || cycle % SMS_REFRESH_EVERY == 0 || g_sms_unread_cache != last_sms_unread) {
-                if (refresh_sms_cache()) g_sms_list_valid = 1;
+            if (!g_sms_list_valid || g_sms_unread_cache != last_sms_unread) {
+                int full_sms_refresh = !g_sms_list_valid;
+                if (refresh_sms_cache(full_sms_refresh)) g_sms_list_valid = 1;
             }
             last_sms_unread = g_sms_unread_cache;
         }
@@ -4895,7 +5098,8 @@ int main(int argc, char **argv)
         build_snapshot(snap, sizeof snap,
                        board[0] != 0, board,
                        common[0] != 0, common,
-                       imei[0] != 0, imei);
+                       imei[0] != 0, imei,
+                       force_refresh || cycle == 0);
 
         if (once) {
             fputs(snap, stdout);

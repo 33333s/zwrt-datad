@@ -15,7 +15,7 @@ ASSET="$(sed -n 's/^[[:space:]]*"asset":[[:space:]]*"\([^"]*\)".*/\1/p' version.
 CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
   -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
 
-$CC $CFLAGS src/*.c -static -Wl,--gc-sections -o zwrt-datad
+$CC $CFLAGS src/*.c -Wl,--gc-sections -ldl -o zwrt-datad
 echo ">> link OK"
 "$TC/aarch64-linux-size" zwrt-datad
 "$TC/aarch64-linux-strip" -o "$ASSET" zwrt-datad
