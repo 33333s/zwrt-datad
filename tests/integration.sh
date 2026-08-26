@@ -95,6 +95,37 @@ assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
     {"name": "cpuss-0", "celsius": 41.25},
 ]
+assert data["traffic"]["limit"] == {"cid": 1, "monthly_limit": 1024}
+'
+
+# Parse the first state event exactly as a browser EventSource would: only
+# data-prefixed lines belong to the payload and are joined with newlines.
+curl -sN --max-time 3 -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$PORT/events" | python3 -c '
+import json, sys
+event = ""
+data_lines = []
+for raw_line in sys.stdin:
+    line = raw_line.rstrip("\r\n")
+    if line == "":
+        if data_lines:
+            assert event == "state"
+            payload = json.loads("\n".join(data_lines))
+            assert payload["traffic"]["limit"] == {"cid": 1, "monthly_limit": 1024}
+            break
+        event = ""
+        data_lines = []
+    elif line.startswith("event:"):
+        event = line[6:]
+        if event.startswith(" "):
+            event = event[1:]
+    elif line.startswith("data:"):
+        value = line[5:]
+        if value.startswith(" "):
+            value = value[1:]
+        data_lines.append(value)
+else:
+    raise AssertionError("no state event received")
 '
 
 MOCK_MODEL_NAME=CPE_FIXTURE \

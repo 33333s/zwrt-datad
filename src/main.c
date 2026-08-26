@@ -4574,11 +4574,26 @@ static int write_sse_handshake(int fd)
 
 static int sse_send_snapshot(int fd, const char *snap, size_t snap_len)
 {
-    static const char prefix[] = "event: state\ndata: ";
-    static const char suffix[] = "\n\n";
-    if (write_all(fd, prefix, sizeof prefix - 1) < 0) return -1;
-    if (write_all(fd, snap, snap_len) < 0) return -1;
-    return write_all(fd, suffix, sizeof suffix - 1);
+    static const char event[] = "event: state\n";
+    static const char data[] = "data: ";
+    static const char newline[] = "\n";
+    size_t line_start = 0;
+
+    if (write_all(fd, event, sizeof event - 1) < 0) return -1;
+    for (;;) {
+        size_t line_end = line_start;
+        while (line_end < snap_len && snap[line_end] != '\r' && snap[line_end] != '\n')
+            line_end++;
+        if (write_all(fd, data, sizeof data - 1) < 0 ||
+            write_all(fd, snap + line_start, line_end - line_start) < 0 ||
+            write_all(fd, newline, sizeof newline - 1) < 0)
+            return -1;
+        if (line_end == snap_len) break;
+        if (snap[line_end] == '\r' && line_end + 1 < snap_len && snap[line_end + 1] == '\n')
+            line_end++;
+        line_start = line_end + 1;
+    }
+    return write_all(fd, newline, sizeof newline - 1);
 }
 
 static int open_server_socket(const char *bind_addr, int port)
