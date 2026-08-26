@@ -28,7 +28,19 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.sys_info.net_select='Only_5G'" \
         "zte_nwinfo.band_lock.nr5g_sa_band_lock='78'" \
         "zte_nwinfo.band_lock.nr5g_nsa_band_lock=''" \
-        "zte_nwinfo.band_lock.lte_ext_band_lock='1,3'"
+        "zte_nwinfo.band_lock.lte_ext_band_lock='1,3'" \
+        "zte_nwinfo.sys_info.msim_1_0_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_1_0_network_provider='Fixture UCI LTE One'" \
+        "zte_nwinfo.sys_info.msim_1_0_signalbar='4'" \
+        "zte_nwinfo.sys_info.msim_1_0_lte_rsrp='-96'" \
+        "zte_nwinfo.sys_info.msim_1_0_lte_bandwidth='10'" \
+        "zte_nwinfo.sys_info.msim_2_0_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_2_0_network_provider='Fixture UCI LTE Two'" \
+        "zte_nwinfo.sys_info.msim_2_0_signalbar='3'" \
+        "zte_nwinfo.sys_info.msim_2_0_lte_rsrp='-102'" \
+        "zte_nwinfo.sys_info.msim_2_0_lte_bandwidth='20'" | sed \
+        -e "s/msim_1_0_/msim_1_${MOCK_UCI_MSIM1_SLOT:-0}_/g" \
+        -e "s/msim_2_0_/msim_2_${MOCK_UCI_MSIM2_SLOT:-0}_/g"
     exit 0
 fi
 

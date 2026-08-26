@@ -353,6 +353,74 @@ grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
 
+# External modem network keys follow each modem-local active SIM slot.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_V3T1_SLOT=1 \
+MOCK_V3T2_SLOT=0 \
+MOCK_MSIM1_SLOT=1 \
+MOCK_MSIM2_SLOT=0 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert [modem["subid"] for modem in data["modems"][1:]] == [4, 5]
+assert [modem["sim"]["slot"] for modem in data["modems"][1:]] == [1, 0]
+assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
+assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
+'
+
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_V3T1_SLOT=0 \
+MOCK_V3T2_SLOT=1 \
+MOCK_MSIM1_SLOT=0 \
+MOCK_MSIM2_SLOT=1 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert [modem["subid"] for modem in data["modems"][1:]] == [3, 6]
+assert [modem["sim"]["slot"] for modem in data["modems"][1:]] == [0, 1]
+assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
+assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
+'
+
+# The UCI fallback uses the same active-slot prefixes as the live UBus path.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_V3T1_SLOT=1 \
+MOCK_V3T2_SLOT=0 \
+MOCK_MSIM_NWINFO_FAIL=1 \
+MOCK_UCI_MSIM1_SLOT=1 \
+MOCK_UCI_MSIM2_SLOT=0 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["modems"][1]["net"]["operator"] == "Fixture UCI LTE One"
+assert data["modems"][1]["net"]["bandwidth"] == "10"
+assert data["modems"][2]["net"]["operator"] == "Fixture UCI LTE Two"
+assert data["modems"][2]["net"]["bandwidth"] == "20"
+'
+
+# During a slot switch, do not report stale fields from the other slot.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_V3T1_SLOT=1 \
+MOCK_V3T2_SLOT=1 \
+MOCK_MSIM1_SLOT=0 \
+MOCK_MSIM2_SLOT=0 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["modems"][1]["net"]["operator"] == ""
+assert data["modems"][1]["net"]["bars"] == 0
+assert data["modems"][2]["net"]["operator"] == ""
+assert data["modems"][2]["net"]["bars"] == 0
+'
+
 # Legacy manual/off configurations are no longer a valid steady state: an
 # upgrade must move them to the saved custom curve before exposing the switch.
 printf '%s\n' \
