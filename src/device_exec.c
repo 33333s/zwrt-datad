@@ -248,6 +248,25 @@ int device_adb_read_file(const char *serial, const char *path,
     return out[0] ? 0 : -1;
 }
 
+int device_adb_read_qos_log(const char *serial, char *out, size_t outlen)
+{
+    const char *adb = getenv("ZWRT_DATAD_ADB_BIN");
+    const char *argv[6];
+    size_t n;
+    if (!valid_command_name(serial) || !out || outlen == 0) return -1;
+    if (!adb || !*adb) adb = "adb";
+    argv[0] = adb;
+    argv[1] = "-s";
+    argv[2] = serial;
+    argv[3] = "shell";
+    argv[4] = "grep QCI= /logfs/key.log | tail -n 64";
+    argv[5] = NULL;
+    if (device_run_capture_timeout(argv, out, outlen, 2500) != 0) return -1;
+    n = strlen(out);
+    while (n && isspace((unsigned char)out[n - 1])) out[--n] = 0;
+    return out[0] ? 0 : -1;
+}
+
 int device_uci_commit(const char *package_name)
 {
     const char *uci = getenv("ZWRT_DATAD_UCI_BIN");

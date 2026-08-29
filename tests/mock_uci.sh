@@ -11,8 +11,9 @@ esac
 
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; then
     printf '%s\n' \
-        "zte_nwinfo.sys_info.network_type='SA'" \
+        "zte_nwinfo.sys_info.network_type='${MOCK_UCI_NETWORK_TYPE:-SA}'" \
         "zte_nwinfo.signal_strength.signalbar='4'" \
+        "zte_nwinfo.sys_info.simcard_roam='Home'" \
         "zte_nwinfo.plmn_info.network_provider_fullname='Fixture TopFlow Mobile'" \
         "zte_nwinfo.wan_active_band.GWLSA_band='n78'" \
         "zte_nwinfo.wan_active_band.odu_nrband='78'" \
@@ -25,35 +26,40 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.cell_info.nr5g_cellid='123456'" \
         "zte_nwinfo.cell_info.nr5g_action_channel='633984'" \
         "zte_nwinfo.cell_info.nr5g_bandwidth='100'" \
+        "zte_nwinfo.cell_info.lte_bandwidth='${MOCK_UCI_LTE_BANDWIDTH:-20}'" \
         "zte_nwinfo.sys_info.net_select='Only_5G'" \
         "zte_nwinfo.band_lock.nr5g_sa_band_lock='78'" \
         "zte_nwinfo.band_lock.nr5g_nsa_band_lock=''" \
-        "zte_nwinfo.band_lock.lte_ext_band_lock='1,3'"
-    # UCI fallback copy of the external-modem multi-SIM fields, keyed by each
-    # modem's active local slot (issue #23).
-    s1="${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}"
-    s2="${MOCK_V3T2_SLOT:-${MOCK_V3T_SLOT:-0}}"
-    printf '%s\n' \
-        "zte_nwinfo.sys_info.msim_1_${s1}_network_provider='Fixture LTE One'" \
-        "zte_nwinfo.sys_info.msim_1_${s1}_network_type='LTE'" \
-        "zte_nwinfo.sys_info.msim_1_${s1}_wan_active_band='LTE BAND 3'" \
-        "zte_nwinfo.sys_info.msim_1_${s1}_lte_rsrp='-95'" \
-        "zte_nwinfo.sys_info.msim_1_${s1}_operate_mode='ONLINE'" \
-        "zte_nwinfo.sys_info.msim_2_${s2}_network_provider='Fixture LTE Two'" \
-        "zte_nwinfo.sys_info.msim_2_${s2}_network_type='LTE'" \
-        "zte_nwinfo.sys_info.msim_2_${s2}_wan_active_band='LTE BAND 3'" \
-        "zte_nwinfo.sys_info.msim_2_${s2}_lte_rsrp='-101'" \
-        "zte_nwinfo.sys_info.msim_2_${s2}_operate_mode='ONLINE'"
+        "zte_nwinfo.band_lock.lte_ext_band_lock='1,3'" \
+        "zte_nwinfo.sys_info.msim_1_0_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_1_0_network_provider='Fixture UCI LTE One'" \
+        "zte_nwinfo.sys_info.msim_1_0_signalbar='4'" \
+        "zte_nwinfo.sys_info.msim_1_0_simcard_roam='Home'" \
+        "zte_nwinfo.sys_info.msim_1_0_lte_rsrp='-96'" \
+        "zte_nwinfo.sys_info.msim_1_0_lte_bandwidth='10'" \
+        "zte_nwinfo.sys_info.msim_2_0_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_2_0_network_provider='Fixture UCI LTE Two'" \
+        "zte_nwinfo.sys_info.msim_2_0_signalbar='3'" \
+        "zte_nwinfo.sys_info.msim_2_0_simcard_roam='Roaming'" \
+        "zte_nwinfo.sys_info.msim_2_0_lte_rsrp='-102'" \
+        "zte_nwinfo.sys_info.msim_2_0_lte_bandwidth='20'" | sed \
+        -e "s/msim_1_0_/msim_1_${MOCK_UCI_MSIM1_SLOT:-${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}}_/g" \
+        -e "s/msim_2_0_/msim_2_${MOCK_UCI_MSIM2_SLOT:-${MOCK_V3T2_SLOT:-${MOCK_V3T_SLOT:-0}}}_/g"
     exit 0
 fi
 
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ]; then
     case "${3:-}" in
         zwrt_zte_mdm)
+            if [ "${MOCK_UCI_NO_MSISDN:-0}" = '1' ]; then
+                msisdn_line=
+            else
+                msisdn_line="zwrt_zte_mdm.sim_info.msisdn='${MOCK_UCI_MSISDN:-10086}'"
+            fi
             printf '%s\n' \
                 "zwrt_zte_mdm.sim_info.sim_iccid='8986000000000000000'" \
                 "zwrt_zte_mdm.sim_info.sim_imsi='460000000000001'" \
-                "zwrt_zte_mdm.sim_info.msisdn='10086'" \
+                "$msisdn_line" \
                 "zwrt_zte_mdm.sim_info.current_sim_slot='1'" \
                 "zwrt_zte_mdm.sim_info.sim_states='ready'" \
                 "zwrt_zte_mdm.sim_info.modem_main_state='online'" \
@@ -125,6 +131,13 @@ fi
 
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     case "${3:-}" in
+        zwrt_common_info.common_config.model_name)
+            [ "${MOCK_MODEL_NAME_MISSING:-0}" = '1' ] && exit 1
+            printf '%s\n' "${MOCK_MODEL_NAME:-MU5252}"
+            ;;
+        zwrt_common_info.common_config.hardware_version)
+            printf '%s\n' "${MOCK_HARDWARE_VERSION:-MU5252_HW1.0}"
+            ;;
         wireless.main_2g.ssid) printf '%s\n' 'Fixture 2G' ;;
         wireless.main_2g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_2g.encryption) printf '%s\n' 'sae-mixed' ;;
@@ -133,6 +146,14 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
         wireless.main_5g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_5g.encryption) printf '%s\n' 'sae-mixed' ;;
         wireless.main_5g.disabled) printf '%s\n' '0' ;;
+        wireless.wifi0.txpowerpercent) printf '%s\n' '100' ;;
+        wireless.wifi0.txpower) printf '%s\n' '30' ;;
+        wireless.wifi0.max_power) printf '%s\n' '30' ;;
+        wireless.wifi0.disabled) printf '%s\n' '1' ;;
+        wireless.wifi1.txpowerpercent) printf '%s\n' '100' ;;
+        wireless.wifi1.txpower) printf '%s\n' '30' ;;
+        wireless.wifi1.max_power) printf '%s\n' '30' ;;
+        wireless.wifi1.disabled) printf '%s\n' '0' ;;
         zte_nwinfo.sys_info.network_type) printf '%s\n' 'SA' ;;
         zte_nwinfo.signal_strength.signalbar) printf '%s\n' '4' ;;
         zte_nwinfo.plmn_info.network_provider_fullname) printf '%s\n' 'Fixture TopFlow Mobile' ;;
