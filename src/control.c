@@ -550,9 +550,11 @@ void control_release_cooling_state(void)
 {
     struct cooling_config cfg;
     if (!load_cooling_config(&cfg)) return;
-    if (cfg.fan_mode != FAN_MODE_KERNEL || cfg.fan_always_on) {
+    if (cfg.fan_mode != FAN_MODE_KERNEL || cfg.fan_always_on ||
+        g_fan_automatic_hard_override) {
         (void)set_fan_thermal_enabled(1);
         (void)apply_fan_curve(&cfg);
+        g_fan_automatic_hard_override = 0;
     }
     if (cfg.liquid_always_on) {
         (void)write_text_file(env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT),

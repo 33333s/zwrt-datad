@@ -640,6 +640,33 @@ grep -F 'fan_mode=1' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
 [ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
 
+# Even if automatic mode enters the >=80 C userspace override during --once,
+# process shutdown must hand the fan back to the vendor kernel curve.
+printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_MODEL_NAME=MU5252 \
+ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
+ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
+ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
+ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
+ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
+ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+"$BIN" --once | python3 -c '
+import json, sys
+fan = json.load(sys.stdin)["cooling"]["fan"]
+assert fan["mode"] == "automatic"
+assert fan["kernel_zone_enabled"] is False
+assert fan["pwm"] == 255
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+[ "$(cat "$COOLING_TMP/fan_thermal_enable")" = "1" ]
+printf '%s\n' '47000' >"$COOLING_TMP/zone/temp"
+
 # Legacy manual/off configurations are no longer a valid steady state: an
 # upgrade must move them to the saved custom curve before exposing the switch.
 printf '%s\n' \
