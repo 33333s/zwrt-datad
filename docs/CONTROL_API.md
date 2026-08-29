@@ -56,6 +56,11 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `wifi.set_module` | `enabled`，`0/1` |
 | `wifi.set_chip` | `chip`, `guest_enabled?` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
+| `wifi.txpower.status` | 无；返回两频段的启用状态、功率百分比、配置功率、配置上限和原厂上限 |
+| `wifi.txpower.apply` | `band`=`2g`/`5g`，以及 `percent`/`limit_dbm` 至少一项；一次提交并只重载一次 WiFi |
+| `wifi.txpower.set_percent` | `band`=`2g`/`5g`，`percent`=10–100（10% 步进） |
+| `wifi.txpower.set_limit` | `band`=`2g`/`5g`，`limit_dbm`=1–30；同时修改 `txpower` 与 `max_power` |
+| `wifi.txpower.restore_limit` | `band`=`2g`/`5g`；分别恢复为 MU5252 原厂 19/18 dBm |
 | `lan.set` | `ip/netmask/dhcp_disabled/dhcp_start/dhcp_end/lease_seconds` |
 | `lan.set_mtu` | `mtu` |
 | `dns.set` | `primary/secondary/manual_ipv4/manual_ipv6` |
@@ -66,6 +71,12 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `client.rename` | `mac`, `hostname` |
 
 `wifi.configure.key` 是设备 WiFi 明文密码，只能在本机受 Token 保护的接口中传输，不应写入日志。
+
+`wifi.txpower.*` 只在 MU5252 上执行。触摸屏使用 `apply` 把百分比和上限一次提交；
+`set_limit`、`restore_limit` 与 `apply.limit_dbm` 都会同时设置 radio 的 `txpower` 和
+`max_power`。目标值没有变化时返回 `changed=false`，不重载 WiFi；发生变化时只提交一次
+`wireless` 并重载一次 WiFi，重载失败会尝试恢复旧配置。这里返回的是配置/驱动目标，
+不是天线端实测射频功率。
 
 ## APN
 
@@ -123,12 +134,13 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `multiwan.member.set` | `section,metric,weight` | 修改已存在 member 的优先级与权重 |
 | `multiwan.policy.set` | `section,last_resort,use_member` | 修改已存在 policy 的成员列表与无可用链路时动作 |
 | `multiwan.rule.set` | `section,use_policy,sticky,logging` | 修改已存在 rule 使用的策略、会话保持与日志开关 |
-| `cooling.fan.set_enabled` | `enabled` | 兼容 action 名；实际控制“风扇常开”。`true` 固定厂商 PWM 128，`false` 恢复保存的自定义曲线 |
+| `cooling.fan.set_enabled` | `enabled` | 兼容 action 名；`true` 切到常开，`false` 切到自定义曲线 |
+| `cooling.fan.set_mode` | `mode` | `automatic` 使用原厂内核三档曲线，`custom` 使用保存的 2–8 点线性曲线，`always_on` 固定 PWM 128 |
 | `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 保存并启用 datad 自定义曲线，同时退出常开；2–8 点，温度严格递增、PWM 不递减 |
 | `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；实际控制“液冷常开”。`true` 固定厂商参数 `1023 60 200`，`false` 解除强制并交还 thermal 控制 |
 | `cooling.liquid.set_mode` | `mode` | MU5252 液冷模式：`automatic` 交还内核 thermal；`low` 使用原厂低档幅度 60；`high` 使用原厂高档幅度 200。两档均保持频率 200，不伪造连续百分比 |
 
-风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。状态中的 `always_on` 是新字段，`enabled` 仅作为同值兼容别名。风扇常开持续写 PWM 128；关闭常开时使用保存的曲线。MU5252 的风扇 `thermal_enable` 是硬件供电开关，datad 控制时必须保持为 1；它只禁用 `sys-therm-4` thermal zone，并动态找到 `pwm-fan` cooling device 清零其锁存 state，之后每秒按温度曲线写 PWM。这样 PWM 0 能真正停转，非零 PWM 也能实际驱动风扇；80℃ 始终强制 PWM 255。液冷常开关闭时先写 `0 0 0`，再恢复其 `thermal_enable`。datad 正常退出时会重新启用风扇 thermal zone，并把风扇和液冷 thermal 控制交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
+风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。状态中的 `always_on` 表示常开，`enabled` 仅作为同值兼容别名。`automatic` 会重新启用 `sys-therm-4` 并使用设备树的 44/48/53℃、30/50/70% 三档曲线；`custom` 会禁用该 thermal zone、清零 `pwm-fan` 的锁存 state，并每秒按保存曲线线性插值写 PWM；`always_on` 采用同一用户态控制路径持续写 PWM 128。三种模式都保持风扇 `thermal_enable=1`，且 80℃ 始终强制 PWM 255。`factory_curve` 与 `custom_curve` 分别返回原厂和自定义曲线；`curve` 保留为旧消费者兼容字段。液冷自动模式恢复其 `thermal_enable`，低/高档使用原厂固定硬件参数。datad 正常退出时会把风扇和液冷 thermal 控制交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
 
 `multiwan.*.set` 只能修改已存在且类型匹配的 mwan3 section，不提供任意 UCI 路径写入。datad 会先校验所有 section、数值范围、IP 地址和引用关系再提交；`use_member` 与 `track_ip` 以受限列表替换。`MULTIWAN` 模式保存后重启 mwan3 并返回 `applied=true`，`SMULTIWAN` 模式只保存并返回 `applied=false`。
 

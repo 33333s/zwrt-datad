@@ -74,6 +74,7 @@
 #define TOPFLOW_MODEM_COUNT 3
 #define TOPFLOW_EXTERNAL_MODEM_COUNT 2
 #define TOPFLOW_THERMAL_POLL_SEC 30
+#define TOPFLOW_EXTERNAL_QOS_POLL_SEC 60
 #define TOPFLOW_V3E_TEMP_PATH "/sys/devices/virtual/power/zte_power/adc2_temp"
 #define TOPFLOW_FAN_PWM_PATH "/sys/class/hwmon/hwmon0/pwm1"
 #define TOPFLOW_FAN_RPM_PATH "/sys/class/hwmon/hwmon0/fan1_input"
@@ -1014,6 +1015,9 @@ struct qos_values {
 static struct qos_candidate g_qos_candidates[QOS_CANDIDATE_MAX];
 static unsigned long g_qos_seq;
 static off_t g_qos_floor_off;
+static struct qos_values g_topflow_external_qos[TOPFLOW_EXTERNAL_MODEM_COUNT];
+static time_t g_topflow_external_qos_sampled_at[TOPFLOW_EXTERNAL_MODEM_COUNT];
+static time_t g_topflow_external_qos_next_at;
 
 static int parse_int_after(const char *s, const char *needle, int *out)
 {
@@ -1453,6 +1457,60 @@ static void rescan_qos_cache(void)
     g_qos_floor_off = 0;
     scan_qos_file(KEY_LOG_ROTATED_PATH, 0, NULL, 0);
     refresh_qos_cache();
+}
+
+static int parse_topflow_external_qos(const char *text, struct qos_values *out)
+{
+    const char *line = text;
+    int found = 0;
+
+    if (!text || !out) return 0;
+    memset(out, 0, sizeof *out);
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        size_t length = end ? (size_t)(end - line) : strlen(line);
+        char record[512];
+        int qci = 0, dl_kbps = 0, ul_kbps = 0;
+
+        if (length >= sizeof record) length = sizeof record - 1;
+        memcpy(record, line, length);
+        record[length] = 0;
+        if (strstr(record, "[DATA]") && contains_ci(record, "cid1") &&
+            parse_int_after(record, "QCI=", &qci) &&
+            parse_int_after(record, "DL_AMBR=", &dl_kbps) &&
+            parse_int_after(record, "UL_AMBR=", &ul_kbps) &&
+            qci > 0 && qci <= 255 && dl_kbps >= 0 && ul_kbps >= 0) {
+            out->qci = qci;
+            out->qci_valid = 1;
+            out->ambr_dl = (double)dl_kbps / 1000.0;
+            out->ambr_ul = (double)ul_kbps / 1000.0;
+            out->ambr_dl_valid = 1;
+            out->ambr_ul_valid = 1;
+            found = 1;
+        }
+        line = end ? end + 1 : NULL;
+    }
+    return found;
+}
+
+static void refresh_topflow_external_qos_cache(time_t now)
+{
+    static const char *serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {
+        "V3E1T12345", "V3E2T12345"
+    };
+
+    if (g_topflow_external_qos_next_at != 0 && now < g_topflow_external_qos_next_at)
+        return;
+    for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
+        char lines[16384];
+        struct qos_values values;
+        if (device_adb_read_qos_log(serials[i], lines, sizeof lines) == 0 &&
+            parse_topflow_external_qos(lines, &values)) {
+            g_topflow_external_qos[i] = values;
+            g_topflow_external_qos_sampled_at[i] = now;
+        }
+    }
+    g_topflow_external_qos_next_at = now + TOPFLOW_EXTERNAL_QOS_POLL_SEC;
 }
 
 static int g_active_subid = 1;
@@ -2150,11 +2208,29 @@ static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
             (!g_topflow_mwan3_running && interface_up);
         uptime = json_get_int(path, "uptime", 0);
         if (json_get(path, "track_ip", targets, sizeof targets)) {
-            cursor = copy_next_json_object(targets, first_target, sizeof first_target);
-            (void)cursor;
-            if (first_target[0]) {
-                latency = json_double_or(first_target, "latency", -1.0);
-                packet_loss = json_double_or(first_target, "packetloss", -1.0);
+            double fallback_latency = -1.0, fallback_loss = -1.0;
+            cursor = targets;
+            while ((cursor = copy_next_json_object(cursor, first_target,
+                                                    sizeof first_target)) != NULL) {
+                char target_status[64] = "unknown";
+                double target_latency = json_double_or(first_target, "latency", -1.0);
+                double target_loss = json_double_or(first_target, "packetloss", -1.0);
+                (void)json_get(first_target, "status", target_status,
+                               sizeof target_status);
+                if (strcasecmp(target_status, "skipped") && fallback_latency < 0.0) {
+                    fallback_latency = target_latency;
+                    fallback_loss = target_loss;
+                }
+                if (!strcasecmp(target_status, "online") ||
+                    !strcasecmp(target_status, "up")) {
+                    latency = target_latency;
+                    packet_loss = target_loss;
+                    break;
+                }
+            }
+            if (latency < 0.0) {
+                latency = fallback_latency;
+                packet_loss = fallback_loss;
             }
         } else {
             targets[0] = 0;
@@ -2196,7 +2272,9 @@ static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
             bappend_json_esc(b, ip);
             bappend(b, "\",\"status\":\"");
             bappend_json_esc(b, target_status);
-            bappend(b, "\",\"online\":%s", !strcasecmp(target_status, "online") ? "true" : "false");
+            bappend(b, "\",\"online\":%s",
+                    (!strcasecmp(target_status, "online") ||
+                     !strcasecmp(target_status, "up")) ? "true" : "false");
             if (target_latency >= 0) bappend(b, ",\"latency_ms\":%.2f", target_latency);
             if (target_loss >= 0) bappend(b, ",\"packet_loss_percent\":%.2f", target_loss);
             bappend(b, "}");
@@ -2338,15 +2416,17 @@ static void emit_topflow_hardware_controls(struct buf *b)
             fan_enabled ? "true" : "false",
             fan_enabled ? "true" : "false",
             fan_enabled ? "always_on" :
-            (configured_fan_mode == 2 ? "custom" : (automatic ? "automatic" : "manual")));
+            (configured_fan_mode == 2 ? "custom" :
+             (configured_fan_mode == 1 || automatic ? "automatic" : "manual")));
     bappend(b, "\"pwm\":%ld,\"max_pwm\":255,\"speed_percent\":%ld,",
             pwm, pwm >= 0 ? (pwm * 100 + 127) / 255 : -1);
     bappend(b, "\"manual_speed_percent\":%d,", configured_manual_speed);
     if (cooling_temp > 0) bappend(b, "\"temperature_celsius\":%ld,", cooling_temp);
     bappend(b, "\"hard_full_speed_celsius\":80,");
     if (rpm >= 0) bappend(b, "\"rpm\":%ld,", rpm);
-    bappend(b, "\"thermal_enabled\":%s,\"levels_percent\":[0,30,50,70]},",
-            fan_thermal > 0 ? "true" : "false");
+    bappend(b, "\"thermal_enabled\":%s,\"kernel_zone_enabled\":%s,"
+            "\"levels_percent\":[0,30,50,70]},",
+            fan_thermal > 0 ? "true" : "false", automatic ? "true" : "false");
     bappend(b, "\"liquid\":{\"enabled\":%s,\"always_on\":%s,\"thermal_enabled\":%s,",
             liquid_enabled ? "true" : "false",
             liquid_enabled ? "true" : "false", liquid_thermal > 0 ? "true" : "false");
@@ -2355,7 +2435,25 @@ static void emit_topflow_hardware_controls(struct buf *b)
             liquid_enabled ? configured_liquid_level : 0,
             liquid_enabled ? (configured_liquid_level >= 2 ? 100 : 30) : 0,
             liquid_enabled ? (configured_liquid_level >= 2 ? 200 : 60) : 0);
-    bappend(b, "\"curve\":[");
+    bappend(b, "\"factory_curve\":[");
+    {
+        static const int kernel_pwm[3] = {76, 128, 179};
+        for (int i = 0; i < 3; i++) {
+            if (i) bappend(b, ",");
+            bappend(b, "{\"level\":%d,\"temperature_celsius\":%ld,"
+                    "\"hysteresis_celsius\":%ld,\"pwm\":%d,\"speed_percent\":%d}",
+                    i + 1, temperatures[i] / 1000, hysteresis[i] / 1000,
+                    kernel_pwm[i], (kernel_pwm[i] * 100 + 127) / 255);
+        }
+    }
+    bappend(b, "],\"custom_curve\":[");
+    for (int i = 0; i < custom_curve_count; i++) {
+        if (i) bappend(b, ",");
+        bappend(b, "{\"temperature_celsius\":%d,\"pwm\":%d,\"speed_percent\":%d}",
+                custom_curve[i].temperature, custom_curve[i].pwm,
+                (custom_curve[i].pwm * 100 + 127) / 255);
+    }
+    bappend(b, "],\"curve\":[");
     if (custom_curve_count >= 2) {
         for (int i = 0; i < custom_curve_count; i++) {
             if (i) bappend(b, ",");
@@ -2925,15 +3023,35 @@ static int is_decimal_identity(const char *value)
     return 1;
 }
 
+static int is_msisdn_identity(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)value;
+    if (!p || !*p) return 0;
+    if (*p == '+') p++;
+    if (!*p) return 0;
+    for (; *p; p++) {
+        if (!isdigit(*p)) return 0;
+    }
+    return 1;
+}
+
+static int is_valid_sim_identity(const char *key, const char *value)
+{
+    if (!strcmp(key, "msisdn")) return is_msisdn_identity(value);
+    return is_decimal_identity(value);
+}
+
 static void emit_sim_identity(struct buf *b, const char *key,
                               const char *src, const char *src_key)
 {
     char value[256], uci_value[256];
     if (!json_get(src, src_key, value, sizeof value)) value[0] = 0;
-    if (!is_decimal_identity(value) &&
-        json_get(g_uci_device_info, key, uci_value, sizeof uci_value) &&
-        is_decimal_identity(uci_value))
-        copy_text(value, sizeof value, uci_value);
+    if (!is_valid_sim_identity(key, value)) {
+        value[0] = 0;
+        if (json_get(g_uci_device_info, key, uci_value, sizeof uci_value) &&
+            is_valid_sim_identity(key, uci_value))
+            copy_text(value, sizeof value, uci_value);
+    }
     bappend(b, "\"%s\":\"", key);
     bappend_json_esc(b, value);
     bappend(b, "\"");
@@ -2944,6 +3062,7 @@ static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
     static const struct uci_net_field fields[] = {
         {"network_type", "zte_nwinfo.sys_info.network_type", NULL},
         {"signalbar", "zte_nwinfo.signal_strength.signalbar", NULL},
+        {"simcard_roam", "zte_nwinfo.sys_info.simcard_roam", NULL},
         {"network_provider_fullname", "zte_nwinfo.plmn_info.network_provider_fullname", NULL},
         {"wan_active_band", "zte_nwinfo.wan_active_band.GWLSA_band", "zte_nwinfo.wan_active_band.odu_nrband"},
         {"nr5g_action_band", "zte_nwinfo.wan_active_band.odu_nrband", "zte_nwinfo.wan_active_band.GWLSA_band"},
@@ -3155,6 +3274,7 @@ static void refresh_topflow_multimodem_cache(void)
     }
 
     now = time(NULL);
+    refresh_topflow_external_qos_cache(now);
     if (g_topflow_thermal_next_at == 0 || now >= g_topflow_thermal_next_at) {
         static const char *serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {
             "V3E1T12345", "V3E2T12345"
@@ -3277,6 +3397,22 @@ static void emit_realtime_traffic(struct buf *b, const char *src)
     emit_int(b, "session_time", src, "real_time", 0);
 }
 
+static void emit_modem_qos(struct buf *b, const struct qos_values *qos,
+                           time_t sampled_at)
+{
+    bappend(b, "\"qos\":{");
+    bappend(b, "\"qci\":%d,", qos && qos->qci_valid ? qos->qci : 0);
+    if (qos && qos->ambr_dl_valid)
+        bappend(b, "\"ambr_dl\":\"%.3f\",", qos->ambr_dl);
+    else
+        bappend(b, "\"ambr_dl\":\"\",");
+    if (qos && qos->ambr_ul_valid)
+        bappend(b, "\"ambr_ul\":\"%.3f\",", qos->ambr_ul);
+    else
+        bappend(b, "\"ambr_ul\":\"\",");
+    bappend(b, "\"sampled_at\":%ld}", (long)sampled_at);
+}
+
 static void emit_topflow_external_modem(struct buf *b, int index)
 {
     static const char *ids[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"v3e1", "v3e2"};
@@ -3326,6 +3462,7 @@ static void emit_topflow_external_modem(struct buf *b, int index)
     bappend(b, "\"net\":{");
     emit_prefixed_str(b, "type", g_topflow_msim_netinfo, net_prefix, "network_type"); bappend(b, ",");
     emit_prefixed_int(b, "bars", g_topflow_msim_netinfo, net_prefix, "signalbar", 0); bappend(b, ",");
+    emit_prefixed_str(b, "roaming", g_topflow_msim_netinfo, net_prefix, "simcard_roam"); bappend(b, ",");
     emit_prefixed_str(b, "operator", g_topflow_msim_netinfo, net_prefix, "network_provider"); bappend(b, ",");
     emit_prefixed_str(b, "plmn", g_topflow_msim_netinfo, net_prefix, "rplmn_num"); bappend(b, ",");
     emit_prefixed_str(b, "band", g_topflow_msim_netinfo, net_prefix, "wan_active_band"); bappend(b, ",");
@@ -3359,16 +3496,26 @@ static void emit_topflow_external_modem(struct buf *b, int index)
     emit_interface_status(b, "ipv6", g_topflow_wan6[index + 1]);
     bappend(b, "},\"traffic\":{");
     emit_realtime_traffic(b, g_topflow_traffic[index]);
-    bappend(b, "}}");
+    bappend(b, "},");
+    emit_modem_qos(b, &g_topflow_external_qos[index],
+                   g_topflow_external_qos_sampled_at[index]);
+    bappend(b, "}");
 }
 
 static void emit_topflow_modems(struct buf *b, const char *net, const char *traffic,
-                                const char *imei_cache)
+                                const char *imei_cache, const struct qos_values *qos)
 {
+    char network_type[32] = "", bandwidth[32] = "";
     if (!g_topflow_multimodem_enabled) {
         bappend(b, "[]");
         return;
     }
+
+    (void)json_get(net, "network_type", network_type, sizeof network_type);
+    if (!strcmp(network_type, "SA") || !strcmp(network_type, "NSA"))
+        (void)json_get(net, "nr5g_bandwidth", bandwidth, sizeof bandwidth);
+    if (!bandwidth[0])
+        (void)json_get(net, "lte_bandwidth", bandwidth, sizeof bandwidth);
 
     bappend(b, "[{");
     emit_kv_str(b, "id", "x75"); bappend(b, ",");
@@ -3380,8 +3527,10 @@ static void emit_topflow_modems(struct buf *b, const char *net, const char *traf
     bappend(b, "\"net\":{");
     emit_str(b, "type", net, "network_type"); bappend(b, ",");
     emit_int(b, "bars", net, "signalbar", 0); bappend(b, ",");
+    emit_str(b, "roaming", net, "simcard_roam"); bappend(b, ",");
     emit_str(b, "operator", net, "network_provider_fullname"); bappend(b, ",");
     emit_str(b, "band", net, "wan_active_band"); bappend(b, ",");
+    emit_kv_str(b, "bandwidth", bandwidth); bappend(b, ",");
     emit_int(b, "nr_rsrp", net, "nr5g_rsrp", 0); bappend(b, ",");
     emit_int(b, "nr_rsrq", net, "nr5g_rsrq", 0); bappend(b, ",");
     emit_str(b, "nr_snr", net, "nr5g_snr"); bappend(b, ",");
@@ -3408,7 +3557,9 @@ static void emit_topflow_modems(struct buf *b, const char *net, const char *traf
     emit_interface_status(b, "ipv6", g_topflow_wan6[0]);
     bappend(b, "},\"traffic\":{");
     emit_realtime_traffic(b, traffic);
-    bappend(b, "}}");
+    bappend(b, "},");
+    emit_modem_qos(b, qos, 0);
+    bappend(b, "}");
     for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
         bappend(b, ",");
         emit_topflow_external_modem(b, i);
@@ -3518,6 +3669,7 @@ static void build_snapshot(char *out, size_t outlen,
     bappend(&b, "\"net\":{");
     emit_str(&b, "type", net, "network_type");      bappend(&b, ",");
     emit_int(&b, "bars", net, "signalbar", 0);       bappend(&b, ",");
+    emit_str(&b, "roaming", net, "simcard_roam");  bappend(&b, ",");
     emit_str(&b, "operator", net, "network_provider_fullname"); bappend(&b, ",");
     emit_str(&b, "band", net, "wan_active_band");    bappend(&b, ",");
     emit_str(&b, "nr_band", net, "nr5g_action_band"); bappend(&b, ",");
@@ -3674,7 +3826,7 @@ static void build_snapshot(char *out, size_t outlen,
 
     /* MU5252/TopFlow exposes one integrated X75 and two CDC-ECM LTE modems. */
     bappend(&b, "\"modems\":");
-    emit_topflow_modems(&b, net, traf, imei_cache);
+    emit_topflow_modems(&b, net, traf, imei_cache, &qos);
     bappend(&b, ",");
 
     /* dhcp */

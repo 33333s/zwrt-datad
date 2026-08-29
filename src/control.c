@@ -235,7 +235,9 @@ static int load_cooling_config(struct cooling_config *cfg)
      * unexpectedly become a fixed PWM 128 after upgrade. */
     if (cfg->fan_always_on < 0)
         cfg->fan_always_on = cfg->fan_mode == FAN_MODE_KERNEL ? cfg->fan_enabled : 0;
-    if (!cfg->fan_always_on && cfg->fan_mode != FAN_MODE_CUSTOM)
+    /* Preserve an explicit kernel/automatic mode.  Only the removed legacy
+     * manual/off state needs migration to the saved custom curve. */
+    if (!cfg->fan_always_on && cfg->fan_mode == FAN_MODE_MANUAL)
         cfg->fan_mode = FAN_MODE_CUSTOM;
     if (cfg->liquid_always_on < 0) cfg->liquid_always_on = 0;
     return loaded;
@@ -976,6 +978,215 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
     return 1;
 }
 
+struct wifi_power_band {
+    const char *name;
+    const char *section;
+    int factory_limit_dbm;
+};
+
+static int wifi_power_model_supported(char *err, size_t errlen)
+{
+    char model[64];
+    if (device_uci_get("zwrt_common_info.common_config.model_name",
+                       model, sizeof model) != 0 || strcmp(model, "MU5252")) {
+        set_invalid_error(err, errlen, "wifi power control is only supported on MU5252");
+        return 0;
+    }
+    return 1;
+}
+
+static const struct wifi_power_band *wifi_power_band_from_params(const char *params,
+                                                                  char *err, size_t errlen)
+{
+    static const struct wifi_power_band bands[] = {
+        {"2g", "wifi0", 19},
+        {"5g", "wifi1", 18}
+    };
+    char band[16];
+    if (!param_value(params, "band", band, sizeof band)) {
+        set_invalid_error(err, errlen, "missing parameter: band");
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof bands / sizeof bands[0]; i++)
+        if (!strcmp(band, bands[i].name)) return &bands[i];
+    set_invalid_error(err, errlen, "band must be 2g or 5g");
+    return NULL;
+}
+
+static int wifi_power_read_int(const char *section, const char *option, long *value)
+{
+    char path[96], raw[32];
+    if (snprintf(path, sizeof path, "wireless.%s.%s", section, option) >= (int)sizeof path ||
+        device_uci_get(path, raw, sizeof raw) != 0 || !normalized_int(raw, value))
+        return 0;
+    return 1;
+}
+
+static int control_wifi_power_status(char *result, size_t result_len,
+                                     char *err, size_t errlen)
+{
+    static const struct wifi_power_band bands[] = {
+        {"2g", "wifi0", 19},
+        {"5g", "wifi1", 18}
+    };
+    struct json_buf b = {result, result_len, 0};
+    if (!wifi_power_model_supported(err, errlen)) return 0;
+    jb_add(&b, "{");
+    for (size_t i = 0; i < sizeof bands / sizeof bands[0]; i++) {
+        long percent, txpower, max_power, disabled;
+        if (!wifi_power_read_int(bands[i].section, "txpowerpercent", &percent) ||
+            !wifi_power_read_int(bands[i].section, "txpower", &txpower) ||
+            !wifi_power_read_int(bands[i].section, "max_power", &max_power) ||
+            !wifi_power_read_int(bands[i].section, "disabled", &disabled)) {
+            snprintf(err, errlen, "failed to read %s wifi power configuration", bands[i].name);
+            return 0;
+        }
+        if (i) jb_add(&b, ",");
+        jb_string(&b, bands[i].name);
+        jb_add(&b,
+               ":{\"enabled\":%s,\"percent\":%ld,\"txpower_dbm\":%ld,"
+               "\"limit_dbm\":%ld,\"factory_limit_dbm\":%d}",
+               disabled ? "false" : "true", percent, txpower, max_power,
+               bands[i].factory_limit_dbm);
+    }
+    jb_add(&b, "}");
+    if (b.len + 1 >= b.cap) {
+        snprintf(err, errlen, "wifi power status response too large");
+        return 0;
+    }
+    return 1;
+}
+
+static int wifi_power_restore_committed(const struct wifi_power_band *band,
+                                        long old_percent, long old_txpower, long old_limit)
+{
+    char path[96], value[32];
+    const char *options[] = {"txpowerpercent", "txpower", "max_power"};
+    long values[] = {old_percent, old_txpower, old_limit};
+    for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
+        snprintf(path, sizeof path, "wireless.%s.%s", band->section, options[i]);
+        snprintf(value, sizeof value, "%ld", values[i]);
+        if (device_uci_set(path, value) != 0) return 0;
+    }
+    if (device_uci_commit("wireless") != 0) return 0;
+    return device_wifi_reload() == 0;
+}
+
+static int control_wifi_power_set(const char *action, const char *params,
+                                  char *result, size_t result_len,
+                                  char *err, size_t errlen)
+{
+    const struct wifi_power_band *band = wifi_power_band_from_params(params, err, errlen);
+    char raw[32], path[96], value[32];
+    long new_percent, new_limit, old_percent, old_txpower, old_limit;
+    int set_percent = !strcmp(action, "wifi.txpower.set_percent");
+    int restore_limit = !strcmp(action, "wifi.txpower.restore_limit");
+    int apply = !strcmp(action, "wifi.txpower.apply");
+    int percent_present = 0, limit_present = 0;
+    int percent_changed, limit_changed;
+    if (!wifi_power_model_supported(err, errlen)) return 0;
+    if (!band) return 0;
+    if (!wifi_power_read_int(band->section, "txpowerpercent", &old_percent) ||
+        !wifi_power_read_int(band->section, "txpower", &old_txpower) ||
+        !wifi_power_read_int(band->section, "max_power", &old_limit)) {
+        snprintf(err, errlen, "failed to read existing wifi power configuration");
+        return 0;
+    }
+
+    new_percent = old_percent;
+    new_limit = old_limit;
+    if (apply) {
+        percent_present = json_get(params, "percent", raw, sizeof raw);
+        if (percent_present && !normalized_int(raw, &new_percent)) {
+            set_invalid_error(err, errlen, "invalid percent");
+            return 0;
+        }
+        limit_present = json_get(params, "limit_dbm", raw, sizeof raw);
+        if (limit_present && !normalized_int(raw, &new_limit)) {
+            set_invalid_error(err, errlen, "invalid limit_dbm");
+            return 0;
+        }
+        if (!percent_present && !limit_present) {
+            set_invalid_error(err, errlen, "percent or limit_dbm is required");
+            return 0;
+        }
+    } else if (restore_limit) {
+        limit_present = 1;
+        new_limit = band->factory_limit_dbm;
+    } else if (!param_value(params, set_percent ? "percent" : "limit_dbm", raw, sizeof raw)) {
+        set_invalid_error(err, errlen, "missing power value");
+        return 0;
+    } else if (set_percent) {
+        percent_present = 1;
+        if (!normalized_int(raw, &new_percent)) {
+            set_invalid_error(err, errlen, "invalid percent");
+            return 0;
+        }
+    } else {
+        limit_present = 1;
+        if (!normalized_int(raw, &new_limit)) {
+            set_invalid_error(err, errlen, "invalid limit_dbm");
+            return 0;
+        }
+    }
+    if (percent_present &&
+        (new_percent < 10 || new_percent > 100 || new_percent % 10 != 0)) {
+        set_invalid_error(err, errlen, "percent must be 10 to 100 in steps of 10");
+        return 0;
+    }
+    if (limit_present && (new_limit < 1 || new_limit > 30)) {
+        set_invalid_error(err, errlen, "limit_dbm must be between 1 and 30");
+        return 0;
+    }
+
+    percent_changed = percent_present && new_percent != old_percent;
+    limit_changed = limit_present &&
+        (new_limit != old_txpower || new_limit != old_limit);
+    if (!percent_changed && !limit_changed) {
+        snprintf(result, result_len,
+                 "{\"band\":\"%s\",\"changed\":false,\"percent\":%ld,"
+                 "\"txpower_dbm\":%ld,\"limit_dbm\":%ld,\"factory_limit_dbm\":%d}",
+                 band->name, old_percent, old_txpower, old_limit, band->factory_limit_dbm);
+        return 1;
+    }
+
+    if (percent_changed) {
+        snprintf(value, sizeof value, "%ld", new_percent);
+        snprintf(path, sizeof path, "wireless.%s.txpowerpercent", band->section);
+        if (device_uci_set(path, value) != 0) goto stage_failed;
+    }
+    if (limit_changed) {
+        snprintf(value, sizeof value, "%ld", new_limit);
+        snprintf(path, sizeof path, "wireless.%s.txpower", band->section);
+        if (device_uci_set(path, value) != 0) goto stage_failed;
+        snprintf(path, sizeof path, "wireless.%s.max_power", band->section);
+        if (device_uci_set(path, value) != 0) goto stage_failed;
+    }
+    if (device_uci_commit("wireless") != 0) {
+        (void)device_uci_revert("wireless");
+        snprintf(err, errlen, "failed to commit wifi power configuration");
+        return 0;
+    }
+    if (device_wifi_reload() != 0) {
+        int rolled_back = wifi_power_restore_committed(band, old_percent, old_txpower, old_limit);
+        snprintf(err, errlen, "wifi reload failed; previous configuration %s",
+                 rolled_back ? "restored" : "could not be restored");
+        return 0;
+    }
+    snprintf(result, result_len,
+             "{\"band\":\"%s\",\"changed\":true,\"percent\":%ld,"
+             "\"txpower_dbm\":%ld,\"limit_dbm\":%ld,\"factory_limit_dbm\":%d}",
+             band->name, percent_changed ? new_percent : old_percent,
+             limit_changed ? new_limit : old_txpower,
+             limit_changed ? new_limit : old_limit, band->factory_limit_dbm);
+    return 1;
+
+stage_failed:
+    (void)device_uci_revert("wireless");
+    snprintf(err, errlen, "failed to stage wifi power configuration");
+    return 0;
+}
+
 static int control_client_access(const char *action, const char *params,
                                  char *result, size_t result_len,
                                  char *err, size_t errlen)
@@ -1430,6 +1641,49 @@ fail:
     (void)device_uci_revert("mwan3"); return 0;
 }
 
+static const char *fan_mode_name(const struct cooling_config *cfg)
+{
+    if (cfg->fan_always_on) return "always_on";
+    if (cfg->fan_mode == FAN_MODE_KERNEL) return "automatic";
+    if (cfg->fan_mode == FAN_MODE_CUSTOM) return "custom";
+    return "manual";
+}
+
+static int control_set_fan_mode(struct cooling_config *cfg, const char *mode,
+                                char *result, size_t result_len,
+                                char *err, size_t errlen)
+{
+    if (!strcmp(mode, "automatic")) {
+        cfg->fan_always_on = 0;
+        cfg->fan_mode = FAN_MODE_KERNEL;
+    } else if (!strcmp(mode, "custom")) {
+        cfg->fan_always_on = 0;
+        cfg->fan_mode = FAN_MODE_CUSTOM;
+    } else if (!strcmp(mode, "always_on")) {
+        cfg->fan_always_on = 1;
+    } else {
+        set_invalid_error(err, errlen,
+                          "mode must be automatic, custom, or always_on");
+        return 0;
+    }
+    cfg->fan_enabled = 1;
+    if (!apply_fan_config(cfg)) {
+        snprintf(err, errlen, "fan control is unavailable");
+        return 0;
+    }
+    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status",
+                                  cfg->fan_always_on) ||
+        !save_cooling_config(cfg)) {
+        snprintf(err, errlen, "failed to persist fan state");
+        return 0;
+    }
+    snprintf(result, result_len,
+             "{\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\"}",
+             cfg->fan_always_on ? "true" : "false",
+             cfg->fan_always_on ? "true" : "false", fan_mode_name(cfg));
+    return 1;
+}
+
 static int control_fan_enabled(const char *params, char *result, size_t result_len,
                                char *err, size_t errlen)
 {
@@ -1437,25 +1691,21 @@ static int control_fan_enabled(const char *params, char *result, size_t result_l
     int enabled;
     (void)load_cooling_config(&cfg);
     if (!required_bool_param(params, "enabled", &enabled, err, errlen)) return 0;
-    cfg.fan_enabled = 1;
-    cfg.fan_always_on = enabled;
-    if (!enabled) cfg.fan_mode = FAN_MODE_CUSTOM;
-    if (!apply_fan_config(&cfg)) {
-        snprintf(err, errlen, "fan control is unavailable");
+    return control_set_fan_mode(&cfg, enabled ? "always_on" : "custom",
+                                result, result_len, err, errlen);
+}
+
+static int control_fan_mode(const char *params, char *result, size_t result_len,
+                            char *err, size_t errlen)
+{
+    struct cooling_config cfg;
+    char mode[24];
+    (void)load_cooling_config(&cfg);
+    if (!param_value(params, "mode", mode, sizeof mode)) {
+        set_invalid_error(err, errlen, "missing parameter: mode");
         return 0;
     }
-    if (!set_vendor_switch_status("zwrt_deviceui.Device.fan_switch_status", enabled) ||
-        !save_cooling_config(&cfg)) {
-        snprintf(err, errlen, "failed to persist fan state");
-        return 0;
-    }
-    snprintf(result, result_len,
-             "{\"enabled\":%s,\"always_on\":%s,\"mode\":\"%s\"}",
-             enabled ? "true" : "false",
-             enabled ? "true" : "false",
-             enabled ? "always_on" : (cfg.fan_mode == FAN_MODE_CUSTOM ? "custom" :
-             (cfg.fan_mode == FAN_MODE_KERNEL ? "automatic" : "manual")));
-    return 1;
+    return control_set_fan_mode(&cfg, mode, result, result_len, err, errlen);
 }
 
 static int parse_custom_curve(const char *params, struct cooling_config *cfg,
@@ -1655,14 +1905,16 @@ const char *control_capabilities_json(void)
         "\"cellular.connect\",\"cellular.disconnect\",\"cellular.set\","
         "\"network.set_mode\",\"band.set_lte\",\"band.set_nr_sa\",\"band.set_nr_nsa\","
         "\"cell.lock_lte\",\"cell.lock_nr\",\"cell.unlock_all\",\"sim.set_slot\","
-        "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\",\"lan.set\",\"lan.set_mtu\",\"dns.set\","
+        "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\","
+        "\"wifi.txpower.status\",\"wifi.txpower.apply\",\"wifi.txpower.set_percent\",\"wifi.txpower.set_limit\",\"wifi.txpower.restore_limit\","
+        "\"lan.set\",\"lan.set_mtu\",\"dns.set\","
         "\"usb.status\",\"usb.set\",\"sleep.status\",\"sleep.set\",\"nfc.set\","
         "\"apn.list\",\"apn.set_mode\",\"apn.add\",\"apn.modify\",\"apn.delete\",\"apn.enable\","
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
         "\"client.access\",\"client.block\",\"client.unblock\",\"client.kick\",\"client.rename\","
         "\"aggregation.set\",\"multiwan.interface.set\",\"multiwan.member.set\",\"multiwan.policy.set\",\"multiwan.rule.set\","
-        "\"cooling.fan.set_enabled\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\",\"cooling.liquid.set_mode\","
+        "\"cooling.fan.set_enabled\",\"cooling.fan.set_mode\",\"cooling.fan.set_curve\",\"cooling.liquid.set_enabled\",\"cooling.liquid.set_mode\","
         "\"state.refresh\",\"state.set_interval\",\"qos.reload\",\"qos.clear\"],"
         "\"events\":[\"state\"],"
         "\"discovery\":[\"ubus.list\",\"ubus.list_verbose\"],"
@@ -1805,6 +2057,14 @@ struct control_result control_execute(const char *request_json,
                         result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "wifi.configure")) {
         ok = control_wifi_configure(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "wifi.txpower.status")) {
+        ok = control_wifi_power_status(result, sizeof result, err, sizeof err);
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "wifi.txpower.apply") ||
+               !strcmp(action, "wifi.txpower.set_percent") ||
+               !strcmp(action, "wifi.txpower.set_limit") ||
+               !strcmp(action, "wifi.txpower.restore_limit")) {
+        ok = control_wifi_power_set(action, params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "lan.set")) {
         ok = control_lan(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "lan.set_mtu")) {
@@ -1967,6 +2227,8 @@ struct control_result control_execute(const char *request_json,
         ok = control_multiwan_rule_set(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_enabled")) {
         ok = control_fan_enabled(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "cooling.fan.set_mode")) {
+        ok = control_fan_mode(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.fan.set_curve")) {
         ok = control_fan_curve(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "cooling.liquid.set_enabled")) {

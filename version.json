@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.19",
+    "version": "0.9.20",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 TopFlow 外挂基带活动卡槽读取、SSE 多行快照截断，以及外部命令继承监听端口导致服务重启失败"
+    "notes": "新增 MU5252 WiFi 功率与风扇三模式控制，补全三基带漫游、QoS 和频宽状态，并修正 SIM 身份与 MultiWAN 探测摘要"
   }
 }

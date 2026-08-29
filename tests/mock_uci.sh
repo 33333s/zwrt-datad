@@ -13,6 +13,7 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
     printf '%s\n' \
         "zte_nwinfo.sys_info.network_type='SA'" \
         "zte_nwinfo.signal_strength.signalbar='4'" \
+        "zte_nwinfo.sys_info.simcard_roam='Home'" \
         "zte_nwinfo.plmn_info.network_provider_fullname='Fixture TopFlow Mobile'" \
         "zte_nwinfo.wan_active_band.GWLSA_band='n78'" \
         "zte_nwinfo.wan_active_band.odu_nrband='78'" \
@@ -32,11 +33,13 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.sys_info.msim_1_0_network_type='LTE'" \
         "zte_nwinfo.sys_info.msim_1_0_network_provider='Fixture UCI LTE One'" \
         "zte_nwinfo.sys_info.msim_1_0_signalbar='4'" \
+        "zte_nwinfo.sys_info.msim_1_0_simcard_roam='Home'" \
         "zte_nwinfo.sys_info.msim_1_0_lte_rsrp='-96'" \
         "zte_nwinfo.sys_info.msim_1_0_lte_bandwidth='10'" \
         "zte_nwinfo.sys_info.msim_2_0_network_type='LTE'" \
         "zte_nwinfo.sys_info.msim_2_0_network_provider='Fixture UCI LTE Two'" \
         "zte_nwinfo.sys_info.msim_2_0_signalbar='3'" \
+        "zte_nwinfo.sys_info.msim_2_0_simcard_roam='Roaming'" \
         "zte_nwinfo.sys_info.msim_2_0_lte_rsrp='-102'" \
         "zte_nwinfo.sys_info.msim_2_0_lte_bandwidth='20'" | sed \
         -e "s/msim_1_0_/msim_1_${MOCK_UCI_MSIM1_SLOT:-0}_/g" \
@@ -47,10 +50,15 @@ fi
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ]; then
     case "${3:-}" in
         zwrt_zte_mdm)
+            if [ "${MOCK_UCI_NO_MSISDN:-0}" = '1' ]; then
+                msisdn_line=
+            else
+                msisdn_line="zwrt_zte_mdm.sim_info.msisdn='${MOCK_UCI_MSISDN:-10086}'"
+            fi
             printf '%s\n' \
                 "zwrt_zte_mdm.sim_info.sim_iccid='8986000000000000000'" \
                 "zwrt_zte_mdm.sim_info.sim_imsi='460000000000001'" \
-                "zwrt_zte_mdm.sim_info.msisdn='10086'" \
+                "$msisdn_line" \
                 "zwrt_zte_mdm.sim_info.current_sim_slot='1'" \
                 "zwrt_zte_mdm.sim_info.sim_states='ready'" \
                 "zwrt_zte_mdm.sim_info.modem_main_state='online'" \
@@ -122,6 +130,9 @@ fi
 
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     case "${3:-}" in
+        zwrt_common_info.common_config.model_name)
+            printf '%s\n' "${MOCK_MODEL_NAME:-MU5252}"
+            ;;
         wireless.main_2g.ssid) printf '%s\n' 'Fixture 2G' ;;
         wireless.main_2g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_2g.encryption) printf '%s\n' 'sae-mixed' ;;
@@ -130,6 +141,14 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
         wireless.main_5g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_5g.encryption) printf '%s\n' 'sae-mixed' ;;
         wireless.main_5g.disabled) printf '%s\n' '0' ;;
+        wireless.wifi0.txpowerpercent) printf '%s\n' '100' ;;
+        wireless.wifi0.txpower) printf '%s\n' '30' ;;
+        wireless.wifi0.max_power) printf '%s\n' '30' ;;
+        wireless.wifi0.disabled) printf '%s\n' '1' ;;
+        wireless.wifi1.txpowerpercent) printf '%s\n' '100' ;;
+        wireless.wifi1.txpower) printf '%s\n' '30' ;;
+        wireless.wifi1.max_power) printf '%s\n' '30' ;;
+        wireless.wifi1.disabled) printf '%s\n' '0' ;;
         zte_nwinfo.sys_info.network_type) printf '%s\n' 'SA' ;;
         zte_nwinfo.signal_strength.signalbar) printf '%s\n' '4' ;;
         zte_nwinfo.plmn_info.network_provider_fullname) printf '%s\n' 'Fixture TopFlow Mobile' ;;

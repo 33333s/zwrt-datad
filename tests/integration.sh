@@ -189,6 +189,61 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
 
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.status","params":{}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)["result"]
+assert data["2g"] == {"enabled": False, "percent": 100, "txpower_dbm": 30, "limit_dbm": 30, "factory_limit_dbm": 19}
+assert data["5g"] == {"enabled": True, "percent": 100, "txpower_dbm": 30, "limit_dbm": 30, "factory_limit_dbm": 18}
+'
+
+# A no-op must not reload Wi-Fi.
+: >"$CALL_LOG"
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.set_limit","params":{"band":"5g","limit_dbm":30}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["ok"] is True; assert data["result"]["changed"] is False'
+! grep -F "$(printf 'zwrt_wlan\treload')" "$CALL_LOG" >/dev/null
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.set_percent","params":{"band":"5g","percent":90}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["ok"] is True; assert data["result"]["changed"] is True'
+grep -F "$(printf 'uci\tset wireless.wifi1.txpowerpercent=90')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tcommit wireless')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'zwrt_wlan\treload')" "$CALL_LOG" >/dev/null
+
+: >"$CALL_LOG"
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.apply","params":{"band":"5g","percent":90,"limit_dbm":29}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["ok"] is True; assert data["result"]["percent"] == 90; assert data["result"]["limit_dbm"] == 29'
+grep -F "$(printf 'uci\tset wireless.wifi1.txpowerpercent=90')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi1.txpower=29')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi1.max_power=29')" "$CALL_LOG" >/dev/null
+[ "$(grep -Fc "$(printf 'zwrt_wlan\treload')" "$CALL_LOG")" = "1" ]
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.restore_limit","params":{"band":"2g"}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["limit_dbm"] == 19'
+grep -F "$(printf 'uci\tset wireless.wifi0.txpower=19')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi0.max_power=19')" "$CALL_LOG" >/dev/null
+
+code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.txpower.set_percent","params":{"band":"5g","percent":95}}' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "400" ]
+python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["error"]["code"] == "invalid_parameter"' "$INVALID_WIFI_OUT"
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
     -d '{"action":"device.login_info","params":{}}' \
     "http://127.0.0.1:$PORT/control" | python3 -c \
     'import json,sys; data=json.load(sys.stdin); assert data["result"]["zte_web_sault"] == "fixture-salt"'
@@ -301,6 +356,7 @@ assert data["device"]["api_template"] == "MU5252"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["net"]["type"] == "SA"
+assert data["net"]["roaming"] == "Home"
 assert data["net"]["operator"] == "Fixture TopFlow Mobile"
 assert data["net"]["nr_pci"] == 321
 assert data["sim"]["imsi"] == "460000000000001"
@@ -312,10 +368,22 @@ assert [modem["id"] for modem in data["modems"]] == ["x75", "v3e1", "v3e2"]
 assert [modem["subid"] for modem in data["modems"]] == [2, 3, 5]
 assert data["modems"][0]["net"]["nr_pci"] == 321
 assert data["modems"][0]["net"]["nr_cell_id"] == 123456
+assert data["modems"][0]["net"]["bandwidth"] == "100"
+assert data["modems"][0]["net"]["roaming"] == "Home"
 assert data["modems"][1]["net"]["operator"] == "Fixture LTE One"
+assert data["modems"][1]["net"]["roaming"] == "Home"
 assert data["modems"][2]["net"]["operator"] == "Fixture LTE Two"
+assert data["modems"][2]["net"]["roaming"] == "Roaming"
 assert "bandwidth" not in data["modems"][1]["net"]
 assert data["modems"][2]["net"]["bandwidth"] == "20"
+assert data["modems"][1]["qos"]["qci"] == 9
+assert data["modems"][1]["qos"]["ambr_dl"] == "100.000"
+assert data["modems"][1]["qos"]["ambr_ul"] == "100.000"
+assert data["modems"][1]["qos"]["sampled_at"] > 0
+assert data["modems"][2]["qos"]["qci"] == 9
+assert data["modems"][2]["qos"]["ambr_dl"] == "150.000"
+assert data["modems"][2]["qos"]["ambr_ul"] == "75.000"
+assert data["modems"][2]["qos"]["sampled_at"] > 0
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
@@ -355,6 +423,10 @@ paths = {path["id"]: path for path in data["aggregation"]["paths"]}
 assert paths["x75"]["latency_ms"] == 18.5
 assert paths["x75"]["packet_loss_percent"] == 0
 assert paths["x75"]["interface_up"] is True
+assert paths["x75"]["targets"][0]["status"] == "skipped"
+assert paths["x75"]["targets"][0]["online"] is False
+assert paths["x75"]["targets"][1]["status"] == "up"
+assert paths["x75"]["targets"][1]["online"] is True
 assert paths["v3e1"]["latency_ms"] == 35
 assert paths["v3e1"]["packet_loss_percent"] == 1
 assert paths["v3e2"]["online"] is False
@@ -373,6 +445,7 @@ assert data["cooling"]["fan"]["mode"] == "always_on"
 assert data["cooling"]["fan"]["pwm"] == 128
 assert data["cooling"]["fan"]["speed_percent"] == 50
 assert data["cooling"]["fan"]["manual_speed_percent"] == 0
+assert data["cooling"]["fan"]["kernel_zone_enabled"] is False
 assert "rpm" not in data["cooling"]["fan"]
 assert data["cooling"]["liquid"]["enabled"] is False
 assert data["cooling"]["liquid"]["always_on"] is False
@@ -380,6 +453,12 @@ assert data["cooling"]["liquid"]["mode"] == "automatic"
 assert data["cooling"]["liquid"]["level"] == 0
 assert data["cooling"]["liquid"]["speed_percent"] == 0
 assert data["cooling"]["liquid"]["levels_percent"] == [30, 100]
+assert data["cooling"]["factory_curve"] == [
+    {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4, "pwm": 76, "speed_percent": 30},
+    {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4, "pwm": 128, "speed_percent": 50},
+    {"level": 3, "temperature_celsius": 53, "hysteresis_celsius": 4, "pwm": 179, "speed_percent": 70},
+]
+assert data["cooling"]["custom_curve"] == []
 assert data["cooling"]["curve"] == [
     {"level": 1, "temperature_celsius": 44, "hysteresis_celsius": 4, "pwm": 76, "speed_percent": 30},
     {"level": 2, "temperature_celsius": 48, "hysteresis_celsius": 4, "pwm": 128, "speed_percent": 50},
@@ -389,6 +468,35 @@ assert data["cooling"]["curve"] == [
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
+
+# Invalid encrypted identities are normalized at the API boundary. A valid UCI
+# value remains a fallback; without one, MSISDN is explicitly unknown.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_ENCRYPTED_SIM=1 \
+MOCK_UCI_NO_MSISDN=1 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["sim"]["imsi"] == "460000000000001"
+assert data["sim"]["msisdn"] == ""
+assert data["modems"][0]["sim"]["imsi"] == "460000000000001"
+assert data["modems"][0]["sim"]["msisdn"] == ""
+'
+
+# MSISDN may use international notation; unlike IMSI, one leading plus is valid.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_SIM_MSISDN='+8610010' \
+MOCK_UCI_NO_MSISDN=1 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["sim"]["msisdn"] == "+8610010"
+assert data["modems"][0]["sim"]["msisdn"] == "+8610010"
+'
 
 # External modem network keys follow each modem-local active SIM slot.
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
@@ -436,8 +544,10 @@ MOCK_UCI_MSIM2_SLOT=0 \
 import json, sys
 data = json.load(sys.stdin)
 assert data["modems"][1]["net"]["operator"] == "Fixture UCI LTE One"
+assert data["modems"][1]["net"]["roaming"] == "Home"
 assert data["modems"][1]["net"]["bandwidth"] == "10"
 assert data["modems"][2]["net"]["operator"] == "Fixture UCI LTE Two"
+assert data["modems"][2]["net"]["roaming"] == "Roaming"
 assert data["modems"][2]["net"]["bandwidth"] == "20"
 '
 
@@ -457,6 +567,40 @@ assert data["modems"][1]["net"]["bars"] == 0
 assert data["modems"][2]["net"]["operator"] == ""
 assert data["modems"][2]["net"]["bars"] == 0
 '
+
+# An explicit kernel mode is a valid steady state and must survive config load.
+printf '%s\n' \
+    'fan_enabled=1' 'fan_always_on=0' 'fan_auto=1' 'fan_mode=1' \
+    'fan_speed_percent=50' 'liquid_enabled=0' \
+    'temperature_1=44' 'temperature_2=48' 'temperature_3=53' \
+    'hysteresis_1=4' 'hysteresis_2=4' 'hysteresis_3=4' \
+    'custom_curve_count=2' \
+    'custom_temperature_1=40' 'custom_pwm_1=0' \
+    'custom_temperature_2=70' 'custom_pwm_2=255' \
+    >"$COOLING_TMP/cooling.conf"
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_ASSERT_NO_SOCKET_FDS=1 \
+ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
+ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
+ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
+ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
+ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
+ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
+ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+"$BIN" --once | python3 -c '
+import json, sys
+fan = json.load(sys.stdin)["cooling"]["fan"]
+assert fan["always_on"] is False
+assert fan["mode"] == "automatic"
+assert fan["kernel_zone_enabled"] is True
+'
+grep -F 'fan_mode=1' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
 
 # Legacy manual/off configurations are no longer a valid steady state: an
 # upgrade must move them to the saved custom curve before exposing the switch.
@@ -554,6 +698,9 @@ curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     grep -F 'cooling.fan.set_curve' >/dev/null
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
+    grep -F 'cooling.fan.set_mode' >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
     grep -F 'state.set_interval' >/dev/null
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     "http://127.0.0.1:$TOPFLOW_PORT/capabilities" | \
@@ -624,6 +771,41 @@ grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_curve_count=5' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_temperature_5=70' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_pwm_5=255' "$COOLING_TMP/cooling.conf" >/dev/null
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["always_on"] is False
+assert data["result"]["mode"] == "automatic"
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+grep -F 'fan_mode=1' "$COOLING_TMP/cooling.conf" >/dev/null
+grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["cooling"]["fan"]["mode"] == "automatic"
+assert data["cooling"]["fan"]["kernel_zone_enabled"] is True
+assert len(data["cooling"]["factory_curve"]) == 3
+assert len(data["cooling"]["custom_curve"]) == 5
+'
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_mode","params":{"mode":"custom"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["mode"] == "custom"
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+grep -F 'fan_mode=2' "$COOLING_TMP/cooling.conf" >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
