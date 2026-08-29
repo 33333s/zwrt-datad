@@ -92,7 +92,7 @@ struct cooling_config {
 /* Automatic mode temporarily takes userspace ownership at the hard thermal
  * limit. Remember that transition so the next cooler sample can hand control
  * back to the kernel curve instead of leaving PWM 255 latched. */
-static int g_fan_automatic_hard_override;
+static int g_fan_hard_override;
 
 static const char *env_path(const char *name, const char *fallback)
 {
@@ -473,29 +473,27 @@ static int apply_custom_curve(const struct cooling_config *cfg, long temperature
 static int apply_fan_config(const struct cooling_config *cfg)
 {
     long temperature = read_custom_curve_temperature();
+    if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C ||
+        (temperature <= 0 && g_fan_hard_override)) {
+        int ok = apply_datad_fan_pwm(255);
+        if (ok) g_fan_hard_override = 1;
+        return ok;
+    }
     if (cfg->fan_always_on) {
-        int ok = apply_datad_fan_pwm(temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C
-                                     ? 255 : FAN_ALWAYS_ON_PWM);
-        if (ok) g_fan_automatic_hard_override = 0;
+        int ok = apply_datad_fan_pwm(FAN_ALWAYS_ON_PWM);
+        if (ok) g_fan_hard_override = 0;
         return ok;
     }
     if (cfg->fan_mode == FAN_MODE_KERNEL) {
-        if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C ||
-            (temperature <= 0 && g_fan_automatic_hard_override)) {
-            int ok = apply_datad_fan_pwm(255);
-            if (ok) g_fan_automatic_hard_override = 1;
-            return ok;
-        }
         if (!set_fan_thermal_enabled(1) || !apply_fan_curve(cfg)) return 0;
-        g_fan_automatic_hard_override = 0;
+        g_fan_hard_override = 0;
         return 1;
     }
     if (cfg->fan_mode == FAN_MODE_CUSTOM) {
         int ok = apply_custom_curve(cfg, temperature);
-        if (ok) g_fan_automatic_hard_override = 0;
+        if (ok) g_fan_hard_override = 0;
         return ok;
     }
-    if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) return apply_datad_fan_pwm(255);
     if (!prepare_fan_pwm_control()) return 0;
     if (set_fan_pwm_percent(cfg->fan_speed_percent)) return 1;
     (void)set_cooling_zone_mode(1);
@@ -521,20 +519,20 @@ void control_cooling_tick(long temperature_celsius)
     int pwm;
     if (!load_cooling_config(&cfg)) return;
     if (cfg.liquid_always_on) (void)apply_liquid_switch(1, cfg.liquid_level);
+    if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C ||
+        (temperature_celsius <= 0 && g_fan_hard_override)) {
+        if (apply_datad_fan_pwm(255)) g_fan_hard_override = 1;
+        return;
+    }
     if (!cfg.fan_always_on && cfg.fan_mode == FAN_MODE_KERNEL) {
-        if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
-            if (apply_datad_fan_pwm(255))
-                g_fan_automatic_hard_override = 1;
-        } else if (temperature_celsius > 0 && g_fan_automatic_hard_override) {
+        if (g_fan_hard_override) {
             if (set_fan_thermal_enabled(1) && apply_fan_curve(&cfg))
-                g_fan_automatic_hard_override = 0;
+                g_fan_hard_override = 0;
         }
         return;
     }
-    g_fan_automatic_hard_override = 0;
-    if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
-        pwm = 255;
-    } else if (cfg.fan_always_on) {
+    g_fan_hard_override = 0;
+    if (cfg.fan_always_on) {
         pwm = FAN_ALWAYS_ON_PWM;
     } else if (cfg.fan_mode == FAN_MODE_CUSTOM && temperature_celsius > 0) {
         pwm = custom_curve_pwm(&cfg, temperature_celsius);
@@ -552,10 +550,10 @@ void control_release_cooling_state(void)
     struct cooling_config cfg;
     if (!load_cooling_config(&cfg)) return;
     if (cfg.fan_mode != FAN_MODE_KERNEL || cfg.fan_always_on ||
-        g_fan_automatic_hard_override) {
+        g_fan_hard_override) {
         (void)set_fan_thermal_enabled(1);
         (void)apply_fan_curve(&cfg);
-        g_fan_automatic_hard_override = 0;
+        g_fan_hard_override = 0;
     }
     if (cfg.liquid_always_on) {
         (void)write_text_file(env_path("ZWRT_DATAD_LIQUID_DRIVE_PATH", LIQUID_DRIVE_DEFAULT),

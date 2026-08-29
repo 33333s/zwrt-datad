@@ -896,6 +896,27 @@ sleep 0.3
 [ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
 [ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
 
+# Mode changes cannot lower cooling while the last valid sample was hot and
+# the current temperature is unreadable.
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_mode","params":{"mode":"always_on"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["result"]["mode"] == "always_on"
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["result"]["mode"] == "automatic"
+'
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
+
 # Falling below the threshold must hand control back to the kernel curve and
 # publish the post-tick zone state in the same refreshed snapshot.
 printf '%s\n' '47000' >"$COOLING_TMP/zone/temp"
