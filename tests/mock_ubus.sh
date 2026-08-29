@@ -24,6 +24,19 @@ if [ -n "${MOCK_CALL_LOG:-}" ]; then
     printf '%s\t%s\t%s\n' "$service" "$method" "$args" >>"$MOCK_CALL_LOG"
 fi
 
+# Regression aid for issue #26: record any socket descriptor this exec'd child
+# inherited from datad. A correctly close-on-exec'd listener must not appear.
+if [ -n "${ZWRT_DATAD_FD_DUMP:-}" ] && [ -d "/proc/$$/fd" ]; then
+    for _link in /proc/$$/fd/*; do
+        _n=${_link##*/}
+        [ "$_n" -gt 2 ] 2>/dev/null || continue
+        _t=$(readlink "$_link" 2>/dev/null) || continue
+        case "$_t" in
+            socket:*) printf '%s %s\n' "$_n" "$_t" >>"$ZWRT_DATAD_FD_DUMP" ;;
+        esac
+    done
+fi
+
 case "$service:$method" in
     system:board)
         printf '%s\n' '{"model":"Fixture Router","hostname":"fixture","board_name":"qcom,fixture","release":{"description":"Fixture Linux"}}'

@@ -11,6 +11,7 @@ MC7523_PORT=$((PORT + 4))
 MC8532B_PORT=$((PORT + 5))
 TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
+CHILD_FD_LOG="$ROOT/tests/child-fds.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
@@ -45,7 +46,7 @@ cleanup() {
     [ -n "$MC7523_PID" ] && wait "$MC7523_PID" 2>/dev/null || true
     [ -n "$MC8532B_PID" ] && kill "$MC8532B_PID" 2>/dev/null || true
     [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
-    rm -f "$TOKEN_FILE" "$CALL_LOG" "$MU5252_CALL_LOG" \
+    rm -f "$TOKEN_FILE" "$CALL_LOG" "$CHILD_FD_LOG" "$MU5252_CALL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
     rm -rf "$COOLING_TMP"
 }
@@ -53,12 +54,14 @@ trap cleanup EXIT INT TERM
 
 printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$CALL_LOG"
+: >"$CHILD_FD_LOG"
 chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh"
 export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$CALL_LOG" \
+ZWRT_DATAD_FD_DUMP="$CHILD_FD_LOG" \
 "$BIN" -i 200 -p "$PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 PID=$!
 
@@ -71,6 +74,18 @@ done
 
 code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/state")"
 [ "$code" = "401" ]
+
+# issue #26: external commands (here the ubus mock) must not inherit datad's
+# listener/client sockets, otherwise a persistent grandchild keeps the port in
+# LISTEN after datad exits. Linux-only (needs /proc).
+if [ -d /proc/1/fd ]; then
+    sleep 0.5
+    if [ -s "$CHILD_FD_LOG" ]; then
+        echo 'exec-ed child inherited datad sockets:' >&2
+        cat "$CHILD_FD_LOG" >&2
+        exit 1
+    fi
+fi
 
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     "http://127.0.0.1:$PORT/state" | python3 -c '
