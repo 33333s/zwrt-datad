@@ -86,6 +86,12 @@ case "$service:$method" in
     zwrt_data:get_wwandst)
         printf '%s\n' '{"real_time":12,"real_tx_bytes":120,"real_rx_bytes":240,"real_tx_speed":10,"real_rx_speed":20,"real_max_tx_speed":30,"real_max_rx_speed":40,"day_tx_bytes":120,"day_rx_bytes":240,"month_tx_bytes":120,"month_rx_bytes":240,"total_tx_bytes":120,"total_rx_bytes":240}'
         ;;
+    zwrt_data:get_wwandst_monthlimit)
+        # Real firmware returns pretty-printed JSON with tab indentation and
+        # embedded newlines; keep it multi-line here so the SSE framing test
+        # exercises the passthrough path (see issue #17).
+        printf '{\n\t"cid": 1,\n\t"enable": 0,\n\t"type": 2,\n\t"value": "1610612736000"\n}\n'
+        ;;
     zwrt_bsp.battery:list)
         [ "${MOCK_NO_BATTERY:-0}" = '1' ] && exit 1
         printf '%s\n' '{"battery_capacity":0,"battery_temperature":30000,"battery_online":1,"battery_health":1}'

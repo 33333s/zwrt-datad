@@ -92,6 +92,52 @@ assert data["thermal"]["zones"] == [
 ]
 '
 
+# SSE stream must stay spec-compliant even though traffic.limit is a verbatim
+# passthrough of pretty-printed (multi-line) ubus JSON. Every payload line has
+# to carry its own "data:" prefix so a compliant client can reassemble the
+# whole snapshot instead of just the truncated first line (issue #17).
+python3 - "$PORT" <<'PY'
+import json, socket, sys, time
+
+req = (
+    b"GET /events HTTP/1.1\r\n"
+    b"Host: 127.0.0.1\r\n"
+    b"Authorization: Bearer fixture-private-token\r\n"
+    b"Accept: text/event-stream\r\n\r\n"
+)
+buf = b""
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as sock:
+    sock.sendall(req)
+    sock.settimeout(5)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        idx = buf.find(b"event: state")
+        if idx != -1 and b"\n\n" in buf[idx:]:
+            break
+
+head, _, body = buf.partition(b"\r\n\r\n")
+assert head.startswith(b"HTTP/1.1 200"), head
+assert b"text/event-stream" in head, head
+
+start = body.find(b"event: state")
+assert start != -1, body[:200]
+event = body[start:].split(b"\n\n", 1)[0]
+
+data_lines = []
+for line in event.split(b"\n"):
+    assert line.startswith(b"event:") or line.startswith(b"data:"), line
+    if line.startswith(b"data:"):
+        data_lines.append(line[5:].lstrip(b" "))
+
+snap = json.loads(b"\n".join(data_lines))
+assert snap["traffic"]["limit"]["value"] == "1610612736000", snap["traffic"]["limit"]
+assert "system" in snap, sorted(snap)
+PY
+
 MOCK_MODEL_NAME=CPE_FIXTURE \
 MOCK_NO_BATTERY=1 \
 MOCK_NO_NFC=1 \

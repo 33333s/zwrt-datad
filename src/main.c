@@ -4549,11 +4549,27 @@ static int write_sse_handshake(int fd)
 
 static int sse_send_snapshot(int fd, const char *snap, size_t snap_len)
 {
-    static const char prefix[] = "event: state\ndata: ";
-    static const char suffix[] = "\n\n";
-    if (write_all(fd, prefix, sizeof prefix - 1) < 0) return -1;
-    if (write_all(fd, snap, snap_len) < 0) return -1;
-    return write_all(fd, suffix, sizeof suffix - 1);
+    static const char event_line[] = "event: state\n";
+    static const char data_prefix[] = "data: ";
+    static const char lf[] = "\n";
+
+    if (write_all(fd, event_line, sizeof event_line - 1) < 0) return -1;
+
+    /* Per the SSE spec every physical line of the payload must carry its own
+     * "data:" prefix; a bare newline terminates the event. The snapshot can
+     * legitimately contain embedded newlines (e.g. pretty-printed JSON passed
+     * through verbatim from ubus), so emit one "data:" line per segment. A
+     * spec-compliant client rejoins the segments with "\n", reproducing the
+     * original bytes. */
+    size_t start = 0;
+    for (size_t i = 0; i <= snap_len; i++) {
+        if (i < snap_len && snap[i] != '\n') continue;
+        if (write_all(fd, data_prefix, sizeof data_prefix - 1) < 0) return -1;
+        if (i > start && write_all(fd, snap + start, i - start) < 0) return -1;
+        if (write_all(fd, lf, sizeof lf - 1) < 0) return -1;
+        start = i + 1;
+    }
+    return write_all(fd, lf, sizeof lf - 1);
 }
 
 static int open_server_socket(const char *bind_addr, int port)
