@@ -24,6 +24,19 @@ if [ -n "${MOCK_CALL_LOG:-}" ]; then
     printf '%s\t%s\t%s\n' "$service" "$method" "$args" >>"$MOCK_CALL_LOG"
 fi
 
+# Regression aid for issue #26: record any socket descriptor this exec'd child
+# inherited from datad. A correctly close-on-exec'd listener must not appear.
+if [ -n "${ZWRT_DATAD_FD_DUMP:-}" ] && [ -d "/proc/$$/fd" ]; then
+    for _link in /proc/$$/fd/*; do
+        _n=${_link##*/}
+        [ "$_n" -gt 2 ] 2>/dev/null || continue
+        _t=$(readlink "$_link" 2>/dev/null) || continue
+        case "$_t" in
+            socket:*) printf '%s %s\n' "$_n" "$_t" >>"$ZWRT_DATAD_FD_DUMP" ;;
+        esac
+    done
+fi
+
 case "$service:$method" in
     system:board)
         printf '%s\n' '{"model":"Fixture Router","hostname":"fixture","board_name":"qcom,fixture","release":{"description":"Fixture Linux"}}'
@@ -53,14 +66,21 @@ case "$service:$method" in
         fi
         ;;
     zwrt_zte_mdm.api:get_v3t_sim_info)
-        printf '%s\n' '{"v3t_1_modem_main_state":"modem_init_complete","v3t_1_sim_imsi":"460000000000003","v3t_1_sim_iccid":"8986000000000000003","v3t_1_msisdn":"10010","v3t_1_imei":"860000000000003","v3t_1_st_slot":"0","v3t_2_modem_main_state":"modem_init_complete","v3t_2_sim_imsi":"460000000000005","v3t_2_sim_iccid":"8986000000000000005","v3t_2_msisdn":"10011","v3t_2_imei":"860000000000005","v3t_2_st_slot":"0"}'
+        s1="${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}"
+        s2="${MOCK_V3T2_SLOT:-${MOCK_V3T_SLOT:-0}}"
+        printf '{"v3t_1_modem_main_state":"modem_init_complete","v3t_1_sim_imsi":"460000000000003","v3t_1_sim_iccid":"8986000000000000003","v3t_1_msisdn":"10010","v3t_1_imei":"860000000000003","v3t_1_st_slot":"%s","v3t_2_modem_main_state":"modem_init_complete","v3t_2_sim_imsi":"460000000000005","v3t_2_sim_iccid":"8986000000000000005","v3t_2_msisdn":"10011","v3t_2_imei":"860000000000005","v3t_2_st_slot":"%s"}\n' "$s1" "$s2"
         ;;
     zte_nwinfo_api:nwinfo_get_netinfo)
         [ "${MOCK_NWINFO_FAIL:-0}" = '1' ] && exit 1
         printf '%s\n' '{"network_type":"SA","signalbar":4,"network_provider_fullname":"Fixture Mobile","wan_active_band":"n78","nr5g_action_band":"78","nr5g_rsrp":-90,"nr5g_rsrq":-11,"nr5g_snr":"18.0","rmcc":460,"rmnc":0,"net_select":"WL_AND_5G","nr5g_sa_band_lock":"78","nr5g_nsa_band_lock":"","lte_band":"1,3"}'
         ;;
     zte_nwinfo_api:nwinfo_get_msim_netinfo)
-        printf '%s\n' '{"msim_1_0_net_select":"Only_LTE","msim_1_0_network_type":"LTE","msim_1_0_rplmn_num":"46000","msim_1_0_network_provider":"Fixture LTE One","msim_1_0_wan_active_band":"LTE BAND 3","msim_1_0_signalbar":"4","msim_1_0_cell_id":"1001","msim_1_0_wan_active_channel":"1300","msim_1_0_lte_pci":"31","msim_1_0_lte_rsrp":"-95","msim_1_0_lte_rsrq":"-10","msim_1_0_lte_rssi":"-65","msim_1_0_lte_snr":"7.0","msim_1_0_operate_mode":"ONLINE","msim_1_0_lte_bandwidth":"2Slot:2_0","msim_2_0_net_select":"Only_LTE","msim_2_0_network_type":"LTE","msim_2_0_rplmn_num":"46001","msim_2_0_network_provider":"Fixture LTE Two","msim_2_0_wan_active_band":"LTE BAND 3","msim_2_0_signalbar":"3","msim_2_0_cell_id":"1002","msim_2_0_wan_active_channel":"1650","msim_2_0_lte_pci":"32","msim_2_0_lte_rsrp":"-101","msim_2_0_lte_rsrq":"-13","msim_2_0_lte_rssi":"-73","msim_2_0_lte_snr":"1.0","msim_2_0_operate_mode":"ONLINE","msim_2_0_lte_bandwidth":"20"}'
+        [ "${MOCK_MSIM_NWINFO_FAIL:-0}" = '1' ] && exit 1
+        # B20 only exposes fields for each modem's currently active local slot.
+        s1="${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}"
+        s2="${MOCK_V3T2_SLOT:-${MOCK_V3T_SLOT:-0}}"
+        printf '%s\n' '{"msim_1_0_net_select":"Only_LTE","msim_1_0_network_type":"LTE","msim_1_0_rplmn_num":"46000","msim_1_0_network_provider":"Fixture LTE One","msim_1_0_wan_active_band":"LTE BAND 3","msim_1_0_signalbar":"4","msim_1_0_cell_id":"1001","msim_1_0_wan_active_channel":"1300","msim_1_0_lte_pci":"31","msim_1_0_lte_rsrp":"-95","msim_1_0_lte_rsrq":"-10","msim_1_0_lte_rssi":"-65","msim_1_0_lte_snr":"7.0","msim_1_0_operate_mode":"ONLINE","msim_1_0_lte_bandwidth":"2Slot:2_0","msim_2_0_net_select":"Only_LTE","msim_2_0_network_type":"LTE","msim_2_0_rplmn_num":"46001","msim_2_0_network_provider":"Fixture LTE Two","msim_2_0_wan_active_band":"LTE BAND 3","msim_2_0_signalbar":"3","msim_2_0_cell_id":"1002","msim_2_0_wan_active_channel":"1650","msim_2_0_lte_pci":"32","msim_2_0_lte_rsrp":"-101","msim_2_0_lte_rsrq":"-13","msim_2_0_lte_rssi":"-73","msim_2_0_lte_snr":"1.0","msim_2_0_operate_mode":"ONLINE","msim_2_0_lte_bandwidth":"20"}' \
+            | sed "s/\"msim_1_0_/\"msim_1_${s1}_/g; s/\"msim_2_0_/\"msim_2_${s2}_/g"
         ;;
     zwrt_wms:zwrt_wms_get_wms_capacity)
         printf '%s\n' '{"sms_dev_unread_num":1,"sms_sim_unread_num":0}'

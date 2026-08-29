@@ -3025,6 +3025,21 @@ static int load_traffic_snapshot_for_template(const struct device_template_spec 
     return run_ubus("zwrt_data", "get_wwandst", args, traffic, traffic_n);
 }
 
+/* Active local SIM slot (0 or 1) of external modem `index`, taken from
+ * get_v3t_sim_info's v3t_<n>_st_slot. B20 keys its multi-SIM network fields by
+ * this slot (msim_<modem>_<slot>_*), so reading a fixed slot 0 leaves the net
+ * object empty whenever the modem is camped on slot 1 (issue #23). */
+static int topflow_external_active_slot(int index)
+{
+    char key[64];
+    long slot;
+
+    if (index < 0 || index >= TOPFLOW_EXTERNAL_MODEM_COUNT) return 0;
+    snprintf(key, sizeof key, "v3t_%d_st_slot", index + 1);
+    slot = json_get_int(g_topflow_v3t_sim, key, 0);
+    return (slot == 1) ? 1 : 0;
+}
+
 static int load_topflow_msim_netinfo_uci(char *out, size_t outlen)
 {
     static const char *suffixes[] = {
@@ -3046,13 +3061,14 @@ static int load_topflow_msim_netinfo_uci(char *out, size_t outlen)
     }
     bappend(&b, "{");
     for (int modem = 1; modem <= TOPFLOW_EXTERNAL_MODEM_COUNT; modem++) {
+        int slot = topflow_external_active_slot(modem - 1);
         for (size_t i = 0; i < sizeof suffixes / sizeof suffixes[0]; i++) {
             char path[160], key[128], value[256] = "";
-            snprintf(path, sizeof path, "zte_nwinfo.sys_info.msim_%d_0_%s",
-                     modem, suffixes[i]);
+            snprintf(path, sizeof path, "zte_nwinfo.sys_info.msim_%d_%d_%s",
+                     modem, slot, suffixes[i]);
             if (uci_show_value(show, path, value, sizeof value) != 0 || !value[0])
                 continue;
-            snprintf(key, sizeof key, "msim_%d_0_%s", modem, suffixes[i]);
+            snprintf(key, sizeof key, "msim_%d_%d_%s", modem, slot, suffixes[i]);
             if (fields++) bappend(&b, ",");
             bappend(&b, "\"%s\":\"", key);
             bappend_json_esc(&b, value);
@@ -3069,16 +3085,8 @@ static int load_topflow_msim_netinfo_uci(char *out, size_t outlen)
 
 static int topflow_external_subid(int index)
 {
-    char key[64];
-    long slot;
-    int base;
-
     if (index < 0 || index >= TOPFLOW_EXTERNAL_MODEM_COUNT) return 0;
-    snprintf(key, sizeof key, "v3t_%d_st_slot", index + 1);
-    slot = json_get_int(g_topflow_v3t_sim, key, 0);
-    if (slot < 0 || slot > 1) slot = 0;
-    base = index == 0 ? 3 : 5;
-    return base + (int)slot;
+    return (index == 0 ? 3 : 5) + topflow_external_active_slot(index);
 }
 
 static void update_device_template_features(const char *common)
@@ -3111,15 +3119,19 @@ static void refresh_topflow_multimodem_cache(void)
 
     if (!g_topflow_multimodem_enabled) return;
 
+    /* Fetch the per-modem active SIM slot first: load_topflow_msim_netinfo_uci()
+     * keys its lookups by v3t_<n>_st_slot, so g_topflow_v3t_sim must be current
+     * before the UCI fallback runs (issue #23). */
+    if (run_ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", NULL,
+                 next, sizeof next) == 0)
+        copy_text(g_topflow_v3t_sim, sizeof g_topflow_v3t_sim, next);
+
     if (run_ubus("zte_nwinfo_api", "nwinfo_get_msim_netinfo", NULL,
                  next, sizeof next) == 0) {
         copy_text(g_topflow_msim_netinfo, sizeof g_topflow_msim_netinfo, next);
     } else if (load_topflow_msim_netinfo_uci(next, sizeof next) == 0) {
         copy_text(g_topflow_msim_netinfo, sizeof g_topflow_msim_netinfo, next);
     }
-    if (run_ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", NULL,
-                 next, sizeof next) == 0)
-        copy_text(g_topflow_v3t_sim, sizeof g_topflow_v3t_sim, next);
 
     for (int i = 1; i < TOPFLOW_MODEM_COUNT; i++) {
         if (run_ubus(wan4_services[i], "status", NULL, next, sizeof next) == 0)
@@ -3279,7 +3291,8 @@ static void emit_topflow_external_modem(struct buf *b, int index)
     long carrier;
     int usb_present, adb_available;
 
-    snprintf(net_prefix, sizeof net_prefix, "msim_%d_0_", index + 1);
+    snprintf(net_prefix, sizeof net_prefix, "msim_%d_%d_", index + 1,
+             topflow_external_active_slot(index));
     snprintf(sim_prefix, sizeof sim_prefix, "v3t_%d_", index + 1);
     has_bandwidth = get_prefixed_lte_bandwidth(
         g_topflow_msim_netinfo, net_prefix, "lte_bandwidth", bandwidth, sizeof bandwidth);
@@ -3783,6 +3796,29 @@ static int set_nonblock(int fd)
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+/* Keep server/client sockets out of the external commands we exec (ubus, adb,
+ * uci, ...). Without this the device-internal adb fork-server inherits and
+ * pins the HTTP listener, so 9460/9461 stay in LISTEN after datad exits and
+ * service.sh restart fails with "bind: Address in use" (issue #26). */
+static int set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
+static int accept_cloexec(int listen_fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    int fd;
+#ifdef __linux__
+    fd = accept4(listen_fd, addr, addrlen, SOCK_CLOEXEC);
+    if (fd >= 0 || errno != ENOSYS) return fd;
+#endif
+    fd = accept(listen_fd, addr, addrlen);
+    if (fd >= 0) (void)set_cloexec(fd);
+    return fd;
 }
 
 static int wait_readable(int fd, int timeout_ms)
@@ -4588,6 +4624,11 @@ static int open_server_socket(const char *bind_addr, int port)
         perror("socket");
         return -1;
     }
+    if (set_cloexec(fd) < 0) {
+        perror("fcntl");
+        close(fd);
+        return -1;
+    }
 
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0) {
         perror("setsockopt");
@@ -4660,7 +4701,7 @@ static void accept_ready_http_clients(const struct http_listener *listener,
     for (;;) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof peer;
-        int cli_fd = accept(listener->fd, (struct sockaddr *)&peer, &peer_len);
+        int cli_fd = accept_cloexec(listener->fd, (struct sockaddr *)&peer, &peer_len);
         if (cli_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
