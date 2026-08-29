@@ -29,6 +29,21 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.band_lock.nr5g_sa_band_lock='78'" \
         "zte_nwinfo.band_lock.nr5g_nsa_band_lock=''" \
         "zte_nwinfo.band_lock.lte_ext_band_lock='1,3'"
+    # UCI fallback copy of the external-modem multi-SIM fields, keyed by each
+    # modem's active local slot (issue #23).
+    s1="${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}"
+    s2="${MOCK_V3T2_SLOT:-${MOCK_V3T_SLOT:-0}}"
+    printf '%s\n' \
+        "zte_nwinfo.sys_info.msim_1_${s1}_network_provider='Fixture LTE One'" \
+        "zte_nwinfo.sys_info.msim_1_${s1}_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_1_${s1}_wan_active_band='LTE BAND 3'" \
+        "zte_nwinfo.sys_info.msim_1_${s1}_lte_rsrp='-95'" \
+        "zte_nwinfo.sys_info.msim_1_${s1}_operate_mode='ONLINE'" \
+        "zte_nwinfo.sys_info.msim_2_${s2}_network_provider='Fixture LTE Two'" \
+        "zte_nwinfo.sys_info.msim_2_${s2}_network_type='LTE'" \
+        "zte_nwinfo.sys_info.msim_2_${s2}_wan_active_band='LTE BAND 3'" \
+        "zte_nwinfo.sys_info.msim_2_${s2}_lte_rsrp='-101'" \
+        "zte_nwinfo.sys_info.msim_2_${s2}_operate_mode='ONLINE'"
     exit 0
 fi
 

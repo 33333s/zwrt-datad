@@ -414,6 +414,37 @@ grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
 
+# issue #23: when an external modem is camped on local SIM slot 1, its network
+# fields are published as msim_<modem>_1_* (not msim_<modem>_0_*). Both the
+# realtime UBus path and the UCI fallback must follow v3t_<n>_st_slot.
+MOCK_MODEL_NAME=MU5252 MOCK_V3T_SLOT=1 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+modems = {m["id"]: m for m in data["modems"]}
+assert modems["v3e1"]["subid"] == 4, modems["v3e1"]["subid"]
+assert modems["v3e2"]["subid"] == 6, modems["v3e2"]["subid"]
+assert modems["v3e1"]["net"]["operator"] == "Fixture LTE One", modems["v3e1"]["net"]
+assert modems["v3e2"]["net"]["operator"] == "Fixture LTE Two", modems["v3e2"]["net"]
+assert modems["v3e1"]["net"]["band"] == "LTE BAND 3", modems["v3e1"]["net"]
+'
+
+# Mixed slots + realtime msim query unavailable -> UCI fallback, still per-modem.
+MOCK_MODEL_NAME=MU5252 MOCK_V3T1_SLOT=1 MOCK_V3T2_SLOT=0 MOCK_MSIM_NWINFO_FAIL=1 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+modems = {m["id"]: m for m in data["modems"]}
+assert modems["v3e1"]["subid"] == 4, modems["v3e1"]["subid"]
+assert modems["v3e2"]["subid"] == 5, modems["v3e2"]["subid"]
+assert modems["v3e1"]["net"]["operator"] == "Fixture LTE One", modems["v3e1"]["net"]
+assert modems["v3e2"]["net"]["operator"] == "Fixture LTE Two", modems["v3e2"]["net"]
+'
+
 # Legacy manual/off configurations are no longer a valid steady state: an
 # upgrade must move them to the saved custom curve before exposing the switch.
 printf '%s\n' \
