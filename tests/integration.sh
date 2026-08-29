@@ -354,9 +354,20 @@ code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
 grep -F "$(printf 'uci\trevert wireless')" "$CALL_LOG" >/dev/null
 
 : >"$MU5252_CALL_LOG"
+# Without an enumerated ADB interface, TopFlow sampling must not spawn two
+# synchronous adb commands and stall the snapshot/SSE producer.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
+"$BIN" --once >/dev/null
+! grep -F "$(printf 'adb\t')" "$MU5252_CALL_LOG" >/dev/null
+
+: >"$MU5252_CALL_LOG"
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
@@ -605,6 +616,7 @@ printf '%s\n' \
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 MOCK_ASSERT_NO_SOCKET_FDS=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
@@ -637,6 +649,7 @@ printf '%s\n' \
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$MU5252_CALL_LOG" \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
@@ -684,6 +697,7 @@ ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$COOLING_TMP/liquid_thermal_enable" \
 ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
 ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
+MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
 ZWRT_DATAD_MWAN3_INIT=/usr/bin/true \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
@@ -815,6 +829,52 @@ assert data["cooling"]["fan"]["kernel_zone_enabled"] is True
 assert len(data["cooling"]["factory_curve"]) == 3
 assert len(data["cooling"]["custom_curve"]) == 5
 '
+
+# Automatic mode takes userspace control at 80 C, then must restore the kernel
+# thermal zone as soon as the temperature falls below the hard limit.
+printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.refresh","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+i=0
+until [ "$(cat "$COOLING_TMP/pwm1")" = "255" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'automatic hard-speed override did not engage' >&2; exit 1; }
+    sleep 0.1
+done
+[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+
+printf '%s\n' '47000' >"$COOLING_TMP/zone/temp"
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.refresh","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+i=0
+until [ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'automatic kernel control was not restored' >&2; exit 1; }
+    sleep 0.1
+done
+[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+
+# qos.reload must bypass the 60-second cache deadline and refresh both external
+# modem logs immediately.
+qos_calls_before="$(grep -c 'grep QCI=' "$MU5252_CALL_LOG" || true)"
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"qos.reload","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+i=0
+while :; do
+    qos_calls_after="$(grep -c 'grep QCI=' "$MU5252_CALL_LOG" || true)"
+    [ "$qos_calls_after" -ge $((qos_calls_before + 2)) ] && break
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || { echo 'qos.reload did not refresh external modems' >&2; exit 1; }
+    sleep 0.1
+done
+[ "$qos_calls_after" -ge $((qos_calls_before + 2)) ]
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \

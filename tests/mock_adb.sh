@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+if [ -n "${MOCK_ADB_CALL_LOG:-}" ]; then
+    printf 'adb\t%s\n' "$*" >>"$MOCK_ADB_CALL_LOG"
+fi
+
 [ "$1" = "-s" ]
 serial="$2"
 [ "$3" = "shell" ]

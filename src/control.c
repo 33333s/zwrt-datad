@@ -89,6 +89,11 @@ struct cooling_config {
     struct fan_curve_point custom_curve[CUSTOM_CURVE_MAX_POINTS];
 };
 
+/* Automatic mode temporarily takes userspace ownership at the hard thermal
+ * limit. Remember that transition so the next cooler sample can hand control
+ * back to the kernel curve instead of leaving PWM 255 latched. */
+static int g_fan_automatic_hard_override;
+
 static const char *env_path(const char *name, const char *fallback)
 {
     const char *value = getenv(name);
@@ -504,6 +509,17 @@ void control_cooling_tick(long temperature_celsius)
     int pwm;
     if (!load_cooling_config(&cfg)) return;
     if (cfg.liquid_always_on) (void)apply_liquid_switch(1, cfg.liquid_level);
+    if (!cfg.fan_always_on && cfg.fan_mode == FAN_MODE_KERNEL) {
+        if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
+            if (apply_datad_fan_pwm(255))
+                g_fan_automatic_hard_override = 1;
+        } else if (g_fan_automatic_hard_override) {
+            if (set_fan_thermal_enabled(1) && apply_fan_curve(&cfg))
+                g_fan_automatic_hard_override = 0;
+        }
+        return;
+    }
+    g_fan_automatic_hard_override = 0;
     if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
         pwm = 255;
     } else if (cfg.fan_always_on) {

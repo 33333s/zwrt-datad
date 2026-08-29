@@ -1493,6 +1493,20 @@ static int parse_topflow_external_qos(const char *text, struct qos_values *out)
     return found;
 }
 
+static int topflow_external_adb_available(int index)
+{
+    static const char *usb_paths[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"1-1", "1-2"};
+    const char *adb_override = getenv("ZWRT_DATAD_ADB_BIN");
+    char path[128];
+
+    if (index < 0 || index >= TOPFLOW_EXTERNAL_MODEM_COUNT) return 0;
+    if (adb_override && *adb_override) return 1;
+    if (snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/%s:1.3",
+                 usb_paths[index], usb_paths[index]) >= (int)sizeof path)
+        return 0;
+    return access(path, F_OK) == 0;
+}
+
 static void refresh_topflow_external_qos_cache(time_t now)
 {
     static const char *serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {
@@ -1504,6 +1518,11 @@ static void refresh_topflow_external_qos_cache(time_t now)
     for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
         char lines[16384];
         struct qos_values values;
+        if (!topflow_external_adb_available(i)) {
+            memset(&g_topflow_external_qos[i], 0, sizeof g_topflow_external_qos[i]);
+            g_topflow_external_qos_sampled_at[i] = 0;
+            continue;
+        }
         if (device_adb_read_qos_log(serials[i], lines, sizeof lines) == 0 &&
             parse_topflow_external_qos(lines, &values)) {
             g_topflow_external_qos[i] = values;
@@ -3279,14 +3298,10 @@ static void refresh_topflow_multimodem_cache(void)
         static const char *serials[TOPFLOW_EXTERNAL_MODEM_COUNT] = {
             "V3E1T12345", "V3E2T12345"
         };
-        static const char *usb_paths[TOPFLOW_EXTERNAL_MODEM_COUNT] = {"1-1", "1-2"};
-        const char *adb_override = getenv("ZWRT_DATAD_ADB_BIN");
         for (int i = 0; i < TOPFLOW_EXTERNAL_MODEM_COUNT; i++) {
-            char raw[64], path[128], *end = NULL;
+            char raw[64], *end = NULL;
             long value;
-            snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/%s:1.3",
-                     usb_paths[i], usb_paths[i]);
-            if ((!adb_override || !*adb_override) && access(path, F_OK) != 0) {
+            if (!topflow_external_adb_available(i)) {
                 g_topflow_external_temp_valid[i] = 0;
                 g_topflow_external_temp_sampled_at[i] = 0;
                 continue;
@@ -5286,6 +5301,9 @@ int main(int argc, char **argv)
         if (g_qos_refresh_req) {
             g_qos_refresh_req = 0;
             rescan_qos_cache();
+            g_topflow_external_qos_next_at = 0;
+            if (g_topflow_multimodem_enabled)
+                refresh_topflow_external_qos_cache(time(NULL));
             if (qos_cache_has_values()) qos_retry_left = 0;
         } else if (qos_retry_left > 0) {
             if (qos_retry_left == 1 || (qos_retry_left % qos_retry_every) == 0)
