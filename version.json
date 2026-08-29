@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.19",
+    "version": "0.9.20",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 SSE 多行快照帧格式，确保客户端完整解析状态数据"
+    "notes": "修复 HTTP socket 跨 exec 泄漏，并按外挂基带活动 SIM 卡槽读取网络状态"
   }
 }
