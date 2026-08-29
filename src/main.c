@@ -3785,6 +3785,29 @@ static int set_nonblock(int fd)
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* Keep server/client sockets out of the external commands we exec (ubus, adb,
+ * uci, ...). Without this the device-internal adb fork-server inherits and
+ * pins the HTTP listener, so 9460/9461 stay in LISTEN after datad exits and
+ * service.sh restart fails with "bind: Address in use" (issue #26). */
+static int set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
+static int accept_cloexec(int listen_fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    int fd;
+#ifdef __linux__
+    fd = accept4(listen_fd, addr, addrlen, SOCK_CLOEXEC);
+    if (fd >= 0 || errno != ENOSYS) return fd;
+#endif
+    fd = accept(listen_fd, addr, addrlen);
+    if (fd >= 0) (void)set_cloexec(fd);
+    return fd;
+}
+
 static int wait_readable(int fd, int timeout_ms)
 {
     fd_set rfds;
@@ -4588,6 +4611,11 @@ static int open_server_socket(const char *bind_addr, int port)
         perror("socket");
         return -1;
     }
+    if (set_cloexec(fd) < 0) {
+        perror("fcntl");
+        close(fd);
+        return -1;
+    }
 
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0) {
         perror("setsockopt");
@@ -4660,7 +4688,7 @@ static void accept_ready_http_clients(const struct http_listener *listener,
     for (;;) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof peer;
-        int cli_fd = accept(listener->fd, (struct sockaddr *)&peer, &peer_len);
+        int cli_fd = accept_cloexec(listener->fd, (struct sockaddr *)&peer, &peer_len);
         if (cli_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;

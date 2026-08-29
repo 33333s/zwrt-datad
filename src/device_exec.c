@@ -82,6 +82,15 @@ static int device_run_capture_timeout(const char *const argv[], char *out, size_
             if (devnull > STDERR_FILENO) close(devnull);
         }
         if (pipefd[1] > STDOUT_FILENO) close(pipefd[1]);
+        /* Depth defense: drop every other inherited descriptor before exec so a
+         * persistent child (e.g. the device-internal adb fork-server) cannot
+         * pin datad's listener or client sockets. See zwrt-datad issue #26. */
+        {
+            long maxfd = sysconf(_SC_OPEN_MAX);
+            if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+            for (int extra = STDERR_FILENO + 1; extra < (int)maxfd; extra++)
+                close(extra);
+        }
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
