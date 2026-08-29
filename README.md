@@ -171,12 +171,12 @@ curl -H 'Authorization: Bearer <token>' \
 设备不会输出 `nfc`；不会用 `-1`、`0` 或空对象冒充“不支持”。调用方应根据
 块/字段是否存在决定是否显示功能，同时把 `0%`、关闭状态和 `0mA` 视为有效值。
 
-MU5252 模板还会输出三路 `modems`、`aggregation`、`multiwan` 和 `cooling`。聚合状态会区分开关、ICG 配置是否下发、ICG/mwan3 控制进程、实际 TCP 隧道和 mwan3 各承载链路质量；实际隧道从 `zte_icg_agg` 进程持有的 socket 反查，不依赖可能滞后的静态服务器配置。`multiwan` 提供结构化 mwan3 配置，并明确 `SMULTIWAN`（ICG）与 `MULTIWAN`（mwan3）的互斥生效关系。ICG 剩余流量和当日用量优先读取厂商落盘 UCI 的字节值，云端接口仅短超时低频触发刷新，不阻塞 SSE 主循环。聚合、风扇常开、
+MU5252 模板还会输出三路 `modems`、`aggregation`、`multiwan` 和 `cooling`。聚合状态会区分开关、ICG 配置是否下发、ICG/mwan3 控制进程、实际 TCP 隧道和 mwan3 各承载链路质量；实际隧道从 `zte_icg_agg` 进程持有的 socket 反查，不依赖可能滞后的静态服务器配置。`multiwan` 提供结构化 mwan3 配置，并明确 `SMULTIWAN`（ICG）与 `MULTIWAN`（mwan3）的互斥生效关系。ICG 剩余流量和当日用量优先读取厂商落盘 UCI 的字节值，云端接口仅短超时低频触发刷新，不阻塞 SSE 主循环。聚合、风扇三模式、
 多点自定义温度/PWM 曲线和液冷模式都通过语义化 `/control` 动作操作；散热配置
 只保存到 `/data/zwrt-datad/cooling.conf`，启动时由 datad 恢复，不安装额外 init 脚本。
 自定义曲线允许 2–8 个控制点，datad 每秒按 `sys-therm-4` 温度线性插值 PWM；80℃
-硬保护始终强制 PWM 255。风扇常开使用厂商固定 PWM 128，关闭常开时恢复自定义
-曲线；液冷支持自动、低档常开和高档常开，分别对应设备树真实幅度 0/60/200，
+硬保护始终强制 PWM 255。风扇原厂模式启用内核 44/48/53℃ 三档曲线，自定义模式
+禁用该 zone 并由 datad 插值，常开模式使用固定 PWM 128；液冷支持自动、低档常开和高档常开，分别对应设备树真实幅度 0/60/200，
 自动模式把 thermal 控制交还厂商。
 
 ## QoS / 短信说明
@@ -190,6 +190,7 @@ QoS 相关有一个容易踩的点：`qci` / `session_ambr` 往往更新得比 `
 - 后续只显示缓存，不在每轮快照里反复扫日志
 - 收到 `SIGUSR1` 时立即重读
 - 检测到 `sim_iccid/current_sim_slot` 变化时清空旧缓存，并在新日志写入后自动补读
+- MU5252 的 X75、V3E1、V3E2 还会分别在 `modems[].qos` 输出承载缓存；两个 V3E 通过内部 ADB 每 60 秒读取一次各自日志，前端不直接扫描日志
 
 运行中的 `zwrt-datad` 支持：
 

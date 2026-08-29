@@ -22,6 +22,7 @@ int device_ubus_call_raw(const char *service, const char *method, const char *ar
 int device_ubus_list(int verbose, char *out, size_t outlen);
 int device_adb_read_file(const char *serial, const char *path,
                          char *out, size_t outlen);
+int device_adb_read_qos_log(const char *serial, char *out, size_t outlen);
 int device_uci_set(const char *path, const char *value);
 int device_uci_get(const char *path, char *out, size_t outlen);
 int device_uci_show(const char *package_name, char *out, size_t outlen);
