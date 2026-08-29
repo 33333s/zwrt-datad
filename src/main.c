@@ -3107,6 +3107,7 @@ static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
         {"nr5g_cell_id", "zte_nwinfo.cell_info.nr5g_cellid", NULL},
         {"nr5g_action_channel", "zte_nwinfo.cell_info.nr5g_action_channel", NULL},
         {"nr5g_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth", NULL},
+        {"lte_bandwidth", "zte_nwinfo.cell_info.lte_bandwidth", NULL},
         {"nrca", "zte_nwinfo.sys_info.nrca", "zte_nwinfo.sys_info.odu_nrca"},
         {"lteca", "zte_nwinfo.sys_info.lteca", "zte_nwinfo.sys_info.odu_lteca"},
         {"ltecasig", "zte_nwinfo.sys_info.ltecasig", NULL},

@@ -11,7 +11,7 @@ esac
 
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; then
     printf '%s\n' \
-        "zte_nwinfo.sys_info.network_type='SA'" \
+        "zte_nwinfo.sys_info.network_type='${MOCK_UCI_NETWORK_TYPE:-SA}'" \
         "zte_nwinfo.signal_strength.signalbar='4'" \
         "zte_nwinfo.sys_info.simcard_roam='Home'" \
         "zte_nwinfo.plmn_info.network_provider_fullname='Fixture TopFlow Mobile'" \
@@ -26,6 +26,7 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.cell_info.nr5g_cellid='123456'" \
         "zte_nwinfo.cell_info.nr5g_action_channel='633984'" \
         "zte_nwinfo.cell_info.nr5g_bandwidth='100'" \
+        "zte_nwinfo.cell_info.lte_bandwidth='${MOCK_UCI_LTE_BANDWIDTH:-20}'" \
         "zte_nwinfo.sys_info.net_select='Only_5G'" \
         "zte_nwinfo.band_lock.nr5g_sa_band_lock='78'" \
         "zte_nwinfo.band_lock.nr5g_nsa_band_lock=''" \

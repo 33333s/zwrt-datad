@@ -480,7 +480,8 @@ static int apply_fan_config(const struct cooling_config *cfg)
         return ok;
     }
     if (cfg->fan_mode == FAN_MODE_KERNEL) {
-        if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
+        if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C ||
+            (temperature <= 0 && g_fan_automatic_hard_override)) {
             int ok = apply_datad_fan_pwm(255);
             if (ok) g_fan_automatic_hard_override = 1;
             return ok;
@@ -524,7 +525,7 @@ void control_cooling_tick(long temperature_celsius)
         if (temperature_celsius >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
             if (apply_datad_fan_pwm(255))
                 g_fan_automatic_hard_override = 1;
-        } else if (g_fan_automatic_hard_override) {
+        } else if (temperature_celsius > 0 && g_fan_automatic_hard_override) {
             if (set_fan_thermal_enabled(1) && apply_fan_curve(&cfg))
                 g_fan_automatic_hard_override = 0;
         }

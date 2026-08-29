@@ -502,6 +502,21 @@ assert data["cooling"]["curve"] == [
     {"level": 3, "temperature_celsius": 53, "hysteresis_celsius": 4, "pwm": 179, "speed_percent": 70},
 ]
 '
+
+# If the live X75 network call fails while registered on LTE, the UCI fallback
+# must still populate the integrated modem bandwidth.
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+MOCK_MODEL_NAME=MU5252 \
+MOCK_NWINFO_FAIL=1 \
+MOCK_UCI_NETWORK_TYPE=LTE \
+MOCK_UCI_LTE_BANDWIDTH=20 \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["modems"][0]["net"]["type"] == "LTE"
+assert data["modems"][0]["net"]["bandwidth"] == "20"
+'
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":2' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":3' >/dev/null
 grep -F 'get_wwandst' "$MU5252_CALL_LOG" | grep -F '"subid":5' >/dev/null
@@ -870,6 +885,16 @@ assert fan["pwm"] == 255
     [ "$i" -lt 50 ] || { echo 'automatic override state was not published' >&2; exit 1; }
     sleep 0.1
 done
+
+# A failed temperature read must fail safe and keep the known-hot override.
+rm -f "$COOLING_TMP/zone/temp"
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"state.refresh","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
+sleep 0.3
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
+[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
 
 # Falling below the threshold must hand control back to the kernel curve and
 # publish the post-tick zone state in the same refreshed snapshot.
