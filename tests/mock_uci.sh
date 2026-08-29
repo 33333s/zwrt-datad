@@ -131,7 +131,11 @@ fi
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
     case "${3:-}" in
         zwrt_common_info.common_config.model_name)
+            [ "${MOCK_MODEL_NAME_MISSING:-0}" = '1' ] && exit 1
             printf '%s\n' "${MOCK_MODEL_NAME:-MU5252}"
+            ;;
+        zwrt_common_info.common_config.hardware_version)
+            printf '%s\n' "${MOCK_HARDWARE_VERSION:-MU5252_HW1.0}"
             ;;
         wireless.main_2g.ssid) printf '%s\n' 'Fixture 2G' ;;
         wireless.main_2g.key) printf '%s\n' 'fixture-password' ;;

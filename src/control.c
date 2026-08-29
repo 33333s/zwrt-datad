@@ -474,15 +474,26 @@ static int apply_fan_config(const struct cooling_config *cfg)
 {
     long temperature = read_custom_curve_temperature();
     if (cfg->fan_always_on) {
-        return apply_datad_fan_pwm(temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C
-                                   ? 255 : FAN_ALWAYS_ON_PWM);
+        int ok = apply_datad_fan_pwm(temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C
+                                     ? 255 : FAN_ALWAYS_ON_PWM);
+        if (ok) g_fan_automatic_hard_override = 0;
+        return ok;
     }
     if (cfg->fan_mode == FAN_MODE_KERNEL) {
-        if (!set_fan_thermal_enabled(1)) return 0;
-        return apply_fan_curve(cfg);
+        if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) {
+            int ok = apply_datad_fan_pwm(255);
+            if (ok) g_fan_automatic_hard_override = 1;
+            return ok;
+        }
+        if (!set_fan_thermal_enabled(1) || !apply_fan_curve(cfg)) return 0;
+        g_fan_automatic_hard_override = 0;
+        return 1;
     }
-    if (cfg->fan_mode == FAN_MODE_CUSTOM)
-        return apply_custom_curve(cfg, temperature);
+    if (cfg->fan_mode == FAN_MODE_CUSTOM) {
+        int ok = apply_custom_curve(cfg, temperature);
+        if (ok) g_fan_automatic_hard_override = 0;
+        return ok;
+    }
     if (temperature >= CUSTOM_CURVE_HARD_FULL_SPEED_C) return apply_datad_fan_pwm(255);
     if (!prepare_fan_pwm_control()) return 0;
     if (set_fan_pwm_percent(cfg->fan_speed_percent)) return 1;
@@ -1002,13 +1013,16 @@ struct wifi_power_band {
 
 static int wifi_power_model_supported(char *err, size_t errlen)
 {
-    char model[64];
+    char model[64] = "", hardware[128] = "";
     if (device_uci_get("zwrt_common_info.common_config.model_name",
-                       model, sizeof model) != 0 || strcmp(model, "MU5252")) {
-        set_invalid_error(err, errlen, "wifi power control is only supported on MU5252");
-        return 0;
-    }
-    return 1;
+                       model, sizeof model) == 0 && !strcmp(model, "MU5252"))
+        return 1;
+    if (device_uci_get("zwrt_common_info.common_config.hardware_version",
+                       hardware, sizeof hardware) == 0 &&
+        !strncmp(hardware, "MU5252_", strlen("MU5252_")))
+        return 1;
+    set_invalid_error(err, errlen, "wifi power control is only supported on MU5252");
+    return 0;
 }
 
 static const struct wifi_power_band *wifi_power_band_from_params(const char *params,

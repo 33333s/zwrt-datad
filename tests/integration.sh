@@ -61,6 +61,8 @@ export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$CALL_LOG" \
+MOCK_MODEL_NAME_MISSING=1 \
+MOCK_HARDWARE_VERSION=MU5252_HW1.0 \
 ZWRT_DATAD_FD_DUMP="$CHILD_FD_LOG" \
 "$BIN" -i 200 -p "$PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 PID=$!
@@ -807,6 +809,9 @@ grep -F 'custom_curve_count=5' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_temperature_5=70' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'custom_pwm_5=255' "$COOLING_TMP/cooling.conf" >/dev/null
 
+# Entering automatic mode while already at the hard limit must retain PWM 255
+# immediately; it must never expose the lower factory curve between calls.
+printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' \
@@ -817,35 +822,30 @@ assert data["ok"] is True
 assert data["result"]["always_on"] is False
 assert data["result"]["mode"] == "automatic"
 '
-[ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
+[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
 grep -F 'fan_mode=1' "$COOLING_TMP/cooling.conf" >/dev/null
 grep -F 'fan_always_on=0' "$COOLING_TMP/cooling.conf" >/dev/null
-curl -fsS -H 'X-Auth-Token: fixture-private-token' \
-    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-assert data["cooling"]["fan"]["mode"] == "automatic"
-assert data["cooling"]["fan"]["kernel_zone_enabled"] is True
-assert len(data["cooling"]["factory_curve"]) == 3
-assert len(data["cooling"]["custom_curve"]) == 5
-'
-
-# Automatic mode takes userspace control at 80 C, then must restore the kernel
-# thermal zone as soon as the temperature falls below the hard limit.
-printf '%s\n' '80000' >"$COOLING_TMP/zone/temp"
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"action":"state.refresh","params":{}}' \
     "http://127.0.0.1:$TOPFLOW_PORT/control" >/dev/null
 i=0
-until [ "$(cat "$COOLING_TMP/pwm1")" = "255" ]; do
+until curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+fan = json.load(sys.stdin)["cooling"]["fan"]
+assert fan["mode"] == "automatic"
+assert fan["kernel_zone_enabled"] is False
+assert fan["pwm"] == 255
+'; do
     i=$((i + 1))
-    [ "$i" -lt 50 ] || { echo 'automatic hard-speed override did not engage' >&2; exit 1; }
+    [ "$i" -lt 50 ] || { echo 'automatic override state was not published' >&2; exit 1; }
     sleep 0.1
 done
-[ "$(cat "$COOLING_TMP/pwm1")" = "255" ]
-[ "$(cat "$COOLING_TMP/zone/mode")" = "disabled" ]
 
+# Falling below the threshold must hand control back to the kernel curve and
+# publish the post-tick zone state in the same refreshed snapshot.
 printf '%s\n' '47000' >"$COOLING_TMP/zone/temp"
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \
@@ -858,6 +858,13 @@ until [ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]; do
     sleep 0.1
 done
 [ "$(cat "$COOLING_TMP/zone/mode")" = "enabled" ]
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+fan = json.load(sys.stdin)["cooling"]["fan"]
+assert fan["mode"] == "automatic"
+assert fan["kernel_zone_enabled"] is True
+'
 
 # qos.reload must bypass the 60-second cache deadline and refresh both external
 # modem logs immediately.

@@ -2413,6 +2413,13 @@ static void emit_topflow_hardware_controls(struct buf *b)
                                    custom_curve, &custom_curve_count))
         configured_fan_mode = 0;
     control_cooling_tick(cooling_temp);
+    /* The tick may enter or leave the 80 C userspace override. Report the
+     * post-transition zone state, not the value sampled before the hardware
+     * change. */
+    if (find_topflow_cooling_zone(zone, sizeof zone) &&
+        snprintf(path, sizeof path, "%s/mode", zone) < (int)sizeof path &&
+        read_line_file(path, mode, sizeof mode))
+        automatic = !strcmp(mode, "enabled");
     pwm = read_long_file(runtime_path("ZWRT_DATAD_FAN_PWM_PATH", TOPFLOW_FAN_PWM_PATH), -1);
     rpm = read_long_file(runtime_path("ZWRT_DATAD_FAN_RPM_PATH", TOPFLOW_FAN_RPM_PATH), -1);
     fan_thermal = read_labeled_long_file(
