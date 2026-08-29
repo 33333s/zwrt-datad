@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.18",
+    "version": "0.9.19",
     "asset": "zwrt-datad-aarch64",
-    "notes": "TopFlow 短信由 datad 通过设备 OpenSSL 3 解密为 UTF-8，并采用分层状态采样与增量短信缓存降低刷新负载"
+    "notes": "修复 SSE 多行快照帧格式，确保客户端完整解析状态数据"
   }
 }
