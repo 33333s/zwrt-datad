@@ -183,7 +183,7 @@ enum temp_source_mode {
 
 enum network_source_mode {
     NETWORK_SOURCE_NWINFO_UBUS_ONLY = 0,
-    NETWORK_SOURCE_MU5252_UCI_FALLBACK = 1
+    NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK = 1
 };
 
 enum traffic_source_mode {
@@ -240,7 +240,7 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_COMPAT_FALLBACK,
-    NETWORK_SOURCE_NWINFO_UBUS_ONLY,
+    NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK,
     TRAFFIC_SOURCE_CID1,
     OPTIONAL_SECTION_AUTO,
     OPTIONAL_SECTION_AUTO,
@@ -257,7 +257,7 @@ static const struct device_template_spec TEMPLATE_TOPFLOW_MU5252 = {
     WIFI_SOURCE_COMPAT_AUTO,
     CLIENT_SOURCE_DHCP_THEN_ROUTER,
     TEMP_SOURCE_U60_UBUS_ONLY,
-    NETWORK_SOURCE_MU5252_UCI_FALLBACK,
+    NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK,
     TRAFFIC_SOURCE_CID1_ACTIVE_SUBID,
     OPTIONAL_SECTION_AUTO,
     OPTIONAL_SECTION_AUTO,
@@ -2993,12 +2993,35 @@ static void refresh_uci_device_info(void)
         {"battery_enable", "zwrt_zte_mc_tmp.battery.bat_enable"},
         {"power_adapter", "zwrt_zte_mc_tmp.battery.power_adapter"},
         {"mtu", "zwrt_router.network.mtu"},
-        {"mss", "zwrt_router.network.mss"}
+        {"mss", "zwrt_router.network.mss"},
+        {"radio_network_type", "zte_nwinfo.sys_info.network_type"},
+        {"radio_signalbar", "zte_nwinfo.signal_strength.signalbar"},
+        {"radio_operator", "zte_nwinfo.plmn_info.network_provider_fullname"},
+        {"radio_lte_band", "zte_nwinfo.wan_active_band.GWLSA_band"},
+        {"radio_nr_band", "zte_nwinfo.wan_active_band.odu_nrband"},
+        {"radio_lte_rsrp", "zte_nwinfo.signal_strength.lte_rsrp"},
+        {"radio_lte_rsrq", "zte_nwinfo.signal_strength.lte_rsrq"},
+        {"radio_lte_snr", "zte_nwinfo.signal_strength.lte_snr"},
+        {"radio_nr_rsrp", "zte_nwinfo.signal_strength.nr5g_rsrp"},
+        {"radio_nr_rsrq", "zte_nwinfo.signal_strength.nr5g_rsrq"},
+        {"radio_nr_snr", "zte_nwinfo.signal_strength.nr5g_snr"},
+        {"radio_lte_cell_id", "zte_nwinfo.cell_info.cell_id"},
+        {"radio_lte_pci", "zte_nwinfo.cell_info.lte_pci"},
+        {"radio_lte_channel", "zte_nwinfo.cell_info.wan_active_channel"},
+        {"radio_nr_pci", "zte_nwinfo.cell_info.nr5g_pci"},
+        {"radio_nr_channel", "zte_nwinfo.cell_info.nr5g_action_channel"},
+        {"radio_nr_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth"},
+        {"radio_nrca", "zte_nwinfo.sys_info.nrca"},
+        {"radio_lteca", "zte_nwinfo.sys_info.lteca"},
+        {"radio_net_select", "zte_nwinfo.sys_info.net_select"},
+        {"radio_nr_sa_bands", "zte_nwinfo.band_lock.nr5g_sa_band_lock"},
+        {"radio_nr_nsa_bands", "zte_nwinfo.band_lock.nr5g_nsa_band_lock"},
+        {"radio_lte_bands", "zte_nwinfo.band_lock.lte_ext_band_lock"}
     };
     static const char *packages[] = {
         "zwrt_zte_mdm", "zwrt_common_info", "network", "dhcp",
         "zwrt_data_commit", "system", "zwrt_web", "zwrt_tr069",
-        "zwrt_zte_mc_tmp", "zwrt_router"
+        "zwrt_zte_mc_tmp", "zwrt_router", "zte_nwinfo"
     };
     struct buf b = {g_uci_device_info, sizeof g_uci_device_info, 0};
     struct buf without_battery = {
@@ -3083,7 +3106,7 @@ static void emit_sim_identity(struct buf *b, const char *key,
     bappend(b, "\"");
 }
 
-static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
+static int load_network_snapshot_uci(char *out, size_t outlen)
 {
     static const struct uci_net_field fields[] = {
         {"network_type", "zte_nwinfo.sys_info.network_type", NULL},
@@ -3103,6 +3126,9 @@ static int load_network_snapshot_mu5252_uci(char *out, size_t outlen)
         {"rssi", "zte_nwinfo.signal_strength.rssi", NULL},
         {"rmcc", "zte_nwinfo.plmn_info.rmcc", NULL},
         {"rmnc", "zte_nwinfo.plmn_info.rmnc", NULL},
+        {"cell_id", "zte_nwinfo.cell_info.cell_id", NULL},
+        {"lte_pci", "zte_nwinfo.cell_info.lte_pci", NULL},
+        {"wan_active_channel", "zte_nwinfo.cell_info.wan_active_channel", NULL},
         {"nr5g_pci", "zte_nwinfo.cell_info.nr5g_pci", NULL},
         {"nr5g_cell_id", "zte_nwinfo.cell_info.nr5g_cellid", NULL},
         {"nr5g_action_channel", "zte_nwinfo.cell_info.nr5g_action_channel", NULL},
@@ -3151,8 +3177,8 @@ static int load_network_snapshot_for_template(const struct device_template_spec 
 {
     if (run_ubus("zte_nwinfo_api", "nwinfo_get_netinfo", NULL, net, net_n) == 0)
         return 0;
-    if (tpl->network_mode == NETWORK_SOURCE_MU5252_UCI_FALLBACK)
-        return load_network_snapshot_mu5252_uci(net, net_n);
+    if (tpl->network_mode == NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK)
+        return load_network_snapshot_uci(net, net_n);
     return -1;
 }
 
@@ -3702,6 +3728,9 @@ static void build_snapshot(char *out, size_t outlen,
     emit_int(&b, "rssi", net, "rssi", 0);            bappend(&b, ",");
     emit_int(&b, "mcc", net, "rmcc", 0);             bappend(&b, ",");
     emit_int(&b, "mnc", net, "rmnc", 0);             bappend(&b, ",");
+    emit_int(&b, "lte_pci", net, "lte_pci", 0);      bappend(&b, ",");
+    emit_int(&b, "lte_cell_id", net, "cell_id", 0);   bappend(&b, ",");
+    emit_int(&b, "lte_channel", net, "wan_active_channel", 0); bappend(&b, ",");
     emit_int(&b, "nr_pci", net, "nr5g_pci", 0);      bappend(&b, ",");
     emit_int(&b, "nr_cell_id", net, "nr5g_cell_id", 0); bappend(&b, ",");
     emit_int(&b, "nr_channel", net, "nr5g_action_channel", 0); bappend(&b, ",");

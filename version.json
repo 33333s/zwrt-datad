@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.22",
+    "version": "0.9.23",
     "asset": "zwrt-datad-aarch64",
-    "notes": "补全 TopFlow 多基带短信发送：主机 AES-GCM 加密与状态轮询，以及 V3E1/V3E2/SIM 卡槽发送路由"
+    "notes": "完善 MC8532B 完整 ubus 与无线 UCI 适配：补齐 LTE 小区字段，并为网络快照提供 zte_nwinfo 回退"
   }
 }
