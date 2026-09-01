@@ -267,6 +267,29 @@ int device_adb_read_qos_log(const char *serial, char *out, size_t outlen)
     return out[0] ? 0 : -1;
 }
 
+int device_http_post_form(const char *url, const char *form,
+                          char *out, size_t outlen, int timeout_ms)
+{
+    const char *curl = getenv("ZWRT_DATAD_CURL_BIN");
+    char seconds[16];
+    const char *argv[11];
+    if (!url || !*url || !form || !out || outlen < 2) return -1;
+    if (!curl || !*curl) curl = "curl";
+    snprintf(seconds, sizeof seconds, "%d", timeout_ms > 0 ? (timeout_ms + 999) / 1000 : 10);
+    argv[0] = curl;
+    argv[1] = "-fsS";
+    argv[2] = "-m";
+    argv[3] = seconds;
+    argv[4] = "-H";
+    argv[5] = "Content-Type: application/x-www-form-urlencoded";
+    argv[6] = "--data";
+    argv[7] = form;
+    argv[8] = url;
+    argv[9] = NULL;
+    return device_run_capture_timeout(argv, out, outlen,
+                                      timeout_ms > 0 ? timeout_ms : 10000);
+}
+
 int device_uci_commit(const char *package_name)
 {
     const char *uci = getenv("ZWRT_DATAD_UCI_BIN");

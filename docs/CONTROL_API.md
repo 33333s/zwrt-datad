@@ -117,11 +117,11 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 | action | params |
 |---|---|
-| `sms.send_raw` | `number`, `message_hex`, `sms_time` |
+| `sms.send_raw` | `number`, `message_hex`, `sms_time`，可选 `sender` |
 | `sms.delete` | `ids`，使用设备要求的分号格式 |
 | `sms.mark_read` | `ids`, `tag?` |
 
-`sms.send_raw` 接受已经编码的 UCS-2 hex。文本编码、转发、黑名单和业务去重继续由 UFI 负责。
+`sms.send_raw` 接受已经编码的 UCS-2 hex。`sender` 为空或 `host` 时使用当前主卡；TopFlow 可选 `x75`、`v3e1`、`v3e2`，其中 V3E 通过各自内网管理接口发送；普通双卡机型可选 `sim1`、`sim2`，datad 会先用原厂 provisioning 接口激活目标卡槽并等待切换完成。主机 WMS 发送会使用 datad 已注册的厂商 AES-GCM Web 会话加密号码和正文，并轮询 `sms_cmd=4`，只有状态 3 才返回成功。文本编码、转发、黑名单和业务去重继续由 UFI 负责。
 
 ## MU5252 Aggregation And Cooling
 

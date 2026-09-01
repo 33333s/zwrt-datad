@@ -117,6 +117,7 @@ device sources -> template select -> state/runtime caches -> /state + /events
 - 换卡检测基于 `sim_iccid/current_sim_slot`
 - 短信首次按 NV/SIM 各最多 32 条同步；未读数变化后各增量取最新 8 条并合并缓存，短信控制操作后才重新全量同步
 - 厂商 Web 加密短信在 datad 内通过设备 OpenSSL 3 解密成 UTF-8；UFI 等消费者只接收明文
+- 短信发送复用同一 AES-GCM Web 会话加密号码/正文，并以 `sms_cmd=4` 轮询最终状态；TopFlow 的 X75/V3E1/V3E2 和普通双卡 SIM1/SIM2 统一由 `sms.send_raw.sender` 路由
 - `device.api_template_supported = 1` 才代表当前机型已有明确模板；`0` 只表示落到了内部兼容模板
 
 ## 构建
