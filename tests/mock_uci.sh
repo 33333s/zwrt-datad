@@ -22,6 +22,9 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
         "zte_nwinfo.signal_strength.nr5g_snr='17.0'" \
         "zte_nwinfo.plmn_info.rmcc='460'" \
         "zte_nwinfo.plmn_info.rmnc='1'" \
+        "zte_nwinfo.cell_info.cell_id='654321'" \
+        "zte_nwinfo.cell_info.lte_pci='123'" \
+        "zte_nwinfo.cell_info.wan_active_channel='1650'" \
         "zte_nwinfo.cell_info.nr5g_pci='321'" \
         "zte_nwinfo.cell_info.nr5g_cellid='123456'" \
         "zte_nwinfo.cell_info.nr5g_action_channel='633984'" \

@@ -1240,12 +1240,37 @@ assert data["device"]["api_template"] == "MC8532B"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
+assert data["net"]["lte_pci"] == 0
+assert data["net"]["lte_cell_id"] == 0
+assert data["net"]["lte_channel"] == 0
+assert data["uci_device_info"]["radio_network_type"] == "SA"
+assert data["uci_device_info"]["radio_signalbar"] == "4"
+assert data["uci_device_info"]["radio_operator"] == "Fixture TopFlow Mobile"
+assert data["uci_device_info"]["radio_nr_pci"] == "321"
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},
     {"name": "cpuss-0", "celsius": 41.25},
 ]
 assert data["thermal"]["modems"] == []
+'
+
+MOCK_MODEL_NAME=MC8532B \
+MOCK_NWINFO_FAIL=1 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["device"]["api_template"] == "MC8532B"
+assert data["net"]["type"] == "SA"
+assert data["net"]["bars"] == 4
+assert data["net"]["operator"] == "Fixture TopFlow Mobile"
+assert data["net"]["lte_pci"] == 123
+assert data["net"]["lte_cell_id"] == 654321
+assert data["net"]["lte_channel"] == 1650
+assert data["net"]["nr_pci"] == 321
+assert data["net"]["nr_channel"] == 633984
 '
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
