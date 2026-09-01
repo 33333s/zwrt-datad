@@ -14,6 +14,7 @@ typedef struct evp_cipher_st EVP_CIPHER;
 typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
 
 #define EVP_CTRL_AEAD_SET_IVLEN 0x9
+#define EVP_CTRL_AEAD_GET_TAG 0x10
 #define EVP_CTRL_AEAD_SET_TAG 0x11
 #define RSA_PKCS1_PADDING 1
 
@@ -39,6 +40,11 @@ struct crypto_api {
     int (*EVP_DecryptUpdate)(EVP_CIPHER_CTX *, unsigned char *, int *,
                              const unsigned char *, int);
     int (*EVP_DecryptFinal_ex)(EVP_CIPHER_CTX *, unsigned char *, int *);
+    int (*EVP_EncryptInit_ex)(EVP_CIPHER_CTX *, const EVP_CIPHER *, void *,
+                              const unsigned char *, const unsigned char *);
+    int (*EVP_EncryptUpdate)(EVP_CIPHER_CTX *, unsigned char *, int *,
+                             const unsigned char *, int);
+    int (*EVP_EncryptFinal_ex)(EVP_CIPHER_CTX *, unsigned char *, int *);
 };
 
 static struct crypto_api api;
@@ -81,6 +87,9 @@ int web_crypto_init(void)
     LOAD(EVP_CIPHER_CTX_ctrl);
     LOAD(EVP_DecryptUpdate);
     LOAD(EVP_DecryptFinal_ex);
+    LOAD(EVP_EncryptInit_ex);
+    LOAD(EVP_EncryptUpdate);
+    LOAD(EVP_EncryptFinal_ex);
 #undef LOAD
     return 1;
 
@@ -290,6 +299,39 @@ done:
         memset(plain, 0, raw_len - 28 + 1);
         free(plain);
     }
+    if (raw) {
+        memset(raw, 0, raw_cap);
+        free(raw);
+    }
+    return ok;
+}
+
+int web_crypto_encrypt_envelope(const char *value, char *out, size_t outlen)
+{
+    size_t plain_len = value ? strlen(value) : 0;
+    size_t raw_cap = 12 + 16 + plain_len + 16;
+    unsigned char *raw = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    int produced = 0, final_len = 0, ok = 0;
+
+    if (!value || !session_key_valid || !web_crypto_init()) return 0;
+    raw = calloc(1, raw_cap);
+    if (!raw) return 0;
+    if (api.RAND_bytes(raw, 12) != 1) goto done;
+    ctx = api.EVP_CIPHER_CTX_new();
+    if (!ctx || api.EVP_EncryptInit_ex(ctx, api.EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        api.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
+        api.EVP_EncryptInit_ex(ctx, NULL, NULL, session_key, raw) != 1 ||
+        api.EVP_EncryptUpdate(ctx, raw + 28, &produced,
+                              (const unsigned char *)value, (int)plain_len) != 1 ||
+        api.EVP_EncryptFinal_ex(ctx, raw + 28 + produced, &final_len) != 1 ||
+        api.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, raw + 12) != 1)
+        goto done;
+    ok = base64_encode(raw, 28 + (size_t)produced + (size_t)final_len,
+                       out, outlen) != 0;
+
+done:
+    if (ctx) api.EVP_CIPHER_CTX_free(ctx);
     if (raw) {
         memset(raw, 0, raw_cap);
         free(raw);

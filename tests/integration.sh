@@ -13,6 +13,7 @@ TOKEN_FILE="$ROOT/tests/auth.token"
 CALL_LOG="$ROOT/tests/mock-calls.log"
 CHILD_FD_LOG="$ROOT/tests/child-fds.log"
 MU5252_CALL_LOG="$ROOT/tests/mu5252-calls.log"
+MOCK_CURL_LOG="$ROOT/tests/mock-curl.log"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
@@ -47,6 +48,7 @@ cleanup() {
     [ -n "$MC8532B_PID" ] && kill "$MC8532B_PID" 2>/dev/null || true
     [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$CHILD_FD_LOG" "$MU5252_CALL_LOG" \
+        "$MOCK_CURL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
     rm -rf "$COOLING_TMP"
 }
@@ -55,7 +57,8 @@ trap cleanup EXIT INT TERM
 printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$CALL_LOG"
 : >"$CHILD_FD_LOG"
-chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh"
+: >"$MOCK_CURL_LOG"
+chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh" "$ROOT/tests/mock_curl.sh"
 export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
@@ -375,6 +378,8 @@ MOCK_SIM_SLOT=2 \
 MOCK_NWINFO_FAIL=1 \
 MOCK_ENCRYPTED_SIM=1 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_CURL_BIN="$ROOT/tests/mock_curl.sh" \
+MOCK_CURL_LOG="$MOCK_CURL_LOG" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
 ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
@@ -696,6 +701,8 @@ MOCK_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
 MOCK_MODEL_NAME=MU5252 \
 ZWRT_DATAD_ADB_BIN="$ROOT/tests/mock_adb.sh" \
+ZWRT_DATAD_CURL_BIN="$ROOT/tests/mock_curl.sh" \
+MOCK_CURL_LOG="$MOCK_CURL_LOG" \
 ZWRT_DATAD_FAN_PWM_PATH="$COOLING_TMP/pwm1" \
 ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$COOLING_TMP/fan_thermal_enable" \
 ZWRT_DATAD_FAN_COOLING_STATE_PATH="$COOLING_TMP/fan_cooling_state" \
@@ -742,6 +749,8 @@ ZWRT_DATAD_LIQUID_DRIVE_PATH="$COOLING_TMP/liquid_drive" \
 ZWRT_DATAD_COOLING_ZONE_PATH="$COOLING_TMP/zone" \
 ZWRT_DATAD_COOLING_CONFIG="$COOLING_TMP/cooling.conf" \
 MOCK_ADB_CALL_LOG="$MU5252_CALL_LOG" \
+ZWRT_DATAD_CURL_BIN="$ROOT/tests/mock_curl.sh" \
+MOCK_CURL_LOG="$MOCK_CURL_LOG" \
 ZWRT_DATAD_MWAN3_INIT=/usr/bin/true \
 "$BIN" -i 200 -p "$TOPFLOW_PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 TOPFLOW_PID=$!
@@ -752,6 +761,19 @@ until curl -fsS "http://127.0.0.1:$TOPFLOW_PORT/healthz" >/dev/null; do
     [ "$i" -lt 50 ] || { echo 'TopFlow test server did not start' >&2; exit 1; }
     sleep 0.1
 done
+
+curl -fsS -H 'X-Auth-Token: fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"sms.send_raw","params":{"sender":"v3e1","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["ok"] is True
+assert data["result"]["sender"] == "v3e1"
+assert data["result"]["status"] == 3
+'
+grep -F 'http://192.168.56.1/goform/goform_set_cmd_process' "$MOCK_CURL_LOG" >/dev/null
+grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$MOCK_CURL_LOG" >/dev/null
 
 curl -fsS -H 'X-Auth-Token: fixture-private-token' \
     -H 'Content-Type: application/json' \

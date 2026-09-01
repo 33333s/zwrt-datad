@@ -10,6 +10,7 @@
 #include "control.h"
 #include "device_exec.h"
 #include "json.h"
+#include "web_crypto.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -846,6 +847,146 @@ static int control_sim_slot(const char *params, char *result, size_t result_len,
     snprintf(args, sizeof args, "{\"active_slot\":%ld,\"active_flag\":1}", slot);
     return ubus_call("zwrt_zte_mdm.api", "zwrt_mdm_change_provision_session",
                      args, result, result_len, err, errlen);
+}
+
+static long sms_current_slot(void)
+{
+    char reply[4096];
+    long current;
+    if (device_ubus_call("zwrt_zte_mdm.api", "get_sim_info", NULL,
+                         reply, sizeof reply) != 0)
+        return 0;
+    current = json_get_int(reply, "current_sim_slot", 0);
+    if (current == 0) current = json_get_int(reply, "sim_slot", 0);
+    return current;
+}
+
+static int sms_wait_for_slot(long slot, char *err, size_t errlen)
+{
+    for (int attempt = 0; attempt < 30; attempt++) {
+        if (sms_current_slot() == slot) return 1;
+        usleep(500000);
+    }
+    snprintf(err, errlen, "SIM slot %ld did not become active", slot);
+    return 0;
+}
+
+static int sms_poll_host_status(char *result, size_t result_len,
+                                char *err, size_t errlen)
+{
+    char reply[4096];
+    for (int attempt = 0; attempt < 20; attempt++) {
+        long status;
+        usleep(500000);
+        if (device_ubus_call("zwrt_wms", "zwrt_wms_get_cmd_status",
+                             "{\"sms_cmd\":4}", reply, sizeof reply) != 0)
+            continue;
+        status = json_get_int(reply, "sms_cmd_status_result", -1);
+        if (status == 3) {
+            snprintf(result, result_len, "{\"sender\":\"host\",\"status\":3}");
+            return 1;
+        }
+        if (status == 2) {
+            snprintf(err, errlen, "zwrt_wms SMS command failed");
+            return 0;
+        }
+    }
+    snprintf(err, errlen, "zwrt_wms SMS command timed out");
+    return 0;
+}
+
+static int sms_send_host(const char *number, const char *message_hex,
+                         const char *sms_time, char *result, size_t result_len,
+                         char *err, size_t errlen)
+{
+    char encrypted_number[512], encrypted_message[8192], args[12288], initial[4096];
+    struct json_buf b = {args, sizeof args, 0};
+    if (!web_crypto_encrypt_envelope(number, encrypted_number, sizeof encrypted_number) ||
+        !web_crypto_encrypt_envelope(message_hex, encrypted_message, sizeof encrypted_message)) {
+        snprintf(err, errlen, "vendor SMS crypto session unavailable");
+        return 0;
+    }
+    jb_add(&b, "{\"number\":"); jb_string(&b, encrypted_number);
+    jb_add(&b, ",\"message_body\":"); jb_string(&b, encrypted_message);
+    jb_add(&b, ",\"sms_time\":"); jb_string(&b, sms_time);
+    jb_add(&b, ",\"encode_type\":\"UNICODE\",\"id\":\"-1\"}");
+    if (b.len + 1 >= b.cap ||
+        !ubus_call("zwrt_wms", "zte_libwms_send_sms", args,
+                   initial, sizeof initial, err, errlen))
+        return 0;
+    return sms_poll_host_status(result, result_len, err, errlen);
+}
+
+static int sms_valid_external_input(const char *number, const char *message_hex,
+                                    const char *sms_time)
+{
+    size_t n = number ? strlen(number) : 0;
+    size_t m = message_hex ? strlen(message_hex) : 0;
+    size_t t = sms_time ? strlen(sms_time) : 0;
+    if (!n || n > 32 || !m || m > 4096 || (m % 2) != 0 || !t || t > 64) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isdigit((unsigned char)number[i]) && !(i == 0 && number[i] == '+')) return 0;
+    for (size_t i = 0; i < m; i++)
+        if (!isxdigit((unsigned char)message_hex[i])) return 0;
+    for (size_t i = 0; i < t; i++)
+        if (!isdigit((unsigned char)sms_time[i]) && sms_time[i] != ';' &&
+            sms_time[i] != '+' && sms_time[i] != '-') return 0;
+    return 1;
+}
+
+static int sms_send_external(const char *sender, const char *number,
+                             const char *message_hex, const char *sms_time,
+                             char *result, size_t result_len,
+                             char *err, size_t errlen)
+{
+    const char *host = !strcmp(sender, "v3e1") ? "192.168.56.1" : "192.168.57.1";
+    char url[128], form[8192], reply[4096], encoded_number[96], encoded_time[192];
+    size_t pos = 0;
+    if (strcmp(sender, "v3e1") && strcmp(sender, "v3e2")) {
+        snprintf(err, errlen, "invalid external SMS sender");
+        return 0;
+    }
+    if (!sms_valid_external_input(number, message_hex, sms_time)) {
+        snprintf(err, errlen, "invalid external SMS parameters");
+        return 0;
+    }
+    for (const char *p = number; *p && pos + 4 < sizeof encoded_number; p++) {
+        if (*p == '+') {
+            memcpy(encoded_number + pos, "%2B", 3);
+            pos += 3;
+        } else {
+            encoded_number[pos++] = *p;
+        }
+    }
+    encoded_number[pos] = 0;
+    pos = 0;
+    for (const char *p = sms_time; *p && pos + 4 < sizeof encoded_time; p++) {
+        if (*p == '+') {
+            memcpy(encoded_time + pos, "%2B", 3);
+            pos += 3;
+        } else {
+            encoded_time[pos++] = *p;
+        }
+    }
+    encoded_time[pos] = 0;
+    snprintf(url, sizeof url, "http://%s/goform/goform_set_cmd_process", host);
+    if (snprintf(form, sizeof form,
+                 "goformId=SEND_SMS&Number=%s&MessageBody=%s&ID=-1&encode_type=UNICODE&sms_time=%s",
+                 encoded_number, message_hex, encoded_time) >= (int)sizeof form) {
+        snprintf(err, errlen, "external SMS form too large");
+        return 0;
+    }
+    if (device_http_post_form(url, form, reply, sizeof reply, 20000) != 0) {
+        snprintf(err, errlen, "%s SMS endpoint unavailable", sender);
+        return 0;
+    }
+    if (!strstr(reply, "\"result\":\"success\"") &&
+        !strstr(reply, "\"result\": \"success\"")) {
+        snprintf(err, errlen, "%s SMS send failed", sender);
+        return 0;
+    }
+    snprintf(result, result_len, "{\"sender\":\"%s\",\"status\":3}", sender);
+    return 1;
 }
 
 static int control_nfc(const char *params, char *result, size_t result_len,
@@ -2204,16 +2345,39 @@ struct control_result control_execute(const char *request_json,
         static const struct param_spec specs[] = {
             {"number", "number", PARAM_STRING, 1},
             {"message_hex", "message_body", PARAM_STRING, 1},
-            {"sms_time", "sms_time", PARAM_STRING, 1}
+            {"sms_time", "sms_time", PARAM_STRING, 1},
+            {"sender", "sender", PARAM_STRING, 0}
         };
-        char args[CONTROL_UBUS_ARGS_MAX], partial[CONTROL_UBUS_ARGS_MAX];
-        struct json_buf b = {args, sizeof args, 0};
-        if (build_args(params, specs, 3, partial, sizeof partial, err, sizeof err)) {
-            size_t n = strlen(partial); if (n && partial[n - 1] == '}') partial[n - 1] = 0;
-            jb_add(&b, "%s,\"encode_type\":\"UNICODE\",\"id\":\"-1\"}", partial);
-            ok = ubus_call("zwrt_wms", "zte_libwms_send_sms", args,
-                           result, sizeof result, err, sizeof err);
+        char ignored[CONTROL_UBUS_ARGS_MAX];
+        char number[64], message_hex[8192], sms_time[64], sender[32];
+        if (build_args(params, specs, 4, ignored, sizeof ignored, err, sizeof err) &&
+            param_value(params, "number", number, sizeof number) &&
+            param_value(params, "message_hex", message_hex, sizeof message_hex) &&
+            param_value(params, "sms_time", sms_time, sizeof sms_time)) {
+            if (!param_value(params, "sender", sender, sizeof sender) || !sender[0])
+                snprintf(sender, sizeof sender, "host");
+            if (!strcmp(sender, "v3e1") || !strcmp(sender, "v3e2")) {
+                ok = sms_send_external(sender, number, message_hex, sms_time,
+                                       result, sizeof result, err, sizeof err);
+            } else {
+                if (!strcmp(sender, "sim1") || !strcmp(sender, "sim2")) {
+                    char slot_params[32], slot_result[4096];
+                    long slot = sender[3] - '0';
+                    snprintf(slot_params, sizeof slot_params, "{\"slot\":%ld}", slot);
+                    if (sms_current_slot() != slot &&
+                        (!control_sim_slot(slot_params, slot_result, sizeof slot_result,
+                                           err, sizeof err) ||
+                         !sms_wait_for_slot(slot, err, sizeof err)))
+                        goto sms_send_done;
+                } else if (strcmp(sender, "host") && strcmp(sender, "x75")) {
+                    set_invalid_error(err, sizeof err, "invalid SMS sender");
+                    goto sms_send_done;
+                }
+                ok = sms_send_host(number, message_hex, sms_time,
+                                   result, sizeof result, err, sizeof err);
+            }
         }
+sms_send_done: ;
     } else if (!strcmp(action, "sms.delete")) {
         static const struct param_spec specs[] = {{"ids", "id", PARAM_STRING, 1}};
         ok = call_specs(params, "zwrt_wms", "zwrt_wms_delete_sms", specs, 1,

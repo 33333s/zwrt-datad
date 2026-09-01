@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.21",
+    "version": "0.9.22",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MU5252 WiFi 功率与风扇三模式控制，补全三基带漫游、QoS 和频宽状态，并修正 SIM 身份与 MultiWAN 探测摘要"
+    "notes": "补全 TopFlow 多基带短信发送：主机 AES-GCM 加密与状态轮询，以及 V3E1/V3E2/SIM 卡槽发送路由"
   }
 }

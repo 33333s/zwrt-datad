@@ -25,4 +25,10 @@ void web_crypto_reset(void);
  */
 int web_crypto_decrypt_envelope(const char *value, char *out, size_t outlen);
 
+/*
+ * Encrypt plaintext as Base64(12-byte nonce || 16-byte tag || ciphertext)
+ * with the currently registered vendor Web AES-256-GCM session.
+ */
+int web_crypto_encrypt_envelope(const char *value, char *out, size_t outlen);
+
 #endif
