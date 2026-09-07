@@ -87,7 +87,7 @@ func TestMQTTTLSReportAndCancel(t *testing.T) {
 		}
 	}()
 	state := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"device":{"firmware_version":"test"},"system":{"memory":{"used":12}},"password":"do-not-upload"}`))
+		w.Write([]byte(`{"system":{"sw_version":"test","cpu_usage":23,"mem_used_pct":42},"thermal":{"cpu_celsius":51},"password":"do-not-upload"}`))
 	}))
 	defer state.Close()
 	c := validConfig()
@@ -111,12 +111,21 @@ func TestMQTTTLSReportAndCancel(t *testing.T) {
 			}
 			if p["model"] == "MU5252" {
 				found["device"] = true
+				if p["firmware_version"] != "test" {
+					t.Fatal("missing firmware version")
+				}
 			}
 			if p["online"] == true {
 				found["online"] = true
 			}
 			if _, ok := p["boot_id"]; ok {
 				found["system"] = true
+				cpu, _ := p["cpu"].(map[string]any)
+				mem, _ := p["memory"].(map[string]any)
+				temp, _ := p["temperature"].(map[string]any)
+				if cpu["usage_percent"] != float64(23) || mem["usage_percent"] != float64(42) || temp["cpu_celsius"] != float64(51) {
+					t.Fatal("incorrect NMS resource schema", p)
+				}
 			}
 		case <-time.After(8 * time.Second):
 			t.Fatal("missing telemetry", found)
