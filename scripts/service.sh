@@ -63,9 +63,14 @@ running_pid() {
     return 1
 }
 
+cloud_service() {
+    [ ! -f "$SERVICE_DIR/cloud-service.sh" ] || sh "$SERVICE_DIR/cloud-service.sh" "$1"
+}
+
 start() {
     active_pid="$(running_pid)"
     if [ -n "$active_pid" ]; then
+        cloud_service start
         echo "zwrt-datad 正在运行 (PID $active_pid)"
         return 0
     fi
@@ -94,12 +99,14 @@ start() {
     sleep 1
     if process_matches "$launched_pid"; then
         write_pid "$launched_pid" || true
+        cloud_service start
         echo "zwrt-datad 已启动 (PID $launched_pid)"
         return 0
     fi
     active_pid="$(find_running_pid)"
     if [ -n "$active_pid" ]; then
         write_pid "$active_pid" || true
+        cloud_service start
         echo "zwrt-datad 已启动 (PID $active_pid)"
         return 0
     fi
@@ -109,6 +116,7 @@ start() {
 }
 
 stop() {
+    cloud_service stop
     active_pid="$(running_pid)"
     if [ -z "$active_pid" ]; then
         rm -f "$PID_FILE"
