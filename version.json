@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.23",
+    "version": "0.9.24",
     "asset": "zwrt-datad-aarch64",
-    "notes": "完善 MC8532B 完整 ubus 与无线 UCI 适配：补齐 LTE 小区字段，并为网络快照提供 zte_nwinfo 回退"
+    "notes": "新增隔离的 NMS 云端连接、MQTTS 遥测与受控反向通道"
   }
 }

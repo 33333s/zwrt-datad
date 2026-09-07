@@ -12,7 +12,7 @@ jobs:
       - name: Build with strict warnings
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/main.c \
+            src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/main.c \
             -ldl -o zwrt-datad-test
       - name: Test JSON helpers
         run: |
@@ -32,3 +32,9 @@ jobs:
         run: |
           chmod +x tests/integration.sh tests/mock_ubus.sh tests/mock_uci.sh
           tests/integration.sh ./zwrt-datad-test
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Test cloud worker
+        working-directory: cloud
+        run: go test -race ./... && go vet ./...

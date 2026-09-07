@@ -13,6 +13,7 @@
 #include "device_exec.h"
 #include "system_ext.h"
 #include "web_crypto.h"
+#include "cloud_proxy.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -4975,6 +4976,18 @@ static void accept_ready_http_clients(const struct http_listener *listener,
 
         if (open_auth_route && !strcmp(path, "/auth/exchange")) {
             handle_auth_exchange(cli_fd, req, query, &peer, auth);
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/cloud/config") || !strcmp(path, "/cloud/status")) {
+            if (listener->lan_only || (ntohl(peer.sin_addr.s_addr) >> 24) != 127) write_http_error(cli_fd, 403, "Forbidden");
+            else if (strcmp(method, "GET") && (strcmp(method, "POST") || strcmp(path, "/cloud/config")))
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+            else {
+                const char *body = strstr(req, "\r\n\r\n");
+                cloud_proxy(cli_fd, method, path, body ? body + 4 : "");
+            }
             close(cli_fd);
             continue;
         }
