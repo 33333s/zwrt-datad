@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.24",
+    "version": "0.9.25",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增隔离的 NMS 云端连接、MQTTS 遥测与受控反向通道"
+    "notes": "将实际 datad CPU、内存、温度和固件版本字段映射到 NMS v1 遥测格式"
   }
 }

@@ -358,8 +358,11 @@ func (a *agent) report(ctx context.Context, client mqtt.Client, c Config) error 
 	} else {
 		a.setStatus("connected", "")
 	}
-	dev, _ := state["device"].(map[string]any)
-	fw, _ := dev["firmware_version"].(string)
+	rawSystem, _ := state["system"].(map[string]any)
+	fw, _ := rawSystem["sw_version"].(string)
+	if fw == "" {
+		fw, _ = rawSystem["fw"].(string)
+	}
 	if e = publish(client, root(c)+"/telemetry/device", map[string]any{"vendor": c.Vendor, "model": c.Model, "device_id": c.Identity, "id_type": c.IdentityType, "platform": c.Platform, "agent_version": version, "firmware_version": fw, "capabilities": []string{}, "remote_services": c.Services, "remote_enabled": c.RemoteEnabled}); e != nil {
 		return e
 	}
@@ -367,14 +370,7 @@ func (a *agent) report(ctx context.Context, client mqtt.Client, c Config) error 
 		return e
 	}
 	// Upload only selected non-secret resource metrics, never raw /state or modem credentials.
-	system := map[string]any{}
-	if s, ok := state["system"].(map[string]any); ok {
-		for _, k := range []string{"cpu", "memory", "temperature", "uptime"} {
-			if v, ok := s[k]; ok {
-				system[k] = v
-			}
-		}
-	}
+	system := systemTelemetry(state)
 	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	system["boot_id"] = strings.TrimSpace(string(boot))
 	up, _ := os.ReadFile("/proc/uptime")
