@@ -243,7 +243,8 @@ static const struct device_template_spec TEMPLATE_G5PRO_MC8532B = {
     TEMP_SOURCE_COMPAT_FALLBACK,
     NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK,
     TRAFFIC_SOURCE_CID1,
-    OPTIONAL_SECTION_AUTO,
+    /* Mains-powered CPE: firmware exposes zero-filled battery placeholders. */
+    OPTIONAL_SECTION_HIDDEN,
     OPTIONAL_SECTION_AUTO,
     OPTIONAL_SECTION_AUTO,
     OPTIONAL_SECTION_AUTO

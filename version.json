@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.25",
+    "version": "0.9.26",
     "asset": "zwrt-datad-aarch64",
-    "notes": "将实际 datad CPU、内存、温度和固件版本字段映射到 NMS v1 遥测格式"
+    "notes": "修复 MC8532B 无电池 CPE 被固件零值误判为有电池，隐藏电池及兼容字段"
   }
 }
