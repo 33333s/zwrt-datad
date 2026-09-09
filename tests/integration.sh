@@ -1327,6 +1327,9 @@ login_json="$(curl -fsS -u admin:fixture-password -X POST \
 access_token="$(printf '%s' "$login_json" | python3 -c \
     'import json,sys; print(json.load(sys.stdin)["access_token"])')"
 [ "${#access_token}" = "48" ]
+code="$(curl -sS -o /dev/null -w '%{http_code}' -u admin:wrong-fixture-password -X POST "http://127.0.0.1:$LAN_PORT/auth/login")"
+[ "$code" = "401" ]
+
 
 long_basic="$(python3 -c '
 import base64

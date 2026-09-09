@@ -225,3 +225,5 @@ TopFlow 的短信密文使用设备自带 OpenSSL 3 的 AES-256-GCM 解密。dat
 ## 许可
 
 [MIT](LICENSE)
+
+LAN Basic login accepts the actual web password. datad fetches a fresh `web_login_info.zte_web_sault` challenge and submits uppercase SHA256(uppercase SHA256(password) + salt), matching the native web UI. Missing challenges fail closed; failed logins are never retried with alternate password formats.
