@@ -13,6 +13,7 @@
 #include "device_exec.h"
 #include "system_ext.h"
 #include "web_crypto.h"
+#include "password_auth.h"
 #include "cloud_proxy.h"
 
 #include <arpa/inet.h>
@@ -4595,10 +4596,16 @@ static int auth_verify_password_login(const char *username, const char *password
 {
     char args[HTTP_AUTH_ARG_MAX];
     char reply[HTTP_AUTH_REPLY_MAX];
+    char salt[257], response[65];
     struct buf b = {args, sizeof args, 0};
     if (!username || !*username || !password) return 0;
+    /* Match the native web UI. Fetch a fresh challenge for each attempt;
+     * never retry raw passwords or reuse an old salt after a rejection. */
+    if (run_ubus("zwrt_web", "web_login_info", "{}", reply, sizeof reply) != 0 ||
+        !auth_reply_field_string(reply, "zte_web_sault", salt, sizeof salt) ||
+        !password_vendor_response(password, salt, response)) return 0;
     bappend(&b, "{\"username\":\""); bappend_json_esc(&b, username);
-    bappend(&b, "\",\"password\":\""); bappend_json_esc(&b, password); bappend(&b, "\"}");
+    bappend(&b, "\",\"password\":\""); bappend_json_esc(&b, response); bappend(&b, "\"}");
     return run_ubus("zwrt_web", "web_login", args, reply, sizeof reply) == 0 &&
         auth_reply_indicates_success(reply);
 }

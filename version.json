@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.26",
+    "version": "0.9.27",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 MC8532B 无电池 CPE 被固件零值误判为有电池，隐藏电池及兼容字段"
+    "notes": "修复 LAN Basic 登录，按原厂随机盐生成双 SHA-256 密码响应"
   }
 }

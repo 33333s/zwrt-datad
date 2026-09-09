@@ -90,6 +90,12 @@ case "$service:$method" in
         printf '%s\n' '{"list":[]}'
         ;;
     zwrt_web:web_login)
+        if printf '%s' "$args" | grep -q '"username"'; then
+            case "$args" in
+                *"20BDBB3CF6843057DE843F378D0F5989CC2C3DB4F66708C85C12C90337322198"*) ;;
+                *) printf '%s\n' '{"result":1}'; exit 0 ;;
+            esac
+        fi
         printf '%s\n' '{"result":0,"ubus_rpc_session":"fixture-session"}'
         ;;
     zwrt_web:web_login_info)
