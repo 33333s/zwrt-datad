@@ -1239,6 +1239,11 @@ data = json.load(sys.stdin)
 assert data["device"]["api_template"] == "MC8532B"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
+# The mock returns battery fields (including a valid zero-percent reading).
+# MC8532B has no battery: do not advertise placeholders as a real battery.
+assert "battery" not in data
+assert not any(key.startswith("battery_") for key in data["uci_device_info"])
+assert "power_adapter" not in data["uci_device_info"]
 assert data["modems"] == []
 assert data["net"]["lte_pci"] == 0
 assert data["net"]["lte_cell_id"] == 0
@@ -1264,6 +1269,8 @@ import json, sys
 data = json.load(sys.stdin)
 assert data["device"]["api_template"] == "MC8532B"
 assert data["net"]["type"] == "SA"
+assert "battery" not in data
+assert not any(key.startswith("battery_") for key in data["uci_device_info"])
 assert data["net"]["bars"] == 4
 assert data["net"]["operator"] == "Fixture TopFlow Mobile"
 assert data["net"]["lte_pci"] == 123
