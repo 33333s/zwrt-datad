@@ -241,6 +241,20 @@ static unsigned long long count_table(const char *path, int has_header)
     return count;
 }
 
+static unsigned long long count_tcp_established(void)
+{
+    FILE *fp = fopen("/proc/net/tcp", "r");
+    char line[512];
+    unsigned long long count = 0;
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        unsigned state;
+        if (sscanf(line, "%*s %*s %*s %x", &state) == 1 && state == 1) count++;
+    }
+    fclose(fp);
+    return count;
+}
+
 static int iface_bytes(const char *name, unsigned long long *rx, unsigned long long *tx)
 {
     char path[192];
@@ -248,6 +262,29 @@ static int iface_bytes(const char *name, unsigned long long *rx, unsigned long l
     if (!read_ull(path, rx)) return 0;
     snprintf(path, sizeof path, "/sys/class/net/%s/statistics/tx_bytes", name);
     return read_ull(path, tx);
+}
+
+static void emit_link_rates(struct json_buf *b)
+{
+    static const char *names[] = {"rmnet_data0", "V3E1net0", "V3E2net0", "eth0"};
+    static struct speed_sample previous[4];
+    long long now = now_ms();
+    int emitted = 0;
+    add(b, "\"link_rates\":[");
+    for (int i = 0; i < 4; i++) {
+        unsigned long long rx, tx;
+        if (!iface_bytes(names[i], &rx, &tx)) { previous[i].at_ms = 0; continue; }
+        long long window = now - previous[i].at_ms;
+        int valid = previous[i].at_ms > 0 && window > 0 && rx >= previous[i].rx && tx >= previous[i].tx;
+        if (emitted++) add(b, ",");
+        add(b, "{\"interface\":\"%s\",\"source\":\"netdev\",\"window_ms\":%lld,\"rx_bytes\":%llu,\"tx_bytes\":%llu,", names[i], valid ? window : 0, rx, tx);
+        if (valid) add(b, "\"rx_bps\":%.0f,\"tx_bps\":%.0f}",
+            (double)(rx - previous[i].rx) * 1000.0 / window,
+            (double)(tx - previous[i].tx) * 1000.0 / window);
+        else add(b, "\"rx_bps\":null,\"tx_bps\":null}");
+        previous[i] = (struct speed_sample){rx, tx, now};
+    }
+    add(b, "],");
 }
 
 static void user_bytes(unsigned long long *rx, unsigned long long *tx)
@@ -347,10 +384,15 @@ int system_ext_build_json(char *out, size_t outlen,
             total, total >= free_bytes ? total - free_bytes : 0, avail);
     } else add(&b, "\"storage\":{\"total\":0,\"used\":0,\"available\":0},");
 
-    add(&b, "\"connections\":{\"tcp4\":%llu,\"tcp6\":%llu,\"udp4\":%llu,\"udp6\":%llu,\"unix\":%llu},",
-        count_table("/proc/net/tcp", 1), count_table("/proc/net/tcp6", 1),
+    unsigned long long tcp4 = count_table("/proc/net/tcp", 1);
+    unsigned long long active = count_tcp_established();
+    if (active > tcp4) active = tcp4;
+    add(&b, "\"connections\":{\"tcp_active\":%llu,\"tcp_other\":%llu,\"tcp4\":%llu,\"tcp6\":%llu,\"udp4\":%llu,\"udp6\":%llu,\"unix\":%llu},",
+        active, tcp4 - active,
+        tcp4, count_table("/proc/net/tcp6", 1),
         count_table("/proc/net/udp", 1), count_table("/proc/net/udp6", 1),
         count_table("/proc/net/unix", 1));
+    emit_link_rates(&b);
     add(&b, "\"throughput\":{\"rx_bps\":%llu,\"tx_bps\":%llu,\"window_ms\":%lld}}",
         rx_bps, tx_bps, speed_window_ms);
     return total_usage;

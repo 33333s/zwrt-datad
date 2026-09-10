@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -1999,6 +2000,9 @@ static void refresh_topflow_aggregation_cache(void)
     time_t now = time(NULL);
     int enabled;
 
+    // The custom QUIC client owns its telemetry, not the stock ICG manager.
+    if (proc_find_command("icg-client") > 0) return;
+
     if (run_ubus("mwan3", "status", NULL, next, sizeof next) == 0)
         copy_text(g_topflow_mwan3_status, sizeof g_topflow_mwan3_status, next);
     if (now >= g_topflow_mwan3_config_next_at) {
@@ -2308,9 +2312,109 @@ static void emit_topflow_aggregation_paths(struct buf *b, int *path_count,
     bappend(b, "]");
 }
 
+static int emit_custom_aggregation(struct buf *b, int enabled, const char *mode)
+{
+    int pid = proc_find_command("icg-client");
+    if (pid <= 0) return 0;
+    char status[16384], lanes[15000], lane[1024];
+    int fresh = read_line_file(runtime_path("ZWRT_DATAD_ICG_STATUS_PATH", "/tmp/icg-v3-status.json"), status, sizeof status);
+    time_t age = time(NULL) - json_get_int(status, "timestamp", 0);
+    fresh = fresh && json_get_int(status, "schema", 0) == 1 &&
+        json_get_int(status, "pid", 0) == pid && age >= 0 && age <= 5;
+    struct custom_path {
+        char ip[64], iface[64];
+        int lanes, online, rates;
+        double rx, tx, rtt, sent, lost, uptime;
+        int loss_samples, uptime_samples;
+    } paths[16] = {0};
+    int count = 0, online = 0, tunnels = 0, port = 0;
+    char server[64] = "";
+    struct ifaddrs *addresses = NULL;
+    (void)getifaddrs(&addresses);
+    if (fresh && json_get(status, "lanes", lanes, sizeof lanes)) {
+        const char *cursor = lanes;
+        while ((cursor = copy_next_json_object(cursor, lane, sizeof lane)) != NULL) {
+            char ip[64] = "";
+            if (!json_get(lane, "local_ip", ip, sizeof ip)) continue;
+            int index;
+            for (index = 0; index < count; index++) if (!strcmp(paths[index].ip, ip)) break;
+            if (index == count) {
+                if (count == 16) break;
+                copy_text(paths[index].ip, sizeof paths[index].ip, ip);
+                for (struct ifaddrs *it = addresses; it; it = it->ifa_next) {
+                    char text[INET6_ADDRSTRLEN];
+                    if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
+                    struct sockaddr_in *addr = (struct sockaddr_in *)it->ifa_addr;
+                    if (inet_ntop(AF_INET, &addr->sin_addr, text, sizeof text) && !strcmp(text, ip)) {
+                        copy_text(paths[index].iface, sizeof paths[index].iface, it->ifa_name);
+                        break;
+                    }
+                }
+                count++;
+            }
+            if (!server[0]) {
+                (void)json_get(lane, "server_ip", server, sizeof server);
+                port = json_get_int(lane, "server_port", 0);
+            }
+            struct custom_path *p = &paths[index];
+            p->lanes++;
+            int live = json_bool_or(lane, "online", 0);
+            p->online += live;
+            if (live) {
+                double rx = json_double_or(lane, "rx_bps", -1);
+                double tx = json_double_or(lane, "tx_bps", -1);
+                if (rx >= 0 && tx >= 0) { p->rates++; p->rx += rx; p->tx += tx; }
+                p->rtt += json_double_or(lane, "rtt_us", 0) / 1000.0;
+                double sent = json_double_or(lane, "sent_packets", -1);
+                double lost = json_double_or(lane, "lost_packets", -1);
+                if (sent >= 0 && lost >= 0) { p->sent += sent; p->lost += lost; p->loss_samples++; }
+                double uptime = json_double_or(lane, "uptime_seconds", -1);
+                if (uptime >= 0) {
+                    // Oldest surviving authenticated lane: a partial lane reconnect
+                    // must not reset the whole physical path's online time.
+                    if (uptime > p->uptime) p->uptime = uptime;
+                    p->uptime_samples++;
+                }
+            }
+        }
+    }
+    if (addresses) freeifaddrs(addresses);
+    for (int i = 0; i < count; i++) { online += paths[i].online > 0; tunnels += paths[i].online; }
+    bappend(b, "\"aggregation\":{\"enabled\":%s,\"mode\":\"", enabled ? "true" : "false");
+    bappend_json_esc(b, mode);
+    bappend(b, "\",\"source\":\"icg-v3\",\"transport\":\"quic\",\"state\":\"%s\",\"online\":%s,"
+        "\"telemetry_fresh\":%s,\"controller\":{\"icg_process_running\":true},\"quic_tunnel_count\":%d,"
+        "\"path_count\":%d,\"online_path_count\":%d,\"server\":{\"source\":\"runtime\",\"ip\":\"",
+        !enabled ? "disabled" : tunnels ? "online" : "waiting", enabled && tunnels ? "true" : "false",
+        fresh ? "true" : "false", tunnels, count, online);
+    bappend_json_esc(b, server);
+    bappend(b, "\",\"udp_port\":%d},\"traffic\":{\"remaining_bytes\":null,\"source\":\"unavailable\"},\"paths\":[", port);
+    for (int i = 0; i < count; i++) {
+        struct custom_path *p = &paths[i];
+        const char *label = !strcmp(p->iface, "rmnet_data0") ? "X75" :
+            !strcmp(p->iface, "V3E1net0") ? "V3E1" : !strcmp(p->iface, "V3E2net0") ? "V3E2" :
+            !strcmp(p->iface, "eth0") ? "Ethernet" : p->ip;
+        bappend(b, "%s{\"id\":\"", i ? "," : ""); bappend_json_esc(b, p->ip);
+        bappend(b, "\",\"label\":\""); bappend_json_esc(b, label);
+        bappend(b, "\",\"interface\":\""); bappend_json_esc(b, p->iface);
+        bappend(b, "\",\"online\":%s,\"quic_tunnel_count\":%d,\"configured_tunnels\":%d",
+            p->online ? "true" : "false", p->online, p->lanes);
+        if (p->online) bappend(b, ",\"latency_ms\":%.2f", p->rtt / p->online);
+        if (p->online && p->rates == p->online) bappend(b, ",\"rx_bps\":%.0f,\"tx_bps\":%.0f", p->rx, p->tx);
+        if (p->online && p->loss_samples == p->online && p->sent > 0)
+            bappend(b, ",\"packet_loss_percent\":%.3f,\"packet_loss_source\":\"quic_tx_lifetime\"", 100.0 * p->lost / p->sent);
+        if (p->online && p->uptime_samples == p->online)
+            bappend(b, ",\"uptime_seconds\":%.0f", p->uptime);
+        bappend(b, "}");
+    }
+    bappend(b, "]},");
+    return 1;
+}
+
 static void emit_topflow_aggregation(struct buf *b, int enabled,
                                      const char *aggregation_mode)
 {
+    if (emit_custom_aggregation(b, enabled, aggregation_mode)) return;
     char remaining[128] = "", today_used[128] = "";
     int path_count, online_path_count;
     const char *state = !enabled ? "disabled" :

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.28",
+    "version": "0.9.29",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复静态 ARM64 构建的短信解密，内嵌 OpenSSL libcrypto"
+    "notes": "新增自定义 QUIC 聚合遥测、物理链路速率及 TCP 连接分类"
   }
 }
