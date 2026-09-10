@@ -227,3 +227,7 @@ TopFlow 的短信密文使用设备自带 OpenSSL 3 的 AES-256-GCM 解密。dat
 [MIT](LICENSE)
 
 LAN Basic login accepts the actual web password. datad fetches a fresh `web_login_info.zte_web_sault` challenge and submits uppercase SHA256(uppercase SHA256(password) + salt), matching the native web UI. Missing challenges fail closed; failed logins are never retried with alternate password formats.
+
+### Static SMS cryptography
+
+The ARM64 musl build links OpenSSL libcrypto directly (`WEB_CRYPTO_STATIC`); it must not depend on `dlopen`, which static musl does not support. `scripts/build-static-crypto.sh` downloads the pinned OpenSSL 3.5.8 LTS source from openssl.org, checks SHA256, and caches a no-shared/no-module/no-dso build under `~/.cache/zwrt-datad/`. The build needs curl, tar, make and Perl. Native developer builds retain the existing dynamically loaded backend. Never treat an unread count alone as successful SMS-list validation.

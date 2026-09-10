@@ -39,3 +39,6 @@ scripts/_*.sh
 
 /zwrt-datad-cloud-aarch64
 /cloud/cloud
+
+/web-crypto-test
+/zwrt-datad-linked-test

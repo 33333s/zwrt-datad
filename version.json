@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.27",
+    "version": "0.9.28",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 LAN Basic 登录，按原厂随机盐生成双 SHA-256 密码响应"
+    "notes": "修复静态 ARM64 构建的短信解密，内嵌 OpenSSL libcrypto"
   }
 }
