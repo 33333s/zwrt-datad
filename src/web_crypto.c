@@ -1,12 +1,23 @@
 #include "web_crypto.h"
 
 #include <ctype.h>
+#ifndef WEB_CRYPTO_STATIC
 #include <dlfcn.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WEB_CRYPTO_STATIC
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#else
+typedef struct engine_st ENGINE;
+typedef int pem_password_cb(char *, int, int, void *);
 typedef struct bio_st BIO;
 typedef struct evp_pkey_st EVP_PKEY;
 typedef struct evp_pkey_ctx_st EVP_PKEY_CTX;
@@ -17,14 +28,15 @@ typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
 #define EVP_CTRL_AEAD_GET_TAG 0x10
 #define EVP_CTRL_AEAD_SET_TAG 0x11
 #define RSA_PKCS1_PADDING 1
+#endif
 
 struct crypto_api {
     void *handle;
     BIO *(*BIO_new_mem_buf)(const void *, int);
     int (*BIO_free)(BIO *);
-    EVP_PKEY *(*PEM_read_bio_PUBKEY)(BIO *, EVP_PKEY **, void *, void *);
+    EVP_PKEY *(*PEM_read_bio_PUBKEY)(BIO *, EVP_PKEY **, pem_password_cb *, void *);
     void (*EVP_PKEY_free)(EVP_PKEY *);
-    EVP_PKEY_CTX *(*EVP_PKEY_CTX_new)(EVP_PKEY *, void *);
+    EVP_PKEY_CTX *(*EVP_PKEY_CTX_new)(EVP_PKEY *, ENGINE *);
     void (*EVP_PKEY_CTX_free)(EVP_PKEY_CTX *);
     int (*EVP_PKEY_encrypt_init)(EVP_PKEY_CTX *);
     int (*EVP_PKEY_CTX_set_rsa_padding)(EVP_PKEY_CTX *, int);
@@ -34,13 +46,13 @@ struct crypto_api {
     EVP_CIPHER_CTX *(*EVP_CIPHER_CTX_new)(void);
     void (*EVP_CIPHER_CTX_free)(EVP_CIPHER_CTX *);
     const EVP_CIPHER *(*EVP_aes_256_gcm)(void);
-    int (*EVP_DecryptInit_ex)(EVP_CIPHER_CTX *, const EVP_CIPHER *, void *,
+    int (*EVP_DecryptInit_ex)(EVP_CIPHER_CTX *, const EVP_CIPHER *, ENGINE *,
                               const unsigned char *, const unsigned char *);
     int (*EVP_CIPHER_CTX_ctrl)(EVP_CIPHER_CTX *, int, int, void *);
     int (*EVP_DecryptUpdate)(EVP_CIPHER_CTX *, unsigned char *, int *,
                              const unsigned char *, int);
     int (*EVP_DecryptFinal_ex)(EVP_CIPHER_CTX *, unsigned char *, int *);
-    int (*EVP_EncryptInit_ex)(EVP_CIPHER_CTX *, const EVP_CIPHER *, void *,
+    int (*EVP_EncryptInit_ex)(EVP_CIPHER_CTX *, const EVP_CIPHER *, ENGINE *,
                               const unsigned char *, const unsigned char *);
     int (*EVP_EncryptUpdate)(EVP_CIPHER_CTX *, unsigned char *, int *,
                              const unsigned char *, int);
@@ -51,14 +63,22 @@ static struct crypto_api api;
 static unsigned char session_key[32];
 static int session_key_valid;
 
+#ifndef WEB_CRYPTO_STATIC
 static int load_symbol(void **target, const char *name)
 {
     *target = dlsym(api.handle, name);
     return *target != NULL;
 }
 
+#endif
+
 int web_crypto_init(void)
 {
+#ifdef WEB_CRYPTO_STATIC
+    if (api.handle) return 1;
+    api.handle = &api;
+#define LOAD(name) do { api.name = name; } while (0)
+#else
     static const char *const candidates[] = {
         "/usr/lib/libcrypto.so.3", "libcrypto.so.3", "libcrypto.so.1.1"
     };
@@ -70,6 +90,7 @@ int web_crypto_init(void)
     if (!api.handle) return 0;
 
 #define LOAD(name) do { if (!load_symbol((void **)&api.name, #name)) goto fail; } while (0)
+#endif
     LOAD(BIO_new_mem_buf);
     LOAD(BIO_free);
     LOAD(PEM_read_bio_PUBKEY);
@@ -93,10 +114,12 @@ int web_crypto_init(void)
 #undef LOAD
     return 1;
 
+#ifndef WEB_CRYPTO_STATIC
 fail:
     dlclose(api.handle);
     memset(&api, 0, sizeof api);
     return 0;
+#endif
 }
 
 static size_t base64_encode(const unsigned char *src, size_t len,

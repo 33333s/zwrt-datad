@@ -15,7 +15,9 @@ ASSET="$(sed -n 's/^[[:space:]]*"asset":[[:space:]]*"\([^"]*\)".*/\1/p' version.
 CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
   -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
 
-$CC $CFLAGS -static src/*.c -Wl,--gc-sections -ldl -o zwrt-datad
+CRYPTO_PREFIX="$(bash scripts/build-static-crypto.sh)"
+$CC $CFLAGS -DWEB_CRYPTO_STATIC -I"$CRYPTO_PREFIX/include" -static src/*.c \
+  "$CRYPTO_PREFIX/lib/libcrypto.a" -Wl,--gc-sections -pthread -o zwrt-datad
 echo ">> link OK"
 "$TC/aarch64-linux-size" zwrt-datad
 "$TC/aarch64-linux-strip" -o "$ASSET" zwrt-datad
