@@ -101,7 +101,17 @@ nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
 ./zwrt-datad -i 1000 --lan-bind 0.0.0.0 --lan-port 9461
 ```
 
-作为 OpenWRT 常驻服务安装：
+标准自动安装（ARM64 设备上以 root 执行）：
+
+```sh
+curl -4fL --retry 3 'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' -o /tmp/install-datad.sh && sh /tmp/install-datad.sh
+```
+
+安装器使用发布时固定的二进制 SHA-256，从配置的 HTTPS 镜像下载；服务脚本、`version.json` 和 OpenSSL 许可证内嵌在同一安装器中。固定安装到 `/data/zwrt-datad`，保留已有 Token、云端与散热配置。变更前备份，二进制先经临时启动检查；需要启动时只运行一个 datad 控制进程，隔离端口验收后再切换正式服务。失败会尝试恢复原文件和服务。
+
+自启统一为 `/etc/rc.local` 中、UFI 和 `exit 0` 之前的一条 `sh /data/zwrt-datad/service.sh start`。安装器清理已识别的旧路径、直接启动命令和重复项，停用旧 datad init 启动链接；不新建 init 脚本。标准内容完全相同时不改写 `rc.local`，再次安装同版且服务健康时不重启。
+
+手动安装 OpenWRT 常驻服务：
 
 ```sh
 adb shell 'mkdir -p /data/zwrt-datad'
@@ -231,3 +241,7 @@ LAN Basic login accepts the actual web password. datad fetches a fresh `web_logi
 ### Static SMS cryptography
 
 The ARM64 musl build links OpenSSL libcrypto directly (`WEB_CRYPTO_STATIC`); it must not depend on `dlopen`, which static musl does not support. `scripts/build-static-crypto.sh` downloads the pinned OpenSSL 3.5.8 LTS source from openssl.org, checks SHA256, and caches a no-shared/no-module/no-dso build under `~/.cache/zwrt-datad/`. The build needs curl, tar, make and Perl. Native developer builds retain the existing dynamically loaded backend. Never treat an unread count alone as successful SMS-list validation.
+
+## 发布资产
+
+`scripts/build.sh` 生成静态、stripped 的 `zwrt-datad-aarch64` 及匹配版本的 `build/install-datad.sh`。合并提交上构建完成后，使用 `bash scripts/publish-release.sh <发布说明文件>` 上传二进制、`version.json`、`OPENSSL-LICENSE.txt`、`service.sh` 和 `install-datad.sh`。发布验收需要确认这些附件可下载，版本清单与 tag 一致，二进制与安装器内固定的 SHA-256 一致。

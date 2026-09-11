@@ -24,4 +24,6 @@ echo ">> link OK"
 cp "$ASSET" zwrt-datad.stripped
 ls -lh zwrt-datad "$ASSET" zwrt-datad.stripped
 sha256sum "$ASSET"
+python3 scripts/render-installer.py "$ASSET" build/install-datad.sh
+sh -n build/install-datad.sh
 echo "BUILD-OK"
