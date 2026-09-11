@@ -51,6 +51,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | action | params |
 |---|---|
 | `wifi.status` | 无，返回 `main_2g/main_5g` 配置 |
+| `wireless.config` | 无参数时返回两频段国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
 | `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
 | `wifi.set_dual_band` | `enabled`，布尔值 |
 | `wifi.set_module` | `enabled`，`0/1` |
@@ -71,6 +72,14 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `client.rename` | `mac`, `hostname` |
 
 `wifi.configure.key` 是设备 WiFi 明文密码，只能在本机受 Token 保护的接口中传输，不应写入日志。
+
+`wireless.config` 的国家码作用于整台无线芯片，因此写入任一频段时会同步
+`wireless.wifi0.country` 与 `wireless.wifi1.country`。信道 `0` 或 `auto` 表示自动。
+国家码变更后，datad 会先让厂商 `zwrt_wlan.reload` 应用监管域，再读取
+`iwinfo.freqlist` 校验目标信道；因此原厂静态 `channellist` 未列出的 100-144
+只有在目标国家的设备驱动实际开放时才能写入。设备重载期间会等待最长 20 秒让
+`iwinfo` 恢复；校验或 reload 失败会恢复原国家码和信道。`wifi.configure` 收到的
+字段与 UCI 当前值完全相同时不会重载 WiFi，避免一次页面提交重复触发无线重启。
 
 `wifi.txpower.*` 只在 MU5252 上执行。触摸屏使用 `apply` 把百分比和上限一次提交；
 `set_limit`、`restore_limit` 与 `apply.limit_dbm` 都会同时设置 radio 的 `txpower` 和
@@ -163,3 +172,44 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 - WiFi、APN 和密码字段不得写入运行日志。
 - 重启、关机和密码修改应由 UFI 再做用户确认。
 - 切换 `SMULTIWAN` 会重配 WAN，远程设备可能短暂断线；UFI 应明确提示用户。
+
+
+### Topflow advanced wireless
+
+`wifi.advanced.status` returns two radio entries and the configured SSIDs, including
+live interface names, band, readiness, driver-reported power and PSM. Passwords
+are omitted. Power readback is a driver/firmware value, not an RF measurement.
+
+- `wifi.txpower.set_dbm`: `{band:"2g"|"5g", dbm:1..30}` stores a 1 dBm-step policy;
+  the current channel's reported limit is enforced when available. `{band,mode:"oem"}`
+  removes it and reapplies the OEM configured power. The legacy percentage setter
+  rejects changes while a dBm policy is active.
+- `wifi.psm.set`: `{section,mode:"on"|"off"|"default"}` persists an SSID-specific
+  policy. `default` releases ownership and retains the current driver state until
+  the next driver reset. Inactive interfaces receive saved policies when ready.
+- `wifi.interface.configure`: `{section,ssid?,encryption?,key?,enabled?,hidden?,isolate?}`
+  edits a stock main/guest interface. A blank key retains the existing password.
+  `enabled`, `hidden` and `isolate` are 0 or 1. OEM changes can restart Wi-Fi;
+  callers must poll readiness instead of treating save success as an active AP.
+- `wifi.interface.create`: `{band,ssid,encryption,key,enabled?,hidden?,isolate?}`
+  allocates one of two additional SSID slots. `wifi.interface.configure` also
+  accepts those returned section IDs, and an optional `band` for them.
+- `wifi.interface.delete`: `{section}` deletes only an additional SSID.
+
+Supported additional-SSID encryption values are `none`, `psk2+ccmp`, `sae-mixed`
+and `sae`. SSIDs contain 1-32 UTF-8 bytes; encrypted passwords contain 8-63 bytes.
+Additional SSIDs bridge to the existing LAN; AP isolation does not provide a
+separate guest subnet or block access to other LAN devices.
+
+The OEM QCMAP loader accepts its four predefined sections. Additional SSIDs live
+in the separate UCI package `datad_wifi` and use independently managed hostapd
+processes in `/data/zwrt-datad/wifi/`, with private config files and reserved
+interfaces wlan4/wlan5. Creation waits for an active stock AP on the same band.
+The runtime restores these APs after a radio restart without installing hotplug
+scripts or modifying the OEM loader. Ownership checks use PID command lines plus
+boot ID and interface index before cleanup. PSM policies apply after readiness, once per interface generation or explicit edit.
+Power is reapplied once after an atomic wireless config revision has settled,
+because the OEM post-DFS workflow commits configuration before resetting power.
+This does not reassert PSM, and it does not continuously fight arbitrary live
+changes. Additional APs inherit the OEM computed radio power when no dBm override
+is selected.

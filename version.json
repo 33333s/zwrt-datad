@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.29",
+    "version": "0.9.30",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增自定义 QUIC 聚合遥测、物理链路速率及 TCP 连接分类"
+    "notes": "新增国家码与合法信道配置、TopFlow dBm 功率、每 SSID PSM 和附加 SSID 管理"
   }
 }

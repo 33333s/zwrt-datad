@@ -9,6 +9,7 @@
  */
 #include "control.h"
 #include "device_exec.h"
+#include "wifi_control.h"
 #include "json.h"
 #include "web_crypto.h"
 
@@ -1082,12 +1083,13 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
         {"pmf", "pmf"}, {"maxassoc", "maxassoc"}, {"hidden", "hidden"},
         {"isolate", "isolate"}
     };
-    char section[64], path[128], values[sizeof fields / sizeof fields[0]][2048];
-    char enabled_value[32];
+    char section[64], path[128], current[2048];
+    char values[sizeof fields / sizeof fields[0]][2048];
+    char enabled_value[32], desired_disabled[2];
     int present[sizeof fields / sizeof fields[0]];
     int enabled_present;
     long enabled = 0;
-    int section_ok = 0, changed = 0;
+    int section_ok = 0, any_present = 0, changed = 0;
     if (!param_value(params, "section", section, sizeof section)) {
         set_invalid_error(err, errlen, "missing parameter: section");
         return 0;
@@ -1102,7 +1104,7 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
     /* Validate and copy every requested field before the first UCI mutation. */
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
         present[i] = json_get(params, fields[i].input, values[i], sizeof values[i]);
-        if (present[i]) changed = 1;
+        if (present[i]) any_present = 1;
     }
     enabled_present = json_get(params, "enabled", enabled_value, sizeof enabled_value);
     if (enabled_present) {
@@ -1110,29 +1112,71 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
             set_invalid_error(err, errlen, "enabled must be 0 or 1");
             return 0;
         }
-        changed = 1;
+        any_present = 1;
     }
-    if (!changed) {
+    if (!any_present) {
         set_invalid_error(err, errlen, "no wifi fields supplied");
         return 0;
+    }
+
+    if (present[0] && (!values[0][0] || strlen(values[0]) > 32 || strpbrk(values[0], "\r\n"))) {
+        set_invalid_error(err, errlen, "SSID must contain 1 to 32 bytes without line breaks");
+        return 0;
+    }
+    if (present[1] && strcmp(values[1], "none") && strcmp(values[1], "psk2+ccmp") &&
+        strcmp(values[1], "sae-mixed") && strcmp(values[1], "sae") &&
+        strcmp(values[1], "psk-mixed+tkip+ccmp") && strcmp(values[1], "psk2") && strcmp(values[1], "psk-mixed")) {
+        set_invalid_error(err, errlen, "unsupported Wi-Fi encryption");
+        return 0;
+    }
+    if (present[2] && (!values[2][0])) present[2] = 0; /* blank means keep existing key */
+    if (present[2] && (strlen(values[2]) < 8 || strlen(values[2]) > 63 || strpbrk(values[2], "\r\n"))) {
+        set_invalid_error(err, errlen, "Wi-Fi password must contain 8 to 63 bytes without line breaks");
+        return 0;
+    }
+    for (size_t i = 5; i <= 6; i++) {
+        if (present[i] && strcmp(values[i], "0") && strcmp(values[i], "1")) {
+            set_invalid_error(err, errlen, "hidden and isolate must be 0 or 1");
+            return 0;
+        }
+    }
+    if (present[1] && strcmp(values[1], "none") && !present[2]) {
+        snprintf(path, sizeof path, "wireless.%s.key", section);
+        if (device_uci_get(path, current, sizeof current) != 0 || strlen(current) < 8) {
+            set_invalid_error(err, errlen, "encrypted Wi-Fi requires a password");
+            return 0;
+        }
     }
 
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
         if (!present[i]) continue;
         snprintf(path, sizeof path, "wireless.%s.%s", section, fields[i].option);
+        if (device_uci_get(path, current, sizeof current) == 0 &&
+            !strcmp(current, values[i])) continue;
         if (device_uci_set(path, values[i]) != 0) {
             (void)device_uci_revert("wireless");
             snprintf(err, errlen, "failed to set wifi option: %s", fields[i].input);
             return 0;
         }
+        changed = 1;
     }
     if (enabled_present) {
         snprintf(path, sizeof path, "wireless.%s.disabled", section);
-        if (device_uci_set(path, enabled ? "0" : "1") != 0) {
-            (void)device_uci_revert("wireless");
-            snprintf(err, errlen, "failed to set wifi enabled state");
-            return 0;
+        snprintf(desired_disabled, sizeof desired_disabled, "%d", enabled ? 0 : 1);
+        if (device_uci_get(path, current, sizeof current) != 0 ||
+            strcmp(current, desired_disabled)) {
+            if (device_uci_set(path, desired_disabled) != 0) {
+                (void)device_uci_revert("wireless");
+                snprintf(err, errlen, "failed to set wifi enabled state");
+                return 0;
+            }
+            changed = 1;
         }
+    }
+    if (!changed) {
+        snprintf(result, result_len,
+                 "{\"section\":\"%s\",\"changed\":false}", section);
+        return 1;
     }
     if (device_uci_commit("wireless") != 0) {
         (void)device_uci_revert("wireless");
@@ -1143,7 +1187,446 @@ static int control_wifi_configure(const char *params, char *result, size_t resul
         snprintf(err, errlen, "wifi configuration committed but reload failed");
         return 0;
     }
-    snprintf(result, result_len, "{\"section\":\"%s\"}", section);
+    snprintf(result, result_len,
+             "{\"section\":\"%s\",\"changed\":true}", section);
+    return 1;
+}
+
+#define WIRELESS_MAX_CHANNELS 64
+#define WIRELESS_MAX_COUNTRIES 256
+#define WIRELESS_RELOAD_CHANNEL_RETRIES 80
+
+struct wireless_capabilities {
+    int channels_2g[WIRELESS_MAX_CHANNELS];
+    int channels_5g[WIRELESS_MAX_CHANNELS];
+    size_t channels_2g_count;
+    size_t channels_5g_count;
+    char countries[WIRELESS_MAX_COUNTRIES][3];
+    size_t country_count;
+    int channels_from_iwinfo;
+};
+
+/* Read the next object from a trusted local ubus JSON array. */
+static int wireless_next_array_object(const char **cursor, char *object, size_t object_len)
+{
+    const char *p = *cursor, *start;
+    int depth = 0, in_string = 0, escaped = 0;
+    size_t len;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == ',') {
+        p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
+    if (*p == ']') {
+        *cursor = p + 1;
+        return 0;
+    }
+    if (*p != '{') return -1;
+    start = p;
+    for (; *p; p++) {
+        char c = *p;
+        if (in_string) {
+            if (escaped) escaped = 0;
+            else if (c == '\\') escaped = 1;
+            else if (c == '"') in_string = 0;
+            continue;
+        }
+        if (c == '"') in_string = 1;
+        else if (c == '{') depth++;
+        else if (c == '}' && --depth == 0) {
+            p++;
+            break;
+        }
+    }
+    if (depth != 0 || (len = (size_t)(p - start)) >= object_len) return -1;
+    memcpy(object, start, len);
+    object[len] = 0;
+    *cursor = p;
+    return 1;
+}
+
+static int wireless_safe_ifname(const char *name)
+{
+    size_t n = name ? strlen(name) : 0;
+    if (!n || n >= 32) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!isalnum(c) && c != '_' && c != '-' && c != '.') return 0;
+    }
+    return 1;
+}
+
+static int wireless_iwinfo_call(const char *method, char *out, size_t outlen)
+{
+    static const char *uci_paths[] = {
+        "wireless.main_5g.ifname", "wireless.main_2g.ifname"
+    };
+    static const char *fallbacks[] = {"wlan0", "wlan1", "wlanx"};
+    char device[32], args[96];
+    for (size_t i = 0; i < sizeof uci_paths / sizeof uci_paths[0]; i++) {
+        if (device_uci_get(uci_paths[i], device, sizeof device) != 0 ||
+            !wireless_safe_ifname(device)) continue;
+        snprintf(args, sizeof args, "{\"device\":\"%s\"}", device);
+        if (device_ubus_call("iwinfo", method, args, out, outlen) == 0 &&
+            strstr(out, "\"results\"")) return 1;
+    }
+    for (size_t i = 0; i < sizeof fallbacks / sizeof fallbacks[0]; i++) {
+        snprintf(args, sizeof args, "{\"device\":\"%s\"}", fallbacks[i]);
+        if (device_ubus_call("iwinfo", method, args, out, outlen) == 0 &&
+            strstr(out, "\"results\"")) return 1;
+    }
+    return 0;
+}
+
+static void wireless_add_channel(int *channels, size_t *count, int channel)
+{
+    if (channel <= 0 || *count >= WIRELESS_MAX_CHANNELS) return;
+    for (size_t i = 0; i < *count; i++) if (channels[i] == channel) return;
+    channels[(*count)++] = channel;
+}
+
+static int wireless_parse_channel_list(const char *value, int *channels, size_t *count)
+{
+    const char *p = value;
+    int parsed = 0;
+    while (p && *p) {
+        char *end;
+        long channel;
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        channel = strtol(p, &end, 10);
+        if (end == p || channel <= 0 || channel > 255) return 0;
+        wireless_add_channel(channels, count, (int)channel);
+        parsed = 1;
+        p = end;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p && *p != ',') return 0;
+    }
+    return parsed;
+}
+
+static int wireless_load_channels(struct wireless_capabilities *caps, int retries)
+{
+    char raw[CONTROL_UBUS_RESPONSE_MAX], array[CONTROL_UBUS_RESPONSE_MAX];
+    int attempts = retries > 0 ? retries : 1;
+    caps->channels_2g_count = caps->channels_5g_count = 0;
+    caps->channels_from_iwinfo = 0;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        if (wireless_iwinfo_call("freqlist", raw, sizeof raw) &&
+            json_get(raw, "results", array, sizeof array) && array[0] == '[') {
+            const char *p = array + 1;
+            char object[1024];
+            int rc;
+            while ((rc = wireless_next_array_object(&p, object, sizeof object)) > 0) {
+                char restricted[16];
+                long band = json_get_int(object, "band", -1);
+                long channel = json_get_int(object, "channel", -1);
+                if (json_get(object, "restricted", restricted, sizeof restricted) &&
+                    (!strcmp(restricted, "true") || !strcmp(restricted, "1"))) continue;
+                if (band == 2) wireless_add_channel(caps->channels_2g,
+                                                     &caps->channels_2g_count,
+                                                     (int)channel);
+                else if (band == 5) wireless_add_channel(caps->channels_5g,
+                                                          &caps->channels_5g_count,
+                                                          (int)channel);
+            }
+            if (caps->channels_2g_count || caps->channels_5g_count) {
+                caps->channels_from_iwinfo = 1;
+                break;
+            }
+        }
+        if (attempt + 1 < attempts) usleep(250000);
+    }
+
+    /* A disabled radio has no iwinfo interface. Keep its vendor list visible,
+     * but never use this fallback to invent country-specific DFS channels. */
+    if (!caps->channels_2g_count &&
+        device_uci_get("wireless.wifi0.channellist", raw, sizeof raw) == 0)
+        (void)wireless_parse_channel_list(raw, caps->channels_2g, &caps->channels_2g_count);
+    if (!caps->channels_5g_count &&
+        device_uci_get("wireless.wifi1.channellist", raw, sizeof raw) == 0)
+        (void)wireless_parse_channel_list(raw, caps->channels_5g, &caps->channels_5g_count);
+    return caps->channels_2g_count || caps->channels_5g_count;
+}
+
+static int wireless_valid_country_code(const char *country)
+{
+    return country && strlen(country) == 2 &&
+        ((!strcmp(country, "00")) ||
+         (isalpha((unsigned char)country[0]) && isalpha((unsigned char)country[1])));
+}
+
+static void wireless_add_country(struct wireless_capabilities *caps, const char *country)
+{
+    if (!wireless_valid_country_code(country) || caps->country_count >= WIRELESS_MAX_COUNTRIES)
+        return;
+    for (size_t i = 0; i < caps->country_count; i++)
+        if (!strcmp(caps->countries[i], country)) return;
+    snprintf(caps->countries[caps->country_count++], 3, "%s", country);
+}
+
+static int wireless_load_countries(struct wireless_capabilities *caps)
+{
+    char raw[CONTROL_UBUS_RESPONSE_MAX], array[CONTROL_UBUS_RESPONSE_MAX];
+    const char *p;
+    char object[512];
+    int rc;
+    caps->country_count = 0;
+    if (!wireless_iwinfo_call("countrylist", raw, sizeof raw) ||
+        !json_get(raw, "results", array, sizeof array) || array[0] != '[') return 0;
+    p = array + 1;
+    while ((rc = wireless_next_array_object(&p, object, sizeof object)) > 0) {
+        char country[8] = "";
+        if (!json_get(object, "iso3166", country, sizeof country))
+            (void)json_get(object, "code", country, sizeof country);
+        for (char *q = country; *q; q++) *q = (char)toupper((unsigned char)*q);
+        wireless_add_country(caps, country);
+    }
+    return caps->country_count > 0;
+}
+
+static int wireless_country_supported(const struct wireless_capabilities *caps,
+                                      const char *country)
+{
+    for (size_t i = 0; i < caps->country_count; i++)
+        if (!strcmp(caps->countries[i], country)) return 1;
+    return 0;
+}
+
+static int wireless_channel_supported(const struct wireless_capabilities *caps,
+                                      int band, long channel)
+{
+    const int *channels = band == 2 ? caps->channels_2g : caps->channels_5g;
+    size_t count = band == 2 ? caps->channels_2g_count : caps->channels_5g_count;
+    if (channel == 0) return 1;
+    for (size_t i = 0; i < count; i++) if (channels[i] == channel) return 1;
+    return 0;
+}
+
+static void wireless_emit_channels(struct json_buf *b, const int *channels, size_t count)
+{
+    jb_add(b, "[0");
+    for (size_t i = 0; i < count; i++) jb_add(b, ",%d", channels[i]);
+    jb_add(b, "]");
+}
+
+static void wireless_emit_radio(struct json_buf *b, const char *band,
+                                const char *section, const char *ap_section,
+                                const struct wireless_capabilities *caps)
+{
+    char path[96], country[8] = "", channel[16] = "", htmode[32] = "", disabled[8] = "";
+    snprintf(path, sizeof path, "wireless.%s.country", section);
+    (void)device_uci_get(path, country, sizeof country);
+    snprintf(path, sizeof path, "wireless.%s.channel", section);
+    (void)device_uci_get(path, channel, sizeof channel);
+    snprintf(path, sizeof path, "wireless.%s.htmode", section);
+    (void)device_uci_get(path, htmode, sizeof htmode);
+    snprintf(path, sizeof path, "wireless.%s.disabled", section);
+    (void)device_uci_get(path, disabled, sizeof disabled);
+    jb_string(b, band);
+    jb_add(b, ":{\"section\":"); jb_string(b, section);
+    jb_add(b, ",\"ap_section\":"); jb_string(b, ap_section);
+    jb_add(b, ",\"country\":"); jb_string(b, country);
+    jb_add(b, ",\"channel\":"); jb_string(b, channel[0] ? channel : "0");
+    jb_add(b, ",\"htmode\":"); jb_string(b, htmode);
+    jb_add(b, ",\"enabled\":%s,\"supported_channels\":",
+           !strcmp(disabled, "1") ? "false" : "true");
+    if (!strcmp(band, "2g"))
+        wireless_emit_channels(b, caps->channels_2g, caps->channels_2g_count);
+    else
+        wireless_emit_channels(b, caps->channels_5g, caps->channels_5g_count);
+    jb_add(b, "}");
+}
+
+static int control_wireless_config_status(char *result, size_t result_len,
+                                          char *err, size_t errlen)
+{
+    struct wireless_capabilities caps;
+    struct json_buf b = {result, result_len, 0};
+    char country0[8] = "", country1[8] = "";
+    memset(&caps, 0, sizeof caps);
+    (void)wireless_load_channels(&caps, 1);
+    (void)wireless_load_countries(&caps);
+    (void)device_uci_get("wireless.wifi0.country", country0, sizeof country0);
+    (void)device_uci_get("wireless.wifi1.country", country1, sizeof country1);
+    if (country0[0]) wireless_add_country(&caps, country0);
+    if (country1[0]) wireless_add_country(&caps, country1);
+
+    result[0] = 0;
+    jb_add(&b, "{\"country_scope\":\"device\",\"country\":");
+    jb_string(&b, !strcmp(country0, country1) ? country0 : "");
+    jb_add(&b, ",\"channel_source\":\"%s\",\"countries\":[",
+           caps.channels_from_iwinfo ? "iwinfo" : "uci");
+    for (size_t i = 0; i < caps.country_count; i++) {
+        if (i) jb_add(&b, ",");
+        jb_string(&b, caps.countries[i]);
+    }
+    jb_add(&b, "],\"radios\":{");
+    wireless_emit_radio(&b, "2g", "wifi0", "main_2g", &caps);
+    jb_add(&b, ",");
+    wireless_emit_radio(&b, "5g", "wifi1", "main_5g", &caps);
+    jb_add(&b, "}}");
+    if (b.len + 1 >= b.cap) {
+        snprintf(err, errlen, "wireless configuration response too large");
+        return 0;
+    }
+    return 1;
+}
+
+static int wireless_restore_value(const char *path, const char *value, int present)
+{
+    return present ? device_uci_set(path, value) : device_uci_delete(path);
+}
+
+static int wireless_restore_config(const char *radio, const char *old_channel,
+                                   int old_channel_present,
+                                   const char *old_country0, int old_country0_present,
+                                   const char *old_country1, int old_country1_present)
+{
+    char path[96];
+    int ok = 1;
+    if (wireless_restore_value("wireless.wifi0.country", old_country0,
+                               old_country0_present) != 0) ok = 0;
+    if (wireless_restore_value("wireless.wifi1.country", old_country1,
+                               old_country1_present) != 0) ok = 0;
+    snprintf(path, sizeof path, "wireless.%s.channel", radio);
+    if (wireless_restore_value(path, old_channel, old_channel_present) != 0) ok = 0;
+    if (!ok || device_uci_commit("wireless") != 0) return 0;
+    return device_wifi_reload() == 0;
+}
+
+static int control_wireless_config_set(const char *params, char *result, size_t result_len,
+                                       char *err, size_t errlen)
+{
+    struct wireless_capabilities caps;
+    char band_name[8], country[8] = "", channel_raw[32] = "";
+    char old_country0[8] = "", old_country1[8] = "", old_channel[32] = "";
+    char channel_path[96], channel_value[32];
+    const char *radio;
+    long channel = LONG_MIN;
+    int country_present = json_get(params, "country", country, sizeof country);
+    int channel_present = json_get(params, "channel", channel_raw, sizeof channel_raw);
+    int old_country0_present, old_country1_present, old_channel_present;
+    int country_changed, channel_changed;
+
+    if (!country_present && !channel_present)
+        return control_wireless_config_status(result, result_len, err, errlen);
+    if (!param_value(params, "band", band_name, sizeof band_name)) {
+        set_invalid_error(err, errlen, "missing parameter: band");
+        return 0;
+    }
+    if (!strcmp(band_name, "2g")) radio = "wifi0";
+    else if (!strcmp(band_name, "5g")) radio = "wifi1";
+    else {
+        set_invalid_error(err, errlen, "band must be 2g or 5g");
+        return 0;
+    }
+    if (country_present) {
+        for (char *p = country; *p; p++) *p = (char)toupper((unsigned char)*p);
+        if (!wireless_valid_country_code(country)) {
+            set_invalid_error(err, errlen, "country must be an ISO 3166-1 alpha-2 code");
+            return 0;
+        }
+    }
+    if (channel_present) {
+        if (!strcasecmp(channel_raw, "auto")) channel = 0;
+        else if (!normalized_int(channel_raw, &channel) || channel < 0 || channel > 255) {
+            set_invalid_error(err, errlen, "channel must be auto, 0, or a valid channel number");
+            return 0;
+        }
+        snprintf(channel_value, sizeof channel_value, "%ld", channel);
+    }
+
+    memset(&caps, 0, sizeof caps);
+    (void)wireless_load_channels(&caps, 1);
+    (void)wireless_load_countries(&caps);
+    if (country_present && !wireless_country_supported(&caps, country)) {
+        set_invalid_error(err, errlen, "country is not supported by the device");
+        return 0;
+    }
+
+    old_country0_present = device_uci_get("wireless.wifi0.country", old_country0,
+                                          sizeof old_country0) == 0;
+    old_country1_present = device_uci_get("wireless.wifi1.country", old_country1,
+                                          sizeof old_country1) == 0;
+    snprintf(channel_path, sizeof channel_path, "wireless.%s.channel", radio);
+    old_channel_present = device_uci_get(channel_path, old_channel, sizeof old_channel) == 0;
+    country_changed = country_present &&
+        ((!old_country0_present || strcmp(old_country0, country)) ||
+         (!old_country1_present || strcmp(old_country1, country)));
+    channel_changed = channel_present &&
+        (!old_channel_present || strcmp(old_channel, channel_value));
+    if (!country_changed && !channel_changed) {
+        snprintf(result, result_len,
+                 "{\"changed\":false,\"band\":\"%s\",\"country\":\"%s\",\"channel\":\"%s\"}",
+                 band_name, country_present ? country : old_country0,
+                 channel_present ? channel_value : old_channel);
+        return 1;
+    }
+
+    if (country_changed) {
+        if (device_uci_set("wireless.wifi0.country", country) != 0 ||
+            device_uci_set("wireless.wifi1.country", country) != 0 ||
+            (channel_present && device_uci_set(channel_path, "0") != 0) ||
+            device_uci_commit("wireless") != 0 || device_wifi_reload() != 0) {
+            int restored = wireless_restore_config(radio, old_channel, old_channel_present,
+                                                   old_country0, old_country0_present,
+                                                   old_country1, old_country1_present);
+            snprintf(err, errlen, "failed to apply country; previous configuration %s",
+                     restored ? "restored" : "could not be restored");
+            return 0;
+        }
+        memset(&caps, 0, sizeof caps);
+        int channels_loaded = 0;
+        for (int attempt = 0;
+             channel_present && attempt < WIRELESS_RELOAD_CHANNEL_RETRIES;
+             attempt++) {
+            memset(&caps, 0, sizeof caps);
+            channels_loaded = wireless_load_channels(&caps, 1);
+            if (channels_loaded && wireless_channel_supported(&caps,
+                    !strcmp(band_name, "2g") ? 2 : 5, channel)) break;
+            if (attempt + 1 < WIRELESS_RELOAD_CHANNEL_RETRIES) usleep(250000);
+        }
+        if (channel_present && !channels_loaded) {
+            int restored = wireless_restore_config(radio, old_channel, old_channel_present,
+                                                   old_country0, old_country0_present,
+                                                   old_country1, old_country1_present);
+            snprintf(err, errlen, "could not read channels for country %s; previous configuration %s",
+                     country, restored ? "restored" : "could not be restored");
+            return 0;
+        }
+    }
+
+    if (channel_present && !wireless_channel_supported(&caps,
+            !strcmp(band_name, "2g") ? 2 : 5, channel)) {
+        int restored = 1;
+        if (country_changed)
+            restored = wireless_restore_config(radio, old_channel, old_channel_present,
+                                               old_country0, old_country0_present,
+                                               old_country1, old_country1_present);
+        set_invalid_error(err, errlen,
+                          "channel %ld is not permitted for %s under country %s%s",
+                          channel, band_name, country_present ? country : old_country0,
+                          country_changed && !restored ? "; rollback failed" : "");
+        return 0;
+    }
+
+    if (channel_changed || (country_changed && channel_present)) {
+        if (device_uci_set(channel_path, channel_value) != 0 ||
+            device_uci_commit("wireless") != 0 || device_wifi_reload() != 0) {
+            int restored = wireless_restore_config(radio, old_channel, old_channel_present,
+                                                   old_country0, old_country0_present,
+                                                   old_country1, old_country1_present);
+            snprintf(err, errlen, "failed to apply channel; previous configuration %s",
+                     restored ? "restored" : "could not be restored");
+            return 0;
+        }
+    }
+    snprintf(result, result_len,
+             "{\"changed\":true,\"band\":\"%s\",\"country\":\"%s\",\"channel\":\"%s\",\"channel_source\":\"%s\"}",
+             band_name, country_present ? country : old_country0,
+             channel_present ? channel_value : old_channel,
+             caps.channels_from_iwinfo ? "iwinfo" : "uci");
     return 1;
 }
 
@@ -1262,6 +1745,12 @@ static int control_wifi_power_set(const char *action, const char *params,
         !wifi_power_read_int(band->section, "txpower", &old_txpower) ||
         !wifi_power_read_int(band->section, "max_power", &old_limit)) {
         snprintf(err, errlen, "failed to read existing wifi power configuration");
+        return 0;
+    }
+
+    snprintf(path, sizeof path, "wireless.%s.datad_txpower_dbm", band->section);
+    if (device_uci_get(path, value, sizeof value) == 0 && value[0]) {
+        set_invalid_error(err, errlen, "dBm policy is active; select OEM power mode first");
         return 0;
     }
 
@@ -2077,8 +2566,8 @@ const char *control_capabilities_json(void)
         "\"cellular.connect\",\"cellular.disconnect\",\"cellular.set\","
         "\"network.set_mode\",\"band.set_lte\",\"band.set_nr_sa\",\"band.set_nr_nsa\","
         "\"cell.lock_lte\",\"cell.lock_nr\",\"cell.unlock_all\",\"sim.set_slot\","
-        "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\","
-        "\"wifi.txpower.status\",\"wifi.txpower.apply\",\"wifi.txpower.set_percent\",\"wifi.txpower.set_limit\",\"wifi.txpower.restore_limit\","
+        "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\",\"wireless.config\","
+        "\"wifi.advanced.status\",\"wifi.psm.set\",\"wifi.txpower.set_dbm\",\"wifi.interface.configure\",\"wifi.interface.create\",\"wifi.interface.delete\",\"wifi.txpower.status\",\"wifi.txpower.apply\",\"wifi.txpower.set_percent\",\"wifi.txpower.set_limit\",\"wifi.txpower.restore_limit\","
         "\"lan.set\",\"lan.set_mtu\",\"dns.set\","
         "\"usb.status\",\"usb.set\",\"sleep.status\",\"sleep.set\",\"nfc.set\","
         "\"apn.list\",\"apn.set_mode\",\"apn.add\",\"apn.modify\",\"apn.delete\",\"apn.enable\","
@@ -2229,6 +2718,22 @@ struct control_result control_execute(const char *request_json,
                         result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "wifi.configure")) {
         ok = control_wifi_configure(params, result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "wireless.config")) {
+        char country[8], channel[32];
+        int mutating = json_get(params, "country", country, sizeof country) ||
+                       json_get(params, "channel", channel, sizeof channel);
+        ok = control_wireless_config_set(params, result, sizeof result, err, sizeof err);
+        if (!mutating) status.refresh_state = 0;
+    } else if (!strcmp(action, "wifi.advanced.status") || !strcmp(action, "wifi.psm.set") || !strcmp(action, "wifi.txpower.set_dbm") || !strcmp(action,"wifi.interface.create") || !strcmp(action,"wifi.interface.delete")) {
+        ok = wifi_control_execute(action, params, result, sizeof result, err, sizeof err);
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "wifi.interface.configure")) {
+        char section[64];
+        json_get(params, "section", section, sizeof section);
+        if (!strncmp(section, "datad_ssid_", 11))
+            ok = wifi_control_execute(action, params, result, sizeof result, err, sizeof err);
+        else
+            ok = control_wifi_configure(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "wifi.txpower.status")) {
         ok = control_wifi_power_status(result, sizeof result, err, sizeof err);
         status.refresh_state = 0;

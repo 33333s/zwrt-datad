@@ -38,6 +38,19 @@ if [ -n "${ZWRT_DATAD_FD_DUMP:-}" ] && [ -d "/proc/$$/fd" ]; then
 fi
 
 case "$service:$method" in
+    iwinfo:countrylist)
+        printf '%s\n' '{"results":[{"code":"00","country":"World","iso3166":"00","active":false},{"code":"CN","country":"China","iso3166":"CN","active":true},{"code":"HK","country":"Hong Kong","iso3166":"HK","active":false}]}'
+        ;;
+    iwinfo:freqlist)
+        extended_restricted=true
+        if [ -n "${MOCK_IWINFO_DELAY_FILE:-}" ] && [ -f "$MOCK_IWINFO_DELAY_FILE" ]; then
+            count=$(cat "$MOCK_IWINFO_DELAY_FILE" 2>/dev/null || printf '%s' 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" >"$MOCK_IWINFO_DELAY_FILE"
+            [ "$count" -le "${MOCK_IWINFO_DELAY_CALLS:-0}" ] || extended_restricted=false
+        fi
+        printf '%s\n' "{\"results\":[{\"band\":2,\"channel\":1,\"mhz\":2412,\"restricted\":false},{\"band\":2,\"channel\":6,\"mhz\":2437,\"restricted\":false},{\"band\":2,\"channel\":11,\"mhz\":2462,\"restricted\":false},{\"band\":5,\"channel\":36,\"mhz\":5180,\"restricted\":false},{\"band\":5,\"channel\":40,\"mhz\":5200,\"restricted\":false},{\"band\":5,\"channel\":100,\"mhz\":5500,\"restricted\":$extended_restricted},{\"band\":5,\"channel\":149,\"mhz\":5745,\"restricted\":false}]}"
+        ;;
     system:board)
         printf '%s\n' '{"model":"Fixture Router","hostname":"fixture","board_name":"qcom,fixture","release":{"description":"Fixture Linux"}}'
         ;;
