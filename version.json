@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.30",
+    "version": "0.9.31",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增国家码与合法信道配置、TopFlow dBm 功率、每 SSID PSM 和附加 SSID 管理"
+    "notes": "新增可重复执行的标准安装器，校验下载、整理唯一 rc.local 自启并保留现有配置"
   }
 }
