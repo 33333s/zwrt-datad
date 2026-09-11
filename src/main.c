@@ -10,6 +10,7 @@
  */
 #include "json.h"
 #include "control.h"
+#include "neighbor.h"
 #include "wifi_control.h"
 #include "device_exec.h"
 #include "system_ext.h"
@@ -3873,6 +3874,21 @@ static void build_snapshot(char *out, size_t outlen,
         bappend(&b, "},");
     }
 
+    /* Direct supply belongs to the charger and can exist independently of a
+     * battery state block. Absence means unavailable, not disabled. */
+    {
+        char supply[256];
+        if (control_direct_supply_state(chg, supply, sizeof supply))
+            bappend(&b, "\"power\":{\"direct_supply\":%s},", supply);
+    }
+
+    {
+        char neighbor_json[NEIGHBOR_JSON_MAX];
+        neighbor_manager_tick(net, g_sim_cache);
+        neighbor_manager_json(neighbor_json, sizeof neighbor_json, net);
+        bappend(&b, "\"neighbor\":%s,", neighbor_json);
+    }
+
     /* connected clients */
     bappend(&b, "\"clients\":{");
     emit_int(&b, "total", rnum, "access_total_num", 0); bappend(&b, ",");
@@ -5309,7 +5325,9 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
 
 int main(int argc, char **argv)
 {
-    int once = 0, interval_ms = 1000;
+    if (argc > 1 && !strcmp(argv[1], "--neighbor-parse")) return neighbor_parse_cli(argc - 2, argv + 2);
+    int once = 0, interval_ms = 1000, neighbor_enabled = -1;
+    const char *neighbor_config = NULL;
     const char *bind_addr = HTTP_BIND_ADDR;
     const char *lan_bind_addr = NULL;
     const char *auth_token_file = HTTP_AUTH_TOKEN_FILE;
@@ -5322,6 +5340,8 @@ int main(int argc, char **argv)
     int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--once")) once = 1;
+        else if (!strcmp(argv[i], "--neighbor")) neighbor_enabled = 1;
+        else if (!strcmp(argv[i], "--neighbor-config") && i + 1 < argc) neighbor_config = argv[++i];
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bind")) && i + 1 < argc)
             bind_addr = argv[++i];
@@ -5337,7 +5357,9 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] "
-                 "[--lan-bind addr] [--lan-port port] [--auth-token-file path]");
+                 "[--lan-bind addr] [--lan-port port] [--auth-token-file path] "
+                 "[--neighbor] [--neighbor-config path]\n"
+                 "       zwrt-datad --neighbor-parse FILE.qmdl [FILE.qmdl ...]");
             return 0;
         } else {
             fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
@@ -5393,6 +5415,9 @@ int main(int argc, char **argv)
             }
         }
     }
+
+    /* One-shot snapshots never start diagnostic capture. */
+    neighbor_manager_init(once ? 0 : neighbor_enabled, neighbor_config);
 
     /* board info changes rarely: fetch once, refresh hourly. */
     static char board[RAW_MAX];
@@ -5525,6 +5550,7 @@ int main(int argc, char **argv)
         cycle++;
     } while (g_run);
 
+    neighbor_manager_stop();
     if (g_topflow_multimodem_enabled) control_release_cooling_state();
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
     if (lan_listener.fd >= 0) close(lan_listener.fd);

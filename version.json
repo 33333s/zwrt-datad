@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.31",
+    "version": "0.9.32",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增可重复执行的标准安装器，校验下载、整理唯一 rc.local 自启并保留现有配置"
+    "notes": "新增内置邻区采集与直供电控制，适配 MU5250 B28 NR 同频和异频邻区"
   }
 }

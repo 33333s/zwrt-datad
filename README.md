@@ -69,7 +69,7 @@ bash scripts/build.sh
 
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-  src/json.c src/device_exec.c src/system_ext.c src/control.c src/main.c \
+  src/*.c src/neighbor/*.c -lm -ldl \
   -o zwrt-datad-test
 ```
 
@@ -245,3 +245,12 @@ The ARM64 musl build links OpenSSL libcrypto directly (`WEB_CRYPTO_STATIC`); it 
 ## 发布资产
 
 `scripts/build.sh` 生成静态、stripped 的 `zwrt-datad-aarch64` 及匹配版本的 `build/install-datad.sh`。合并提交上构建完成后，使用 `bash scripts/publish-release.sh <发布说明文件>` 上传二进制、`version.json`、`OPENSSL-LICENSE.txt`、`service.sh` 和 `install-datad.sh`。发布验收需要确认这些附件可下载，版本清单与 tag 一致，二进制与安装器内固定的 SHA-256 一致。
+
+## Optional neighbor and direct supply support
+
+Neighbor collection is disabled by default. See [NEIGHBOR.md](docs/NEIGHBOR.md)
+for enablement, status interpretation, resource limits and firmware compatibility.
+The charger direct-supply enum is exposed through `power.direct_supply` and the
+`power.direct_supply.status` / `power.direct_supply.set` control actions.
+Writes are confirmed by reading the charger state back. See
+[CONTROL_API.md](docs/CONTROL_API.md) and [STATE_SCHEMA.md](docs/STATE_SCHEMA.md).

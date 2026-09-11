@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "control.h"
+#include "neighbor.h"
 #include "device_exec.h"
 #include "wifi_control.h"
 #include "json.h"
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #define CONTROL_PARAMS_MAX 16384
 #define CONTROL_UBUS_ARGS_MAX 16384
@@ -2036,6 +2038,96 @@ static int required_bool_param(const char *params, const char *name, int *value,
     return 1;
 }
 
+/* Read exactly the firmware enum; missing/unknown never becomes false. */
+static int direct_supply_mode(const char *charger)
+{
+    char mode[64];
+    if (!json_get(charger, "direct_power_supply_mode", mode, sizeof mode)) return -2;
+    if (!strcmp(mode, "enable")) return 1;
+    if (!strcmp(mode, "disable")) return 0;
+    return -1;
+}
+
+int control_direct_supply_state(const char *charger, char *out, size_t outlen)
+{
+    int mode = direct_supply_mode(charger);
+    if (mode < 0) {
+        snprintf(out, outlen, "{\"supported\":%s,\"enabled\":null,\"mode\":null}",
+                 mode == -2 ? "false" : "true");
+    } else {
+        snprintf(out, outlen, "{\"supported\":true,\"enabled\":%s,\"mode\":\"%s\"}",
+                 mode ? "true" : "false", mode ? "enable" : "disable");
+    }
+    return mode != -2;
+}
+
+static int direct_supply_read(char *charger, size_t len, char *err, size_t errlen)
+{
+    if (device_ubus_call_timeout("zwrt_bsp.charger", "list", "{}", charger, len, 750) != 0 ||
+        !json_is_valid_object(charger)) {
+        snprintf(err, errlen, "cannot read direct supply state");
+        return 0;
+    }
+    char error[128];
+    if (json_get(charger, "error", error, sizeof error)) {
+        snprintf(err, errlen, "charger returned an error");
+        return 0;
+    }
+    return 1;
+}
+
+static int control_direct_supply_status(char *result, size_t len, char *err, size_t errlen)
+{
+    char charger[4096];
+    if (!direct_supply_read(charger, sizeof charger, err, errlen)) return 0;
+    (void)control_direct_supply_state(charger, result, len);
+    return 1;
+}
+
+static int control_direct_supply_set(const char *params, char *result, size_t len,
+                                     char *err, size_t errlen)
+{
+    int wanted;
+    char charger[4096], args[80], reply[4096], error[128];
+    if (!required_bool_param(params, "enabled", &wanted, err, errlen)) return 0;
+    if (!direct_supply_read(charger, sizeof charger, err, errlen)) return 0;
+    int before = direct_supply_mode(charger);
+    if (before < 0) {
+        snprintf(err, errlen, "%s", before == -2 ? "direct supply is not supported by this firmware" :
+                 "direct supply state is unknown; refusing to guess");
+        return 0;
+    }
+    if (before != wanted) {
+        snprintf(args, sizeof args, "{\"direct_power_supply_mode\":\"%s\"}", wanted ? "enable" : "disable");
+        if (device_ubus_call_raw_timeout("zwrt_bsp.charger", "set", args, reply, sizeof reply, 750) != 0) {
+            snprintf(err, errlen, "direct supply write failed");
+            return 0;
+        }
+        /* MU5252 B20 succeeds with an empty ubus response. A nonempty reply
+         * must still be valid and error-free; readback is mandatory below. */
+        const char *body = reply;
+        while (isspace((unsigned char)*body)) body++;
+        if (*body && (!json_is_valid_object(body) || json_get(body, "error", error, sizeof error) ||
+                      json_get_int(body, "result", 0) != 0)) {
+            snprintf(err, errlen, "direct supply write failed");
+            return 0;
+        }
+        int verified = 0;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (attempt) { struct timespec pause = {0, 100000000}; nanosleep(&pause, NULL); }
+            if (direct_supply_read(charger, sizeof charger, err, errlen) &&
+                direct_supply_mode(charger) == wanted) { verified = 1; break; }
+        }
+        if (!verified) {
+            snprintf(err, errlen, "direct supply readback did not confirm the requested mode");
+            return 0;
+        }
+    }
+    snprintf(result, len, "{\"supported\":true,\"enabled\":%s,\"mode\":\"%s\",\"changed\":%s,\"verified\":true}",
+             wanted ? "true" : "false", wanted ? "enable" : "disable", before == wanted ? "false" : "true");
+    return 1;
+}
+
 static int control_aggregation_set(const char *params, char *result, size_t result_len,
                                    char *err, size_t errlen)
 {
@@ -2569,7 +2661,7 @@ const char *control_capabilities_json(void)
         "\"wifi.status\",\"wifi.dual_band_status\",\"wifi.set_dual_band\",\"wifi.set_module\",\"wifi.set_chip\",\"wifi.configure\",\"wireless.config\","
         "\"wifi.advanced.status\",\"wifi.psm.set\",\"wifi.txpower.set_dbm\",\"wifi.interface.configure\",\"wifi.interface.create\",\"wifi.interface.delete\",\"wifi.txpower.status\",\"wifi.txpower.apply\",\"wifi.txpower.set_percent\",\"wifi.txpower.set_limit\",\"wifi.txpower.restore_limit\","
         "\"lan.set\",\"lan.set_mtu\",\"dns.set\","
-        "\"usb.status\",\"usb.set\",\"sleep.status\",\"sleep.set\",\"nfc.set\","
+        "\"neighbor.status\",\"neighbor.set\",\"power.direct_supply.status\",\"power.direct_supply.set\",\"usb.status\",\"usb.set\",\"sleep.status\",\"sleep.set\",\"nfc.set\","
         "\"apn.list\",\"apn.set_mode\",\"apn.add\",\"apn.modify\",\"apn.delete\",\"apn.enable\","
         "\"traffic.set_limit\",\"traffic.set_clear_day\",\"traffic.calibrate\","
         "\"sms.send_raw\",\"sms.delete\",\"sms.mark_read\","
@@ -2757,6 +2849,21 @@ struct control_result control_execute(const char *request_json,
         };
         ok = call_specs_require_any(params, "zwrt_router.api", "router_set_lan_dns", specs, 4,
                                     result, sizeof result, err, sizeof err);
+    } else if (!strcmp(action, "neighbor.status")) {
+        neighbor_manager_json(result, sizeof result, NULL);
+        ok = 1;
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "neighbor.set")) {
+        int enabled;
+        if (required_bool_param(params, "enabled", &enabled, err, sizeof err)) {
+            ok = neighbor_manager_set_enabled(enabled, err, sizeof err);
+            if (ok) neighbor_manager_json(result, sizeof result, NULL);
+        }
+    } else if (!strcmp(action, "power.direct_supply.status")) {
+        ok = control_direct_supply_status(result, sizeof result, err, sizeof err);
+        status.refresh_state = 0;
+    } else if (!strcmp(action, "power.direct_supply.set")) {
+        ok = control_direct_supply_set(params, result, sizeof result, err, sizeof err);
     } else if (!strcmp(action, "usb.set")) {
         static const struct param_spec specs[] = {
             {"mode", "mode", PARAM_STRING, 0},
@@ -2959,7 +3066,8 @@ sms_send_done: ;
         write_error(response, response_len, action,
                     invalid ? "invalid_parameter" : "device_call_failed", message);
         status.http_status = invalid ? 400 : 502;
-        status.refresh_state = 0;
+        /* A timed-out charger write may still have changed the hardware. */
+        status.refresh_state = !invalid && !strcmp(action, "power.direct_supply.set");
         return status;
     }
     write_success(response, response_len, action, result);

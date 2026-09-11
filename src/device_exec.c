@@ -194,6 +194,13 @@ int device_ubus_call_timeout(const char *service, const char *method, const char
                                  (timeout_ms + 999) / 1000);
 }
 
+int device_ubus_call_raw_timeout(const char *service, const char *method, const char *args,
+                                 char *out, size_t outlen, int timeout_ms)
+{
+    return device_ubus_call_impl(service, method, args, out, outlen, 0, timeout_ms,
+                                 (timeout_ms + 999) / 1000);
+}
+
 int device_ubus_call_raw(const char *service, const char *method, const char *args,
                          char *out, size_t outlen)
 {
