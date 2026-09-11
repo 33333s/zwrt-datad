@@ -12,7 +12,7 @@ jobs:
       - name: Build with strict warnings
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/main.c \
+            src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/main.c \
             -ldl -o zwrt-datad-test
       - name: Test linked SMS crypto backend
         run: |
@@ -24,8 +24,12 @@ jobs:
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             tests/custom_aggregation_test.c src/password_auth.c src/cloud_proxy.c src/json.c \
-            src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c -ldl -o /tmp/custom-aggregation-test
+            src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c -ldl -o /tmp/custom-aggregation-test
           /tmp/custom-aggregation-test
+      - name: Test wireless policy and interface mapping
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/wifi_control_test.c src/wifi_control.c src/json.c -o wifi-control-test
+          ./wifi-control-test
       - name: Test password challenge hashing
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/password_auth_test.c src/password_auth.c -o password-auth-test

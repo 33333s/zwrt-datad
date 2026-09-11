@@ -17,6 +17,7 @@ MOCK_CURL_LOG="$ROOT/tests/mock-curl.log"
 INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
+IWINFO_DELAY_FILE="$ROOT/tests/iwinfo-delay.count"
 THERMAL_FIXTURE="$ROOT/tests/fixtures/thermal"
 COOLING_FIXTURE="$ROOT/tests/fixtures/cooling"
 COOLING_TMP="$(mktemp -d)"
@@ -49,7 +50,8 @@ cleanup() {
     [ -n "$MC8532B_PID" ] && wait "$MC8532B_PID" 2>/dev/null || true
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$CHILD_FD_LOG" "$MU5252_CALL_LOG" \
         "$MOCK_CURL_LOG" \
-        "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT"
+        "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT" \
+        "$IWINFO_DELAY_FILE"
     rm -rf "$COOLING_TMP"
 }
 trap cleanup EXIT INT TERM
@@ -66,6 +68,8 @@ ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
 MOCK_CALL_LOG="$CALL_LOG" \
 MOCK_MODEL_NAME_MISSING=1 \
 MOCK_HARDWARE_VERSION=MU5252_HW1.0 \
+MOCK_IWINFO_DELAY_FILE="$IWINFO_DELAY_FILE" \
+MOCK_IWINFO_DELAY_CALLS=25 \
 ZWRT_DATAD_FD_DUMP="$CHILD_FD_LOG" \
 "$BIN" -i 200 -p "$PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 PID=$!
@@ -217,6 +221,68 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     "http://127.0.0.1:$PORT/control" | python3 -c \
     'import json,sys; data=json.load(sys.stdin); assert data["result"]["main_2g"]["ssid"] == "Fixture 2G"'
 
+# Submitting unchanged AP fields must not restart Wi-Fi after a radio-level
+# country/channel change in the same UFI request.
+: >"$CALL_LOG"
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wifi.configure","params":{"section":"main_5g","ssid":"Fixture 5G"}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["changed"] is False'
+! grep -F "$(printf 'uci\tset ')" "$CALL_LOG" >/dev/null
+! grep -F "$(printf 'zwrt_wlan\treload')" "$CALL_LOG" >/dev/null
+
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wireless.config","params":{}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)["result"]
+assert data["country"] == "CN"
+assert "HK" in data["countries"]
+assert data["channel_source"] == "iwinfo"
+assert data["radios"]["2g"]["htmode"] == "EHT40"
+assert data["radios"]["5g"]["channel"] == "36"
+assert data["radios"]["5g"]["supported_channels"] == [0, 36, 40, 149]
+'
+
+: >"$CALL_LOG"
+code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
+    -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wireless.config","params":{"band":"5g","channel":100}}' \
+    "http://127.0.0.1:$PORT/control")"
+[ "$code" = "400" ]
+python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["error"]["code"] == "invalid_parameter"' "$INVALID_WIFI_OUT"
+! grep -F "$(printf 'uci\tset ')" "$CALL_LOG" >/dev/null
+
+: >"$CALL_LOG"
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wireless.config","params":{"band":"5g","channel":149}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["changed"] is True'
+grep -F "$(printf 'uci\tset wireless.wifi1.channel=149')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'zwrt_wlan\treload')" "$CALL_LOG" >/dev/null
+
+# Real ZTE reloads can take more than five seconds before iwinfo exposes the
+# new country's regulatory channels. Keep polling the driver before deciding
+# that an extended channel is invalid.
+printf '%s\n' 0 >"$IWINFO_DELAY_FILE"
+: >"$CALL_LOG"
+curl -fsS -H 'Authorization: Bearer fixture-private-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"wireless.config","params":{"band":"5g","country":"HK","channel":100}}' \
+    "http://127.0.0.1:$PORT/control" | python3 -c \
+    'import json,sys; data=json.load(sys.stdin); assert data["result"]["changed"] is True; assert data["result"]["channel"] == "100"'
+[ "$(cat "$IWINFO_DELAY_FILE")" -gt 20 ]
+grep -F "$(printf 'uci\tset wireless.wifi0.country=HK')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi1.country=HK')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi1.channel=0')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'uci\tset wireless.wifi1.channel=100')" "$CALL_LOG" >/dev/null
+[ "$(grep -Fc "$(printf 'zwrt_wlan\treload')" "$CALL_LOG")" -ge 2 ]
+rm -f "$IWINFO_DELAY_FILE"
+
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"action":"wifi.txpower.status","params":{}}' \
@@ -353,7 +419,7 @@ code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
 code="$(curl -sS -o "$INVALID_WIFI_OUT" -w '%{http_code}' \
     -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
-    -d '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Staged First","encryption":"__mock_fail__"}}' \
+    -d '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Staged First","key":"__mock_fail__"}}' \
     "http://127.0.0.1:$PORT/control")"
 [ "$code" = "502" ]
 grep -F "$(printf 'uci\trevert wireless')" "$CALL_LOG" >/dev/null

@@ -10,6 +10,7 @@
  */
 #include "json.h"
 #include "control.h"
+#include "wifi_control.h"
 #include "device_exec.h"
 #include "system_ext.h"
 #include "web_crypto.h"
@@ -5459,6 +5460,7 @@ int main(int argc, char **argv)
 
         if (force_refresh || cycle == 0 || cycle % interface_poll_every == 0)
             refresh_interface_cache();
+        if (g_topflow_multimodem_enabled) wifi_runtime_tick();
 
         if (g_qos_refresh_req) {
             g_qos_refresh_req = 0;

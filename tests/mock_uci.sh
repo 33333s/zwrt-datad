@@ -145,10 +145,16 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
         wireless.main_2g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_2g.encryption) printf '%s\n' 'sae-mixed' ;;
         wireless.main_2g.disabled) printf '%s\n' '0' ;;
+        wireless.main_2g.ifname) printf '%s\n' 'wlan1' ;;
         wireless.main_5g.ssid) printf '%s\n' 'Fixture 5G' ;;
         wireless.main_5g.key) printf '%s\n' 'fixture-password' ;;
         wireless.main_5g.encryption) printf '%s\n' 'sae-mixed' ;;
         wireless.main_5g.disabled) printf '%s\n' '0' ;;
+        wireless.main_5g.ifname) printf '%s\n' 'wlan0' ;;
+        wireless.wifi0.country) printf '%s\n' 'CN' ;;
+        wireless.wifi0.channel) printf '%s\n' '0' ;;
+        wireless.wifi0.htmode) printf '%s\n' 'EHT40' ;;
+        wireless.wifi0.channellist) printf '%s\n' '1,2,3,4,5,6,7,8,9,10,11,12,13' ;;
         wireless.wifi0.txpowerpercent) printf '%s\n' '100' ;;
         wireless.wifi0.txpower) printf '%s\n' '30' ;;
         wireless.wifi0.max_power) printf '%s\n' '30' ;;
@@ -157,6 +163,10 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ]; then
         wireless.wifi1.txpower) printf '%s\n' '30' ;;
         wireless.wifi1.max_power) printf '%s\n' '30' ;;
         wireless.wifi1.disabled) printf '%s\n' '0' ;;
+        wireless.wifi1.country) printf '%s\n' 'CN' ;;
+        wireless.wifi1.channel) printf '%s\n' '36' ;;
+        wireless.wifi1.htmode) printf '%s\n' 'EHT160' ;;
+        wireless.wifi1.channellist) printf '%s\n' '36,40,44,48,52,56,60,64,149,153,157,161,165' ;;
         zte_nwinfo.sys_info.network_type) printf '%s\n' 'SA' ;;
         zte_nwinfo.signal_strength.signalbar) printf '%s\n' '4' ;;
         zte_nwinfo.plmn_info.network_provider_fullname) printf '%s\n' 'Fixture TopFlow Mobile' ;;
