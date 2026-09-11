@@ -274,3 +274,26 @@ SSE  /events
 - `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
 - `clients.list` 上限 32 条；消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms.unread` 默认每 5 秒读取一次；`sms.list` 启动时按 NV/SIM 各最多 32 条完整同步，之后未读数变化时各取最新 8 条并按消息 ID 合并。发送、删除和标记已读成功后会使缓存失效并在下一轮完整同步。TopFlow 厂商密文由 datad 使用设备 OpenSSL 3 解密，输出到该字段的号码和正文均为 UTF-8 明文；消费者不应再实现厂商会话密钥或解密逻辑。相关写操作通过私有 [`CONTROL_API.md`](CONTROL_API.md) 执行。
+
+
+## Neighbor and charger direct supply
+
+`neighbor` is always present and is `enabled:false,status:disabled` by default.
+It has an independent collection lifecycle and can be enabled through
+`neighbor.set`. See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
+freshness, serving/CA filtering, error reasons and firmware-specific limitations.
+`no_supported_reports` explicitly distinguishes unsupported decoded signatures
+from absence of surrounding cells. The block is sent in regular SSE snapshots.
+
+`power.direct_supply` is optional and independent of the `battery` block. It is
+included only when the charger response contains `direct_power_supply_mode`:
+
+```json
+{"power":{"direct_supply":{"supported":true,"enabled":false,"mode":"disable"}}}
+```
+
+`enable` maps to true and `disable` to false. An unrecognized enum yields
+`enabled:null,mode:null`; absence is not a false value. Use
+`power.direct_supply.status` for a fresh capability read and
+`power.direct_supply.set` for verified changes. These fields describe firmware
+configuration and do not certify battery isolation or measured power flow.

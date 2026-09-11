@@ -14,19 +14,26 @@ jobs:
       - name: Build with strict warnings
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/main.c \
-            -ldl -o zwrt-datad-test
+            src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c src/main.c \
+            -lm -ldl -o zwrt-datad-test
+      - name: Test neighbor parsing, lifecycle and direct supply
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/neighbor_stream_test.c src/neighbor/parser.c -lm -o /tmp/neighbor-stream-test
+          /tmp/neighbor-stream-test
+          python3 tests/neighbor_parser_test.py ./zwrt-datad-test
+          python3 tests/neighbor_http_test.py ./zwrt-datad-test
+          python3 tests/direct_supply_test.py ./zwrt-datad-test
       - name: Test linked SMS crypto backend
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -DWEB_CRYPTO_STATIC -Iinclude tests/web_crypto_test.c src/web_crypto.c -lcrypto -o web-crypto-test
           ./web-crypto-test
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -DWEB_CRYPTO_STATIC -Iinclude src/*.c -lcrypto -o zwrt-datad-linked-test
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -DWEB_CRYPTO_STATIC -Iinclude src/*.c src/neighbor/*.c -lm -lcrypto -o zwrt-datad-linked-test
           tests/integration.sh ./zwrt-datad-linked-test
       - name: Test custom QUIC aggregation
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             tests/custom_aggregation_test.c src/password_auth.c src/cloud_proxy.c src/json.c \
-            src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c -ldl -o /tmp/custom-aggregation-test
+            src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c -lm -ldl -o /tmp/custom-aggregation-test
           /tmp/custom-aggregation-test
       - name: Test wireless policy and interface mapping
         run: |

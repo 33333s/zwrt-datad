@@ -10,6 +10,8 @@ struct control_result {
 };
 
 const char *control_capabilities_json(void);
+/* Returns zero if this charger response does not expose direct supply. */
+int control_direct_supply_state(const char *charger_json, char *out, size_t outlen);
 void control_restore_cooling_state(void);
 void control_cooling_tick(long temperature_celsius);
 void control_release_cooling_state(void);

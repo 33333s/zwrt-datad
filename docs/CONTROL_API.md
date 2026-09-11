@@ -213,3 +213,36 @@ because the OEM post-DFS workflow commits configuration before resetting power.
 This does not reassert PSM, and it does not continuously fight arbitrary live
 changes. Additional APs inherit the OEM computed radio power when no dBm override
 is selected.
+
+## Neighbor collection
+
+| action | params | Result |
+|---|---|---|
+| `neighbor.status` | none | Current cached neighbor block |
+| `neighbor.set` | `enabled`: boolean or 0/1 | Saved enablement and current lifecycle state |
+
+Collection is off by default. Enablement is saved under `/data/zwrt-datad` and
+survives restart. Shutdown is asynchronous. A successful enable request confirms
+the configuration, not compatible firmware reports; inspect `status`, `reason`
+and `cells`. See [NEIGHBOR.md](NEIGHBOR.md) for the supported signature limits.
+
+## Charger direct supply
+
+| action | params | Result |
+|---|---|---|
+| `power.direct_supply.status` | none | `supported`, `enabled`, `mode` |
+| `power.direct_supply.set` | `enabled`: boolean or 0/1 | Same fields plus `changed`, `verified` |
+
+The adapter reads `zwrt_bsp.charger.list.direct_power_supply_mode` and writes only
+that field through `zwrt_bsp.charger.set`, mapping true/false to enable/disable.
+A missing field returns `supported:false,enabled:null,mode:null`. An unknown enum
+returns `supported:true,enabled:null,mode:null`. Neither is treated as disabled,
+and setting either fails with HTTP 502 before any write. Invalid parameters
+return HTTP 400. Unchanged requests return `changed:false,verified:true` without
+issuing a write. Changed requests return success only after bounded readback
+confirms the requested enum. B20 returns an empty body on a successful write;
+this is accepted only with confirmed readback. Command errors and unconfirmed writes return 502.
+State is refreshed after uncertain writes as the hardware may have changed.
+`verified` confirms the firmware setting, not an electrical current measurement.
+No extra datad startup policy rewrites the mode; reboot persistence is whatever
+the device firmware provides. Both actions use the existing token authentication.
