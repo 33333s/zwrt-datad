@@ -4,7 +4,8 @@
 
 当前传输层使用 `HTTP + SSE`：
 
-- `GET /state`：返回当前完整 JSON
+- `GET /version`：返回运行中 datad 的自身版本
+- `GET /state`：返回当前完整 JSON（含 `datad.version`）
 - `GET /events`：返回 `text/event-stream`，持续推送最新快照
 - `GET /healthz`：返回 `ok`
 - `GET /capabilities`：返回允许的设备操作
@@ -68,10 +69,24 @@ bash scripts/build.sh
 主机侧语法检查：
 
 ```sh
+python3 scripts/generate-version.py
 cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
   src/*.c src/neighbor/*.c -lm -ldl \
   -o zwrt-datad-test
 ```
+
+## 读取 datad 版本
+
+```sh
+/data/zwrt-datad/zwrt-datad --version
+curl -fsS http://127.0.0.1:9460/version
+```
+
+命令行输出 `zwrt-datad X.Y.Z`；HTTP 返回 `{"name":"zwrt-datad","version":"X.Y.Z"}`。
+`/state` 和 `/events` 每份快照的 `datad.version` 同样返回这个版本。
+版本来自构建时的 `version.json`，编译进二进制，不读取运行目录中的清单；
+`--version` / `-V` 直接输出并退出，不启动采集或服务。内网 9461 的 `/version` 与 `/state` 使用相同鉴权。
+设备固件版本继续由 `system.sw_version` 提供，上层检查 datad 更新应使用 `datad.version`。
 
 ## 运行
 

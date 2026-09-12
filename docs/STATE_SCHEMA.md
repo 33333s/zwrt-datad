@@ -14,11 +14,19 @@ SSE  /events
 消费者必须用 JSON key 是否存在判断能力，不能用数值真假判断，因为
 `battery.percent=0`、`charging=0` 和 `wlan.enabled=0` 都是合法状态。
 
+## Datad 自身版本
+
+`datad` 块始终存在，与设备模板和硬件状态无关。`datad.version` 是运行中二进制
+在构建时从 `version.json` 固定的版本，`datad.name` 为 `zwrt-datad`；
+`GET /version` 返回同一个对象。`system.sw_version` 保持原义：设备固件版本。
+兼容旧服务时，缺少 `datad.version` 代表未知，不能回退为 `system.sw_version`。
+
 ## Shape
 
 ```json
 {
   "ts": 1781201029,
+  "datad": { "name": "zwrt-datad", "version": "0.9.33" },
   "net": {
     "type": "SA",
     "bars": 5,
