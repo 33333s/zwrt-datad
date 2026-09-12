@@ -5,7 +5,7 @@ from neighbor_parser_test import qsh, snapshot
 BIN=pathlib.Path(sys.argv[1]).resolve()
 with tempfile.TemporaryDirectory(prefix='datad-neighbor-http-') as name:
     base=pathlib.Path(name); config=base/'neighbor.json'; runtime=base/'runtime'; net=base/'net.json'; payload=base/'payload'; pids=base/'pids'
-    token=base/'auth';token.write_text('neighbor-fixture-token')
+    token=base/'auth';token.write_text('neighbor-fixture-token');diag_args=base/'diag-args.json'
     net.write_text(json.dumps({'network_type':'LTE-NSA','nr5g_action_channel':640000,'nr5g_pci':123,'wan_active_channel':1650,'lte_pci':222,'nrca':'124,78,0,640000,100;', 'lteca':'0,223,0,3,1650,20,0,-95,-10,10,-60;'}))
     payload.write_bytes(qsh(3640397572,[78,640000,123,0])+snapshot(3657540452,pci=123)+qsh(3640397572,[78,640000,124,0])+snapshot(3657540452,pci=124)+qsh(3640397572,[41,520000,125,0])+snapshot(3657540452,pci=125)+qsh(3640546464,[1650,222,-920,0])+qsh(3640546464,[1650,223,-950,0])+qsh(3640546464,[1650,224,-960,0]))
     ubus=base/'ubus';ubus.write_text('''#!/bin/sh
@@ -13,12 +13,12 @@ case "$*" in *nwinfo_get_netinfo*) cat "$NEIGHBOR_NET";; *) echo '{}';; esac
 ''');ubus.chmod(0o755)
     diag=base/'diag';diag.write_text('''#!/usr/bin/env python3
 import os,pathlib,sys,time
-args=sys.argv[1:]; ring=pathlib.Path(args[args.index('-o')+1]); out=ring/'fixture.qmdl'
+args=sys.argv[1:]; pathlib.Path(os.environ['NEIGHBOR_DIAG_ARGS']).write_text(__import__('json').dumps(args)); ring=pathlib.Path(args[args.index('-o')+1]); out=ring/'fixture.qmdl'
 with open(os.environ['NEIGHBOR_PIDS'],'a') as f:f.write(str(os.getpid())+'\\n')
 out.write_bytes(pathlib.Path(os.environ['NEIGHBOR_PAYLOAD']).read_bytes())
 while True:time.sleep(1)
 ''');diag.chmod(0o755)
-    env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS_BIN=str(ubus),ZWRT_DATAD_UCI_BIN='/usr/bin/false',ZWRT_DATAD_NEIGHBOR_CONFIG=str(config),ZWRT_DATAD_NEIGHBOR_DIR=str(runtime),ZWRT_DATAD_DIAG_BIN=str(diag),NEIGHBOR_NET=str(net),NEIGHBOR_PAYLOAD=str(payload),NEIGHBOR_PIDS=str(pids))
+    env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS_BIN=str(ubus),ZWRT_DATAD_UCI_BIN='/usr/bin/false',ZWRT_DATAD_NEIGHBOR_CONFIG=str(config),ZWRT_DATAD_NEIGHBOR_DIR=str(runtime),ZWRT_DATAD_DIAG_BIN=str(diag),NEIGHBOR_NET=str(net),NEIGHBOR_PAYLOAD=str(payload),NEIGHBOR_PIDS=str(pids),NEIGHBOR_DIAG_ARGS=str(diag_args))
     processes=[]
     def launch(extra=(),overrides=None):
         with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -47,11 +47,14 @@ while True:time.sleep(1)
         try:p.wait(timeout=6)
         except subprocess.TimeoutExpired:p.kill();p.wait();raise AssertionError('unbounded shutdown')
     try:
-        port,proc=launch(); n=wait(port,lambda n:n['status']=='disabled');assert not runtime.exists()
+        config.write_text(json.dumps({'enabled': True}))
+        port,proc=launch(); n=wait(port,lambda n:n['status']=='disabled');assert not runtime.exists();assert json.loads(config.read_text())=={'enabled':False}
         assert control(port,'set',{'enabled':True},False)[0]==401
         assert control(port,'set',{'enabled':'enable'})[0]==400
         assert control(port,'set',{'enabled':True})[0]==200
         n=wait(port,lambda n:n['status']=='ready');assert {(c['rat'],c['pci']) for c in n['cells']}=={('NR',125),('LTE',224)},n
+        args=json.loads(diag_args.read_text());assert args[-6:]==['-s','4','-n','4','-c','-d'],args
+        assert json.loads(config.read_text())=={'enabled':False}
         assert next(c for c in n['cells'] if c['rat']=='NR')['frequency_relation']=='inter'
         old=config.stat().st_mtime_ns;assert control(port,'set',{'enabled':True})[0]==200;assert config.stat().st_mtime_ns==old
         assert control(port,'status')[1]['result']['enabled']
@@ -64,12 +67,12 @@ while True:time.sleep(1)
         for identity in (123456789,123456790):
             stable['nr5g_cell_id']=identity; net.write_text(json.dumps(stable))
             n=wait(port,lambda n:n['generation']>gen and n['status']=='ready'); gen=n['generation']
-        port2,proc2=launch();wait(port2,lambda n:n['reason']=='another_neighbor_instance');stop(proc2)
+        port2,proc2=launch(('--neighbor',));wait(port2,lambda n:n['reason']=='another_neighbor_instance');stop(proc2)
         gen=n['generation'];net.write_text(json.dumps({'network_type':'LTE','wan_active_channel':1650,'lte_pci':222}))
         n=wait(port,lambda n:n['generation']>gen and n['status']=='ready');assert {c['rat'] for c in n['cells']}=={'LTE'}
         started=time.monotonic();assert req(port,'/healthz')[0]==200;assert time.monotonic()-started<2
-        assert control(port,'set',{'enabled':False})[0]==200;wait(port,lambda n:n['status']=='disabled' and not n['collector_running']);stop(proc)
-        assert not list(runtime.glob('capture.*'))
+        started=time.monotonic();code,disabled=control(port,'set',{'enabled':False});assert code==200 and disabled['result']['status']=='disabled' and not disabled['result']['collector_running'],disabled
+        assert time.monotonic()-started<4.5;assert not list(runtime.glob('capture.*'));stop(proc)
         port,proc=launch();wait(port,lambda n:n['status']=='disabled');stop(proc)
         # B28 identities + comparison report reach HTTP with serving filtering.
         net.write_text(json.dumps(stable))
@@ -91,7 +94,7 @@ while True:time.sleep(1)
         # Directory budget violation stops only the collector and remains observable.
         diag.write_text('#!/usr/bin/env python3\nimport sys,pathlib,time\na=sys.argv; p=pathlib.Path(a[a.index("-o")+1]); (p/"one.bin").write_bytes(bytes(12*1024*1024)); (p/"two.bin").write_bytes(bytes(12*1024*1024)); (p/"three.bin").write_bytes(bytes(12*1024*1024)); time.sleep(60)\n')
         port,proc=launch(('--neighbor',));wait(port,lambda n:n['reason']=='capture_limit');assert req(port,'/healthz')[0]==200;stop(proc)
-        print('neighbor HTTP: default off, auth, persistent toggle, serving/CA filter, NSA, context reset, freshness, lock exclusion, dependency/map/capture errors, health responsiveness and cleanup PASS')
+        print('neighbor HTTP: default off, session-only toggle, auth, synchronous cleanup, bounded circular capture, serving/CA filter, NSA, context reset, freshness, lock exclusion, dependency/map/capture errors, health responsiveness and cleanup PASS')
     finally:
         for p in processes:
             if p.poll() is None:stop(p)

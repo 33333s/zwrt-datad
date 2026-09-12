@@ -219,11 +219,12 @@ is selected.
 | action | params | Result |
 |---|---|---|
 | `neighbor.status` | none | Current cached neighbor block |
-| `neighbor.set` | `enabled`: boolean or 0/1 | Saved enablement and current lifecycle state |
+| `neighbor.set` | `enabled`: boolean or 0/1 | Process-scoped enablement and current lifecycle state |
 
-Collection is off by default. Enablement is saved under `/data/zwrt-datad` and
-survives restart. Shutdown is asynchronous. A successful enable request confirms
-the configuration, not compatible firmware reports; inspect `status`, `reason`
+Collection is off by default and enabling lasts only until datad restarts. Older
+saved `enabled:true` values are reset to false during startup. Disabling waits for
+the owned collector to stop and removes its capture logs before returning success.
+A successful enable request confirms startup, not compatible firmware reports; inspect `status`, `reason`
 and `cells`. See [NEIGHBOR.md](NEIGHBOR.md) for the supported signature limits.
 
 ## Charger direct supply

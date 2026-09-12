@@ -420,6 +420,17 @@ static int config_read(const char *path,int *enabled) {
     else return 0;
     return 1;
 }
+static int config_write(const char *path,int enabled) {
+    char temp[PATH_MAX],data[64];
+    if (snprintf(temp,sizeof temp,"%s.XXXXXX",path)>=(int)sizeof temp) return 0;
+    int fd=mkstemp(temp);
+    if (fd<0) return 0;
+    int len=snprintf(data,sizeof data,"{\"enabled\":%s}\n",enabled ? "true":"false");
+    int ok=write_all(fd,data,(size_t)len) && fsync(fd)==0;
+    close(fd);
+    if (!ok || rename(temp,path)) { unlink(temp); return 0; }
+    return 1;
+}
 static void blank_status(int status,int reason) {
     memset(&manager.latest,0,sizeof manager.latest);
     manager.latest.magic=WIRE_MAGIC; manager.latest.generation=manager.generation;
@@ -430,8 +441,17 @@ void neighbor_manager_init(int enabled,const char *config_file) {
     const char *configured=getenv("ZWRT_DATAD_NEIGHBOR_CONFIG");
     const char *path=config_file ? config_file : configured && *configured ? configured : CONFIG_DEFAULT;
     if (!copy_path(manager.config,sizeof manager.config,path)) { manager.config_error=1; blank_status(ERROR,CONFIG_ERROR); return; }
-    if (enabled>=0) manager.enabled=enabled!=0;
-    else if (!config_read(manager.config,&manager.enabled)) manager.config_error=1;
+    if (enabled>0) {
+        /* --neighbor is an explicit, process-scoped development override. */
+        manager.enabled=1;
+    } else {
+        int saved=0;
+        manager.enabled=0;
+        /* Collection is deliberately session-only. Migrate any persisted true
+         * left by older releases so a service restart always returns to off. */
+        if (!config_read(manager.config,&saved) || (saved && !config_write(manager.config,0)))
+            manager.config_error=1;
+    }
     blank_status(manager.config_error ? ERROR : manager.enabled ? STARTING : DISABLED,
                  manager.config_error ? CONFIG_ERROR : NONE);
 }
@@ -442,24 +462,22 @@ static void request_stop(void) {
 }
 int neighbor_manager_set_enabled(int enabled,char *err,size_t errlen) {
     if (!manager.initialized) { snprintf(err,errlen,"neighbor manager is not initialized"); return 0; }
-    int previous;
-    if (!config_read(manager.config,&previous) || previous!=enabled || access(manager.config,F_OK)) {
-        char temp[PATH_MAX],data[64];
-        if (snprintf(temp,sizeof temp,"%s.XXXXXX",manager.config)>=(int)sizeof temp) { snprintf(err,errlen,"neighbor config path is too long"); return 0; }
-        int fd=mkstemp(temp);
-        if (fd<0) { snprintf(err,errlen,"cannot create neighbor config"); return 0; }
-        int len=snprintf(data,sizeof data,"{\"enabled\":%s}\n",enabled ? "true":"false");
-        int ok=write_all(fd,data,(size_t)len) && fsync(fd)==0; close(fd);
-        if (!ok || rename(temp,manager.config)) { unlink(temp); snprintf(err,errlen,"cannot save neighbor config"); return 0; }
+    int saved=0;
+    /* Keep the durable setting false. Enabling starts only this datad session. */
+    if (!config_read(manager.config,&saved) || saved || access(manager.config,F_OK)) {
+        if (!config_write(manager.config,0)) { snprintf(err,errlen,"cannot save neighbor default"); return 0; }
     }
     manager.config_error=0;
-    if (manager.enabled!=enabled) {
-        manager.enabled=enabled; manager.generation++; manager.retry_at=0;
-        int collector_pid=manager.latest.collector_pid;
-        if (!enabled) request_stop();
-        blank_status(enabled ? STARTING:DISABLED,NONE);
-        if (!enabled) manager.latest.collector_pid=collector_pid;
+    if (manager.enabled==enabled) return 1;
+    manager.enabled=enabled; manager.generation++; manager.retry_at=0;
+    if (!enabled) {
+        /* Wait for the owned worker to stop so its private capture tree is gone
+         * before the control request reports success. */
+        neighbor_manager_stop();
+        blank_status(DISABLED,NONE);
+        return 1;
     }
+    blank_status(STARTING,NONE);
     return 1;
 }
 static void spawn_worker(void) {

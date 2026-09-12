@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.34",
+    "version": "0.9.35",
     "asset": "zwrt-datad-aarch64",
-    "notes": "云端 TLS/MQTT/WebSocket 运行时静态集成进 datad，统一为单一二进制和进程"
+    "notes": "邻区改为按需会话扫描：重启默认关闭，关闭后同步清理日志，并保持 32 MiB 硬上限与 4 x 4 MiB 循环 QMDL"
   }
 }
