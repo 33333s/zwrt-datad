@@ -288,7 +288,9 @@ SSE  /events
 
 `neighbor` is always present and is `enabled:false,status:disabled` by default.
 It has an independent collection lifecycle and can be enabled through
-`neighbor.set`. See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
+`neighbor.set` for the current datad process. Restarting datad restores disabled;
+disabling stops the collector and removes its capture logs before returning.
+See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
 freshness, serving/CA filtering, error reasons and firmware-specific limitations.
 `no_supported_reports` explicitly distinguishes unsupported decoded signatures
 from absence of surrounding cells. The block is sent in regular SSE snapshots.

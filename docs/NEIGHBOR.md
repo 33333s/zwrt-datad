@@ -8,11 +8,13 @@ Enable it through the authenticated local control API:
 {"action":"neighbor.set","params":{"enabled":true}}
 ```
 
-`neighbor.status` returns the current block. Setting `enabled:false` requests an
-asynchronous shutdown; `stopping` changes to `disabled` after the worker exits.
-The setting is saved atomically with mode 0600 in
-`/data/zwrt-datad/neighbor.json`. `--neighbor` enables one process without changing
-the saved setting; `--neighbor-config PATH` selects another setting file.
+`neighbor.status` returns the current block. Enabling is scoped to the current
+datad process: every service restart returns to disabled, including migration from
+an older saved `enabled:true`. Setting `enabled:false` waits for the owned worker to
+exit and removes its private capture directory before success is returned.
+`/data/zwrt-datad/neighbor.json` is kept atomically at `enabled:false` with mode
+0600. `--neighbor` is an explicit process-only development override;
+`--neighbor-config PATH` selects another setting file.
 
 Example cell (illustrative, not a claim about a particular device):
 
