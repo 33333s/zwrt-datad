@@ -122,7 +122,7 @@ nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
 curl -4fL --retry 3 'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' -o /tmp/install-datad.sh && sh /tmp/install-datad.sh
 ```
 
-安装器使用发布时固定的二进制 SHA-256，从配置的 HTTPS 镜像下载；服务脚本、`version.json` 和 OpenSSL 许可证内嵌在同一安装器中。固定安装到 `/data/zwrt-datad`，保留已有 Token、云端与散热配置。变更前备份，二进制先经临时启动检查；需要启动时只运行一个 datad 控制进程，隔离端口验收后再切换正式服务。失败会尝试恢复原文件和服务。
+安装器使用发布时固定的二进制 SHA-256，从配置的 HTTPS 镜像下载；服务脚本、`version.json` 和 OpenSSL 许可证内嵌在同一安装器中。固定安装到 `/data/zwrt-datad`，保留已有 Token、云端与散热配置。变更前备份，二进制先经临时启动检查；需要启动时只运行一个 datad 控制进程，隔离端口验收后再切换正式服务。云端 TLS/MQTT/WebSocket 运行时已经静态链接进同一二进制，不再依赖独立 worker。失败会尝试恢复原文件和服务。
 
 自启统一为 `/etc/rc.local` 中、UFI 和 `exit 0` 之前的一条 `sh /data/zwrt-datad/service.sh start`。安装器清理已识别的旧路径、直接启动命令和重复项，停用旧 datad init 启动链接；不新建 init 脚本。标准内容完全相同时不改写 `rc.local`，再次安装同版且服务健康时不重启。
 

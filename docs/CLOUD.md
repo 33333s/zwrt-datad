@@ -1,8 +1,8 @@
 # NMS 云端管理
 
-默认关闭。zwrt-datad-cloud 是同仓库的可选工作进程，使用 Go TLS/MQTT/WebSocket，C 采样器独立运行。构建使用 scripts/build-cloud.sh；Release 增加 zwrt-datad-cloud-aarch64，安装名为 /data/zwrt-datad/zwrt-datad-cloud。将 scripts/cloud-service.sh 安装至同目录并更新 service.sh，原 datad 服务负责启停，无需新 init.d 或 rc.local 项。
+默认关闭。云端 TLS/MQTT/WebSocket 运行时与 C 采样器静态链接进同一个 `zwrt-datad`，共享同一二进制和 PID。`scripts/build.sh` 先把 C 采样器编译为 archive，再由 Go 主程序链接成最终 ARM64 musl 静态二进制；设备不再安装或启动 `zwrt-datad-cloud`、`cloud-service.sh` 或 `cloud.sock`。
 
-UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。worker 只监听 0600 的 cloud.sock。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。测试可通过 ZWRT_DATAD_CLOUD_SOCKET 改写采样器 Unix socket 目标。
+UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。请求由 datad 进程内直接处理。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。
 
 配置字段：enabled、broker（ssl://主机:端口）、platform_url（https://主机:端口）、username/password（设备 MQTT 凭据）、ca_pem（可选 CA）、vendor/model/identity_type/identity/platform、report_interval_seconds（10–3600）、remote_enabled、services:[{name,port,kind}]（kind=web/terminal）。默认后台端口 80/2333/8899，最多 8 项，禁止 9460/9461。UFI 传入已有持久 UUID，不能每次启用生成新身份。
 

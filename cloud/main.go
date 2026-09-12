@@ -1,4 +1,4 @@
-// zwrt-datad-cloud isolates cloud network I/O from the C sampler.
+// The cloud runtime and C sampler are linked into one zwrt-datad executable.
 package main
 
 import (
@@ -9,19 +9,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -57,12 +54,13 @@ type status struct {
 	LastReport int64  `json:"last_report_at,omitempty"`
 }
 type agent struct {
-	mu       sync.Mutex
-	config   Config
-	status   status
-	file     string
-	stateURL string
-	change   chan struct{}
+	mu        sync.Mutex
+	config    Config
+	status    status
+	loadError bool
+	file      string
+	stateURL  string
+	change    chan struct{}
 }
 
 func defaults() Config {
@@ -179,6 +177,7 @@ func (a *agent) configAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.config = c
+		a.loadError = false
 		a.status = status{State: "reconfiguring"}
 		select {
 		case a.change <- struct{}{}:
@@ -246,7 +245,16 @@ func (a *agent) run(ctx context.Context) {
 	for {
 		a.mu.Lock()
 		c := a.config
+		loadError := a.loadError
 		a.mu.Unlock()
+		if loadError {
+			select {
+			case <-ctx.Done():
+				return
+			case <-a.change:
+				continue
+			}
+		}
 		runCtx, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})
 		go func() { defer close(done); a.connect(runCtx, c) }()
@@ -384,59 +392,4 @@ func (a *agent) report(ctx context.Context, client mqtt.Client, c Config) error 
 	a.status.LastReport = time.Now().Unix()
 	a.mu.Unlock()
 	return nil
-}
-func main() {
-	dir := flag.String("dir", "/data/zwrt-datad", "data directory")
-	stateURL := flag.String("state-url", "http://127.0.0.1:9460/state", "local sampler endpoint")
-	showVersion := flag.Bool("version", false, "print version")
-	flag.Parse()
-	if *showVersion {
-		fmt.Println(version)
-		return
-	}
-	if e := os.MkdirAll(*dir, 0700); e != nil {
-		panic(e)
-	}
-	// flock prevents two workers from replacing the same live socket.
-	lock, e := os.OpenFile(filepath.Join(*dir, "cloud.lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if e != nil {
-		panic(e)
-	}
-	defer lock.Close()
-	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		fmt.Fprintln(os.Stderr, "cloud worker already running")
-		os.Exit(1)
-	}
-	a := &agent{config: defaults(), file: filepath.Join(*dir, "cloud.json"), stateURL: *stateURL, change: make(chan struct{}, 1), status: status{State: "starting"}}
-	b, e := os.ReadFile(a.file)
-	if e == nil {
-		if json.Unmarshal(b, &a.config) != nil || validate(a.config) != nil {
-			fmt.Fprintln(os.Stderr, "invalid cloud configuration")
-			os.Exit(1)
-		}
-	} else if !os.IsNotExist(e) {
-		panic(e)
-	}
-	socket := filepath.Join(*dir, "cloud.sock")
-	os.Remove(socket)
-	l, e := net.Listen("unix", socket)
-	if e != nil {
-		panic(e)
-	}
-	defer os.Remove(socket)
-	if e = os.Chmod(socket, 0600); e != nil {
-		panic(e)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/cloud/config", a.configAPI)
-	mux.HandleFunc("/cloud/status", a.statusAPI)
-	server := &http.Server{Handler: mux, ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 4096}
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
-	done := make(chan struct{})
-	go func() { defer close(done); a.run(ctx) }()
-	go func() { <-ctx.Done(); server.Close() }()
-	server.Serve(l)
-	cancel()
-	<-done
 }

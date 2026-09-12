@@ -18,8 +18,24 @@ CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
   -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
 
 CRYPTO_PREFIX="$(bash scripts/build-static-crypto.sh)"
-$CC $CFLAGS -DWEB_CRYPTO_STATIC -I"$CRYPTO_PREFIX/include" -static src/*.c src/neighbor/*.c \
-  "$CRYPTO_PREFIX/lib/libcrypto.a" -lm -Wl,--gc-sections -pthread -o zwrt-datad
+DATAD_BUILD="$ROOT/build/datad-embedded-aarch64"
+rm -rf "$DATAD_BUILD"
+mkdir -p "$DATAD_BUILD"
+for source in src/*.c src/neighbor/*.c; do
+  object="$DATAD_BUILD/${source//\//_}.o"
+  $CC $CFLAGS -DWEB_CRYPTO_STATIC -DCLOUD_EMBEDDED -DDATAD_EMBEDDED \
+    -I"$CRYPTO_PREFIX/include" -c "$source" -o "$object"
+done
+"$TC/aarch64-linux-ar" rcs "$DATAD_BUILD/libdatad.a" "$DATAD_BUILD"/*.o
+(
+  cd cloud
+  CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="$CC" \
+  CGO_CFLAGS="-I$ROOT/include" \
+  CGO_LDFLAGS="$DATAD_BUILD/libdatad.a $CRYPTO_PREFIX/lib/libcrypto.a -lm -ldl -pthread" \
+  go build -tags datad_embedded,netgo,osusergo -trimpath \
+    -ldflags="-s -w -X main.version=$(python3 -c 'import json; print(json.load(open("../version.json"))["datad"]["version"])') -linkmode external -extldflags -static" \
+    -o "$ROOT/zwrt-datad" .
+)
 echo ">> link OK"
 "$TC/aarch64-linux-size" zwrt-datad
 "$TC/aarch64-linux-strip" -o "$ASSET" zwrt-datad

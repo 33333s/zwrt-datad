@@ -41,6 +41,7 @@ else:
         fake.chmod(0o755)
         self.env = dict(os.environ, ZWRT_DATAD_UBUS_BIN=str(fake),
                         ZWRT_DATAD_UCI_BIN='/usr/bin/false',
+                        ZWRT_DATAD_DIR=str(self.root / 'cloud'),
                         VERSION_TEST_CALLS=str(self.calls),
                         ZWRT_DATAD_NEIGHBOR_DIR=str(self.root / 'capture'),
                         ZWRT_DATAD_NEIGHBOR_CONFIG=str(self.root / 'neighbor.json'))

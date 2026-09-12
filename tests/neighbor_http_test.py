@@ -18,7 +18,7 @@ with open(os.environ['NEIGHBOR_PIDS'],'a') as f:f.write(str(os.getpid())+'\\n')
 out.write_bytes(pathlib.Path(os.environ['NEIGHBOR_PAYLOAD']).read_bytes())
 while True:time.sleep(1)
 ''');diag.chmod(0o755)
-    env=dict(os.environ,ZWRT_DATAD_UBUS_BIN=str(ubus),ZWRT_DATAD_UCI_BIN='/usr/bin/false',ZWRT_DATAD_NEIGHBOR_CONFIG=str(config),ZWRT_DATAD_NEIGHBOR_DIR=str(runtime),ZWRT_DATAD_DIAG_BIN=str(diag),NEIGHBOR_NET=str(net),NEIGHBOR_PAYLOAD=str(payload),NEIGHBOR_PIDS=str(pids))
+    env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS_BIN=str(ubus),ZWRT_DATAD_UCI_BIN='/usr/bin/false',ZWRT_DATAD_NEIGHBOR_CONFIG=str(config),ZWRT_DATAD_NEIGHBOR_DIR=str(runtime),ZWRT_DATAD_DIAG_BIN=str(diag),NEIGHBOR_NET=str(net),NEIGHBOR_PAYLOAD=str(payload),NEIGHBOR_PIDS=str(pids))
     processes=[]
     def launch(extra=(),overrides=None):
         with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]

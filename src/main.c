@@ -5335,7 +5335,7 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
     return p;
 }
 
-int main(int argc, char **argv)
+int datad_main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--neighbor-parse")) return neighbor_parse_cli(argc - 2, argv + 2);
     int once = 0, interval_ms = 1000, neighbor_enabled = -1;
@@ -5403,6 +5403,7 @@ int main(int argc, char **argv)
     struct http_listener local_listener = {-1, 0, 0};
     struct http_listener lan_listener = {-1, 1, 1};
     struct auth_state auth;
+    int cloud_started = 0;
     struct sse_client clients[HTTP_MAX_CLIENTS];
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) clients[i].fd = -1;
     auth_state_init(&auth);
@@ -5431,6 +5432,19 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+
+        char cloud_state_url[128];
+        const char *cloud_dir = getenv("ZWRT_DATAD_DIR");
+        if (!cloud_dir || !*cloud_dir) cloud_dir = "/data/zwrt-datad";
+        if (snprintf(cloud_state_url, sizeof cloud_state_url,
+                     "http://127.0.0.1:%d/state", port) >= (int)sizeof cloud_state_url ||
+            cloud_runtime_start(cloud_dir, cloud_state_url) != 0) {
+            fprintf(stderr, "cannot initialize embedded cloud runtime\n");
+            if (lan_listener.fd >= 0) close(lan_listener.fd);
+            close(local_listener.fd);
+            return 1;
+        }
+        cloud_started = 1;
     }
 
     /* One-shot snapshots never start diagnostic capture. */
@@ -5568,9 +5582,17 @@ int main(int argc, char **argv)
     } while (g_run);
 
     neighbor_manager_stop();
+    if (cloud_started) cloud_runtime_stop();
     if (g_topflow_multimodem_enabled) control_release_cooling_state();
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
     if (lan_listener.fd >= 0) close(lan_listener.fd);
     if (local_listener.fd >= 0) close(local_listener.fd);
     return 0;
 }
+
+#ifndef DATAD_EMBEDDED
+int main(int argc, char **argv)
+{
+    return datad_main(argc, argv);
+}
+#endif

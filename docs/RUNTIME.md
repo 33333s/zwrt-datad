@@ -1,6 +1,6 @@
 # 运行与日志
 
-`zwrt-datad` 读取设备 `ubus/uci/sysfs` 与 QoS 日志，并在本机 `127.0.0.1:9460` 提供 HTTP/SSE 和白名单控制接口。它不包含 modem signaling capture/decode、DCI 或厂商 DIAG 工具；这些能力不属于本仓库的公开边界，详见 [REPO_BOUNDARY.md](REPO_BOUNDARY.md)。
+`zwrt-datad` 读取设备 `ubus/uci/sysfs` 与 QoS 日志，并在本机 `127.0.0.1:9460` 提供 HTTP/SSE 和白名单控制接口。云端 TLS/MQTT/WebSocket 运行时静态链接在同一个 `zwrt-datad` 二进制和进程中；`cloud.json` 仍留在正式数据目录。它不包含 modem signaling capture/decode、DCI 或厂商 DIAG 工具；这些能力不属于本仓库的公开边界，详见 [REPO_BOUNDARY.md](REPO_BOUNDARY.md)。
 
 ## 推荐启动方式
 

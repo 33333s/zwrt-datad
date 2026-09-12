@@ -9,15 +9,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
       - name: Test standard installer and boot entry normalization
         run: python3 tests/installer_test.py
       - name: Generate binary version from release manifest
         run: python3 scripts/generate-version.py
-      - name: Build with strict warnings
+      - name: Build integrated datad with strict warnings
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c src/main.c \
-            -lm -ldl -o zwrt-datad-test
+          root="$PWD"
+          mkdir -p build/datad-host
+          for source in src/*.c src/neighbor/*.c; do
+            object="build/datad-host/${source//\//_}.o"
+            cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
+              -DWEB_CRYPTO_STATIC -DCLOUD_EMBEDDED -DDATAD_EMBEDDED \
+              -Iinclude -c "$source" -o "$object"
+          done
+          ar rcs build/datad-host/libdatad.a build/datad-host/*.o
+          version="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
+          cd cloud
+          CGO_ENABLED=1 CC=cc CGO_CFLAGS="-I$root/include" \
+          CGO_LDFLAGS="$root/build/datad-host/libdatad.a -lm -lcrypto -ldl -pthread" \
+            go build -tags datad_embedded,netgo,osusergo -trimpath \
+            -ldflags="-s -w -X main.version=$version" -o ../zwrt-datad-test .
+      - name: Test in-process cloud API
+        run: python3 tests/cloud_embedded_test.py ./zwrt-datad-test
       - name: Test running version via CLI, HTTP and SSE
         run: python3 tests/version_test.py ./zwrt-datad-test
       - name: Test neighbor parsing, lifecycle and direct supply
@@ -27,12 +44,10 @@ jobs:
           python3 tests/neighbor_parser_test.py ./zwrt-datad-test
           python3 tests/neighbor_http_test.py ./zwrt-datad-test
           python3 tests/direct_supply_test.py ./zwrt-datad-test
-      - name: Test linked SMS crypto backend
+      - name: Test SMS crypto backend
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -DWEB_CRYPTO_STATIC -Iinclude tests/web_crypto_test.c src/web_crypto.c -lcrypto -o web-crypto-test
           ./web-crypto-test
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -DWEB_CRYPTO_STATIC -Iinclude src/*.c src/neighbor/*.c -lm -lcrypto -o zwrt-datad-linked-test
-          tests/integration.sh ./zwrt-datad-linked-test
       - name: Test custom QUIC aggregation
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
@@ -65,9 +80,6 @@ jobs:
         run: |
           chmod +x tests/integration.sh tests/mock_ubus.sh tests/mock_uci.sh
           tests/integration.sh ./zwrt-datad-test
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.x'
-      - name: Test cloud worker
+      - name: Test cloud runtime
         working-directory: cloud
         run: go test -race ./... && go vet ./...

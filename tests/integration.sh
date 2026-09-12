@@ -62,6 +62,7 @@ printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$MOCK_CURL_LOG"
 chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh" "$ROOT/tests/mock_curl.sh"
 export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
+export ZWRT_DATAD_DIR="$COOLING_TMP/cloud"
 
 ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
 ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \

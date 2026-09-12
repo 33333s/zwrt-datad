@@ -63,14 +63,15 @@ running_pid() {
     return 1
 }
 
-cloud_service() {
-    [ ! -f "$SERVICE_DIR/cloud-service.sh" ] || sh "$SERVICE_DIR/cloud-service.sh" "$1"
+stop_legacy_cloud() {
+    [ ! -f "$SERVICE_DIR/cloud-service.sh" ] || sh "$SERVICE_DIR/cloud-service.sh" stop >/dev/null 2>&1 || true
+    rm -f "$SERVICE_DIR/cloud.pid" "$SERVICE_DIR/cloud.sock" "$SERVICE_DIR/cloud.lock"
 }
 
 start() {
     active_pid="$(running_pid)"
     if [ -n "$active_pid" ]; then
-        cloud_service start
+        stop_legacy_cloud
         echo "zwrt-datad 正在运行 (PID $active_pid)"
         return 0
     fi
@@ -86,6 +87,7 @@ start() {
 
     mkdir -p "$SERVICE_DIR" || return 1
     cd "$SERVICE_DIR" || return 1
+    stop_legacy_cloud
     if [ -s "$TOKEN_FILE" ]; then
         nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 \
             --lan-bind 0.0.0.0 --lan-port 9461 --auth-token-file "$TOKEN_FILE" \
@@ -99,14 +101,14 @@ start() {
     sleep 1
     if process_matches "$launched_pid"; then
         write_pid "$launched_pid" || true
-        cloud_service start
+        stop_legacy_cloud
         echo "zwrt-datad 已启动 (PID $launched_pid)"
         return 0
     fi
     active_pid="$(find_running_pid)"
     if [ -n "$active_pid" ]; then
         write_pid "$active_pid" || true
-        cloud_service start
+        stop_legacy_cloud
         echo "zwrt-datad 已启动 (PID $active_pid)"
         return 0
     fi
@@ -116,7 +118,7 @@ start() {
 }
 
 stop() {
-    cloud_service stop
+    stop_legacy_cloud
     active_pid="$(running_pid)"
     if [ -z "$active_pid" ]; then
         rm -f "$PID_FILE"

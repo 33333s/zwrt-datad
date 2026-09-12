@@ -52,8 +52,9 @@ class BootEntries(unittest.TestCase):
         self.check("#!/bin/sh\nif [ -f /data/plugins/zwrt-datad/service.sh ]; then\n sh /data/plugins/zwrt-datad/service.sh start\nfi\nexit 0\n", "#!/bin/sh\n" + START + "exit 0\n")
 
     def test_unrelated_service_and_comments_preserved(self):
-        prefix = "#!/bin/sh\n# old /etc/init.d/zwrt-datad start\nsh /data/zwrt-datad/cloud-service.sh start\n/etc/init.d/icg-v3 start\n"
-        self.check(prefix + "exit 0\n", prefix + START + "exit 0\n")
+        source = "#!/bin/sh\n# old /etc/init.d/zwrt-datad start\nsh /data/zwrt-datad/cloud-service.sh start\n/etc/init.d/icg-v3 start\nexit 0\n"
+        expected = "#!/bin/sh\n# old /etc/init.d/zwrt-datad start\n" + START + "/etc/init.d/icg-v3 start\nexit 0\n"
+        self.check(source, expected)
 
     def test_no_exit(self):
         self.check("#!/bin/sh\necho other\n", "#!/bin/sh\necho other\n" + START)

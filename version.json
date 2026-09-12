@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.33",
+    "version": "0.9.34",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 datad 自身版本读取：命令行、HTTP 和 SSE 统一返回二进制内嵌版本"
+    "notes": "云端 TLS/MQTT/WebSocket 运行时静态集成进 datad，统一为单一二进制和进程"
   }
 }
