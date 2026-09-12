@@ -44,3 +44,6 @@ scripts/_*.sh
 /zwrt-datad-linked-test
 
 /build/
+
+# Generated from version.json before compiling
+/include/datad_version_generated.h

@@ -11,11 +11,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test standard installer and boot entry normalization
         run: python3 tests/installer_test.py
+      - name: Generate binary version from release manifest
+        run: python3 scripts/generate-version.py
       - name: Build with strict warnings
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
             src/password_auth.c src/cloud_proxy.c src/json.c src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c src/main.c \
             -lm -ldl -o zwrt-datad-test
+      - name: Test running version via CLI, HTTP and SSE
+        run: python3 tests/version_test.py ./zwrt-datad-test
       - name: Test neighbor parsing, lifecycle and direct supply
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/neighbor_stream_test.c src/neighbor/parser.c -lm -o /tmp/neighbor-stream-test

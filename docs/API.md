@@ -53,6 +53,19 @@ curl -s -X POST \
   http://<device-lan-ip>:9461/auth/exchange
 ```
 
+### `GET /version`
+
+返回当前进程的 datad 版本，响应示例：
+
+```json
+{"name":"zwrt-datad","version":"0.9.33"}
+```
+
+版本由构建时的 `version.json` 写入二进制，不依赖设备状态和运行目录中的文件。
+本机 9460 默认免鉴权；内网 9461 必须带 Bearer Token，非 GET 请求返回 405。
+`/state` 和 `/events` 的 `datad` 块包含相同对象；`system.sw_version` 是设备固件版本。
+旧 datad 没有此接口/字段时，应显示自身版本未知，不能用固件版本代替。
+
 ### `GET /state`
 
 返回当前完整 JSON 快照。字段结构见 [`STATE_SCHEMA.md`](STATE_SCHEMA.md)。

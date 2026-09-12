@@ -12,6 +12,8 @@ ASSET="$(sed -n 's/^[[:space:]]*"asset":[[:space:]]*"\([^"]*\)".*/\1/p' version.
 [ -x "$CC" ] || { echo "toolchain missing: $CC"; exit 1; }
 [ -n "$ASSET" ] || { echo "invalid asset name in version.json"; exit 1; }
 
+python3 scripts/generate-version.py
+
 CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
   -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
 

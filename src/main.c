@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "json.h"
+#include "datad_version_generated.h"
 #include "control.h"
 #include "neighbor.h"
 #include "wifi_control.h"
@@ -96,6 +97,9 @@
 #define TOPFLOW_AGGREGATION_MAX_PATHS 4
 #define TOPFLOW_ICG_MAX_SOCKETS 256
 #define TOPFLOW_ICG_MAX_TCP_ENTRIES 512
+
+static const char datad_version_json[] =
+    "{\"name\":\"zwrt-datad\",\"version\":\"" ZWRT_DATAD_VERSION "\"}";
 
 static volatile sig_atomic_t g_run = 1;
 static void on_signal(int s) { (void)s; g_run = 0; }
@@ -3816,7 +3820,7 @@ static void build_snapshot(char *out, size_t outlen,
     select_qos_for_plmn(qos_mcc, qos_mnc, &qos);
 
     struct buf b = { out, outlen, 0 };
-    bappend(&b, "{\"ts\":%ld,", (long)time(NULL));
+    bappend(&b, "{\"ts\":%ld,\"datad\":%s,", (long)time(NULL), datad_version_json);
 
     /* network / signal */
     bappend(&b, "\"net\":{");
@@ -5077,6 +5081,7 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
             else (void)write_http_text(cli_fd, "text/plain; charset=utf-8",
                                       "zwrt-datad HTTP API\n"
+                                      "GET  /version      -> running datad version\n"
                                       "GET  /state        -> current JSON snapshot\n"
                                       "GET  /events       -> SSE state stream\n"
                                       "GET  /capabilities -> device control capabilities\n"
@@ -5117,6 +5122,13 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                 const char *body = strstr(req, "\r\n\r\n");
                 cloud_proxy(cli_fd, method, path, body ? body + 4 : "");
             }
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/version")) {
+            if (strcmp(method, "GET") != 0) write_http_error(cli_fd, 405, "Method Not Allowed");
+            else (void)write_http_json(cli_fd, datad_version_json, sizeof datad_version_json - 1);
             close(cli_fd);
             continue;
         }
@@ -5339,7 +5351,11 @@ int main(int argc, char **argv)
     char sim_sig[160];
     int sim_sig_valid;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--once")) once = 1;
+        if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-V")) {
+            puts("zwrt-datad " ZWRT_DATAD_VERSION);
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "--neighbor")) neighbor_enabled = 1;
         else if (!strcmp(argv[i], "--neighbor-config") && i + 1 < argc) neighbor_config = argv[++i];
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
@@ -5359,7 +5375,8 @@ int main(int argc, char **argv)
             puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] "
                  "[--lan-bind addr] [--lan-port port] [--auth-token-file path] "
                  "[--neighbor] [--neighbor-config path]\n"
-                 "       zwrt-datad --neighbor-parse FILE.qmdl [FILE.qmdl ...]");
+                 "       zwrt-datad --neighbor-parse FILE.qmdl [FILE.qmdl ...]\n"
+                 "       zwrt-datad --version | -V");
             return 0;
         } else {
             fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);

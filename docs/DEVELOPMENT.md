@@ -131,15 +131,17 @@ bash scripts/build.sh
 主机侧检查：
 
 ```sh
-cc -std=c11 -Wall -Wextra -Werror -Iinclude -c src/json.c src/main.c
+python3 scripts/generate-version.py
+cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -c src/json.c src/main.c
 ```
 
 完整严格检查：
 
 ```sh
+python3 scripts/generate-version.py
 cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-  src/json.c src/device_exec.c src/system_ext.c src/control.c src/main.c \
-  -o zwrt-datad-test
+  src/*.c src/neighbor/*.c -lm -ldl -o zwrt-datad-test
+python3 tests/version_test.py ./zwrt-datad-test
 ```
 
 ## 运行
