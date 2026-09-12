@@ -16,6 +16,7 @@ CHANGED=0
 STOPPED=0
 SUCCESS=0
 WAS_RUNNING=0
+WAS_CLOUD_RUNNING=0
 RC_WRITTEN=0
 
 say() { printf '[datad-install] %s\n' "$*"; }
@@ -50,6 +51,23 @@ stop_known() {
     while [ -n "$(running_pids)" ] && [ "$count" -lt 10 ]; do sleep 1; count=$((count+1)); done
     for pid in $(running_pids); do kill -KILL "$pid" 2>/dev/null || true; done
 }
+legacy_cloud_pids() {
+    for proc in /proc/[0-9]*; do
+        actual=$(readlink "$proc/exe" 2>/dev/null || true)
+        actual=${actual% (deleted)}
+        case "$actual" in
+            /data/zwrt-datad/zwrt-datad-cloud|/data/plugins/zwrt-datad/zwrt-datad-cloud|/data/data/zwrt-datad/zwrt-datad-cloud)
+                printf '%s\n' "${proc##*/}" ;;
+        esac
+    done
+}
+stop_legacy_cloud() {
+    for pid in $(legacy_cloud_pids); do kill -TERM "$pid" 2>/dev/null || true; done
+    count=0
+    while [ -n "$(legacy_cloud_pids)" ] && [ "$count" -lt 10 ]; do sleep 1; count=$((count+1)); done
+    for pid in $(legacy_cloud_pids); do kill -KILL "$pid" 2>/dev/null || true; done
+    rm -f "$DIR/cloud.pid" "$DIR/cloud.sock" "$DIR/cloud.lock"
+}
 save_file() {
     if [ -e "$1" ]; then cp -p "$1" "$BACKUP/$2"; else : > "$BACKUP/$2.absent"; fi
 }
@@ -76,7 +94,7 @@ cleanup() {
     if [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 1 ]; then
         say "安装失败，恢复原文件和服务"
         stop_known
-        for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt; do restore_file "$DIR/$name" "$name"; done
+        for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt zwrt-datad-cloud cloud-service.sh; do restore_file "$DIR/$name" "$name"; done
         [ "$RC_WRITTEN" = 0 ] || restore_file "$RC" rc.local
         for link in "$BACKUP/legacy-links"/*; do
             [ -L "$link" ] || continue
@@ -85,6 +103,8 @@ cleanup() {
         if [ "$WAS_RUNNING" = 1 ] && [ -f "$BACKUP/original-service" ]; then
             IFS= read -r original_service < "$BACKUP/original-service"
             sh "$original_service" start 9>&- || true
+        elif [ "$WAS_CLOUD_RUNNING" = 1 ] && [ -f "$DIR/cloud-service.sh" ]; then
+            sh "$DIR/cloud-service.sh" start 9>&- || true
         fi
     elif [ "$SUCCESS" != 1 ] && [ "$STOPPED" = 1 ] && [ "$WAS_RUNNING" = 1 ]; then
         sh "$DIR/service.sh" start 9>&- || true
@@ -174,12 +194,19 @@ done
 [ -x "$BIN" ] || BINARY_CHANGED=1
 PIDS=$(running_pids)
 [ -z "$PIDS" ] || WAS_RUNNING=1
+CLOUD_PIDS=$(legacy_cloud_pids)
+[ -z "$CLOUD_PIDS" ] || WAS_CLOUD_RUNNING=1
+LEGACY_CLOUD=0
+[ -z "$CLOUD_PIDS" ] || LEGACY_CLOUD=1
+for legacy_cloud_file in zwrt-datad-cloud cloud-service.sh cloud.pid cloud.sock cloud.lock; do
+    [ ! -e "$DIR/$legacy_cloud_file" ] || LEGACY_CLOUD=1
+done
 NEED_START=1
 if [ "$BINARY_CHANGED" = 0 ] && [ "$SERVICE_CHANGED" = 0 ] && [ "$(printf '%s\n' "$PIDS" | awk 'NF{n++} END{print n+0}')" = 1 ] && health 9460 && health 9461; then
     actual=$(readlink "/proc/$PIDS/exe" 2>/dev/null || true)
     [ "$actual" != "$BIN" ] || NEED_START=0
 fi
-if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-links" ] && [ "$NEED_START" = 0 ]; then
+if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-links" ] && [ "$NEED_START" = 0 ] && [ "$LEGACY_CLOUD" = 0 ]; then
     SUCCESS=1
     say "v$VERSION 已安装；安装文件和自启一致，无需重写或重启服务"
     exit 0
@@ -188,7 +215,7 @@ fi
 BACKUP="$DIR/backups/install-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
-for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt; do save_file "$DIR/$name" "$name"; done
+for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt zwrt-datad-cloud cloud-service.sh; do save_file "$DIR/$name" "$name"; done
 save_file "$RC" rc.local
 printf '%s\n' "$DIR/service.sh" > "$BACKUP/original-service"
 CHANGED=1
@@ -203,6 +230,7 @@ for pid in $PIDS; do
         done
     fi
 done
+if [ "$LEGACY_CLOUD" = 1 ]; then stop_legacy_cloud; fi
 if [ "$NEED_START" = 1 ]; then
     IFS= read -r original_service < "$BACKUP/original-service"
     if [ -f "$original_service" ]; then sh "$original_service" stop 9>&-; fi
@@ -212,7 +240,7 @@ if [ "$NEED_START" = 1 ]; then
     stop_known
     STOPPED=1
     # Only one datad controller runs at a time, including this loopback smoke.
-    (cd "$DIR" && exec "$WORK/zwrt-datad" -b 127.0.0.1 -p 19460 -i 1000) > "$WORK/smoke.log" 2>&1 9>&- &
+    (cd "$DIR" && ZWRT_DATAD_DIR="$WORK/cloud" exec "$WORK/zwrt-datad" -b 127.0.0.1 -p 19460 -i 1000) > "$WORK/smoke.log" 2>&1 9>&- &
     SMOKE_PID=$!
     wait_health 19460 || fail "临时服务健康检查失败"
     [ "$(readlink "/proc/$SMOKE_PID/exe" 2>/dev/null || true)" = "$WORK/zwrt-datad" ] || fail "临时端口未由候选进程提供"
@@ -251,6 +279,7 @@ while IFS= read -r link; do
     cp -P "$link" "$BACKUP/legacy-links/${link##*/}"
     rm "$link"
 done < "$WORK/legacy-links"
+rm -f "$DIR/zwrt-datad-cloud" "$DIR/cloud-service.sh" "$DIR/cloud.pid" "$DIR/cloud.sock" "$DIR/cloud.lock"
 SUCCESS=1
 say "安装完成：v$VERSION，$BIN"
 say "自启：sh /data/zwrt-datad/service.sh start"

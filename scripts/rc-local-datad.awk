@@ -1,7 +1,7 @@
 # Render only datad startup entries; preserve all unrelated commands.
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
 function datad_path(s) {
-    return s ~ /^\/(data\/(plugins\/|data\/)?(zwrt-datad|u60-datad)\/(service\.sh|zwrt-datad|u60-datad)|etc\/init\.d\/(zwrt-datad|u60-datad))$/
+    return s ~ /^\/(data\/(plugins\/|data\/)?(zwrt-datad|u60-datad)\/(service\.sh|cloud-service\.sh|zwrt-datad|u60-datad)|etc\/init\.d\/(zwrt-datad|u60-datad))$/
 }
 function plain(s,    a,n,i,p,check) {
     s=trim(s)
@@ -44,7 +44,7 @@ function flush_line(raw,logical,    t) {
         if (!first_removed) first_removed=count+1
         return
     }
-    if (t !~ /^#/ && t ~ /\/(zwrt-datad|u60-datad)(\/service\.sh|[ \t"\047]|$)/ && t !~ /zwrt-datad-cloud/) {
+    if (t !~ /^#/ && t ~ /\/(zwrt-datad|u60-datad)(\/(cloud-)?service\.sh|[ \t"\047]|$)/) {
         print "Unsupported mixed datad startup command; rc.local left unchanged" > "/dev/stderr"
         bad=1
     }

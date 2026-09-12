@@ -1,33 +1,79 @@
 #include "cloud_proxy.h"
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/time.h>
-#include <unistd.h>
+
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <fcntl.h>
+#include <sys/socket.h>
+
+#ifdef CLOUD_EMBEDDED
+#include "cloud_embedded.h"
+#endif
 
 static int send_all(int fd, const char *p, size_t n) {
- while(n) {ssize_t w=send(fd,p,n,0);if(w<0&&errno==EINTR)continue;if(w<=0)return -1;p+=w;n-=(size_t)w;}return 0;
+    while (n) {
+        ssize_t written = send(fd, p, n, 0);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return -1;
+        p += written;
+        n -= (size_t)written;
+    }
+    return 0;
 }
-void cloud_proxy(int client,const char *method,const char *path,const char *body){
- int fd=-1;char header[512],reply[49152];size_t used=0;struct sockaddr_un addr;struct timeval tv={0,300000};
- const char *sock=getenv("ZWRT_DATAD_CLOUD_SOCKET");if(!sock||!*sock)sock="/data/zwrt-datad/cloud.sock";
- memset(&addr,0,sizeof addr);addr.sun_family=AF_UNIX;
- if(strlen(sock)>=sizeof addr.sun_path)goto unavailable;
- memcpy(addr.sun_path,sock,strlen(sock)+1);
- fd=socket(AF_UNIX,SOCK_STREAM,0);if(fd<0)goto unavailable;
- fcntl(fd,F_SETFD,FD_CLOEXEC);setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
- if(connect(fd,(struct sockaddr *)&addr,sizeof addr)<0)goto unavailable;
- size_t size=body?strlen(body):0;
- int len=snprintf(header,sizeof header,"%s %s HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",method,path,size);
- if(len<0||(size_t)len>=sizeof header||send_all(fd,header,(size_t)len)<0||(size&&send_all(fd,body,size)<0))goto unavailable;
- for(;;){ssize_t n=recv(fd,reply+used,sizeof reply-used,0);if(n<0&&errno==EINTR)continue;if(n<0)goto unavailable;if(n==0)break;used+=(size_t)n;if(used==sizeof reply)goto unavailable;}
- close(fd);send_all(client,reply,used);return;
-unavailable:
- if(fd>=0)close(fd);
- const char *error="HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{\"error\":\"datad cloud worker unavailable\"}";
- send_all(client,error,strlen(error));
+
+static const char *status_text(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        default: return "Service Unavailable";
+    }
+}
+
+int cloud_runtime_start(const char *data_dir, const char *state_url) {
+#ifdef CLOUD_EMBEDDED
+    return CloudStart((char *)data_dir, (char *)state_url);
+#else
+    (void)data_dir;
+    (void)state_url;
+    return 0;
+#endif
+}
+
+void cloud_runtime_stop(void) {
+#ifdef CLOUD_EMBEDDED
+    CloudStop();
+#endif
+}
+
+void cloud_proxy(int client, const char *method, const char *path, const char *body) {
+    int status = 503;
+    const char *reply = "{\"error\":\"datad cloud runtime is not included in this build\"}\n";
+#ifdef CLOUD_EMBEDDED
+    char *owned = CloudHandle((char *)method, (char *)path, (char *)(body ? body : ""), &status);
+    if (owned) reply = owned;
+#else
+    (void)method;
+    (void)path;
+    (void)body;
+#endif
+    size_t size = strlen(reply);
+    char header[320];
+    int length = snprintf(header, sizeof header,
+                          "HTTP/1.0 %d %s\r\n"
+                          "Content-Type: application/json\r\n"
+                          "Cache-Control: no-store\r\n"
+                          "Content-Length: %zu\r\n"
+                          "Connection: close\r\n\r\n",
+                          status, status_text(status), size);
+    if (length > 0 && (size_t)length < sizeof header) {
+        (void)send_all(client, header, (size_t)length);
+        (void)send_all(client, reply, size);
+    }
+#ifdef CLOUD_EMBEDDED
+    if (owned) CloudFree(owned);
+#endif
 }

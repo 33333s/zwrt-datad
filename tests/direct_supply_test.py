@@ -33,7 +33,7 @@ print('{}')
         p=fixture.with_suffix('.new'); p.write_text(json.dumps(data)); p.replace(fixture)
     setup(mode='disable')
     with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
-    env=dict(os.environ,ZWRT_DATAD_UBUS_BIN=str(fake),ZWRT_DATAD_UCI_BIN='/usr/bin/false',
+    env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS_BIN=str(fake),ZWRT_DATAD_UCI_BIN='/usr/bin/false',
              POWER_FIXTURE=str(fixture),POWER_WRITES=str(calls))
     proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def req(path,body=None,auth=True):
