@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.36",
+    "version": "0.9.37",
     "asset": "zwrt-datad-aarch64",
-    "notes": "邻区质量状态只反映最近 60 秒坏帧；未知频点的同 PCI 观察保持独立并要求消费者明确标为未关联"
+    "notes": "内置 Ed25519 签名 OTA；默认启用，支持自定义服务器优先、网盘和 GitHub 回退，以及低负载自动安装"
   }
 }

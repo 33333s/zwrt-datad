@@ -5088,6 +5088,10 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                                       "GET  /ubus         -> ubus object catalog (?verbose=1)\n"
                                       "POST /ubus/call    -> template-enabled full ubus call\n"
                                       "POST /control      -> allow-listed device control\n"
+                                      "GET/POST /ota/config -> signed OTA settings\n"
+                                      "GET  /ota/status   -> OTA state\n"
+                                      "POST /ota/check    -> check signed manifests\n"
+                                      "POST /ota/update   -> install signed update\n"
                                       "POST /auth/login   -> Basic login on LAN listener\n"
                                       "POST /auth/exchange -> vendor token exchange on LAN listener\n"
                                       "GET  /healthz      -> ok\n");
@@ -5114,9 +5118,11 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             continue;
         }
 
-        if (!strcmp(path, "/cloud/config") || !strcmp(path, "/cloud/status")) {
+        if (!strcmp(path, "/cloud/config") || !strcmp(path, "/cloud/status") ||
+            !strcmp(path, "/ota/config") || !strcmp(path, "/ota/status") ||
+            !strcmp(path, "/ota/check") || !strcmp(path, "/ota/update")) {
             if (listener->lan_only || (ntohl(peer.sin_addr.s_addr) >> 24) != 127) write_http_error(cli_fd, 403, "Forbidden");
-            else if (strcmp(method, "GET") && (strcmp(method, "POST") || strcmp(path, "/cloud/config")))
+            else if (strcmp(method, "GET") && strcmp(method, "POST"))
                 write_http_error(cli_fd, 405, "Method Not Allowed");
             else {
                 const char *body = strstr(req, "\r\n\r\n");

@@ -12,6 +12,10 @@
 - `GET /ubus`：返回全部 ubus 对象；`?verbose=1` 同时返回方法签名
 - `POST /ubus/call`：完整 ubus 调用入口（所有模板默认开放）
 - `POST /control`：执行白名单内的设备控制
+- `GET/POST /ota/config`：读取或保存签名 OTA 设置
+- `GET /ota/status`：读取 OTA 状态
+- `POST /ota/check`：按自定义、网盘、GitHub 顺序检查签名清单
+- `POST /ota/update`：启动经过 Ed25519 与 SHA-256 双重校验的更新
 
 默认监听地址：
 
@@ -23,7 +27,7 @@
   - 支持 `Authorization`、`X-Auth-Token`，以及 SSE 使用的 `?access_token=`
   - 非空 `auth.token` 继续作为兼容静态 Token
 
-> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。内网 Token 只保护 datad 传输层；UUID、OTA、插件、数据库、短信转发和面向用户的前端会话鉴权仍属于上层 UFI。
+> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。内网 Token 只保护 datad 传输层；UUID、插件、数据库、短信转发和面向用户的前端会话鉴权仍属于上层 UFI；datad 只承载自身的签名 OTA，UFI 提供鉴权后的设置界面。
 
 公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
 

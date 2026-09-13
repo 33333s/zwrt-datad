@@ -40,6 +40,7 @@ func (w *embeddedResponse) Write(b []byte) (int, error) {
 var embedded struct {
 	sync.Mutex
 	agent  *agent
+	ota    *otaManager
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -70,6 +71,10 @@ func CloudStart(dirC, stateURLC *C.char) C.int {
 		config: defaults(), file: filepath.Join(dir, "cloud.json"), stateURL: stateURL,
 		change: make(chan struct{}, 1), status: status{State: "disabled"},
 	}
+	o, err := newOTAManager(dir, stateURL)
+	if err != nil {
+		return 1
+	}
 	if b, err := os.ReadFile(a.file); err == nil {
 		var saved Config
 		if json.Unmarshal(b, &saved) != nil || validate(saved) != nil {
@@ -87,8 +92,8 @@ func CloudStart(dirC, stateURLC *C.char) C.int {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	embedded.agent, embedded.cancel, embedded.done = a, cancel, done
-	go func() { defer close(done); a.run(ctx) }()
+	embedded.agent, embedded.ota, embedded.cancel, embedded.done = a, o, cancel, done
+	go func() { defer close(done); go o.run(ctx); a.run(ctx) }()
 	return 0
 }
 
@@ -96,7 +101,7 @@ func CloudStart(dirC, stateURLC *C.char) C.int {
 func CloudStop() {
 	embedded.Lock()
 	cancel, done := embedded.cancel, embedded.done
-	embedded.agent, embedded.cancel, embedded.done = nil, nil, nil
+	embedded.agent, embedded.ota, embedded.cancel, embedded.done = nil, nil, nil, nil
 	embedded.Unlock()
 	if cancel == nil {
 		return
@@ -112,6 +117,7 @@ func CloudStop() {
 func CloudHandle(methodC, pathC, bodyC *C.char, statusC *C.int) *C.char {
 	embedded.Lock()
 	a := embedded.agent
+	o := embedded.ota
 	embedded.Unlock()
 	if a == nil {
 		if statusC != nil {
@@ -128,7 +134,21 @@ func CloudHandle(methodC, pathC, bodyC *C.char, statusC *C.int) *C.char {
 		return C.CString("{\"error\":\"配置请求无效\"}\n")
 	}
 	w := &embeddedResponse{header: make(http.Header)}
-	if path == "/cloud/config" {
+	if strings.HasPrefix(path, "/ota/") && o != nil {
+		switch path {
+		case "/ota/config":
+			o.configAPI(w, req)
+		case "/ota/status":
+			o.statusAPI(w, req)
+		case "/ota/check":
+			o.checkAPI(w, req)
+		case "/ota/update":
+			o.updateAPI(w, req)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("{\"error\":\"not found\"}\n"))
+		}
+	} else if path == "/cloud/config" {
 		a.configAPI(w, req)
 	} else if path == "/cloud/status" {
 		a.statusAPI(w, req)
