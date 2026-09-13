@@ -20,6 +20,8 @@
 scripts/_*.sh
 
 # Private-only modem/signaling artifacts
+/AGENTS.md
+/local/
 /docs/WORKLOG.md
 /docs/modem.md
 /docs/MODEM_SIGNALING.md
