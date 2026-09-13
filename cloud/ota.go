@@ -25,9 +25,13 @@ import (
 )
 
 const (
-	otaNetdisk = "https://pan.ericsfj.com/d/github%20releases/zwrt-datad"
-	otaGitHub  = "https://github.com/33333s/zwrt-datad/releases/latest/download"
-	otaIdleFor = 2 * time.Minute
+	otaNetdisk          = "https://pan.ericsfj.com/d/github%20releases/zwrt-datad"
+	otaGitHub           = "https://github.com/33333s/zwrt-datad/releases/latest/download"
+	otaNetdiskManifest  = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json?sign=TZsBt-YNMzLwMcS5FX-ksLg2sK_fCNGOWxzaKN_4JOU=:0"
+	otaNetdiskSignature = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json.sig?sign=gvS_X703akHpSbzEZjzWUvLB7yvZsmPgm8RCjKzNSCA=:0"
+	otaNetdiskInstaller = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/install-datad.sh?sign=8qh7EYrKi_zRCOnHQKNU7k2XxghIxIyiJnoalfNlUss=:0"
+	otaNetdiskBinary    = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/zwrt-datad-aarch64?sign=dOcZWpLnxOETF2JboS_3_191tszCrcTI7_khCWUfLqg=:0"
+	otaIdleFor          = 2 * time.Minute
 )
 
 var errWaitingIdle = errors.New("waiting for idle conditions")
@@ -271,13 +275,12 @@ func (o *otaManager) check(ctx context.Context) (*otaCandidate, error) {
 	o.mu.Unlock()
 	var errs []string
 	for _, base := range o.servers() {
-		murl := base + "/update.json"
-		raw, err := o.fetch(ctx, murl, 1<<20)
+		raw, err := o.fetch(ctx, sourceURL(base, "update.json"), 1<<20)
 		if err != nil {
 			errs = append(errs, base+": "+err.Error())
 			continue
 		}
-		sigb, err := o.fetch(ctx, base+"/update.json.sig", 4096)
+		sigb, err := o.fetch(ctx, sourceURL(base, "update.json.sig"), 4096)
 		if err != nil {
 			errs = append(errs, base+": "+err.Error())
 			continue
@@ -327,6 +330,23 @@ func validateManifest(m otaManifest) error {
 	}
 	return nil
 }
+
+func sourceURL(base, name string) string {
+	if base == otaNetdisk {
+		switch name {
+		case "update.json":
+			return otaNetdiskManifest
+		case "update.json.sig":
+			return otaNetdiskSignature
+		case "install-datad.sh":
+			return otaNetdiskInstaller
+		case "zwrt-datad-aarch64":
+			return otaNetdiskBinary
+		}
+	}
+	return strings.TrimRight(base, "/") + "/" + url.PathEscape(name)
+}
+
 func (o *otaManager) fetch(ctx context.Context, u string, max int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -370,7 +390,7 @@ func (o *otaManager) install(c *otaCandidate, manual bool) error {
 	o.status.WaitReasons = nil
 	o.saveStatusLocked()
 	o.mu.Unlock()
-	raw, err := o.fetch(context.Background(), c.BaseURL+"/"+url.PathEscape(a.Name), 16<<20)
+	raw, err := o.fetch(context.Background(), sourceURL(c.BaseURL, a.Name), 16<<20)
 	if err != nil {
 		return err
 	}
@@ -386,7 +406,7 @@ func (o *otaManager) install(c *otaCandidate, manual bool) error {
 	wrapper := filepath.Join(o.dir, "ota-run.sh")
 	result := filepath.Join(o.dir, "ota-result.log")
 	marker := filepath.Join(o.dir, "ota-install-result")
-	script := "#!/bin/sh\nsleep 2\nrm -f " + shellQuote(marker) + "\nif DATAD_DOWNLOAD_URL=" + shellQuote(c.BaseURL+"/"+url.PathEscape(b.Name)) + " sh " + shellQuote(path) + " >" + shellQuote(result) + " 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >" + shellQuote(marker+".tmp") + "\nmv -f " + shellQuote(marker+".tmp") + " " + shellQuote(marker) + "\n"
+	script := "#!/bin/sh\nsleep 2\nrm -f " + shellQuote(marker) + "\nif DATAD_DOWNLOAD_URL=" + shellQuote(sourceURL(c.BaseURL, b.Name)) + " sh " + shellQuote(path) + " >" + shellQuote(result) + " 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >" + shellQuote(marker+".tmp") + "\nmv -f " + shellQuote(marker+".tmp") + " " + shellQuote(marker) + "\n"
 	if err = otaAtomicWrite(wrapper, []byte(script), 0700); err != nil {
 		return err
 	}

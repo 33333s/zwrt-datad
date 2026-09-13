@@ -44,6 +44,18 @@ func signedOTAServer(t *testing.T, key ed25519.PrivateKey, version string) *http
 	}))
 }
 
+func TestNetdiskUsesPerFileSignedURLs(t *testing.T) {
+	for _, name := range []string{"update.json", "update.json.sig", "install-datad.sh", "zwrt-datad-aarch64"} {
+		u := sourceURL(otaNetdisk, name)
+		if !strings.HasPrefix(u, "https://") || !strings.Contains(u, "sign=") {
+			t.Fatalf("%s does not use a signed URL", name)
+		}
+	}
+	if got := sourceURL("https://custom.example/base", "update.json"); got != "https://custom.example/base/update.json" {
+		t.Fatal(got)
+	}
+}
+
 func TestOTASignedManifestAndCustomPriority(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	good := signedOTAServer(t, priv, "99.0.0")
