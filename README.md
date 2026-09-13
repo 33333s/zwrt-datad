@@ -92,3 +92,5 @@ GitHub Actions 会执行完整检查。本地开发和测试入口见仓库内�
 
 项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见
 [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)。
+
+项目贡献者及署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
