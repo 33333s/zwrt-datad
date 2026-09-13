@@ -1,68 +1,74 @@
 # zwrt-datad
 
-`zwrt-datad` 是一个面向 ZTE 便携式 5G 路由设备的设备数据与控制服务。它会统一轮询 `ubus`、按需扫描 `key.log`，把结果归一化成稳定 JSON，并通过轻量 HTTP/SSE 与上层 UFI 服务交换数据。
+`zwrt-datad` 是面向中兴便携式 5G 路由设备的数据与控制服务。它统一采集
+`ubus`、`uci`、`sysfs` 和必要的设备日志，输出稳定的 JSON 状态，并通过
+HTTP/SSE 向 UFI 等本机应用提供数据与受控操作。
 
-当前传输层使用 `HTTP + SSE`：
+## 功能
 
-- `GET /version`：返回运行中 datad 的自身版本
-- `GET /state`：返回当前完整 JSON（含 `datad.version`）
-- `GET /events`：返回 `text/event-stream`，持续推送最新快照
-- `GET /healthz`：返回 `ok`
-- `GET /capabilities`：返回允许的设备操作
-- `GET /ubus`：返回全部 ubus 对象；`?verbose=1` 同时返回方法签名
-- `POST /ubus/call`：完整 ubus 调用入口（所有模板默认开放）
-- `POST /control`：执行白名单内的设备控制
-- `GET/POST /ota/config`：读取或保存签名 OTA 设置
-- `GET /ota/status`：读取 OTA 状态
-- `POST /ota/check`：按自定义、网盘、GitHub 顺序检查签名清单
-- `POST /ota/update`：启动经过 Ed25519 与 SHA-256 双重校验的更新
+- `GET /state`：读取完整状态快照
+- `GET /events`：通过 SSE 订阅状态变化
+- `GET /healthz`：健康检查
+- `GET /capabilities`：读取当前机型支持的操作
+- `POST /control`：执行白名单控制动作
+- `GET /ubus`、`POST /ubus/call`：访问当前设备注册的 ubus 接口
+- `/ota/*`：检查和安装经过 Ed25519 与 SHA-256 校验的 datad 更新
 
-默认监听地址：
+目前包含以下正式设备模板：
 
-- 本机免鉴权口：`http://127.0.0.1:9460`
-- 内网鉴权口：`http://<设备内网IP>:9461`
-  - init 脚本默认开启；本机历史接口保持不变
-  - 只接受内网、CGNAT、link-local 和 loopback 来源
-  - 通过 `POST /auth/login` 或 `POST /auth/exchange` 换取 Bearer Token
-  - 支持 `Authorization`、`X-Auth-Token`，以及 SSE 使用的 `?access_token=`
-  - 非空 `auth.token` 继续作为兼容静态 Token
+| 型号 | 产品 |
+| --- | --- |
+| `MU5250` | U60 Pro |
+| `MC8532B` | G5 Pro |
+| `MU5252` | TopFlow |
+| `MC7523` | G5 Max WiFi |
 
-> 这是一个 clean-room 实现，只依赖标准 OpenWrt 能力，不链接厂商私有库。内网 Token 只保护 datad 传输层；UUID、插件、数据库、短信转发和面向用户的前端会话鉴权仍属于上层 UFI；datad 只承载自身的签名 OTA，UFI 提供鉴权后的设置界面。
+模板只输出设备实际支持的状态块。调用方应通过字段是否存在判断能力，不应给
+不支持的功能补 `0`、`-1` 或空对象。
 
-公开仓库的文件边界见 [`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)；本仓库不包含 modem signaling capture/decode、qmdl/DCI 工具或本地设备工作流记录。
+## 安装
 
-设备侧 API 模板选择已经收口到后端：后端会先识别机型，再选择对应模板和那套设备接口。当前已经把 `MU5250`、`MC8532B`、`MU5252` 和 `MC7523` 四条模板做实，原先混在主路径里的宽松兼容回退不再算正式机型适配。
+在 ARM64 设备上以 root 执行：
 
-`2026-06-26` 又补做了一轮和新版 `u60pro-devui` 的实机联调：后端已按 `HTTP + SSE` 方式跑通，`/state` 与 `/events` 均可正常读取，前端也已通过本机 `127.0.0.1:9460` 长连接订阅。
+```sh
+curl -4fL --retry 3 \
+  'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' \
+  -o /tmp/install-datad.sh
+sh /tmp/install-datad.sh
+```
 
-## 当前模板
+安装目录固定为 `/data/zwrt-datad`。服务由
+`/data/zwrt-datad/service.sh` 管理，并从 `/etc/rc.local` 启动；不会安装
+datad 自己的 `/etc/init.d` 脚本。
 
-当前只把后端模板明确分成“已实现”和“待拆分适配”两类：
+```sh
+sh /data/zwrt-datad/service.sh start
+sh /data/zwrt-datad/service.sh status
+sh /data/zwrt-datad/service.sh restart
+```
 
-- 目前适配机型：
-  - `MU5250`
-  - 匹配机型：`model_name = MU5250`
-  - 对应设备：`U60 Pro`
-  - `MC8532B`
-  - 匹配机型：`model_name = MC8532B`
-  - 对应设备：`G5 Pro`
-  - `MU5252`
-  - 匹配机型：`model_name = MU5252`
-  - 对应设备：`TopFlow`
-  - `MC7523`
-  - 匹配机型：`model_name = MC7523`
-  - 对应设备：`G5 Max WiFi`
+更完整的运行和日志说明见 [`docs/RUNTIME.md`](docs/RUNTIME.md)。
 
-## 为什么需要它
+## 访问
 
-如果每个 UI、脚本、网页都自己反复执行 `ubus call`，或者自己去扫 `key.log`，设备上的服务和 I/O 会被打得很碎。`zwrt-datad` 把这些读取统一收口：
+默认监听：
 
-- `ubus` 只被单个进程按固定频率轮询
-- `key.log` 只由单个进程按需读取
-- WebUI / 脚本 / 其他本地消费者都只走统一 HTTP 接口
-- 传输层统一后，前端不需要再自己处理文件轮询和 mtime 判定
+- `127.0.0.1:9460`：本机接口
+- `<设备内网 IP>:9461`：需要登录后取得 Bearer Token 的内网接口
 
-## 构建
+```sh
+curl -fsS http://127.0.0.1:9460/healthz
+curl -fsS http://127.0.0.1:9460/state
+curl -N http://127.0.0.1:9460/events
+```
+
+内网调用方可通过 `POST /auth/login` 或 `POST /auth/exchange` 获取 Token。
+详细路由和鉴权方式见 [`docs/API.md`](docs/API.md)。
+
+> `POST /ubus/call` 可以调用设备注册的写方法，包括可能导致断网、重启或配置
+> 变化的方法。面向用户的应用必须自行限制入口并进行必要确认。
+
+## 构建与测试
 
 需要 POSIX shell 和 aarch64 musl 工具链：
 
@@ -70,206 +76,19 @@
 bash scripts/build.sh
 ```
 
-主机侧语法检查：
-
-```sh
-python3 scripts/generate-version.py
-cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-  src/*.c src/neighbor/*.c -lm -ldl \
-  -o zwrt-datad-test
-```
-
-## 读取 datad 版本
-
-```sh
-/data/zwrt-datad/zwrt-datad --version
-curl -fsS http://127.0.0.1:9460/version
-```
-
-命令行输出 `zwrt-datad X.Y.Z`；HTTP 返回 `{"name":"zwrt-datad","version":"X.Y.Z"}`。
-`/state` 和 `/events` 每份快照的 `datad.version` 同样返回这个版本。
-版本来自构建时的 `version.json`，编译进二进制，不读取运行目录中的清单；
-`--version` / `-V` 直接输出并退出，不启动采集或服务。内网 9461 的 `/version` 与 `/state` 使用相同鉴权。
-设备固件版本继续由 `system.sw_version` 提供，上层检查 datad 更新应使用 `datad.version`。
-
-## 运行
-
-手动运行：
-
-```sh
-./zwrt-datad -i 1000
-```
-
-后台运行时，建议把常规输出交给服务管理器；若必须使用 `nohup`，不要把无上限日志写到 `/tmp`（多数设备的 `/tmp` 是内存文件系统）：
-
-```sh
-nohup ./zwrt-datad -i 1000 >/dev/null 2>&1 </dev/null &
-```
-
-运行边界和日志建议见 [`docs/RUNTIME.md`](docs/RUNTIME.md)。
-
-单次采样：
-
-```sh
-./zwrt-datad --once
-```
-
-额外开启内网鉴权口：
-
-```sh
-./zwrt-datad -i 1000 --lan-bind 0.0.0.0 --lan-port 9461
-```
-
-标准自动安装（ARM64 设备上以 root 执行）：
-
-```sh
-curl -4fL --retry 3 'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' -o /tmp/install-datad.sh && sh /tmp/install-datad.sh
-```
-
-安装器使用发布时固定的二进制 SHA-256，从配置的 HTTPS 镜像下载；服务脚本、`version.json` 和 OpenSSL 许可证内嵌在同一安装器中。固定安装到 `/data/zwrt-datad`，保留已有 Token、云端与散热配置。变更前备份，二进制先经临时启动检查；需要启动时只运行一个 datad 控制进程，隔离端口验收后再切换正式服务。云端 TLS/MQTT/WebSocket 运行时已经静态链接进同一二进制，不再依赖独立 worker。失败会尝试恢复原文件和服务。
-
-自启统一为 `/etc/rc.local` 中、UFI 和 `exit 0` 之前的一条 `sh /data/zwrt-datad/service.sh start`。安装器清理已识别的旧路径、直接启动命令和重复项，停用旧 datad init 启动链接；不新建 init 脚本。标准内容完全相同时不改写 `rc.local`，再次安装同版且服务健康时不重启。
-
-手动安装 OpenWRT 常驻服务：
-
-```sh
-adb shell 'mkdir -p /data/zwrt-datad'
-adb push zwrt-datad-aarch64 /data/zwrt-datad/zwrt-datad
-adb push scripts/service.sh /data/zwrt-datad/service.sh
-adb shell 'chmod 755 /data/zwrt-datad/zwrt-datad /data/zwrt-datad/service.sh &&
-           sh /data/zwrt-datad/service.sh start'
-```
-
-`service.sh` 会保留本机 `127.0.0.1:9460`，同时开启 `0.0.0.0:9461` 内网鉴权口。若静态 Token 文件不存在，内网口仍可通过动态登录发放临时 Token。PID 与日志分别写在 `/data/zwrt-datad/zwrt-datad.pid` 和 `/data/zwrt-datad/zwrt-datad.log`。
-
-开机自启只修改 `/etc/rc.local`，在原有 `exit 0` 之前加入：
-
-```sh
-sh /data/zwrt-datad/service.sh start
-```
-
-不要把 datad 启动脚本放进 `/etc/init.d`。除 `/etc/rc.local` 外，datad 的安装和运行文件全部放在 `/data/zwrt-datad`；如果同机还运行 UFI，应让 `rc.local` 先启动 datad，再调用 `/data/ufi-tools/service.sh start`。
-
-## 读取方式
-
-消费者统一走 HTTP / SSE：
-
-```sh
-curl http://127.0.0.1:9460/state
-```
-
-```sh
-curl -N http://127.0.0.1:9460/events
-```
-
-浏览器侧最小示例：
-
-```javascript
-const es = new EventSource("http://127.0.0.1:9460/events");
-es.addEventListener("state", (ev) => {
-  const state = JSON.parse(ev.data);
-  console.log(state);
-});
-```
-
-采样/SSE 周期默认由启动参数 `-i` 决定；运行中可调用
-`state.set_interval` 在 `500..5000` 毫秒范围内切换，无需重启服务。`/state` 顶层
-`sample_interval_ms` 返回当前实际周期。
-
-内网调用方先登录获取 Token：
-
-```sh
-curl -s -u admin:your_web_password -X POST http://<设备内网IP>:9461/auth/login
-```
-
-随后使用请求头访问状态和控制接口：
-
-```sh
-curl -H 'Authorization: Bearer <token>' http://<设备内网IP>:9461/state
-curl -H 'Authorization: Bearer <token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"action":"band.set_nr_nsa","params":{"bands":"41,78"}}' \
-  http://<设备内网IP>:9461/control
-```
-
-通用 `/control` 仍只接受明确列入白名单的动作，不提供 Shell 透传。所有设备模板默认提供完整 `/ubus/call`，能力位保存在模板定义中；该入口只使用参数数组执行 `ubus`，但可以调用设备注册的写方法和危险方法，调用方必须自行约束。完整契约见 [`docs/CONTROL_API.md`](docs/CONTROL_API.md) 和 [`docs/API.md`](docs/API.md)。
-
-后端会先根据 `state.device.model_name` 选择设备侧 API 模板，并把结果写进 `state.device.api_template`。如果前端还需要切自己的 UI 模板，优先使用 `state.device.model_name` 或 `state.device.api_template`，不要再用 `market_name` / `alias_name` 做判断。
-
-模板只输出设备实际支持的可选状态块。无电池设备不会输出 `battery`，无 NFC
-设备不会输出 `nfc`；不会用 `-1`、`0` 或空对象冒充“不支持”。调用方应根据
-块/字段是否存在决定是否显示功能，同时把 `0%`、关闭状态和 `0mA` 视为有效值。
-
-MU5252 模板还会输出三路 `modems`、`aggregation`、`multiwan` 和 `cooling`。聚合状态会区分开关、ICG 配置是否下发、ICG/mwan3 控制进程、实际 TCP 隧道和 mwan3 各承载链路质量；实际隧道从 `zte_icg_agg` 进程持有的 socket 反查，不依赖可能滞后的静态服务器配置。`multiwan` 提供结构化 mwan3 配置，并明确 `SMULTIWAN`（ICG）与 `MULTIWAN`（mwan3）的互斥生效关系。ICG 剩余流量和当日用量优先读取厂商落盘 UCI 的字节值，云端接口仅短超时低频触发刷新，不阻塞 SSE 主循环。聚合、风扇三模式、
-多点自定义温度/PWM 曲线和液冷模式都通过语义化 `/control` 动作操作；散热配置
-只保存到 `/data/zwrt-datad/cooling.conf`，启动时由 datad 恢复，不安装额外 init 脚本。
-自定义曲线允许 2–8 个控制点，datad 每秒按 `sys-therm-4` 温度线性插值 PWM；80℃
-硬保护始终强制 PWM 255。风扇原厂模式启用内核 44/48/53℃ 三档曲线，自定义模式
-禁用该 zone 并由 datad 插值，常开模式使用固定 PWM 128；液冷支持自动、低档常开和高档常开，分别对应设备树真实幅度 0/60/200，
-自动模式把 thermal 控制交还厂商。
-
-## QoS / 短信说明
-
-QoS 相关有一个容易踩的点：`qci` / `session_ambr` 往往更新得比 `apn_ambr_*` 更频繁，而且最新一条日志不一定同时带齐所有字段。当前实现改成：
-
-- 进程启动时按 `key.log.0`、`key.log` 的顺序全量扫描；当前 `key.log` 的有效候选优先，旧轮转日志仅补缺
-- 优先提取带 `access_point=` 或非 IMS `dnn=` 上下文的数据承载 `qci` / `AMBR`
-- 忽略 `dnn=ims` / emergency 承载，避免 IMS 的 256/256 覆盖主数据 AMBR
-- 裸 `qci = ...` 只在紧跟有效数据承载上下文，或完全没有更可信值时兜底
-- 后续只显示缓存，不在每轮快照里反复扫日志
-- 收到 `SIGUSR1` 时立即重读
-- 检测到 `sim_iccid/current_sim_slot` 变化时清空旧缓存，并在新日志写入后自动补读
-- MU5252 的 X75、V3E1、V3E2 还会分别在 `modems[].qos` 输出承载缓存；两个 V3E 通过内部 ADB 每 60 秒读取一次各自日志，前端不直接扫描日志
-
-运行中的 `zwrt-datad` 支持：
-
-```sh
-kill -USR1 $(pidof zwrt-datad)
-```
-
-这会立刻触发一次 QoS 日志重读，供 DevUI 的“刷新 AMBR 缓存”按钮复用。
-
-短信读取和厂商 Web 接口加密也由 datad 统一处理：启动后的第一次读取会分别从
-NV/SIM 存储取最多 32 条并解密为 UTF-8；之后每 5 秒只检查未读计数，发生变化时
-各取最新 8 条并合并进缓存。发送、删除或标记已读后才重新做一次完整同步。上层
-UFI 只读取 `state.sms.list` 的明文，不再持有厂商 Web 会话密钥或处理密文。
-
-TopFlow 的短信密文使用设备自带 OpenSSL 3 的 AES-256-GCM 解密。datad 运行时动态
-加载 `/usr/lib/libcrypto.so.3`，不链接任何厂商私有库；缺少该标准库时不会把无法
-认证的密文作为短信正文输出。
+GitHub Actions 会执行完整检查。本地开发和测试入口见仓库内的 `tests/`。
 
 ## 文档
 
-- 接口说明：[`docs/API.md`](docs/API.md)
-- 控制接口：[`docs/CONTROL_API.md`](docs/CONTROL_API.md)
-- 字段契约：[`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)
-- 仓库边界：[`docs/REPO_BOUNDARY.md`](docs/REPO_BOUNDARY.md)
-- 机型模板索引：[`docs/models/README.md`](docs/models/README.md)
-- MU5250 模板：[`docs/models/MU5250.md`](docs/models/MU5250.md)
-- MC8532B 模板：[`docs/models/MC8532B.md`](docs/models/MC8532B.md)
-- MU5252 模板：[`docs/models/MU5252.md`](docs/models/MU5252.md)
-- MC7523 模板：[`docs/models/MC7523.md`](docs/models/MC7523.md)
-- 开发说明：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
+- [`docs/API.md`](docs/API.md)：HTTP/SSE 接口
+- [`docs/CONTROL_API.md`](docs/CONTROL_API.md)：控制动作
+- [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)：状态字段契约
+- [`docs/models/`](docs/models/)：设备模板与字段来源
+- [`docs/CLOUD.md`](docs/CLOUD.md)：可选 NMS 云端连接
+- [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md)：可选邻区采集
+- [`docs/RUNTIME.md`](docs/RUNTIME.md)：运行、日志与服务管理
 
 ## 许可
 
-[MIT](LICENSE)
-
-LAN Basic login accepts the actual web password. datad fetches a fresh `web_login_info.zte_web_sault` challenge and submits uppercase SHA256(uppercase SHA256(password) + salt), matching the native web UI. Missing challenges fail closed; failed logins are never retried with alternate password formats.
-
-### Static SMS cryptography
-
-The ARM64 musl build links OpenSSL libcrypto directly (`WEB_CRYPTO_STATIC`); it must not depend on `dlopen`, which static musl does not support. `scripts/build-static-crypto.sh` downloads the pinned OpenSSL 3.5.8 LTS source from openssl.org, checks SHA256, and caches a no-shared/no-module/no-dso build under `~/.cache/zwrt-datad/`. The build needs curl, tar, make and Perl. Native developer builds retain the existing dynamically loaded backend. Never treat an unread count alone as successful SMS-list validation.
-
-## 发布资产
-
-`scripts/build.sh` 生成静态、stripped 的 `zwrt-datad-aarch64` 及匹配版本的 `build/install-datad.sh`。合并提交上构建完成后，使用 `bash scripts/publish-release.sh <发布说明文件>` 上传二进制、`version.json`、`OPENSSL-LICENSE.txt`、`service.sh` 和 `install-datad.sh`。发布验收需要确认这些附件可下载，版本清单与 tag 一致，二进制与安装器内固定的 SHA-256 一致。
-
-## Optional neighbor and direct supply support
-
-Neighbor collection is disabled by default. See [NEIGHBOR.md](docs/NEIGHBOR.md)
-for enablement, status interpretation, resource limits and firmware compatibility.
-The charger direct-supply enum is exposed through `power.direct_supply` and the
-`power.direct_supply.status` / `power.direct_supply.set` control actions.
-Writes are confirmed by reading the charger state back. See
-[CONTROL_API.md](docs/CONTROL_API.md) and [STATE_SCHEMA.md](docs/STATE_SCHEMA.md).
+项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见
+[`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)。
