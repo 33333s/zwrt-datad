@@ -204,7 +204,7 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 
 ## Integration Boundary
 
-上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、OTA、插件、数据库和业务逻辑。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
+上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、UFI 自身 OTA、插件、数据库和业务逻辑。datad 自身更新由本机 `/ota/*` 接口完成，UFI 只提供鉴权代理和设置界面。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
 
 内网读取与 SSE 示例：
 
