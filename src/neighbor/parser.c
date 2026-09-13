@@ -44,7 +44,7 @@ typedef struct neighbor_parser {
     Snapshot snapshots[RECORDS];
     size_t direct_count, direct_next, snapshots_count, snapshots_next;
     uint64_t frames, malformed, discarded, reports, seq, capture;
-    int64_t now_ms, seen_ms;
+    int64_t now_ms, seen_ms, malformed_at_ms, discarded_at_ms;
     unsigned char frame[FRAME_MAX];
     size_t frame_len;
     int escaped, dropping, have_capture;
@@ -54,7 +54,10 @@ static void append_snapshot(ParseState *s, Snapshot *v) {
     v->at_ms = s->now_ms;
     size_t slot = s->snapshots_next++ % RECORDS;
     if (s->snapshots_count < RECORDS) s->snapshots_count++;
-    else if (s->now_ms - s->snapshots[slot].at_ms <= NEIGHBOR_TTL_MS) s->discarded++;
+    else if (s->now_ms - s->snapshots[slot].at_ms <= NEIGHBOR_TTL_MS) {
+        s->discarded++;
+        s->discarded_at_ms = s->now_ms;
+    }
     s->snapshots[slot] = *v;
     s->reports++; s->seen_ms = s->now_ms;
 }
@@ -145,7 +148,10 @@ static void process_qsh(ParseState *state, const uint8_t *frame, size_t length,
         direct.at_ms = state->now_ms;
         size_t slot = state->direct_next++ % RECORDS;
         if (state->direct_count < RECORDS) state->direct_count++;
-        else if (state->now_ms - state->direct[slot].at_ms <= NEIGHBOR_TTL_MS) state->discarded++;
+        else if (state->now_ms - state->direct[slot].at_ms <= NEIGHBOR_TTL_MS) {
+            state->discarded++;
+            state->discarded_at_ms = state->now_ms;
+        }
         state->direct[slot] = direct;
         state->reports++; state->seen_ms = state->now_ms;
     }
@@ -243,7 +249,10 @@ struct neighbor_parser *neighbor_parser_new(void) { return calloc(1, sizeof(Pars
 void neighbor_parser_free(struct neighbor_parser *p) { free(p); }
 void neighbor_parser_end_file(struct neighbor_parser *p, uint64_t capture) {
     if (!p || !p->have_capture || p->capture != capture) return;
-    if (p->frame_len || p->escaped || p->dropping) p->malformed++;
+    if (p->frame_len || p->escaped || p->dropping) {
+        p->malformed++;
+        p->malformed_at_ms = p->now_ms;
+    }
     p->frame_len = 0; p->escaped = 0; p->dropping = 0;
     p->have_capture = 0;
 }
@@ -265,7 +274,10 @@ void neighbor_parser_feed(struct neighbor_parser *p, const void *input, size_t n
         unsigned char b = s[i];
         if (b == 0x7e) {
             if (p->dropping || p->escaped || (p->frame_len &&
-                (p->frame_len < 3 || !valid_fcs(p->frame, p->frame_len)))) p->malformed++;
+                (p->frame_len < 3 || !valid_fcs(p->frame, p->frame_len)))) {
+                p->malformed++;
+                p->malformed_at_ms = p->now_ms;
+            }
             else if (p->frame_len) {
                 p->frames++;
                 process_qsh(p, p->frame, p->frame_len - 2, ++p->seq, capture);
@@ -320,7 +332,9 @@ void neighbor_parser_result(struct neighbor_parser *p, int64_t now, struct neigh
     if (!p) return;
     out->frames = p->frames; out->malformed = p->malformed; out->discarded = p->discarded;
     out->reports = p->reports; out->seen_ms = p->seen_ms;
-    out->partial = p->malformed != 0 || p->discarded != 0;
+    out->partial =
+        (p->malformed && recent(now, p->malformed_at_ms)) ||
+        (p->discarded && recent(now, p->discarded_at_ms));
     struct group groups[NEIGHBOR_MAX_CELLS];
     size_t count = 0;
     int heads[1008], next[RECORDS];
