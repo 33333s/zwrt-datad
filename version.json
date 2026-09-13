@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.37",
+    "version": "0.9.38",
     "asset": "zwrt-datad-aarch64",
-    "notes": "内置 Ed25519 签名 OTA；默认启用，支持自定义服务器优先、网盘和 GitHub 回退，以及低负载自动安装"
+    "notes": "内置 Ed25519 签名 OTA；网盘使用逐文件公开签名直链，默认启用，支持自定义服务器优先、网盘和 GitHub 回退，以及低负载自动安装"
   }
 }
