@@ -62,7 +62,7 @@ func TestOTASignedManifestAndCustomPriority(t *testing.T) {
 	defer good.Close()
 	bad := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("tampered")) }))
 	defer bad.Close()
-	o := &otaManager{dir: t.TempDir(), config: otaConfig{Enabled: true, Servers: []string{bad.URL, good.URL}}, status: otaStatus{State: "idle"}, client: good.Client(), pub: pub}
+	o := &otaManager{dir: t.TempDir(), config: otaConfig{Enabled: true, Servers: []string{bad.URL, good.URL}}, status: otaStatus{State: "waiting_idle", WaitReasons: []string{"设备需连续空闲 2 分钟"}}, client: good.Client(), pub: pub}
 	o.client.Timeout = 2 * time.Second
 	c, err := o.check(context.Background())
 	if err != nil {
@@ -73,9 +73,13 @@ func TestOTASignedManifestAndCustomPriority(t *testing.T) {
 	}
 	o.mu.Lock()
 	verified := o.status.SignatureOK
+	waitReasons := append([]string(nil), o.status.WaitReasons...)
 	o.mu.Unlock()
 	if !verified {
 		t.Fatal("signature was not recorded")
+	}
+	if len(waitReasons) != 0 {
+		t.Fatalf("successful check retained stale wait reasons: %v", waitReasons)
 	}
 }
 
@@ -119,6 +123,18 @@ func TestAutomaticIdleWaitDoesNotCountAsFailure(t *testing.T) {
 	}
 	if o.status.FailureCount != 0 || o.status.State != "waiting_idle" {
 		t.Fatalf("idle wait counted as failure: %#v", o.status)
+	}
+}
+
+func TestOTAReconcileSuccessClearsWaitReasons(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ota-install-result"), []byte("success\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	o := &otaManager{dir: dir, status: otaStatus{State: "waiting_idle", Error: "old error", WaitReasons: []string{"设备需连续空闲 2 分钟"}, FailureCount: 2, NextRetryAt: 123}}
+	o.reconcileInstallResult()
+	if o.status.State != "succeeded" || o.status.Error != "" || len(o.status.WaitReasons) != 0 || o.status.FailureCount != 0 || o.status.NextRetryAt != 0 {
+		t.Fatalf("unexpected reconciled status: %#v", o.status)
 	}
 }
 

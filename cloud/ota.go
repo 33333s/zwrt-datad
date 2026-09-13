@@ -301,6 +301,7 @@ func (o *otaManager) check(ctx context.Context) (*otaCandidate, error) {
 		o.status.LatestVersion = m.Version
 		o.status.Source = base
 		o.status.SignatureOK = true
+		o.status.WaitReasons = nil
 		o.status.State = "idle"
 		if newer(m.Version, version) {
 			o.status.State = "available"
@@ -573,6 +574,7 @@ func (o *otaManager) reconcileInstallResult() {
 		o.status.CurrentVersion = version
 		o.status.LastSuccessAt = time.Now().Unix()
 		o.status.Error = ""
+		o.status.WaitReasons = nil
 		o.status.FailureCount = 0
 		o.status.NextRetryAt = 0
 	} else {
