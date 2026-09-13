@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.40",
+    "version": "0.9.41",
     "asset": "zwrt-datad-aarch64",
-    "notes": "精简公开仓库与 README，内部工作流、过期方案和实机研究记录改为仅在本地保存"
+    "notes": "补充贡献者署名，记录 imshuhao 在活动卡槽、SSE、端口继承和 MU5252 控制方面的原始贡献"
   }
 }
