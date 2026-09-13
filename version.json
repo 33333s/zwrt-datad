@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.35",
+    "version": "0.9.36",
     "asset": "zwrt-datad-aarch64",
-    "notes": "邻区改为按需会话扫描：重启默认关闭，关闭后同步清理日志，并保持 32 MiB 硬上限与 4 x 4 MiB 循环 QMDL"
+    "notes": "邻区质量状态只反映最近 60 秒坏帧；未知频点的同 PCI 观察保持独立并要求消费者明确标为未关联"
   }
 }

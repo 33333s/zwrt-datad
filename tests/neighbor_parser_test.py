@@ -160,6 +160,14 @@ class SourceTests(unittest.TestCase):
         data=qsh(3640397572,[78,640000,123,0])+qsh(0x12345678,[])*257+snapshot(3657540452)
         measured=[c for c in self.parse(data)['cells'] if c['rsrp_dbm'] is not None];self.assertIsNone(measured[0]['arfcn'])
 
+    def test_same_pci_known_and_unresolved_observations_stay_distinct(self):
+        pci=978
+        known=qsh(3640397572,[78,627264,pci,0])+qsh(3657646332,[0,627264,pci,-89*128,0,0,1])
+        far=qsh(0x12345678,[])*257+snapshot(3657540452,pci=pci,dbm=-90)
+        result=self.parse(known+far)
+        self.assertEqual(result['malformed'],0)
+        self.assertEqual([(c['pci'],c['arfcn']) for c in result['cells']],[(978,627264),(978,None)])
+
     def test_lte_range_and_zero(self):
         self.assertEqual(self.parse(qsh(3640546464,[0,222,-920,0]))['cells'][0]['arfcn'],0)
         self.assertEqual(self.parse(qsh(3640546464,[0xffffffff,222,-920,0]))['cells'],[])

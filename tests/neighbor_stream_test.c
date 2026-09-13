@@ -33,6 +33,14 @@ int main(void) {
     for(int i=0;i<4097;i++) neighbor_parser_feed(p,data,n,1,1000);
     neighbor_parser_result(p,1000,&r);assert(r.discarded==1 && r.partial && r.cells[0].samples==4096);
     neighbor_parser_free(p);
-    puts("neighbor stream: byte boundaries, observation freshness, TTL, EARFCN zero, bounded records PASS");
+    p=neighbor_parser_new();assert(p);
+    unsigned char malformed[]={1,0x7e};
+    neighbor_parser_feed(p,malformed,sizeof malformed,1,1000);
+    neighbor_parser_result(p,1000,&r);assert(r.malformed==1 && r.partial);
+    neighbor_parser_feed(p,data,n,1,61001);
+    neighbor_parser_result(p,61001,&r);
+    assert(r.malformed==1 && !r.partial && r.count==1 && r.cells[0].samples==1);
+    neighbor_parser_free(p);
+    puts("neighbor stream: byte boundaries, observation freshness, TTL, EARFCN zero, bounded records and recent partial status PASS");
     return 0;
 }

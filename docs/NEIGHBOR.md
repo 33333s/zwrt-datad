@@ -39,6 +39,9 @@ The block also exposes `generation`, `collector_running`, `capture_bytes`,
 `sampled_at` (Unix seconds), `age_ms`, `partial`, `frames`, `malformed`, `discarded`,
 `ambiguous_measurements` and `cells`. Ages measure when new report bytes were
 observed locally, not an independently synchronized modem measurement timestamp.
+`malformed` and `discarded` are cumulative counters for the current collection
+generation; `partial` is true only when either kind of loss occurred within the
+same 60-second horizon as visible neighbor observations.
 Unchanged files do not refresh report ages. Data expires after 60 seconds; SIM,
 registration identity, serving cell or RAT changes invalidate the generation and
 restart the private capture. Equivalent unknown NR cell IDs (absent, zero,
@@ -49,6 +52,10 @@ aggregated carriers are excluded using the current firmware network response.
 ## Interpretation limits
 
 - Unknown ARFCN, band and RSRP are JSON `null`. LTE EARFCN 0 is valid.
+  An unknown-frequency observation remains separate from a confirmed-frequency
+  observation even when RAT and PCI match, because PCI can be reused on another
+  frequency. Consumers should label it as unresolved rather than presenting it
+  as another confirmed cell or merging it without evidence.
 - NR identity association requires the same capture and PCI within 256 decoded
   frames and 5 seconds. Multiple candidate frequencies remain ambiguous; a
   required anchor is never inferred from the serving frequency.
@@ -118,7 +125,8 @@ The embedded mask is written inside the private capture directory, followed by
 32 QMDL files, 256 scanned entries and bounded depth; diagnostic output is
 truncated at 64 KiB. The worker reads at most 4 MiB per poll, uses 64 KiB frame
 buffers and 4096 identity plus 4096 measurement records, and returns at most 128
-cells. Lost/truncated input and discarded current records set `partial`.
+cells. Lost/truncated input and discarded current records set `partial` while the
+loss remains inside the current 60-second result horizon.
 HDLC FCS and complete frame delimiters are required. Incomplete frames are not
 joined across distinct capture files.
 
