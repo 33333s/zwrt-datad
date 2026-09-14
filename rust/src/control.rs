@@ -233,6 +233,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "wifi.txpower.restore_limit" => wifi_power(params, "restore").await,
         "wifi.psm.set" => wifi_psm(params).await,
         "wifi.txpower.set_dbm" => wifi_dbm(params).await,
+        "wireless.config" => wireless_config(params).await,
         "lan.set" => {
             mapped_call(
                 params,
@@ -1130,6 +1131,193 @@ async fn wifi_dbm(params: &Value) -> Outcome {
     }
     Outcome::Ok(
         json!({"band":band,"mode":if restore{"oem"}else{"fixed"},"dbm":if restore{Value::Null}else{json!(dbm)},"saved":true,"pending":!restore&&applied==0,"applied_interfaces":applied}),
+    )
+}
+
+fn status_channels(status: &Value, band: &str) -> Vec<i64> {
+    status
+        .get("radios")
+        .and_then(|v| v.get(band))
+        .and_then(|v| v.get("supported_channels"))
+        .and_then(Value::as_array)
+        .map(|v| v.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
+}
+async fn restore_wireless_config(radio: &str, old0: &str, old1: &str, old_channel: &str) -> bool {
+    for (path, value) in [
+        ("wireless.wifi0.country", old0),
+        ("wireless.wifi1.country", old1),
+    ] {
+        let result = if value.is_empty() {
+            state::uci_write("delete", path, None).await
+        } else {
+            state::uci_write("set", path, Some(value)).await
+        };
+        if result.is_err() {
+            return false;
+        }
+    }
+    let path = format!("wireless.{radio}.channel");
+    let result = if old_channel.is_empty() {
+        state::uci_write("delete", &path, None).await
+    } else {
+        state::uci_write("set", &path, Some(old_channel)).await
+    };
+    result.is_ok()
+        && state::uci_write("commit", "wireless", None).await.is_ok()
+        && state::ubus("zwrt_wlan", "reload", json!({})).await.is_ok()
+}
+async fn wireless_config(params: &Value) -> Outcome {
+    let band = match string(params, "band", true) {
+        Ok(Some(v)) if matches!(v.as_str(), "2g" | "5g") => v,
+        Ok(_) => return Outcome::Invalid("band must be 2g or 5g".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let radio = if band == "2g" { "wifi0" } else { "wifi1" };
+    let initial = match crate::wifi::wireless_config_status().await {
+        Ok(v) => v,
+        Err(e) => return Outcome::Failed(e),
+    };
+    let country = match string(params, "country", false) {
+        Ok(v) => v.map(|v| v.to_ascii_uppercase()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if let Some(ref value) = country {
+        if !(value == "00" || (value.len() == 2 && value.bytes().all(|b| b.is_ascii_alphabetic())))
+        {
+            return Outcome::Invalid("country must be an ISO 3166-1 alpha-2 code".into());
+        }
+        let supported = initial
+            .get("countries")
+            .and_then(Value::as_array)
+            .is_some_and(|v| v.iter().any(|x| x.as_str() == Some(value)));
+        if !supported {
+            return Outcome::Invalid("country is not supported by the device".into());
+        }
+    }
+    let channel = match object(params).get("channel") {
+        Some(Value::String(v)) if v.eq_ignore_ascii_case("auto") => Some(0),
+        Some(Value::String(v)) => match v.parse::<i64>() {
+            Ok(v @ 0..=255) => Some(v),
+            _ => {
+                return Outcome::Invalid(
+                    "channel must be auto, 0, or a valid channel number".into(),
+                );
+            }
+        },
+        Some(Value::Number(v)) => match v.as_i64() {
+            Some(v @ 0..=255) => Some(v),
+            _ => {
+                return Outcome::Invalid(
+                    "channel must be auto, 0, or a valid channel number".into(),
+                );
+            }
+        },
+        Some(_) => {
+            return Outcome::Invalid("channel must be auto, 0, or a valid channel number".into());
+        }
+        None => None,
+    };
+    let old0 = state::uci_read("wireless.wifi0.country").await;
+    let old1 = state::uci_read("wireless.wifi1.country").await;
+    let channel_path = format!("wireless.{radio}.channel");
+    let old_channel = state::uci_read(&channel_path).await;
+    let country_changed = country.as_ref().is_some_and(|v| v != &old0 || v != &old1);
+    let channel_changed = channel.is_some_and(|v| v.to_string() != old_channel);
+    if !country_changed && !channel_changed {
+        return Outcome::Ok(
+            json!({"changed":false,"band":band,"country":country.unwrap_or(old0),"channel":channel.map(|v|v.to_string()).unwrap_or(old_channel)}),
+        );
+    }
+    if !country_changed {
+        if let Some(v) = channel {
+            if !status_channels(&initial, &band).contains(&v) {
+                return Outcome::Invalid(format!(
+                    "channel {v} is not permitted for {band} under country {old0}"
+                ));
+            }
+        }
+    }
+    if country_changed {
+        let value = country.as_deref().unwrap();
+        for path in ["wireless.wifi0.country", "wireless.wifi1.country"] {
+            if state::uci_write("set", path, Some(value)).await.is_err() {
+                let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+                return Outcome::Failed(
+                    "failed to apply country; previous configuration restored".into(),
+                );
+            }
+        }
+        if channel.is_some()
+            && state::uci_write("set", &channel_path, Some("0"))
+                .await
+                .is_err()
+        {
+            let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            return Outcome::Failed("failed to stage automatic channel".into());
+        }
+        if state::uci_write("commit", "wireless", None).await.is_err()
+            || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err()
+        {
+            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            return Outcome::Failed(format!(
+                "failed to apply country; previous configuration {}",
+                if restored {
+                    "restored"
+                } else {
+                    "could not be restored"
+                }
+            ));
+        }
+    }
+    let mut final_status = initial;
+    if let Some(target_channel) = channel.filter(|_| country_changed) {
+        for attempt in 0..80 {
+            final_status = match crate::wifi::wireless_config_status().await {
+                Ok(v) => v,
+                Err(_) => json!({}),
+            };
+            if status_channels(&final_status, &band).contains(&target_channel) {
+                break;
+            }
+            if attempt < 79 {
+                tokio::time::sleep(Duration::from_millis(250)).await
+            }
+        }
+    }
+    if let Some(v) = channel {
+        if !status_channels(&final_status, &band).contains(&v) {
+            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            return Outcome::Invalid(format!(
+                "channel {v} is not permitted for {band} under country {}{}",
+                country.as_deref().unwrap_or(&old0),
+                if country_changed && !restored {
+                    "; rollback failed"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if (channel_changed || country_changed)
+            && (state::uci_write("set", &channel_path, Some(&v.to_string()))
+                .await
+                .is_err()
+                || state::uci_write("commit", "wireless", None).await.is_err()
+                || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err())
+        {
+            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            return Outcome::Failed(format!(
+                "failed to apply channel; previous configuration {}",
+                if restored {
+                    "restored"
+                } else {
+                    "could not be restored"
+                }
+            ));
+        }
+    }
+    Outcome::Ok(
+        json!({"changed":true,"band":band,"country":country.unwrap_or(old0),"channel":channel.map(|v|v.to_string()).unwrap_or(old_channel),"channel_source":final_status.get("channel_source").cloned().unwrap_or(json!("uci"))}),
     )
 }
 
