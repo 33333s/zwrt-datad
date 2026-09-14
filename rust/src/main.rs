@@ -1,6 +1,8 @@
+mod cloud;
 mod command;
 mod model;
 mod neighbor;
+mod neighbor_manager;
 mod server;
 mod state;
 
@@ -66,7 +68,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
-    let app = App::new(args.data_dir, interval, token).await?;
+    let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());

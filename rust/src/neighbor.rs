@@ -54,7 +54,7 @@ struct Cell {
     samples: u32,
     direct_hits: u32,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct Output {
     source: &'static str,
     frames: u64,
@@ -528,4 +528,45 @@ pub fn parse_cli(paths: &[String]) -> i32 {
     let out = parser.result(1, failed);
     println!("{}", serde_json::to_string(&out).unwrap());
     if failed { 66 } else { 0 }
+}
+
+pub fn parse_files(paths: &[std::path::PathBuf], now_ms: i64) -> Result<serde_json::Value, String> {
+    if paths.len() > 32 {
+        return Err("too many capture files".into());
+    }
+    let mut parser = Parser::default();
+    let mut total = 0u64;
+    let mut failed = false;
+    for (i, path) in paths.iter().enumerate() {
+        let meta = path.symlink_metadata().map_err(|e| e.to_string())?;
+        if !meta.file_type().is_file()
+            || meta.len() > INPUT_MAX
+            || total.saturating_add(meta.len()) > INPUT_MAX
+        {
+            return Err("capture limit".into());
+        }
+        total += meta.len();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut remain = meta.len();
+        let mut buf = [0u8; 65536];
+        while remain > 0 {
+            let want = usize::try_from(remain.min(buf.len() as u64)).unwrap();
+            match file.read(&mut buf[..want]) {
+                Ok(0) | Err(_) => {
+                    failed = true;
+                    break;
+                }
+                Ok(n) => {
+                    parser.feed(&buf[..n], i as u64 + 1, now_ms);
+                    remain -= n as u64
+                }
+            }
+        }
+        parser.end_file(i as u64 + 1);
+    }
+    serde_json::to_value(parser.result(now_ms, failed)).map_err(|e| e.to_string())
 }
