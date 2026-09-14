@@ -21,6 +21,8 @@ export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
 export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
 export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
+export MOCK_UCI_STATE_DIR="$TMP/uci-state"
+export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
 mkdir -p "$TMP/data"
 printf 'fixture\n' >"$ZWRT_DATAD_QOS_LOG"
 printf 'rotated\n' >"$ZWRT_DATAD_QOS_LOG_ROTATED"
@@ -67,6 +69,9 @@ wireless_status=$(curl -sS -o "$TMP/wireless-bad.json" -w '%{http_code}' -H 'con
 post '{"action":"wireless.config","params":{"band":"5g","channel":149}}' >/dev/null
 printf '0\n' >"$MOCK_IWINFO_DELAY_FILE"
 post '{"action":"wireless.config","params":{"band":"5g","country":"HK","channel":100}}' >/dev/null
+post '{"action":"wifi.interface.create","params":{"band":"5g","ssid":"Fixture Extra","key":"fixture-extra-key"}}' >/dev/null
+post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","ssid":"Fixture Extra 2","enabled":false}}' >/dev/null
+post '{"action":"wifi.interface.delete","params":{"section":"datad_ssid_1"}}' >/dev/null
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -113,5 +118,9 @@ grep -F 'wireless.wifi1.country=HK' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.wifi1.channel=0' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.wifi1.channel=100' "$MOCK_CALL_LOG" >/dev/null
 [ "$(cat "$MOCK_IWINFO_DELAY_FILE")" -gt 3 ]
+grep -F 'datad_wifi.datad_ssid_1=wifi-iface' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'datad_wifi.datad_ssid_1.ssid=Fixture Extra 2' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'delete datad_wifi.datad_ssid_1' "$MOCK_CALL_LOG" >/dev/null
+[ "$(stat -f '%Lp' "$ZWRT_DATAD_WIFI_CONFIG")" = 600 ]
 
 echo 'rust control HTTP fixture: PASS'

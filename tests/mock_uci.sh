@@ -5,6 +5,23 @@ if [ -n "${MOCK_CALL_LOG:-}" ]; then
     printf 'uci\t%s\n' "$*" >>"$MOCK_CALL_LOG"
 fi
 
+if [ -n "${MOCK_UCI_STATE_DIR:-}" ]; then
+    mkdir -p "$MOCK_UCI_STATE_DIR"
+    if [ "${1:-}" = "set" ]; then
+        path=${2%%=*}; value=${2#*=}
+        printf '%s\n' "$value" >"$MOCK_UCI_STATE_DIR/$path"
+        exit 0
+    fi
+    if [ "${1:-}" = "delete" ]; then
+        rm -f "$MOCK_UCI_STATE_DIR/${2:-}" "$MOCK_UCI_STATE_DIR/${2:-}".*
+        exit 0
+    fi
+    if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ] && [ -f "$MOCK_UCI_STATE_DIR/${3:-}" ]; then
+        cat "$MOCK_UCI_STATE_DIR/${3:-}"
+        exit 0
+    fi
+fi
+
 case "$*" in
     *__mock_fail__*) exit 1 ;;
 esac

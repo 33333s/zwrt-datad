@@ -33,6 +33,9 @@ pub const ACTIONS: &[&str] = &[
     "wifi.txpower.restore_limit",
     "wifi.psm.set",
     "wifi.txpower.set_dbm",
+    "wifi.interface.create",
+    "wifi.interface.configure",
+    "wifi.interface.delete",
     "lan.set",
     "lan.set_mtu",
     "dns.set",
@@ -234,6 +237,9 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "wifi.psm.set" => wifi_psm(params).await,
         "wifi.txpower.set_dbm" => wifi_dbm(params).await,
         "wireless.config" => wireless_config(params).await,
+        "wifi.interface.create" => extra_wifi(params, "create").await,
+        "wifi.interface.configure" => extra_wifi(params, "configure").await,
+        "wifi.interface.delete" => extra_wifi(params, "delete").await,
         "lan.set" => {
             mapped_call(
                 params,
@@ -1319,6 +1325,217 @@ async fn wireless_config(params: &Value) -> Outcome {
     Outcome::Ok(
         json!({"changed":true,"band":band,"country":country.unwrap_or(old0),"channel":channel.map(|v|v.to_string()).unwrap_or(old_channel),"channel_source":final_status.get("channel_source").cloned().unwrap_or(json!("uci"))}),
     )
+}
+
+async fn extra_value(section: &str, option: &str) -> String {
+    state::uci_read(&format!("datad_wifi.{section}.{option}")).await
+}
+async fn extra_exists(section: &str) -> bool {
+    !state::uci_read(&format!("datad_wifi.{section}"))
+        .await
+        .is_empty()
+}
+async fn write_extra(section: &str, values: &[(&str, String)]) -> Result<(), String> {
+    let config =
+        std::env::var("ZWRT_DATAD_WIFI_CONFIG").unwrap_or_else(|_| "/etc/config/datad_wifi".into());
+    if let Some(parent) = std::path::Path::new(&config).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config)
+        .await
+        .map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    state::uci_write("set", &format!("datad_wifi.{section}"), Some("wifi-iface")).await?;
+    for (option, value) in values {
+        if let Err(e) = state::uci_write(
+            "set",
+            &format!("datad_wifi.{section}.{option}"),
+            Some(value),
+        )
+        .await
+        {
+            let _ = state::uci_write("revert", "datad_wifi", None).await;
+            return Err(e);
+        }
+    }
+    if let Err(e) = state::uci_write("commit", "datad_wifi", None).await {
+        let _ = state::uci_write("revert", "datad_wifi", None).await;
+        return Err(e);
+    }
+    Ok(())
+}
+async fn extra_wifi(params: &Value, operation: &str) -> Outcome {
+    if !advanced_wifi_supported().await {
+        return Outcome::Failed("advanced Wi-Fi unsupported by this model".into());
+    }
+    if operation == "configure" {
+        if let Some(section) = object(params).get("section").and_then(Value::as_str) {
+            if matches!(section, "main_2g" | "main_5g" | "guest_2g" | "guest_5g") {
+                return wifi_configure(params).await;
+            }
+        }
+    }
+    let section = if operation == "create" {
+        if !extra_exists("datad_ssid_1").await {
+            "datad_ssid_1".to_owned()
+        } else if !extra_exists("datad_ssid_2").await {
+            "datad_ssid_2".to_owned()
+        } else {
+            return Outcome::Invalid("two extra SSID slots are already configured".into());
+        }
+    } else {
+        match string(params, "section", true) {
+            Ok(Some(v))
+                if matches!(v.as_str(), "datad_ssid_1" | "datad_ssid_2")
+                    && extra_exists(&v).await =>
+            {
+                v
+            }
+            Ok(_) => {
+                return Outcome::Invalid(
+                    "invalid extra SSID settings or duplicate SSID on this band".into(),
+                );
+            }
+            Err(e) => return Outcome::Invalid(e),
+        }
+    };
+    if operation == "delete" {
+        if let Err(e) = state::uci_write("delete", &format!("datad_wifi.{section}"), None).await {
+            return Outcome::Failed(e);
+        }
+        if let Err(e) = state::uci_write("commit", "datad_wifi", None).await {
+            return Outcome::Failed(e);
+        }
+        return Outcome::Ok(json!({"section":section,"changed":true,"deleted":true}));
+    }
+    let band = match string(params, "band", false) {
+        Ok(Some(v)) if matches!(v.as_str(), "2g" | "5g") => v,
+        Ok(None) if operation != "create" => extra_value(&section, "band").await,
+        Ok(_) => {
+            return Outcome::Invalid(
+                "invalid extra SSID settings or duplicate SSID on this band".into(),
+            );
+        }
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let ssid = match string(params, "ssid", false) {
+        Ok(Some(v)) => v,
+        Ok(None) if operation != "create" => extra_value(&section, "ssid").await,
+        Ok(_) => {
+            return Outcome::Invalid(
+                "invalid extra SSID settings or duplicate SSID on this band".into(),
+            );
+        }
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if ssid.is_empty() || ssid.len() > 32 || ssid.contains(['\r', '\n']) {
+        return Outcome::Invalid(
+            "invalid extra SSID settings or duplicate SSID on this band".into(),
+        );
+    }
+    for main in if band == "2g" {
+        ["main_2g", "guest_2g"]
+    } else {
+        ["main_5g", "guest_5g"]
+    } {
+        if state::uci_read(&format!("wireless.{main}.ssid")).await == ssid {
+            return Outcome::Invalid(
+                "invalid extra SSID settings or duplicate SSID on this band".into(),
+            );
+        }
+    }
+    for other in ["datad_ssid_1", "datad_ssid_2"] {
+        if other != section
+            && extra_exists(other).await
+            && extra_value(other, "band").await == band
+            && extra_value(other, "ssid").await == ssid
+        {
+            return Outcome::Invalid(
+                "invalid extra SSID settings or duplicate SSID on this band".into(),
+            );
+        }
+    }
+    let encryption = match string(params, "encryption", false) {
+        Ok(Some(v)) => v,
+        Ok(None) if operation == "create" => "sae-mixed".into(),
+        Ok(None) => extra_value(&section, "encryption").await,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if !matches!(
+        encryption.as_str(),
+        "none" | "psk2+ccmp" | "sae-mixed" | "sae"
+    ) {
+        return Outcome::Invalid(
+            "invalid extra SSID settings or duplicate SSID on this band".into(),
+        );
+    }
+    let key = match string(params, "key", false) {
+        Ok(Some(v)) if !v.is_empty() => v,
+        Ok(_) => extra_value(&section, "key").await,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if encryption != "none" && (!(8..=63).contains(&key.len()) || key.contains(['\r', '\n'])) {
+        return Outcome::Invalid(
+            "invalid extra SSID settings or duplicate SSID on this band".into(),
+        );
+    }
+    let flag = |name: &str, default: i64| -> Result<i64, String> {
+        match object(params).get(name) {
+            Some(Value::Bool(v)) => Ok(i64::from(*v)),
+            Some(Value::Number(v)) if matches!(v.as_i64(), Some(0 | 1)) => Ok(v.as_i64().unwrap()),
+            Some(_) => Err(format!("{name} must be boolean or 0/1")),
+            None => Ok(default),
+        }
+    };
+    let old_enabled = extra_value(&section, "disabled")
+        .await
+        .parse::<i64>()
+        .map(|v| 1 - v)
+        .unwrap_or(1);
+    let enabled = match flag("enabled", old_enabled) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let hidden = match flag(
+        "hidden",
+        extra_value(&section, "hidden").await.parse().unwrap_or(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let isolate = match flag(
+        "isolate",
+        extra_value(&section, "isolate").await.parse().unwrap_or(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let psm = extra_value(&section, "datad_psm").await;
+    let values = [
+        ("band", band),
+        ("ssid", ssid),
+        ("encryption", encryption),
+        ("key", key),
+        ("disabled", (1 - enabled).to_string()),
+        ("hidden", hidden.to_string()),
+        ("isolate", isolate.to_string()),
+        ("datad_psm", psm),
+    ];
+    if let Err(e) = write_extra(&section, &values).await {
+        return Outcome::Failed(format!("could not save extra SSID: {e}"));
+    }
+    Outcome::Ok(json!({"section":section,"saved":true,"changed":true,"pending":enabled==1}))
 }
 
 fn valid_section(value: &str) -> bool {
