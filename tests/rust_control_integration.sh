@@ -30,6 +30,7 @@ export ZWRT_DATAD_PROC_ROOT="$TMP/proc"
 export MOCK_NET_CLASS_DIR="$ZWRT_DATAD_NET_CLASS_DIR"
 export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
 export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
+export ZWRT_DATAD_DHCP_LEASES_PATH="$TMP/dhcp.leases"
 export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
@@ -51,6 +52,7 @@ printf '2000\n' >"$ZWRT_DATAD_NET_CLASS_ROOT/rmnet_data0/statistics/tx_bytes"
 printf 'cpuss-0\n' >"$ZWRT_DATAD_THERMAL_ROOT/thermal_zone0/type"
 printf '42000\n' >"$ZWRT_DATAD_THERMAL_ROOT/thermal_zone0/temp"
 printf 'fixture-boot-id\n' >"$TMP/boot-id"
+printf '4102444800 00:11:22:33:44:99 192.168.0.99 historical-offline *\n' >"$ZWRT_DATAD_DHCP_LEASES_PATH"
 printf '1\n' >"$MOCK_SIM_SLOT_FILE"
 export ZWRT_DATAD_BOOT_ID_PATH="$TMP/boot-id"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/web-private.pem" 2>/dev/null
@@ -203,7 +205,7 @@ curl -fsS "http://127.0.0.1:$PORT/capabilities" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
 sleep 1.2
 curl -fsS "http://127.0.0.1:$PORT/state" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}]}'
 unknown_status=$(curl -sS -o "$TMP/unknown.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"fixture.unknown","params":{}}' "http://127.0.0.1:$PORT/control")
 [ "$unknown_status" = 404 ]

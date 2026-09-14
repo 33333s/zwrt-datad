@@ -533,17 +533,67 @@ fn thermal_zones() -> (i64, Value, Value) {
         Value::Array(runtime_zones),
     )
 }
-fn clients_from_leases() -> Value {
-    Value::Array(
-        fs::read_to_string("/tmp/dhcp.leases")
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let p: Vec<_> = line.split_whitespace().collect();
-                (p.len() >= 4)
-                    .then(|| json!({"name":if p[3]=="*"{""}else{p[3]},"ip":p[2],"mac":p[1]}))
+fn lease_metadata() -> BTreeMap<String, (String, String)> {
+    let path =
+        std::env::var("ZWRT_DATAD_DHCP_LEASES_PATH").unwrap_or_else(|_| "/tmp/dhcp.leases".into());
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let p: Vec<_> = line.split_whitespace().collect();
+            (p.len() >= 4).then(|| {
+                (
+                    p[1].to_ascii_lowercase(),
+                    (
+                        p[2].to_owned(),
+                        if p[3] == "*" { "" } else { p[3] }.to_owned(),
+                    ),
+                )
             })
-            .collect(),
+        })
+        .collect()
+}
+
+fn client_array(value: &Value, key: &str) -> Option<Vec<Value>> {
+    let leases = lease_metadata();
+    value.get(key)?.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|entry| {
+                let mac = ["mac_address", "mac", "mac_addr"]
+                    .into_iter()
+                    .map(|key| string(entry, key))
+                    .find(|value| !value.is_empty())?
+                    .to_ascii_lowercase();
+                let lease = leases.get(&mac);
+                let ip = ["ip_address", "ip", "ip_addr"]
+                    .into_iter()
+                    .map(|key| string(entry, key))
+                    .find(|value| !value.is_empty())
+                    .or_else(|| lease.map(|value| value.0.clone()))
+                    .unwrap_or_default();
+                let name = ["hostname", "name"]
+                    .into_iter()
+                    .map(|key| string(entry, key))
+                    .find(|value| !value.is_empty() && value != "--" && value != "*")
+                    .or_else(|| lease.map(|value| value.1.clone()))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| mac.clone());
+                Some(json!({"name":name,"ip":ip,"mac":mac}))
+            })
+            .collect()
+    })
+}
+
+fn connected_clients(lan: &Value, wifi: &Value) -> (Value, i64, i64) {
+    let wifi = client_array(wifi, "wireless_access_list_info").unwrap_or_default();
+    let lan = client_array(lan, "lan_access_list_info").unwrap_or_default();
+    let wifi_count = wifi.len() as i64;
+    let lan_count = lan.len() as i64;
+    (
+        Value::Array(wifi.into_iter().chain(lan).collect()),
+        wifi_count,
+        lan_count,
     )
 }
 fn memory_fields(info: &Value) -> (i64, i64, i64) {
@@ -817,7 +867,18 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     .await;
     let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
-    let user_count = ubus("zwrt_router.api", "router_get_user_list_num", json!({})).await;
+    let lan_clients = ubus(
+        "zwrt_router.api",
+        "router_lan_access_list",
+        json!({"start_id":1,"end_id":64}),
+    )
+    .await;
+    let wifi_clients = ubus(
+        "zwrt_router.api",
+        "router_wireless_access_list",
+        json!({"start_id":1,"end_id":64}),
+    )
+    .await;
     let router_status = ubus("zwrt_router.api", "router_get_status_no_auth", json!({})).await;
     let thermal = ubus("zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
     let usb = ubus("zwrt_bsp.usb", "list", json!({})).await;
@@ -858,7 +919,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let clear_day = object(clear_day);
     let sim = object(sim);
     let imei = object(imei);
-    let user_count = object(user_count);
+    let lan_clients = object(lan_clients);
+    let wifi_clients = object(wifi_clients);
     let router_status = object(router_status);
     let thermal = object(thermal);
     let usb = object(usb);
@@ -1019,8 +1081,11 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let mut fields = Map::new();
     fields.insert("net".into(), Value::Object(net));
     fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
-    let cl = clients_from_leases();
-    fields.insert("clients".into(),json!({"total":integer(&user_count,"access_total_num"),"wifi":integer(&user_count,"wireless_num"),"lan":integer(&user_count,"lan_num"),"list":cl}));
+    let (client_list, wifi_count, lan_count) = connected_clients(&lan_clients, &wifi_clients);
+    fields.insert(
+        "clients".into(),
+        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list}),
+    );
     let hide_battery = matches!(template, "MC7523" | "MC8532B");
     if !hide_battery
         && battery_ok
@@ -1524,5 +1589,16 @@ mod tests {
         let v = interface(&json!({}));
         assert_eq!(v["up"], false);
         assert_eq!(v["ipv4"], json!([]))
+    }
+    #[test]
+    fn connected_clients_ignore_historical_leases() {
+        let (items, wifi, lan) = connected_clients(
+            &json!({"lan_access_list_info":[]}),
+            &json!({"wireless_access_list_info":[{"mac_address":"AA:BB:CC:DD:EE:FF","ip_address":"192.168.0.2","hostname":"online"}]}),
+        );
+        assert_eq!(wifi, 1);
+        assert_eq!(lan, 0);
+        assert_eq!(items.as_array().unwrap().len(), 1);
+        assert_eq!(items[0]["mac"], "aa:bb:cc:dd:ee:ff");
     }
 }

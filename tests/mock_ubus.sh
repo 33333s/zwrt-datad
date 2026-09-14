@@ -138,6 +138,15 @@ case "$service:$method" in
     zwrt_router.api:router_get_wifi_isolate)
         printf '%s\n' '{"wifimain24_wifimain5_enable":1,"other_option":7}'
         ;;
+    zwrt_router.api:router_get_user_list_num)
+        printf '%s\n' '{"access_total_num":2,"wireless_num":1,"lan_num":1}'
+        ;;
+    zwrt_router.api:router_wireless_access_list)
+        printf '%s\n' '{"wireless_access_list_info":[{"hostname":"wifi-live","ip_address":"192.168.0.2","mac_address":"00:11:22:33:44:55"}]}'
+        ;;
+    zwrt_router.api:router_lan_access_list)
+        printf '%s\n' '{"lan_access_list_info":[{"hostname":"lan-live","ip_address":"192.168.0.3","mac_address":"00:11:22:33:44:66"}]}'
+        ;;
     zwrt_router.api:router_set_wifi_isolate|zwrt_router.api:router_set_wan_mtu)
         printf '%s\n' '{"result":"success"}'
         ;;
