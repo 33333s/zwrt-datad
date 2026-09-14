@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.42",
+    "version": "0.9.43",
     "asset": "zwrt-datad-aarch64",
-    "notes": "重写中英文 README，补充项目功能、已适配设备、一键安装升级和安全边界说明"
+    "notes": "拆分中文 README 与独立英文 README，增加清晰的语言切换和文档入口"
   }
 }

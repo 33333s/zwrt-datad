@@ -1,21 +1,16 @@
 # zwrt-datad
 
-面向中兴 ARM64 5G 路由设备的统一数据与控制服务。<br>
-A unified data and control service for ZTE ARM64 5G routers.
+面向中兴 ARM64 5G 路由设备的统一数据与控制服务。
 
-[中文](#中文) · [English](#english) · [Releases](https://github.com/33333s/zwrt-datad/releases/latest) · [API](docs/API.md)
+[English](README_EN.md) · [最新版本](https://github.com/33333s/zwrt-datad/releases/latest) · [API 文档](docs/API.md)
 
----
-
-## 中文
-
-### 项目介绍
+## 项目介绍
 
 `zwrt-datad` 运行在设备本机，统一读取 `ubus`、`uci`、`sysfs` 和必要的设备日志，把不同机型的底层接口整理成稳定的 JSON 状态，并通过 HTTP 与 SSE 提供给 UFI、WebUI、脚本或其他本机服务。
 
 项目使用机型模板隔离固件差异。上层应用不需要为每台设备重复轮询厂商接口，也不需要自行解析日志。datad 只负责设备数据、设备控制和自身更新，不包含前端页面、插件系统或 UFI 业务。
 
-### 主要功能
+## 主要功能
 
 - 聚合设备、系统、CPU、内存、存储、温度、电池和运行状态
 - 聚合 SIM、移动网络、信号、频段、流量、QoS、Wi-Fi、客户端和短信数据
@@ -28,7 +23,7 @@ A unified data and control service for ZTE ARM64 5G routers.
 - 内置 datad 自更新，使用 Ed25519 签名和 SHA-256 校验更新清单与二进制
 - 单进程、静态 ARM64 发布，默认每秒生成一次状态快照
 
-### 当前已适配设备
+## 当前已适配设备
 
 | 设备型号 | 产品名称 | 模板状态 |
 | --- | --- | --- |
@@ -41,7 +36,7 @@ A unified data and control service for ZTE ARM64 5G routers.
 
 各机型的数据来源和差异见 [`docs/models/`](docs/models/)。其他机型可能进入兼容模板，但不代表已经完成适配。
 
-### 一键安装或升级
+## 一键安装或升级
 
 要求设备为 ARM64/aarch64、使用 root 执行，并可写入 `/data`：
 
@@ -63,7 +58,7 @@ sh /tmp/install-datad.sh
 
 datad 不安装自己的 `/etc/init.d` 脚本。安装器需要设备提供 `curl`、`sha256sum`、`awk`、`cmp`、`stat`、`flock`、`mktemp`、`readlink` 和 `od`。
 
-### 服务管理
+## 服务管理
 
 ```sh
 sh /data/zwrt-datad/service.sh status
@@ -80,7 +75,7 @@ sh /data/zwrt-datad/service.sh stop
 - 本机 API：`http://127.0.0.1:9460`
 - 内网 API：`http://<设备 IP>:9461`
 
-### 快速检查
+## 快速检查
 
 ```sh
 curl -fsS http://127.0.0.1:9460/healthz
@@ -93,7 +88,7 @@ curl -N http://127.0.0.1:9460/events
 
 > **安全提示：** `POST /ubus/call` 可以访问运行时注册的 ubus 方法，其中可能包含修改网络、断开连接或重启设备的写操作。只应向受信任的管理程序开放，并由调用方限制入口和进行必要确认。
 
-### 构建
+## 构建
 
 需要 POSIX shell 和 aarch64 musl 工具链：
 
@@ -103,7 +98,7 @@ bash scripts/build.sh
 
 构建产物位于仓库根目录和 `build/`。GitHub Actions 会运行完整检查；测试入口位于 `tests/`。
 
-### 文档
+## 文档
 
 - [`docs/API.md`](docs/API.md)：HTTP、SSE、鉴权与命令行参数
 - [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)：状态字段契约
@@ -113,114 +108,6 @@ bash scripts/build.sh
 - [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md)：可选邻区采集
 - [`docs/CLOUD.md`](docs/CLOUD.md)：可选 NMS 云端连接
 
----
+## 许可与贡献者
 
-## English
-
-### Overview
-
-`zwrt-datad` runs locally on the router. It reads `ubus`, `uci`, `sysfs`, and selected device logs, normalizes model-specific interfaces into a stable JSON state, and exposes that state to UFI, WebUI clients, scripts, and other local services over HTTP and SSE.
-
-Device templates isolate firmware differences so consumers do not need to poll vendor APIs or parse logs independently. datad is limited to device data, device control, and its own signed updates; it does not include a frontend, plugin system, or UFI application logic.
-
-### Features
-
-- Aggregates device, system, CPU, memory, storage, thermal, battery, and runtime state
-- Aggregates SIM, cellular, signal, band, traffic, QoS, Wi-Fi, client, and SMS data
-- Provides complete JSON snapshots through `GET /state` and change events through `GET /events`
-- Normalizes fields through model templates and reports available operations through `/capabilities`
-- Exposes constrained cellular, Wi-Fi, APN, SMS, power, and device controls through `POST /control`
-- Provides access to the device's registered ubus objects for trusted management clients
-- Includes optional isolated neighbor-cell collection with resource and expiry limits
-- Includes optional NMS cloud connectivity and remote service entry points
-- Verifies datad self-updates with Ed25519 signatures and SHA-256 hashes
-- Ships as a single statically linked ARM64 process with a one-second default sampling interval
-
-### Supported devices
-
-| Model | Product | Support level |
-| --- | --- | --- |
-| `MU5250` | U60 Pro | Supported template |
-| `MC8532B` | G5 Pro | Supported template |
-| `MU5252` | TopFlow | Supported template |
-| `MC7523` | G5 Max WiFi | Supported template |
-
-At runtime, `device.api_template_supported = 1` means that a supported template was selected. Each model only exposes state blocks that the device actually supports. Consumers should test for field presence instead of inventing `0`, `-1`, or empty placeholder objects.
-
-See [`docs/models/`](docs/models/) for model-specific data sources and behavior. An unknown model may use the compatibility template, but that does not mean the device is officially supported.
-
-### One-command install or upgrade
-
-Run as root on an ARM64/aarch64 device with writable `/data` storage:
-
-```sh
-curl -4fL --retry 3 \
-  'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' \
-  -o /tmp/install-datad.sh && \
-sh /tmp/install-datad.sh
-```
-
-Run the same command again to upgrade. The installer:
-
-1. Downloads the release binary and verifies its pinned SHA-256.
-2. Starts the candidate on a temporary port and checks `/healthz` and `/state`.
-3. Backs up the existing installation and atomically updates `/data/zwrt-datad`.
-4. Removes duplicate legacy startup entries and writes one command to `/etc/rc.local`.
-5. Starts the production service and verifies ports 9460/9461 and the single-process invariant.
-6. Restores the previous files and service if any step fails.
-
-datad does not install its own `/etc/init.d` script. The installer requires `curl`, `sha256sum`, `awk`, `cmp`, `stat`, `flock`, `mktemp`, `readlink`, and `od` on the device.
-
-### Service management
-
-```sh
-sh /data/zwrt-datad/service.sh status
-sh /data/zwrt-datad/service.sh start
-sh /data/zwrt-datad/service.sh restart
-sh /data/zwrt-datad/service.sh stop
-```
-
-Default paths and endpoints:
-
-- Binary: `/data/zwrt-datad/zwrt-datad`
-- Log: `/data/zwrt-datad/zwrt-datad.log`
-- PID file: `/data/zwrt-datad/zwrt-datad.pid`
-- Loopback API: `http://127.0.0.1:9460`
-- LAN API: `http://<device-ip>:9461`
-
-### Quick check
-
-```sh
-curl -fsS http://127.0.0.1:9460/healthz
-curl -fsS http://127.0.0.1:9460/version
-curl -fsS http://127.0.0.1:9460/state
-curl -N http://127.0.0.1:9460/events
-```
-
-Port 9460 is the loopback API. The LAN API on port 9461 requires a Bearer Token obtained through `/auth/login` or `/auth/exchange`; see [`docs/API.md`](docs/API.md) for authentication details.
-
-> **Security:** `POST /ubus/call` can invoke runtime-registered ubus methods, including writes that may reconfigure networking, disconnect the device, or reboot it. Expose it only to trusted management clients and enforce confirmation and policy in the caller.
-
-### Build
-
-A POSIX shell and an aarch64 musl toolchain are required:
-
-```sh
-bash scripts/build.sh
-```
-
-Build outputs are written to the repository root and `build/`. GitHub Actions runs the full checks; test entry points are available under `tests/`.
-
-### Documentation
-
-- [`docs/API.md`](docs/API.md): HTTP, SSE, authentication, and command-line options
-- [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md): state schema contract
-- [`docs/CONTROL_API.md`](docs/CONTROL_API.md): control actions and safety boundaries
-- [`docs/models/`](docs/models/): supported device templates
-- [`docs/RUNTIME.md`](docs/RUNTIME.md): runtime, logs, and service management
-- [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md): optional neighbor-cell collection
-- [`docs/CLOUD.md`](docs/CLOUD.md): optional NMS cloud connection
-
-## License and contributors
-
-Licensed under the [MIT License](LICENSE). OpenSSL licensing for static releases is available in [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for project credits.
+项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见 [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
