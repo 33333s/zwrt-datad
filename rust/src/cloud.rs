@@ -1,7 +1,7 @@
 use crate::model::Snapshot;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
-use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS, Transport};
+use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, Outgoing, QoS, Transport};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -325,13 +325,19 @@ async fn session(
             changed = config_rx.changed() => {
                 bridge.shutdown();
                 if connected {
-                    let _ = publish(&client, format!("{}/status", root(config)), json!({"online":false})).await;
+                    let _ = publish_and_flush(
+                        &client,
+                        &mut eventloop,
+                        format!("{}/status", root(config)),
+                        json!({"online":false}),
+                    ).await;
                 }
                 return if changed.is_ok() { SessionEnd::Reconfigure } else { SessionEnd::Stopped };
             }
             event = eventloop.poll() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
+                    ticker.reset();
                     set_status(&status, "connected", "");
                     let snapshot = state_rx.borrow().clone();
                     if report(&client, config, &snapshot, &status).await.is_err() {
@@ -360,6 +366,31 @@ async fn session(
             }
         }
     }
+}
+
+async fn publish_and_flush(
+    client: &AsyncClient,
+    eventloop: &mut rumqttc::EventLoop,
+    topic: String,
+    payload: Value,
+) -> Result<(), String> {
+    publish(client, topic, payload).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut pending = None;
+        loop {
+            match eventloop.poll().await.map_err(|error| error.to_string())? {
+                Event::Outgoing(Outgoing::Publish(packet_id)) if packet_id != 0 => {
+                    pending = Some(packet_id);
+                }
+                Event::Incoming(Incoming::PubAck(ack)) if pending == Some(ack.pkid) => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| "MQTT offline status acknowledgement timed out".to_owned())?
 }
 
 async fn report(
@@ -993,6 +1024,17 @@ mod tests {
             }
         }
         config_tx.send(Some(Config::default())).unwrap();
+        let offline = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value = reports_rx.recv().await.unwrap();
+                if value["online"] == false {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(offline["protocol_version"], 1);
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(5), session_task)
                 .await
