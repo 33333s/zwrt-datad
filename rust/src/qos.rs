@@ -38,6 +38,28 @@ pub fn read_for_plmn(mcc: i64, mnc: i64) -> Values {
     )
 }
 
+pub fn parse_external(text: &str) -> Option<Values> {
+    let mut selected = None;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !line.contains("[DATA]") || !lower.contains("cid1") {
+            continue;
+        }
+        let qci = integer_after_ci(&lower, "qci=")?;
+        let dl = integer_after_ci(&lower, "dl_ambr=")?;
+        let ul = integer_after_ci(&lower, "ul_ambr=")?;
+        if !(1..=255).contains(&qci) || dl < 0 || ul < 0 {
+            continue;
+        }
+        selected = Some(Values {
+            qci,
+            ambr_dl: format_mbps(dl as f64 / 1000.0),
+            ambr_ul: format_mbps(ul as f64 / 1000.0),
+        });
+    }
+    selected
+}
+
 fn read_tail(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
@@ -243,6 +265,14 @@ mod tests {
                 "session_ambr_dl_unit="
             ),
             Some(200.0)
+        );
+        assert_eq!(
+            parse_external("[DATA] cid1, QCI=[9], DL_AMBR=[150000]kbps, UL_AMBR=[75000]kbps"),
+            Some(Values {
+                qci: 9,
+                ambr_dl: "150.000".into(),
+                ambr_ul: "75.000".into()
+            })
         );
     }
 }

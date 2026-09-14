@@ -5,12 +5,12 @@ The Rust branch is never installed over the production binary until every requir
 | Area | Rust status | Production gate |
 |---|---|---|
 | CLI and static ARM64 musl build | implemented | real MU5252 `/tmp` smoke passed |
-| `/healthz`, `/version`, `/state` | MC7523 has 273/273 leaf-path parity with no missing, extra, or type mismatches | MU5250, MU5252 and MC8532B golden comparisons pending |
+| `/healthz`, `/version`, `/state` | MC7523 has 273/273 leaf-path parity; MU5252 TopFlow state now covers three modems, slot-aware fallbacks, QoS, aggregation, multi-WAN and cooling | MU5250 and MC8532B golden comparisons plus final MU5252 device comparison pending |
 | change-driven `/events` SSE | implemented; original framing suite passes | reconnect and client-limit tests pending |
 | `/capabilities` | reports only the eleven currently implemented controls | expand with each verified action until exact parity |
 | `/ubus`, `/ubus/list`, `/ubus/call` | implemented with validation, timeout, output cap and auth/list shape checks | complete |
 | static and dynamic authentication | static token, LAN Basic login, vendor-token exchange, 48-byte-hex sessions and sliding expiry implemented | supported-device login smoke |
-| normalized device state | MC7523 structure complete; battery, NFC, SMS, thermal and bounded QoS sources ported | finish MU5250, MU5252 and MC8532B value semantics |
+| normalized device state | MC7523 structure complete; battery, NFC, SMS, thermal, bounded QoS, TopFlow aggregation/multi-WAN/cooling and slot-aware MU5252 modem state ported | finish MU5250 and MC8532B value semantics and normalized SMS payloads |
 | allow-listed device controls | ten read-only/session neighbor actions implemented; malformed JSON parity implemented | mutating actions require fixture, readback, rollback and error-code parity |
 | bounded neighbor QTrace parser | parser and lifecycle implemented; original parser and HTTP suites pass | final supported-device smoke |
 | cloud config | validation, password redaction, atomic 0600 persistence and LAN isolation implemented | MQTT/TLS reporting and WebSocket tunnel runtime |
