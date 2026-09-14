@@ -8,6 +8,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::Request,
+    extract::rejection::JsonRejection,
     extract::{Query, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
@@ -180,7 +181,23 @@ async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
     Json(app.snapshot().await)
 }
 async fn capabilities() -> Json<Value> {
-    Json(json!({"protocol":1,"events":["state"],"rewrite":"rust"}))
+    Json(json!({
+        "protocol":1,
+        "events":["state"],
+        "controls":[
+            "device.login_info",
+            "wifi.status",
+            "wifi.dual_band_status",
+            "sleep.status",
+            "usb.status",
+            "power.direct_supply.status",
+            "apn.list",
+            "client.access",
+            "neighbor.status",
+            "neighbor.set"
+        ],
+        "rewrite":"rust"
+    }))
 }
 
 async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -211,12 +228,40 @@ async fn ubus_call(Json(req): Json<UbusCall>) -> Response {
             .into_response(),
     }
 }
-async fn control(State(app): State<App>, method: Method, Json(body): Json<Value>) -> Response {
+async fn control(
+    State(app): State<App>,
+    method: Method,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let _ = method;
+    let Json(body) = match payload {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok":false,"error":{"code":"invalid_request","message":"request body must be valid JSON"}})),
+            )
+                .into_response();
+        }
+    };
     let action = body
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if action.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":{"code":"invalid_request","message":"missing action"}})),
+        )
+            .into_response();
+    }
+    if body.get("params").is_some_and(|params| !params.is_object()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"action":action,"error":{"code":"invalid_request","message":"params must be a JSON object"}})),
+        )
+            .into_response();
+    }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
     }
@@ -230,7 +275,148 @@ async fn control(State(app): State<App>, method: Method, Json(body): Json<Value>
         };
         return match app.inner.neighbor.lock().await.set_enabled(enabled).await {Ok(value)=>(StatusCode::OK,Json(json!({"ok":true,"action":action,"result":value}))).into_response(),Err(error)=>(StatusCode::BAD_GATEWAY,Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}}))).into_response()};
     }
+    if action == "device.login_info" {
+        return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
+    }
+    if action == "wifi.dual_band_status" {
+        return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
+            Ok(value) => {
+                let enabled = value
+                    .get("wifimain24_wifimain5_enable")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    != 0;
+                control_ok(
+                    action,
+                    json!({
+                        "WiFiDualBandSupported":"1",
+                        "WiFiDualBandEnabled":if enabled { "1" } else { "0" },
+                        "BandSteeringSwitch":if enabled { "1" } else { "0" }
+                    }),
+                )
+            }
+            Err(error) => control_failed(action, error),
+        };
+    }
+    if action == "wifi.status" {
+        let mut result = serde_json::Map::new();
+        for section in ["main_2g", "main_5g"] {
+            let mut item = serde_json::Map::new();
+            for field in ["ssid", "key", "encryption", "disabled"] {
+                item.insert(
+                    field.into(),
+                    json!(state::uci_read(&format!("wireless.{section}.{field}")).await),
+                );
+            }
+            result.insert(section.into(), Value::Object(item));
+        }
+        return control_ok(action, Value::Object(result));
+    }
+    if action == "sleep.status" {
+        return control_ok(
+            action,
+            json!({
+                "idle_seconds":state::uci_read("zwrt_sleep.ztmp_time.SysIdTime").await,
+                "enabled":state::uci_read("zwrt_sleep.ztmp_switch.sleepSwitch").await,
+                "wakeup":state::uci_read("zwrt_sleep.ztmp_switch.wakeupSwitch").await,
+                "status":state::uci_read("zwrt_sleep.ztmp_status.sleepStatus").await,
+            }),
+        );
+    }
+    if action == "usb.status" {
+        let typec = state::ubus("zwrt_bsp.typec", "list", json!({})).await;
+        let usb = state::ubus("zwrt_bsp.usb", "list", json!({})).await;
+        return match (typec, usb) {
+            (Ok(typec), Ok(usb)) => control_ok(action, json!({"typec":typec,"usb":usb})),
+            (Err(error), _) | (_, Err(error)) => control_failed(action, error),
+        };
+    }
+    if action == "power.direct_supply.status" {
+        return match state::ubus("zwrt_bsp.charger", "list", json!({})).await {
+            Ok(value) => {
+                let result = match value
+                    .get("direct_power_supply_mode")
+                    .and_then(Value::as_str)
+                {
+                    Some("enable") => json!({"supported":true,"enabled":true,"mode":"enable"}),
+                    Some("disable") => json!({"supported":true,"enabled":false,"mode":"disable"}),
+                    Some(_) => json!({"supported":true,"enabled":Value::Null,"mode":Value::Null}),
+                    None => json!({"supported":false,"enabled":Value::Null,"mode":Value::Null}),
+                };
+                control_ok(action, result)
+            }
+            Err(error) => control_failed(action, error),
+        };
+    }
+    if action == "apn.list" {
+        let values = tokio::join!(
+            state::ubus("zwrt_apn_object", "get_apn_mode", json!({})),
+            state::ubus("zwrt_apn_object", "getAutoApnList", json!({})),
+            state::ubus("zwrt_apn_object", "getManuApnList", json!({})),
+            state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({}))
+        );
+        return match values {
+            (Ok(mode), Ok(automatic), Ok(manual), Ok(enabled)) => control_ok(
+                action,
+                json!({"mode":mode,"automatic":automatic,"manual":manual,"enabled":enabled}),
+            ),
+            (Err(error), _, _, _)
+            | (_, Err(error), _, _)
+            | (_, _, Err(error), _)
+            | (_, _, _, Err(error)) => control_failed(action, error),
+        };
+    }
+    if action == "client.access" {
+        let values = tokio::join!(
+            state::ubus(
+                "uci",
+                "get",
+                json!({"config":"wireless","section":"main_2g"})
+            ),
+            state::ubus(
+                "zwrt_router.api",
+                "router_lan_access_list",
+                json!({"start_id":1,"end_id":64})
+            ),
+            state::ubus(
+                "zwrt_router.api",
+                "router_wireless_access_list",
+                json!({"start_id":1,"end_id":64})
+            )
+        );
+        return match values {
+            (Ok(policy), Ok(lan), Ok(wifi)) => {
+                control_ok(action, json!({"policy":policy,"lan":lan,"wifi":wifi}))
+            }
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                control_failed(action, error)
+            }
+        };
+    }
     (StatusCode::NOT_IMPLEMENTED, Json(json!({"ok":false,"action":body.get("action"),"error":{"code":"rust_port_in_progress","message":"control adapter has not been migrated"}}))).into_response()
+}
+
+fn control_ok(action: &str, value: Value) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({"ok":true,"action":action,"result":value})),
+    )
+        .into_response()
+}
+
+fn control_failed(action: &str, error: String) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}})),
+    )
+        .into_response()
+}
+
+async fn readonly_ubus(action: &str, service: &str, method: &str, args: Value) -> Response {
+    match state::ubus(service, method, args).await {
+        Ok(value) => control_ok(action, value),
+        Err(error) => control_failed(action, error),
+    }
 }
 async fn cloud_config_get(State(app): State<App>) -> Json<Value> {
     Json(app.inner.cloud.read().await.public_config())

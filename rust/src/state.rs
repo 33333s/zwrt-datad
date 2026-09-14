@@ -58,6 +58,21 @@ async fn uci_show(package: &str) -> BTreeMap<String, String> {
         })
         .collect()
 }
+pub async fn uci_read(path: &str) -> String {
+    if path.is_empty()
+        || path.len() > 256
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@[]".contains(&b))
+    {
+        return String::new();
+    }
+    command::run(&uci_bin(), ["-q", "get", path], Duration::from_secs(5))
+        .await
+        .ok()
+        .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
+        .unwrap_or_default()
+}
 fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
     sets.iter()
         .find_map(|s| s.get(path))
