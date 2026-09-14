@@ -1,5 +1,6 @@
 use crate::state;
 use serde_json::{Map, Value, json};
+use std::{net::IpAddr, time::Duration};
 
 pub enum Outcome {
     NotHandled,
@@ -47,6 +48,10 @@ pub const ACTIONS: &[&str] = &[
     "client.rename",
     "client.block",
     "client.unblock",
+    "multiwan.interface.set",
+    "multiwan.member.set",
+    "multiwan.policy.set",
+    "multiwan.rule.set",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -379,6 +384,10 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "client.rename" => client_rename(params).await,
         "client.block" => client_access(params, true).await,
         "client.unblock" => client_access(params, false).await,
+        "multiwan.interface.set" => multiwan_interface(params).await,
+        "multiwan.member.set" => multiwan_member(params).await,
+        "multiwan.policy.set" => multiwan_policy(params).await,
+        "multiwan.rule.set" => multiwan_rule(params).await,
         _ => Outcome::NotHandled,
     }
 }
@@ -753,6 +762,218 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         let _ = state::ubus("zwrt_wlan", "kick_macs", json!({"macs":mac})).await;
     }
     Outcome::Ok(json!({"mac":mac,"blocked":block}))
+}
+
+fn valid_section(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+async fn mwan_section(params: &Value, kind: &str) -> Result<String, Outcome> {
+    let section = match string(params, "section", true) {
+        Ok(Some(v)) if valid_section(&v) => v,
+        Ok(_) => return Err(Outcome::Invalid(format!("unknown mwan3 {kind}"))),
+        Err(e) => return Err(Outcome::Invalid(e)),
+    };
+    if state::uci_read(&format!("mwan3.{section}")).await != kind {
+        return Err(Outcome::Invalid(format!("unknown mwan3 {kind}")));
+    }
+    Ok(section)
+}
+async fn mwan_set(section: &str, option: &str, value: &str) -> Result<(), Outcome> {
+    state::uci_write("set", &format!("mwan3.{section}.{option}"), Some(value))
+        .await
+        .map_err(Outcome::Failed)
+}
+async fn mwan_int(
+    params: &Value,
+    section: &str,
+    option: &str,
+    min: i64,
+    max: i64,
+) -> Result<bool, Outcome> {
+    let Some(value) = object(params).get(option) else {
+        return Ok(false);
+    };
+    let Some(value) = value.as_i64() else {
+        return Err(Outcome::Invalid(format!(
+            "{option} must be between {min} and {max}"
+        )));
+    };
+    if !(min..=max).contains(&value) {
+        return Err(Outcome::Invalid(format!(
+            "{option} must be between {min} and {max}"
+        )));
+    }
+    mwan_set(section, option, &value.to_string()).await?;
+    Ok(true)
+}
+async fn mwan_revert(outcome: Outcome) -> Outcome {
+    let _ = state::uci_write("revert", "mwan3", None).await;
+    outcome
+}
+async fn mwan_finish(section: &str, changed: bool) -> Outcome {
+    if !changed {
+        return mwan_revert(Outcome::Invalid("no mwan3 fields supplied".into())).await;
+    }
+    if let Err(e) = state::uci_write("commit", "mwan3", None).await {
+        return mwan_revert(Outcome::Failed(e)).await;
+    }
+    let mut applied = false;
+    if state::uci_read("zwrt_router.network.opms_wan_mode").await == "MULTIWAN" {
+        let init =
+            std::env::var("ZWRT_DATAD_MWAN3_INIT").unwrap_or_else(|_| "/etc/init.d/mwan3".into());
+        if let Err(e) = crate::command::run(&init, ["restart"], Duration::from_secs(10)).await {
+            return Outcome::Failed(format!(
+                "mwan3 configuration committed but restart failed: {e}"
+            ));
+        }
+        applied = true;
+    }
+    Outcome::Ok(json!({"section":section,"applied":applied}))
+}
+async fn multiwan_interface(params: &Value) -> Outcome {
+    let section = match mwan_section(params, "interface").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut changed = false;
+    for (name, min, max) in [
+        ("enabled", 0, 1),
+        ("reliability", 0, 16),
+        ("count", 1, 16),
+        ("size", 1, 4096),
+        ("max_ttl", 1, 255),
+        ("check_quality", 0, 1),
+        ("timeout", 1, 60),
+        ("interval", 1, 3600),
+        ("failure_interval", 1, 3600),
+        ("recovery_interval", 1, 3600),
+        ("down", 1, 100),
+        ("up", 1, 100),
+    ] {
+        match mwan_int(params, &section, name, min, max).await {
+            Ok(v) => changed |= v,
+            Err(e) => return mwan_revert(e).await,
+        }
+    }
+    if let Some(method) = object(params).get("track_method") {
+        if method.as_str() != Some("ping") {
+            return mwan_revert(Outcome::Invalid("only ping tracking is supported".into())).await;
+        }
+        if let Err(e) = mwan_set(&section, "track_method", "ping").await {
+            return mwan_revert(e).await;
+        }
+        changed = true;
+    }
+    if let Some(raw) = object(params).get("track_ip") {
+        let Some(raw) = raw.as_str() else {
+            return mwan_revert(Outcome::Invalid("track_ip must be a string".into())).await;
+        };
+        let items: Vec<_> = raw
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if items.len() > 16 || items.iter().any(|v| v.parse::<IpAddr>().is_err()) {
+            return mwan_revert(Outcome::Invalid("invalid tracking address".into())).await;
+        }
+        let path = format!("mwan3.{section}.track_ip");
+        let _ = state::uci_write("delete", &path, None).await;
+        for item in items {
+            if let Err(e) = state::uci_write("add_list", &path, Some(item)).await {
+                return mwan_revert(Outcome::Failed(e)).await;
+            }
+        }
+        changed = true;
+    }
+    mwan_finish(&section, changed).await
+}
+async fn multiwan_member(params: &Value) -> Outcome {
+    let section = match mwan_section(params, "member").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut changed = false;
+    for (n, a, b) in [("metric", 1, 65535), ("weight", 1, 1000)] {
+        match mwan_int(params, &section, n, a, b).await {
+            Ok(v) => changed |= v,
+            Err(e) => return mwan_revert(e).await,
+        }
+    }
+    mwan_finish(&section, changed).await
+}
+async fn multiwan_policy(params: &Value) -> Outcome {
+    let section = match mwan_section(params, "policy").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut changed = false;
+    if let Some(v) = object(params).get("last_resort") {
+        let Some(v) = v.as_str() else {
+            return Outcome::Invalid("invalid last_resort".into());
+        };
+        if !matches!(v, "default" | "unreachable" | "blackhole") {
+            return Outcome::Invalid("invalid last_resort".into());
+        }
+        if let Err(e) = mwan_set(&section, "last_resort", v).await {
+            return mwan_revert(e).await;
+        }
+        changed = true;
+    }
+    if let Some(v) = object(params).get("use_member") {
+        let Some(v) = v.as_str() else {
+            return Outcome::Invalid("use_member must be a string".into());
+        };
+        let items: Vec<_> = v
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if items.len() > 16 {
+            return Outcome::Invalid("too many use_member entries".into());
+        }
+        for item in &items {
+            if !valid_section(item) || state::uci_read(&format!("mwan3.{item}")).await != "member" {
+                return mwan_revert(Outcome::Invalid(format!("unknown mwan3 member: {item}"))).await;
+            }
+        }
+        let path = format!("mwan3.{section}.use_member");
+        let _ = state::uci_write("delete", &path, None).await;
+        for item in items {
+            if let Err(e) = state::uci_write("add_list", &path, Some(item)).await {
+                return mwan_revert(Outcome::Failed(e)).await;
+            }
+        }
+        changed = true;
+    }
+    mwan_finish(&section, changed).await
+}
+async fn multiwan_rule(params: &Value) -> Outcome {
+    let section = match mwan_section(params, "rule").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut changed = false;
+    if let Some(v) = object(params).get("use_policy") {
+        let Some(v) = v.as_str() else {
+            return Outcome::Invalid("use_policy must be a string".into());
+        };
+        if !valid_section(v) || state::uci_read(&format!("mwan3.{v}")).await != "policy" {
+            return Outcome::Invalid("unknown mwan3 policy".into());
+        }
+        if let Err(e) = mwan_set(&section, "use_policy", v).await {
+            return mwan_revert(e).await;
+        }
+        changed = true;
+    }
+    for (n, a, b) in [("sticky", 0, 1), ("logging", 0, 1)] {
+        match mwan_int(params, &section, n, a, b).await {
+            Ok(v) => changed |= v,
+            Err(e) => return mwan_revert(e).await,
+        }
+    }
+    mwan_finish(&section, changed).await
 }
 
 #[cfg(test)]
