@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <limits.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -72,7 +73,9 @@
 #define SMS_TEXT_HEX_MAX 32768
 #define SMS_TEXT_UTF8_MAX 16384
 #define SMS_OBJECT_MAX (SMS_TEXT_HEX_MAX + 4096)
-#define CLIENT_LIST_MAX 16384
+#define CLIENT_LIST_MAX 32768
+#define CLIENT_ENTRY_MAX 128
+#define CLIENT_WIFI_IF_MAX 16
 #define SNAP_MAX 1048576
 #define UBUS_CATALOG_MAX 131072
 #define UBUS_CALL_RESULT_MAX 1048576
@@ -2824,12 +2827,125 @@ static void load_wifi_dhcp_for_template(const struct device_template_spec *tpl,
                           enabled, ip, ip_n, start, start_n, limit, limit_n, lease, lease_n);
 }
 
-static int append_client_entries_from_array(const char *arr_json, struct buf *outb, int *items)
+enum client_link_kind {
+    CLIENT_LINK_WIFI = 1,
+    CLIENT_LINK_LAN = 2
+};
+
+struct client_entry {
+    char name[128];
+    char ip[64];
+    char mac[64];
+    enum client_link_kind kind;
+};
+
+static int valid_client_interface(const char *name)
+{
+    size_t n;
+    if (!name || !(n = strlen(name)) || n >= IFNAMSIZ) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!isalnum(c) && c != '_' && c != '-' && c != '.') return 0;
+    }
+    return 1;
+}
+
+static int valid_client_mac(const char *mac)
+{
+    unsigned int octet[6];
+    char tail;
+    return mac && sscanf(mac, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+                         &octet[0], &octet[1], &octet[2],
+                         &octet[3], &octet[4], &octet[5], &tail) == 6;
+}
+
+static int client_neighbor_ip(const char *mac, const char *neighbor,
+                              char *ip, size_t ip_len)
+{
+    const char *p;
+    if (!mac || !neighbor || !*neighbor || !ip || !ip_len) return 0;
+    p = neighbor;
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char row[512], neigh_ip[64], dev[64], neigh_mac[64], state[64];
+        if (len >= sizeof row) len = sizeof row - 1;
+        memcpy(row, p, len);
+        row[len] = 0;
+        if (sscanf(row, "%63s dev %63s lladdr %63s %63s",
+                   neigh_ip, dev, neigh_mac, state) == 4 &&
+            !strcasecmp(neigh_mac, mac) && strcasecmp(state, "FAILED") &&
+            strcasecmp(state, "INCOMPLETE")) {
+            snprintf(ip, ip_len, "%s", neigh_ip);
+            return 1;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+static void client_enrichment(const char *mac, const char *neighbor,
+                              char *name, size_t name_len,
+                              char *ip, size_t ip_len)
+{
+    const char *lease_path = getenv("ZWRT_DATAD_DHCP_LEASES");
+    FILE *fp;
+    char line[512];
+    if (!lease_path || !*lease_path) lease_path = "/tmp/dhcp.leases";
+    fp = fopen(lease_path, "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            char expiry[64], lease_mac[64], lease_ip[64], lease_name[128];
+            if (sscanf(line, "%63s %63s %63s %127s",
+                       expiry, lease_mac, lease_ip, lease_name) == 4 &&
+                !strcasecmp(lease_mac, mac)) {
+                if (ip && ip_len && !ip[0] && strcmp(lease_ip, "*"))
+                    snprintf(ip, ip_len, "%s", lease_ip);
+                if (name && name_len && !name[0] &&
+                    strcmp(lease_name, "*") && strcmp(lease_name, "--"))
+                    snprintf(name, name_len, "%s", lease_name);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    if (ip && ip_len && !ip[0]) (void)client_neighbor_ip(mac, neighbor, ip, ip_len);
+}
+
+static int add_client_entry(struct client_entry *entries, int *count,
+                            const char *name, const char *ip, const char *mac,
+                            enum client_link_kind kind)
+{
+    int i;
+    if (!entries || !count || !valid_client_mac(mac)) return 0;
+    for (i = 0; i < *count; i++) {
+        if (strcasecmp(entries[i].mac, mac)) continue;
+        if (!entries[i].name[0] && name && *name)
+            snprintf(entries[i].name, sizeof entries[i].name, "%s", name);
+        if (!entries[i].ip[0] && ip && *ip)
+            snprintf(entries[i].ip, sizeof entries[i].ip, "%s", ip);
+        return 0;
+    }
+    if (*count >= CLIENT_ENTRY_MAX) return 0;
+    snprintf(entries[*count].mac, sizeof entries[*count].mac, "%s", mac);
+    if (name && *name && strcmp(name, "--") && strcmp(name, "*"))
+        snprintf(entries[*count].name, sizeof entries[*count].name, "%s", name);
+    if (ip && *ip) snprintf(entries[*count].ip, sizeof entries[*count].ip, "%s", ip);
+    entries[*count].kind = kind;
+    (*count)++;
+    return 1;
+}
+
+static int collect_client_entries_from_array(const char *arr_json,
+                                             struct client_entry *entries,
+                                             int *count,
+                                             enum client_link_kind kind)
 {
     const char *p;
     int appended = 0;
 
-    if (!arr_json || !items) return 0;
+    if (!arr_json || !entries || !count) return 0;
     p = strchr(arr_json, '[');
     if (!p) return 0;
     p++;
@@ -2840,7 +2956,6 @@ static int append_client_entries_from_array(const char *arr_json, struct buf *ou
         int depth = 0, in_str = 0, esc = 0;
         char obj[1024];
         char ip[64], mac[64], host[128];
-        const char *name;
 
         while (*p && *p != '{' && *p != ']') p++;
         if (*p != '{') break;
@@ -2877,38 +2992,152 @@ static int append_client_entries_from_array(const char *arr_json, struct buf *ou
             !json_get(obj, "name", host, sizeof host)) host[0] = 0;
         if (!ip[0] && !mac[0]) continue;
 
-        name = (host[0] && strcmp(host, "--")) ? host : (mac[0] ? mac : ip);
-        if (*items) bappend(outb, ",");
-        (*items)++;
-        appended = 1;
-        bappend(outb, "{\"name\":\"");
-        bappend_json_esc(outb, name);
-        bappend(outb, "\",\"ip\":\"");
-        bappend_json_esc(outb, ip);
-        bappend(outb, "\",\"mac\":\"");
-        bappend_json_esc(outb, mac);
-        bappend(outb, "\"}");
+        appended |= add_client_entry(entries, count, host, ip, mac, kind);
     }
 
     return appended;
 }
 
-static int build_client_list_from_router(char *out, size_t outlen)
+static int client_interface_seen(char ifnames[][IFNAMSIZ], int count, const char *name)
+{
+    for (int i = 0; i < count; i++) if (!strcmp(ifnames[i], name)) return 1;
+    return 0;
+}
+
+static int collect_wireless_clients(struct client_entry *entries, int *count,
+                                    char ifnames[][IFNAMSIZ], int *ifcount,
+                                    const char *neighbor)
+{
+    const char *iw = getenv("ZWRT_DATAD_IW_BIN");
+    const char *list_argv[3];
+    char output[RAW_MAX];
+    const char *p;
+    int added = 0;
+    if (!iw || !*iw) iw = "iw";
+    list_argv[0] = iw; list_argv[1] = "dev"; list_argv[2] = NULL;
+    if (device_run_capture(list_argv, output, sizeof output) != 0) return 0;
+    p = output;
+    while (*p && *ifcount < CLIENT_WIFI_IF_MAX) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char row[256], iface[IFNAMSIZ];
+        if (len >= sizeof row) len = sizeof row - 1;
+        memcpy(row, p, len); row[len] = 0;
+        if (sscanf(row, " Interface %15s", iface) == 1 &&
+            valid_client_interface(iface) &&
+            !client_interface_seen(ifnames, *ifcount, iface)) {
+            snprintf(ifnames[*ifcount], IFNAMSIZ, "%s", iface);
+            (*ifcount)++;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    for (int i = 0; i < *ifcount; i++) {
+        const char *argv[] = {iw, "dev", ifnames[i], "station", "dump", NULL};
+        if (device_run_capture(argv, output, sizeof output) != 0) continue;
+        p = output;
+        while (*p) {
+            const char *end = strchr(p, '\n');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            char row[256], mac[64], name[128] = "", ip[64] = "";
+            if (len >= sizeof row) len = sizeof row - 1;
+            memcpy(row, p, len); row[len] = 0;
+            if (sscanf(row, "Station %63s", mac) == 1 && valid_client_mac(mac)) {
+                client_enrichment(mac, neighbor, name, sizeof name, ip, sizeof ip);
+                added += add_client_entry(entries, count, name, ip, mac, CLIENT_LINK_WIFI);
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    return added;
+}
+
+static int collect_fdb_lan_clients(struct client_entry *entries, int *count,
+                                   char ifnames[][IFNAMSIZ], int ifcount,
+                                   const char *neighbor)
+{
+    const char *bridge = getenv("ZWRT_DATAD_BRIDGE_BIN");
+    const char *argv[6];
+    char output[RAW_MAX];
+    const char *p;
+    int added = 0;
+    if (!ifcount) return 0;
+    if (!bridge || !*bridge) bridge = "bridge";
+    argv[0] = bridge; argv[1] = "fdb"; argv[2] = "show";
+    argv[3] = "br"; argv[4] = "br-lan"; argv[5] = NULL;
+    if (device_run_capture(argv, output, sizeof output) != 0) return 0;
+    p = output;
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char row[512], mac[64], iface[IFNAMSIZ], name[128] = "", ip[64] = "";
+        if (len >= sizeof row) len = sizeof row - 1;
+        memcpy(row, p, len); row[len] = 0;
+        if (sscanf(row, "%63s dev %15s", mac, iface) == 2 &&
+            valid_client_mac(mac) && valid_client_interface(iface) &&
+            strstr(row, " master br-lan") && !strstr(row, " permanent") &&
+            !strstr(row, " self") && !client_interface_seen(ifnames, ifcount, iface)) {
+            /* Dynamic FDB entries can outlive a disconnected wired client. */
+            if (!client_neighbor_ip(mac, neighbor, ip, sizeof ip)) {
+                if (!end) break;
+                p = end + 1;
+                continue;
+            }
+            client_enrichment(mac, neighbor, name, sizeof name, ip, sizeof ip);
+            added += add_client_entry(entries, count, name, ip, mac, CLIENT_LINK_LAN);
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return added;
+}
+
+static int build_client_list_from_router(char *out, size_t outlen,
+                                         int *wifi_count, int *lan_count)
 {
     char lan[RAW_MAX], wifi[RAW_MAX], arr[RAW_MAX];
+    char neighbor[RAW_MAX] = "";
+    char wifi_ifnames[CLIENT_WIFI_IF_MAX][IFNAMSIZ];
+    struct client_entry entries[CLIENT_ENTRY_MAX];
     struct buf b = { out, outlen, 0 };
-    int items = 0;
+    int items = 0, wifi_ifcount = 0;
+    const char *ip = getenv("ZWRT_DATAD_IP_BIN");
+    const char *ip_argv[6];
 
-    bappend(&b, "[");
+    memset(entries, 0, sizeof entries);
+    memset(wifi_ifnames, 0, sizeof wifi_ifnames);
+    if (!ip || !*ip) ip = "ip";
+    ip_argv[0] = ip; ip_argv[1] = "neigh"; ip_argv[2] = "show";
+    ip_argv[3] = "dev"; ip_argv[4] = "br-lan"; ip_argv[5] = NULL;
+    (void)device_run_capture(ip_argv, neighbor, sizeof neighbor);
+
     if (run_ubus("zwrt_router.api", "router_wireless_access_list",
                  "{\"start_id\":1,\"end_id\":64}", wifi, sizeof wifi) == 0 &&
         json_get(wifi, "wireless_access_list_info", arr, sizeof arr)) {
-        append_client_entries_from_array(arr, &b, &items);
+        collect_client_entries_from_array(arr, entries, &items, CLIENT_LINK_WIFI);
     }
+    collect_wireless_clients(entries, &items, wifi_ifnames, &wifi_ifcount, neighbor);
     if (run_ubus("zwrt_router.api", "router_lan_access_list",
                  "{}", lan, sizeof lan) == 0 &&
         json_get(lan, "lan_access_list_info", arr, sizeof arr)) {
-        append_client_entries_from_array(arr, &b, &items);
+        collect_client_entries_from_array(arr, entries, &items, CLIENT_LINK_LAN);
+    }
+    collect_fdb_lan_clients(entries, &items, wifi_ifnames, wifi_ifcount, neighbor);
+
+    if (wifi_count) *wifi_count = 0;
+    if (lan_count) *lan_count = 0;
+    bappend(&b, "[");
+    for (int i = 0; i < items; i++) {
+        const char *display_name = entries[i].name[0] ? entries[i].name : entries[i].mac;
+        if (i) bappend(&b, ",");
+        bappend(&b, "{\"name\":\""); bappend_json_esc(&b, display_name);
+        bappend(&b, "\",\"ip\":\""); bappend_json_esc(&b, entries[i].ip);
+        bappend(&b, "\",\"mac\":\""); bappend_json_esc(&b, entries[i].mac);
+        bappend(&b, "\"}");
+        if (entries[i].kind == CLIENT_LINK_WIFI) {
+            if (wifi_count) (*wifi_count)++;
+        } else if (lan_count) (*lan_count)++;
     }
     bappend(&b, "]");
     if (b.len >= b.cap) {
@@ -2918,24 +3147,12 @@ static int build_client_list_from_router(char *out, size_t outlen)
     return items;
 }
 
-static void build_client_list_json_u60(char *out, size_t outlen)
-{
-    build_client_list_from_router(out, outlen);
-}
-
-static void build_client_list_json_compat(char *out, size_t outlen)
-{
-    build_client_list_from_router(out, outlen);
-}
-
 static void build_client_list_json_for_template(const struct device_template_spec *tpl,
-                                                char *out, size_t outlen)
+                                                char *out, size_t outlen,
+                                                int *wifi_count, int *lan_count)
 {
-    if (tpl->client_mode == CLIENT_SOURCE_DHCP_ONLY) {
-        build_client_list_json_u60(out, outlen);
-        return;
-    }
-    build_client_list_json_compat(out, outlen);
+    (void)tpl;
+    build_client_list_from_router(out, outlen, wifi_count, lan_count);
 }
 
 static int load_thermal_snapshot_for_template(const struct device_template_spec *tpl,
@@ -3693,13 +3910,15 @@ static void build_snapshot(char *out, size_t outlen,
 {
     char net[RAW_MAX], traf[RAW_MAX];
     static char batt[RAW_MAX], chg[RAW_MAX], therm[1024];
-    static char rnum[1024], rstat[1024], sysinfo[2048], usb[1024], nfc[1024];
+    static char rstat[1024], sysinfo[2048], usb[1024], nfc[1024];
     static char wifi_ssid[128], wifi_key[128], wifi_enc[64];
     static char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
     char device_profile[64], device_profile_source[64];
     char device_vendor[64], device_model_name[128], device_hw[128];
     char device_market_name[128], device_alias_name[128], device_board_name[128];
     static char client_list[CLIENT_LIST_MAX] = "[]";
+    static int client_wifi_count;
+    static int client_lan_count;
     static int wifi_enabled;
     static time_t power_next_at;
     static time_t slow_state_next_at;
@@ -3734,7 +3953,6 @@ static void build_snapshot(char *out, size_t outlen,
     /* type:1 = realtime session stats; cid:1 = main PDN (rmnet_data0). */
     load_traffic_snapshot_for_template(device_template, traf, sizeof traf);
     if (force_refresh || slow_state_next_at == 0 || poll_now >= slow_state_next_at) {
-        run_ubus("zwrt_router.api", "router_get_user_list_num", NULL, rnum, sizeof rnum);
         run_ubus("zwrt_router.api", "router_get_status_no_auth", NULL, rstat, sizeof rstat);
         run_ubus("system", "info", NULL, sysinfo, sizeof sysinfo);
         run_ubus("zwrt_bsp.usb", "list", NULL, usb, sizeof usb);
@@ -3748,7 +3966,8 @@ static void build_snapshot(char *out, size_t outlen,
                                     dhcp_start, sizeof dhcp_start,
                                     dhcp_limit, sizeof dhcp_limit,
                                     dhcp_lease, sizeof dhcp_lease);
-        build_client_list_json_for_template(device_template, client_list, sizeof client_list);
+        build_client_list_json_for_template(device_template, client_list, sizeof client_list,
+                                            &client_wifi_count, &client_lan_count);
         slow_state_next_at = poll_now + SLOW_STATE_POLL_SEC;
     }
     chg_uv = read_long_file("/sys/class/power_supply/usb/voltage_now", 0);
@@ -3855,9 +4074,9 @@ static void build_snapshot(char *out, size_t outlen,
 
     /* connected clients */
     bappend(&b, "\"clients\":{");
-    emit_int(&b, "total", rnum, "access_total_num", 0); bappend(&b, ",");
-    emit_int(&b, "wifi", rnum, "wireless_num", 0);      bappend(&b, ",");
-    emit_int(&b, "lan", rnum, "lan_num", 0);            bappend(&b, ",");
+    bappend(&b, "\"total\":%d,", client_wifi_count + client_lan_count);
+    bappend(&b, "\"wifi\":%d,", client_wifi_count);
+    bappend(&b, "\"lan\":%d,", client_lan_count);
     bappend(&b, "\"list\":%s", client_list);
     bappend(&b, "},");
 
