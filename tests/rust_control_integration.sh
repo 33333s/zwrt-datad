@@ -86,6 +86,9 @@ post() {
     curl -fsS -H 'content-type: application/json' --data-binary "$1" \
         "http://127.0.0.1:$PORT/control"
 }
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
     python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
@@ -124,7 +127,7 @@ post '{"action":"wifi.interface.create","params":{"band":"5g","ssid":"Fixture Ex
 [ -d "$ZWRT_DATAD_NET_CLASS_DIR/wlan4" ]
 first_hostapd_pid=$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid")
 kill -0 "$first_hostapd_pid"
-[ "$(stat -f '%Lp' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf")" = 600 ]
+[ "$(file_mode "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf")" = 600 ]
 grep -F 'ssid=Fixture Extra' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
 grep -F 'wpa_passphrase=fixture-extra-key' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
 grep -F 'vendor_element=kept' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
@@ -230,7 +233,7 @@ grep -F 'wireless.wifi1.channel=100' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'datad_wifi.datad_ssid_1=wifi-iface' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'datad_wifi.datad_ssid_1.ssid=Fixture Extra 2' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'delete datad_wifi.datad_ssid_1' "$MOCK_CALL_LOG" >/dev/null
-[ "$(stat -f '%Lp' "$ZWRT_DATAD_WIFI_CONFIG")" = 600 ]
+[ "$(file_mode "$ZWRT_DATAD_WIFI_CONFIG")" = 600 ]
 grep -F 'fan_mode=1' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'custom_pwm_5=255' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'liquid_always_on=0' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
