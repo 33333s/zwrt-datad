@@ -5426,8 +5426,13 @@ int datad_main(int argc, char **argv)
             local_listener.auth_required = 1;
         }
         if (strcmp(bind_addr, "127.0.0.1") && strcmp(bind_addr, "::1") &&
-            !local_listener.auth_required)
-            fprintf(stderr, "warning: non-loopback local binding without authentication\n");
+            !local_listener.auth_required) {
+            fprintf(stderr,
+                    "refusing unauthenticated non-loopback listener %s; "
+                    "use --auth-token-file or --lan-bind\n",
+                    bind_addr);
+            return 1;
+        }
 
         local_listener.fd = open_server_socket(bind_addr, port);
         if (local_listener.fd < 0) return 1;

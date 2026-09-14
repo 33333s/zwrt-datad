@@ -49,3 +49,6 @@ scripts/_*.sh
 
 # Generated from version.json before compiling
 /include/datad_version_generated.h
+
+# Experimental Rust branch build artifacts may remain after switching branches.
+/rust/target/
