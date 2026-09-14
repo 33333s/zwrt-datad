@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.46",
+    "version": "0.9.47",
     "asset": "zwrt-datad-aarch64",
-    "notes": "按原厂接口分别读取在线无线和有线设备，清理退出信号误报及安装成功后的旧版备份"
+    "notes": "合并原厂列表与内核实时关联状态，修复 TopFlow 固件漏报在线 Wi-Fi 设备"
   }
 }

@@ -18,6 +18,7 @@ INVALID_JSON_OUT="$ROOT/tests/invalid-json.out"
 INVALID_PARAM_OUT="$ROOT/tests/invalid-param.out"
 INVALID_WIFI_OUT="$ROOT/tests/invalid-wifi.out"
 IWINFO_DELAY_FILE="$ROOT/tests/iwinfo-delay.count"
+CLIENT_LEASES="$ROOT/tests/client.leases"
 THERMAL_FIXTURE="$ROOT/tests/fixtures/thermal"
 COOLING_FIXTURE="$ROOT/tests/fixtures/cooling"
 COOLING_TMP="$(mktemp -d)"
@@ -51,7 +52,7 @@ cleanup() {
     rm -f "$TOKEN_FILE" "$CALL_LOG" "$CHILD_FD_LOG" "$MU5252_CALL_LOG" \
         "$MOCK_CURL_LOG" \
         "$INVALID_JSON_OUT" "$INVALID_PARAM_OUT" "$INVALID_WIFI_OUT" \
-        "$IWINFO_DELAY_FILE"
+        "$IWINFO_DELAY_FILE" "$CLIENT_LEASES"
     rm -rf "$COOLING_TMP"
 }
 trap cleanup EXIT INT TERM
@@ -60,7 +61,14 @@ printf '%s\n' 'fixture-private-token' >"$TOKEN_FILE"
 : >"$CALL_LOG"
 : >"$CHILD_FD_LOG"
 : >"$MOCK_CURL_LOG"
-chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh" "$ROOT/tests/mock_curl.sh"
+cat >"$CLIENT_LEASES" <<'EOF'
+86400 00:11:22:33:44:77 192.168.0.7 phone-live 01:00:11:22:33:44:77
+86400 00:11:22:33:44:88 192.168.0.8 lan-kernel-live 01:00:11:22:33:44:88
+86400 00:11:22:33:44:99 192.168.0.9 historical-only 01:00:11:22:33:44:99
+EOF
+chmod +x "$ROOT/tests/mock_ubus.sh" "$ROOT/tests/mock_uci.sh" "$ROOT/tests/mock_adb.sh" \
+    "$ROOT/tests/mock_curl.sh" "$ROOT/tests/mock_iw.sh" "$ROOT/tests/mock_bridge.sh" \
+    "$ROOT/tests/mock_ip.sh"
 export ZWRT_DATAD_THERMAL_ROOT="$THERMAL_FIXTURE"
 export ZWRT_DATAD_DIR="$COOLING_TMP/cloud"
 
@@ -72,6 +80,10 @@ MOCK_HARDWARE_VERSION=MU5252_HW1.0 \
 MOCK_IWINFO_DELAY_FILE="$IWINFO_DELAY_FILE" \
 MOCK_IWINFO_DELAY_CALLS=25 \
 ZWRT_DATAD_FD_DUMP="$CHILD_FD_LOG" \
+ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh" \
+ZWRT_DATAD_BRIDGE_BIN="$ROOT/tests/mock_bridge.sh" \
+ZWRT_DATAD_IP_BIN="$ROOT/tests/mock_ip.sh" \
+ZWRT_DATAD_DHCP_LEASES="$CLIENT_LEASES" \
 "$BIN" -i 200 -p "$PORT" --auth-token-file "$TOKEN_FILE" >/dev/null 2>&1 &
 PID=$!
 
@@ -111,12 +123,14 @@ assert data["net"]["nr_nsa_supported_bands"] == ""
 assert data["battery"]["percent"] == 0
 assert data["nfc"]["switch"] == 0
 assert data["clients"] == {
-    "total": 2,
-    "wifi": 1,
-    "lan": 1,
+    "total": 4,
+    "wifi": 2,
+    "lan": 2,
     "list": [
         {"name": "wifi-live", "ip": "192.168.0.2", "mac": "00:11:22:33:44:55"},
+        {"name": "phone-live", "ip": "192.168.0.7", "mac": "00:11:22:33:44:77"},
         {"name": "lan-live", "ip": "192.168.0.3", "mac": "00:11:22:33:44:66"},
+        {"name": "lan-kernel-live", "ip": "192.168.0.8", "mac": "00:11:22:33:44:88"},
     ],
 }
 assert data["thermal"]["cpu_celsius"] == 42
