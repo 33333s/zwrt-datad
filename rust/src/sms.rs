@@ -154,6 +154,7 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
         .flat_map(|reply| {
             reply
                 .get("list")
+                .or_else(|| reply.get("messages"))
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default()
@@ -200,7 +201,7 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
             "id":id,
             "num":number,
             "date":sms_date(item.get("date").and_then(Value::as_str).unwrap_or_default()),
-            "unread":unread,
+            "unread":i64::from(unread),
             "text":text
         }));
     }
@@ -385,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn normalizes_plain_sms_and_deduplicates() {
         let replies = [
-            json!({"list":[{"id":"7","num":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","text":"6D4B8BD5"}]}),
+            json!({"messages":[{"id":"7","num":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","text":"6D4B8BD5"}]}),
             json!({"list":[{"id":7,"number":"duplicate","content":"0041"}]}),
         ];
         let list = normalize_lists(&replies).await;
@@ -393,7 +394,7 @@ mod tests {
         assert_eq!(list[0]["num"], "10086");
         assert_eq!(list[0]["text"], "测试");
         assert_eq!(list[0]["date"], "08-27 04:00");
-        assert_eq!(list[0]["unread"], true);
+        assert_eq!(list[0]["unread"], 1);
     }
 
     #[tokio::test]

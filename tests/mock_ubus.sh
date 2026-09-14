@@ -109,7 +109,7 @@ case "$service:$method" in
         printf '%s\n' '{"sms_dev_unread_num":1,"sms_sim_unread_num":0}'
         ;;
     zwrt_wms:zte_libwms_get_sms_data)
-        printf '%s\n' '{"list":[]}'
+        printf '%s\n' '{"messages":[{"id":7,"number":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","content":"6D4B8BD5"}]}'
         ;;
     zwrt_web:web_login)
         if printf '%s' "$args" | grep -q '"username"'; then

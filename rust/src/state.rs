@@ -1,12 +1,12 @@
 use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::CString,
     fs,
     path::Path,
     sync::{Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn ubus_bin() -> String {
@@ -484,13 +484,14 @@ fn read_i64(path: impl AsRef<Path>) -> i64 {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or_default()
 }
-fn thermal_zones() -> (i64, Value) {
+fn thermal_zones() -> (i64, Value, Value) {
     let mut zones = Vec::new();
+    let mut runtime_zones = Vec::new();
     let mut cpuss = Vec::new();
     let root =
         std::env::var("ZWRT_DATAD_THERMAL_ROOT").unwrap_or_else(|_| "/sys/class/thermal".into());
     let Ok(entries) = fs::read_dir(root) else {
-        return (0, json!([]));
+        return (0, json!([]), json!([]));
     };
     for entry in entries.flatten() {
         let p = entry.path();
@@ -506,20 +507,18 @@ fn thermal_zones() -> (i64, Value) {
             .trim()
             .to_owned();
         let raw = read_i64(p.join("temp"));
-        if name.is_empty() || raw <= 0 || raw > 200_000 {
+        if name.is_empty() || raw <= -40_000 || raw == 0 || raw > 200_000 {
             continue;
         }
-        let c = if raw >= 1000 {
-            raw as f64 / 1000.0
-        } else {
-            raw as f64
-        };
+        let c = raw as f64 / 1000.0;
         if name.starts_with("cpuss") {
             cpuss.push(c)
         }
+        runtime_zones.push(json!({"type":name,"temp_milli":raw}));
         zones.push(json!({"name":name,"celsius":c}));
     }
     zones.sort_by_key(|a| string(a, "name"));
+    runtime_zones.sort_by_key(|a| string(a, "type"));
     let cpu = if cpuss.is_empty() {
         zones
             .iter()
@@ -528,7 +527,11 @@ fn thermal_zones() -> (i64, Value) {
     } else {
         cpuss.iter().sum::<f64>() / cpuss.len() as f64
     };
-    (cpu.round() as i64, Value::Array(zones))
+    (
+        cpu.round() as i64,
+        Value::Array(zones),
+        Value::Array(runtime_zones),
+    )
 }
 fn clients_from_leases() -> Value {
     Value::Array(
@@ -604,7 +607,115 @@ fn storage() -> Value {
     json!({"total":total,"used":total.saturating_sub(free),"available":block.saturating_mul(stat.f_bavail as u64)})
 }
 
-fn runtime() -> (i64, Value) {
+#[derive(Clone, Copy)]
+struct SpeedSample {
+    rx: u64,
+    tx: u64,
+    at_ms: u64,
+}
+
+static LINK_PREVIOUS: OnceLock<Mutex<BTreeMap<String, SpeedSample>>> = OnceLock::new();
+static SPEED_RING: OnceLock<Mutex<VecDeque<SpeedSample>>> = OnceLock::new();
+
+fn iface_bytes(name: &str) -> Option<(u64, u64)> {
+    let root =
+        std::env::var("ZWRT_DATAD_NET_CLASS_ROOT").unwrap_or_else(|_| "/sys/class/net".into());
+    let path = Path::new(&root).join(name).join("statistics");
+    let rx = fs::read_to_string(path.join("rx_bytes"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let tx = fs::read_to_string(path.join("tx_bytes"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((rx, tx))
+}
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn link_rates(now: u64) -> Value {
+    let previous = LINK_PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut previous = previous.lock().unwrap();
+    let mut rates = Vec::new();
+    for name in ["rmnet_data0", "V3E1net0", "V3E2net0", "eth0"] {
+        let Some((rx, tx)) = iface_bytes(name) else {
+            previous.remove(name);
+            continue;
+        };
+        let old = previous.get(name).copied();
+        let window = old.map_or(0, |sample| now.saturating_sub(sample.at_ms));
+        let valid = old.is_some_and(|sample| window > 0 && rx >= sample.rx && tx >= sample.tx);
+        rates.push(json!({
+            "interface":name,
+            "source":"netdev",
+            "window_ms":if valid { window } else { 0 },
+            "rx_bytes":rx,
+            "tx_bytes":tx,
+            "rx_bps":if valid { json!(rx.saturating_sub(old.unwrap().rx).saturating_mul(1000)/window) } else { Value::Null },
+            "tx_bps":if valid { json!(tx.saturating_sub(old.unwrap().tx).saturating_mul(1000)/window) } else { Value::Null }
+        }));
+        previous.insert(name.into(), SpeedSample { rx, tx, at_ms: now });
+    }
+    Value::Array(rates)
+}
+
+fn user_bytes() -> (u64, u64) {
+    if let Some((rx, tx)) = iface_bytes("br-lan") {
+        return (tx, rx);
+    }
+    let wifi: Vec<_> = ["wlan0", "wlan2"]
+        .into_iter()
+        .filter_map(iface_bytes)
+        .collect();
+    if !wifi.is_empty() {
+        return wifi
+            .into_iter()
+            .fold((0_u64, 0_u64), |(rx, tx), (raw_rx, raw_tx)| {
+                (rx.saturating_add(raw_tx), tx.saturating_add(raw_rx))
+            });
+    }
+    ["rmnet_data0", "rmnet_ipa0"]
+        .into_iter()
+        .filter_map(iface_bytes)
+        .fold((0_u64, 0_u64), |(rx, tx), (raw_rx, raw_tx)| {
+            (rx.saturating_add(raw_tx), tx.saturating_add(raw_rx))
+        })
+}
+
+fn throughput(now: u64) -> Value {
+    let (rx, tx) = user_bytes();
+    let ring = SPEED_RING.get_or_init(|| Mutex::new(VecDeque::with_capacity(16)));
+    let mut ring = ring.lock().unwrap();
+    if ring.len() == 16 {
+        ring.pop_front();
+    }
+    ring.push_back(SpeedSample { rx, tx, at_ms: now });
+    let Some(old) = ring.front().copied().filter(|_| ring.len() >= 2) else {
+        return json!({"rx_bps":0,"tx_bps":0,"window_ms":0});
+    };
+    let window = now.saturating_sub(old.at_ms);
+    if window == 0 {
+        return json!({"rx_bps":0,"tx_bps":0,"window_ms":0});
+    }
+    json!({
+        "rx_bps":rx.saturating_sub(old.rx).saturating_mul(1000)/window,
+        "tx_bps":tx.saturating_sub(old.tx).saturating_mul(1000)/window,
+        "window_ms":window
+    })
+}
+
+fn runtime(runtime_zones: Value) -> (i64, Value) {
     let mut current = BTreeMap::new();
     for line in fs::read_to_string("/proc/stat").unwrap_or_default().lines() {
         let mut parts = line.split_whitespace();
@@ -664,9 +775,10 @@ fn runtime() -> (i64, Value) {
     let active = tcp_active();
     let tcp4 = count_lines("/proc/net/tcp", true);
     let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)});
+    let now = now_ms();
     (
         total_usage,
-        json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":[],"memory_kb":meminfo(),"storage":storage(),"connections":connections,"link_rates":[],"throughput":{"rx_bps":0,"tx_bps":0,"window_ms":0}}),
+        json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":runtime_zones,"memory_kb":meminfo(),"storage":storage(),"connections":connections,"link_rates":link_rates(now),"throughput":throughput(now)}),
     )
 }
 
@@ -885,7 +997,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
                 .into_iter()
                 .find(|s| !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty())
         });
-    let (cpu_sys, zones) = thermal_zones();
+    let (cpu_sys, zones, runtime_zones) = thermal_zones();
     let cpu_temp = ["cpuss_temp", "cpu_temp", "temperature", "temp"]
         .into_iter()
         .map(|k| integer(&thermal, k))
@@ -1339,7 +1451,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         template
     };
     fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template_label,"api_template_supported":i64::from(template!="legacy_compat"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
-    let (cpu_usage_tenths, runtime) = runtime();
+    let (cpu_usage_tenths, runtime) = runtime(runtime_zones);
     let cpu_usage = if cpu_usage_tenths >= 0 {
         (cpu_usage_tenths + 5) / 10
     } else {
