@@ -552,6 +552,17 @@ async fn control(
             Err(error) => control_failed(action, error),
         };
     }
+    if action == "wireless.config" {
+        let mutating = body.get("params").is_some_and(|params| {
+            params.get("country").is_some() || params.get("channel").is_some()
+        });
+        if !mutating {
+            return match crate::wifi::wireless_config_status().await {
+                Ok(value) => control_ok(action, value),
+                Err(error) => control_failed(action, error),
+            };
+        }
+    }
     if action == "sleep.status" {
         return control_ok(
             action,

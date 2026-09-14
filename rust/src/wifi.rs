@@ -128,6 +128,137 @@ pub async fn advanced_status() -> Result<Value, String> {
     }))
 }
 
+pub async fn wireless_config_status() -> Result<Value, String> {
+    let mut channel_2g = Vec::new();
+    let mut channel_5g = Vec::new();
+    if let Some(results) = iwinfo("freqlist").await {
+        parse_channels(&results, &mut channel_2g, &mut channel_5g);
+    }
+    let from_iwinfo = !channel_2g.is_empty() || !channel_5g.is_empty();
+    if channel_2g.is_empty() {
+        channel_2g = parse_channel_list(&state::uci_read("wireless.wifi0.channellist").await);
+    }
+    if channel_5g.is_empty() {
+        channel_5g = parse_channel_list(&state::uci_read("wireless.wifi1.channellist").await);
+    }
+    let country_2g = state::uci_read("wireless.wifi0.country").await;
+    let country_5g = state::uci_read("wireless.wifi1.country").await;
+    let mut countries = iwinfo("countrylist")
+        .await
+        .map(|results| parse_countries(&results))
+        .unwrap_or_default();
+    for country in [&country_2g, &country_5g] {
+        let normalized = country.to_ascii_uppercase();
+        if valid_country(&normalized) && !countries.contains(&normalized) {
+            countries.push(normalized);
+        }
+    }
+    Ok(json!({
+        "country_scope":"device",
+        "country":if country_2g == country_5g { country_2g } else { String::new() },
+        "channel_source":if from_iwinfo { "iwinfo" } else { "uci" },
+        "countries":countries,
+        "radios":{
+            "2g":wireless_radio("wifi0","main_2g",channel_2g).await,
+            "5g":wireless_radio("wifi1","main_5g",channel_5g).await,
+        }
+    }))
+}
+
+async fn iwinfo(method: &str) -> Option<Vec<Value>> {
+    let mut devices = vec![
+        state::uci_read("wireless.main_5g.ifname").await,
+        state::uci_read("wireless.main_2g.ifname").await,
+    ];
+    devices.extend(["wlan0".into(), "wlan1".into(), "wlanx".into()]);
+    for device in devices {
+        if !safe_ifname(&device) {
+            continue;
+        }
+        if let Ok(value) = state::ubus("iwinfo", method, json!({"device":device})).await
+            && let Some(results) = value.get("results").and_then(Value::as_array)
+        {
+            return Some(results.clone());
+        }
+    }
+    None
+}
+
+async fn wireless_radio(section: &str, ap_section: &str, mut channels: Vec<i64>) -> Value {
+    channels.sort_unstable();
+    channels.dedup();
+    channels.retain(|channel| *channel > 0 && *channel <= 255);
+    channels.insert(0, 0);
+    let prefix = format!("wireless.{section}");
+    let country = state::uci_read(&format!("{prefix}.country")).await;
+    let channel = state::uci_read(&format!("{prefix}.channel")).await;
+    let htmode = state::uci_read(&format!("{prefix}.htmode")).await;
+    let disabled = state::uci_read(&format!("{prefix}.disabled")).await;
+    json!({
+        "section":section,"ap_section":ap_section,"country":country,
+        "channel":if channel.is_empty() { "0" } else { &channel },
+        "htmode":htmode,"enabled":disabled != "1","supported_channels":channels
+    })
+}
+
+fn parse_channels(results: &[Value], channel_2g: &mut Vec<i64>, channel_5g: &mut Vec<i64>) {
+    for item in results {
+        let restricted = item
+            .get("restricted")
+            .is_some_and(|value| value == true || value.as_i64() == Some(1));
+        if restricted {
+            continue;
+        }
+        let channel = item
+            .get("channel")
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+            .unwrap_or_default();
+        match item.get("band").and_then(Value::as_i64) {
+            Some(2) if channel > 0 => channel_2g.push(channel),
+            Some(5) if channel > 0 => channel_5g.push(channel),
+            _ => {}
+        }
+    }
+}
+
+fn parse_channel_list(value: &str) -> Vec<i64> {
+    let mut channels: Vec<_> = value
+        .split(',')
+        .filter_map(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| (1..=255).contains(value))
+        .collect();
+    channels.sort_unstable();
+    channels.dedup();
+    channels
+}
+
+fn parse_countries(results: &[Value]) -> Vec<String> {
+    let mut countries = Vec::new();
+    for item in results {
+        let country = item
+            .get("iso3166")
+            .or_else(|| item.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if valid_country(&country) && !countries.contains(&country) {
+            countries.push(country);
+        }
+    }
+    countries
+}
+
+fn valid_country(value: &str) -> bool {
+    value == "00" || (value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+}
+fn safe_ifname(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() < 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
 fn radio(values: &Map<String, Value>, section: &str, band: &str) -> Result<Value, String> {
     let value = values
         .get(section)
@@ -384,6 +515,26 @@ mod tests {
         match_live(&mut configured, &live);
         assert_eq!(configured[0].live, None);
         assert_eq!(configured[1].live, None);
+    }
+
+    #[test]
+    fn parses_wireless_capabilities_without_restricted_channels() {
+        let results = vec![
+            json!({"band":2,"channel":1,"restricted":false}),
+            json!({"band":5,"channel":100,"restricted":true}),
+            json!({"band":5,"channel":149}),
+        ];
+        let (mut two, mut five) = (Vec::new(), Vec::new());
+        parse_channels(&results, &mut two, &mut five);
+        assert_eq!(two, [1]);
+        assert_eq!(five, [149]);
+        assert_eq!(parse_channel_list("36, 40,40,bad"), [36, 40]);
+        assert_eq!(
+            parse_countries(&[json!({"iso3166":"hk"}), json!({"code":"00"})]),
+            ["HK", "00"]
+        );
+        assert!(safe_ifname("wlan0"));
+        assert!(!safe_ifname("wlan0;reboot"));
     }
 
     fn configured_fixture() -> Interface {
