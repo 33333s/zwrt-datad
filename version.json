@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.43",
+    "version": "0.9.44",
     "asset": "zwrt-datad-aarch64",
-    "notes": "拆分中文 README 与独立英文 README，增加清晰的语言切换和文档入口"
+    "notes": "修复签名有效但版本落后的高优先级源阻塞后续源，更新网盘目录，并支持按来源启用检测"
   }
 }
