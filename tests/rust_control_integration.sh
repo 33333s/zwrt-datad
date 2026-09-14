@@ -176,7 +176,11 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+unknown_status=$(curl -sS -o "$TMP/unknown.json" -w '%{http_code}' -H 'content-type: application/json' \
+    --data-binary '{"action":"fixture.unknown","params":{}}' "http://127.0.0.1:$PORT/control")
+[ "$unknown_status" = 404 ]
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["error"]["code"]=="unknown_action"' "$TMP/unknown.json"
 
 python3 - "$MOCK_CALL_LOG" <<'PY'
 import json, sys

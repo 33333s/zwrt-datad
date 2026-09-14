@@ -710,6 +710,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let battery = ubus("zwrt_bsp.battery", "list", json!({})).await;
     let charger = ubus("zwrt_bsp.charger", "list", json!({})).await;
     let nfc = ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
+    let _ = crate::sms::prepare().await;
     let sms_capacity = ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
     let sms_nv = ubus(
         "zwrt_wms",
@@ -922,12 +923,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
     }
     if sms_ok {
-        let mut list = Vec::new();
-        for reply in [&sms_nv, &sms_sim] {
-            if let Some(items) = reply.get("list").and_then(Value::as_array) {
-                list.extend(items.iter().take(32 - list.len()).cloned())
-            }
-        }
+        let list = crate::sms::normalize_lists(&[sms_nv.clone(), sms_sim.clone()]).await;
         fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
     }
     fields.insert("traffic".into(), Value::Object(tout));

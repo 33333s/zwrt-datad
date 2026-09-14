@@ -74,6 +74,10 @@ async fn ensure_crypto_session() -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+pub async fn prepare() -> bool {
+    ensure_crypto_session().await.is_ok()
+}
+
 fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid AES key")?;
     let mut nonce = [0_u8; 12];
@@ -90,6 +94,117 @@ fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
     envelope.extend_from_slice(&tag);
     envelope.extend_from_slice(&encrypted);
     Ok(STANDARD.encode(envelope))
+}
+
+async fn decrypt(value: &str) -> Result<Option<String>, String> {
+    if value.len() < 40
+        || value.len() % 2 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(None);
+    }
+    let Ok(raw) = STANDARD.decode(value) else {
+        return Ok(None);
+    };
+    if raw.len() <= 28 {
+        return Ok(None);
+    }
+    let key = (*SESSION_KEY.lock().await).ok_or("vendor SMS crypto session unavailable")?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key")?;
+    let mut input = raw[28..].to_vec();
+    input.extend_from_slice(&raw[12..28]);
+    cipher
+        .decrypt(Nonce::from_slice(&raw[..12]), input.as_ref())
+        .map(|plain| Some(String::from_utf8_lossy(&plain).into_owned()))
+        .map_err(|_| "SMS envelope authentication failed".into())
+}
+
+fn utf16be_hex(value: &str) -> String {
+    let digits: String = value.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
+    let units: Vec<u16> = digits
+        .as_bytes()
+        .chunks_exact(4)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .filter_map(|chunk| u16::from_str_radix(chunk, 16).ok())
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn sms_date(value: &str) -> String {
+    let fields: Vec<_> = value.split(',').collect();
+    if fields.len() >= 6 {
+        let parsed: Option<Vec<i64>> = fields[1..=4]
+            .iter()
+            .map(|field| field.parse().ok())
+            .collect();
+        if let Some(parts) = parsed {
+            return format!(
+                "{:02}-{:02} {:02}:{:02}",
+                parts[0], parts[1], parts[2], parts[3]
+            );
+        }
+    }
+    String::new()
+}
+
+pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
+    let mut output = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let items: Vec<Value> = replies
+        .iter()
+        .flat_map(|reply| {
+            reply
+                .get("list")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    for item in items {
+        if output.len() >= 32 {
+            break;
+        }
+        let Some(id) = item.get("id").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str()?.parse::<i64>().ok())
+        }) else {
+            continue;
+        };
+        if !ids.insert(id) {
+            continue;
+        }
+        let number_raw = item
+            .get("num")
+            .or_else(|| item.get("number"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text_raw = item
+            .get("text")
+            .or_else(|| item.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Ok(number) = decrypt(number_raw).await else {
+            continue;
+        };
+        let Ok(text) = decrypt(text_raw).await else {
+            continue;
+        };
+        let number = number.map_or_else(|| number_raw.to_owned(), |value| utf16be_hex(&value));
+        let text = utf16be_hex(text.as_deref().unwrap_or(text_raw));
+        let unread = item.get("tag").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str()?.parse::<i64>().ok())
+        }) == Some(1);
+        output.push(json!({
+            "id":id,
+            "num":number,
+            "date":sms_date(item.get("date").and_then(Value::as_str).unwrap_or_default()),
+            "unread":unread,
+            "text":text
+        }));
+    }
+    output
 }
 
 async fn send_external(
@@ -265,5 +380,34 @@ mod tests {
             .decrypt(Nonce::from_slice(&raw[..12]), input.as_ref())
             .unwrap();
         assert_eq!(plain, b"6D4B8BD5");
+    }
+
+    #[tokio::test]
+    async fn normalizes_plain_sms_and_deduplicates() {
+        let replies = [
+            json!({"list":[{"id":"7","num":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","text":"6D4B8BD5"}]}),
+            json!({"list":[{"id":7,"number":"duplicate","content":"0041"}]}),
+        ];
+        let list = normalize_lists(&replies).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["num"], "10086");
+        assert_eq!(list[0]["text"], "测试");
+        assert_eq!(list[0]["date"], "08-27 04:00");
+        assert_eq!(list[0]["unread"], true);
+    }
+
+    #[tokio::test]
+    async fn authenticates_and_normalizes_encrypted_sms() {
+        let key = [9_u8; 32];
+        *SESSION_KEY.lock().await = Some(key);
+        let number = encrypt(&key, "00310030003000380036").unwrap();
+        let text = encrypt(&key, "6D4B8BD5").unwrap();
+        let list = normalize_lists(&[json!({"list":[{
+            "id":8,"num":number,"date":"26,08,27,04,00,00,+,0","tag":0,"text":text
+        }]})])
+        .await;
+        *SESSION_KEY.lock().await = None;
+        assert_eq!(list[0]["num"], "10086");
+        assert_eq!(list[0]["text"], "测试");
     }
 }

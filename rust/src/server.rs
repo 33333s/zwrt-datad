@@ -394,7 +394,7 @@ async fn version() -> Json<DatadVersion> {
 async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
     Json(app.snapshot().await)
 }
-async fn capabilities() -> Json<Value> {
+fn capability_controls() -> Vec<&'static str> {
     let mut controls = vec![
         "device.login_info",
         "device.login",
@@ -418,10 +418,18 @@ async fn capabilities() -> Json<Value> {
         "qos.reload",
     ];
     controls.extend_from_slice(crate::control::ACTIONS);
+    controls
+}
+
+async fn capabilities() -> Json<Value> {
+    let controls = capability_controls();
     Json(json!({
         "schema_version":1,
         "protocol":1,
         "events":["state"],
+        "discovery":["ubus.list","ubus.list_verbose"],
+        "passthrough":["ubus.call"],
+        "transport":["http","sse"],
         "control":controls,
         "controls":controls,
         "rewrite":"rust"
@@ -778,7 +786,11 @@ async fn control(
         tokio::spawn(async move { refresh.refresh_snapshot().await });
         return control_ok(action, json!({"queued":true}));
     }
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"ok":false,"action":body.get("action"),"error":{"code":"rust_port_in_progress","message":"control adapter has not been migrated"}}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"ok":false,"action":action,"error":{"code":"unknown_action","message":"unsupported control action"}})),
+    )
+        .into_response()
 }
 
 fn control_ok(action: &str, value: Value) -> Response {
@@ -925,10 +937,18 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     #[test]
     fn version_shape() {
         let v = serde_json::to_value(DatadVersion::default()).unwrap();
         assert_eq!(v["name"], "zwrt-datad");
+    }
+
+    #[test]
+    fn capability_controls_match_complete_legacy_count() {
+        let controls = capability_controls();
+        assert_eq!(controls.len(), 79);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 79);
     }
 
     #[test]
