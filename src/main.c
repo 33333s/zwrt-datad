@@ -226,6 +226,13 @@ struct device_template_spec {
     enum optional_section_mode sms_section;
 };
 
+struct supported_band_catalog {
+    char lte[256];
+    char nr_sa[256];
+    char nr_nsa[256];
+    int complete;
+};
+
 static const struct device_template_spec TEMPLATE_U60_MU5250 = {
     "MU5250",
     "MU5250",
@@ -3462,6 +3469,83 @@ static int load_network_snapshot_uci(char *out, size_t outlen)
     return 0;
 }
 
+static int valid_supported_band_list(const char *value)
+{
+    unsigned char seen[1025] = {0};
+    const char *p = value;
+    if (!p || !*p) return 0;
+    while (*p) {
+        char *end = NULL;
+        long band;
+        errno = 0;
+        band = strtol(p, &end, 10);
+        if (errno || end == p || band < 1 || band > 1024 || seen[band]) return 0;
+        seen[band] = 1;
+        if (!*end) return 1;
+        if (*end != ',' || !end[1]) return 0;
+        p = end + 1;
+    }
+    return 0;
+}
+
+static void load_supported_band_catalog(struct supported_band_catalog *catalog)
+{
+    char show[RAW_MAX];
+    int valid = 0;
+    if (!catalog) return;
+    memset(catalog, 0, sizeof *catalog);
+    if (device_uci_show("zwrt_zte_nwinfo", show, sizeof show) != 0) return;
+
+    if (uci_show_value(show,
+                       "zwrt_zte_nwinfo.default_band_lock.default_lte_ext_band_lock",
+                       catalog->lte, sizeof catalog->lte) == 0 &&
+        valid_supported_band_list(catalog->lte)) {
+        valid++;
+    } else {
+        catalog->lte[0] = 0;
+    }
+    if (uci_show_value(show,
+                       "zwrt_zte_nwinfo.default_band_lock.default_nr5g_sa_band_lock",
+                       catalog->nr_sa, sizeof catalog->nr_sa) == 0 &&
+        valid_supported_band_list(catalog->nr_sa)) {
+        valid++;
+    } else {
+        catalog->nr_sa[0] = 0;
+    }
+    if (uci_show_value(show,
+                       "zwrt_zte_nwinfo.default_band_lock.default_nr5g_nsa_band_lock",
+                       catalog->nr_nsa, sizeof catalog->nr_nsa) == 0 &&
+        valid_supported_band_list(catalog->nr_nsa)) {
+        valid++;
+    } else {
+        catalog->nr_nsa[0] = 0;
+    }
+    catalog->complete = valid == 3;
+    if (!catalog->complete) {
+        catalog->lte[0] = 0;
+        catalog->nr_sa[0] = 0;
+        catalog->nr_nsa[0] = 0;
+    }
+}
+
+static void emit_supported_band_array(struct buf *b, const char *value)
+{
+    const char *p = value;
+    int first = 1;
+    bappend(b, "[");
+    while (p && *p) {
+        char *end = NULL;
+        long band = strtol(p, &end, 10);
+        if (end == p) break;
+        if (!first) bappend(b, ",");
+        bappend(b, "%ld", band);
+        first = 0;
+        if (!*end) break;
+        p = end + 1;
+    }
+    bappend(b, "]");
+}
+
 static int load_network_snapshot_for_template(const struct device_template_spec *tpl,
                                               char *net, size_t net_n)
 {
@@ -3913,6 +3997,7 @@ static void build_snapshot(char *out, size_t outlen,
     static char rstat[1024], sysinfo[2048], usb[1024], nfc[1024];
     static char wifi_ssid[128], wifi_key[128], wifi_enc[64];
     static char dhcp_ip[32], dhcp_start[32], dhcp_limit[16], dhcp_lease[32];
+    static struct supported_band_catalog supported_bands;
     char device_profile[64], device_profile_source[64];
     char device_vendor[64], device_model_name[128], device_hw[128];
     char device_market_name[128], device_alias_name[128], device_board_name[128];
@@ -3966,6 +4051,7 @@ static void build_snapshot(char *out, size_t outlen,
                                     dhcp_start, sizeof dhcp_start,
                                     dhcp_limit, sizeof dhcp_limit,
                                     dhcp_lease, sizeof dhcp_lease);
+        load_supported_band_catalog(&supported_bands);
         build_client_list_json_for_template(device_template, client_list, sizeof client_list,
                                             &client_wifi_count, &client_lan_count);
         slow_state_next_at = poll_now + SLOW_STATE_POLL_SEC;
@@ -4034,9 +4120,16 @@ static void build_snapshot(char *out, size_t outlen,
     emit_str(&b, "sa_bands", net, "nr5g_sa_band_lock"); bappend(&b, ",");
     emit_str(&b, "nsa_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
     emit_str(&b, "lte_bands", net, "lte_band");      bappend(&b, ",");
-    emit_str(&b, "lte_supported_bands", net, "lte_band"); bappend(&b, ",");
-    emit_str(&b, "nr_sa_supported_bands", net, "nr5g_sa_band_lock"); bappend(&b, ",");
-    emit_str(&b, "nr_nsa_supported_bands", net, "nr5g_nsa_band_lock"); bappend(&b, ",");
+    emit_kv_str(&b, "lte_supported_bands", supported_bands.lte); bappend(&b, ",");
+    emit_kv_str(&b, "nr_sa_supported_bands", supported_bands.nr_sa); bappend(&b, ",");
+    emit_kv_str(&b, "nr_nsa_supported_bands", supported_bands.nr_nsa); bappend(&b, ",");
+    bappend(&b, "\"band_capabilities\":{");
+    emit_kv_str(&b, "source", supported_bands.complete ?
+                "device_default_band_lock" : "unavailable"); bappend(&b, ",");
+    bappend(&b, "\"complete\":%s,\"lte\":", supported_bands.complete ? "true" : "false");
+    emit_supported_band_array(&b, supported_bands.lte); bappend(&b, ",\"nr_sa\":");
+    emit_supported_band_array(&b, supported_bands.nr_sa); bappend(&b, ",\"nr_nsa\":");
+    emit_supported_band_array(&b, supported_bands.nr_nsa); bappend(&b, "},");
     emit_str(&b, "wan_status", rstat, "current_wan_status"); bappend(&b, ",");
     bappend(&b, "\"HSR\":false");
     bappend(&b, "},");

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.47",
+    "version": "0.9.48",
     "asset": "zwrt-datad-aarch64",
-    "notes": "合并原厂列表与内核实时关联状态，修复 TopFlow 固件漏报在线 Wi-Fi 设备"
+    "notes": "从设备默认频段目录读取完整 LTE、NR SA 和 NR NSA 支持能力，与当前锁频配置分离"
   }
 }

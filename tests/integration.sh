@@ -117,9 +117,18 @@ assert data["device"]["api_template"] == "MU5250"
 assert data["device"]["api_template_supported"] == 1
 assert data["device"]["full_ubus"] == 1
 assert data["modems"] == []
-assert data["net"]["lte_supported_bands"] == "1,3"
-assert data["net"]["nr_sa_supported_bands"] == "78"
-assert data["net"]["nr_nsa_supported_bands"] == ""
+assert data["net"]["lte_bands"] == "1,3"
+assert data["net"]["sa_bands"] == "78"
+assert data["net"]["nr_nsa_supported_bands"] == "1,3,28,41,77,78,79"
+assert data["net"]["lte_supported_bands"] == "1,2,3,7,8,20,28,38,40,41,66"
+assert data["net"]["nr_sa_supported_bands"] == "1,3,28,41,77,78,79"
+assert data["net"]["band_capabilities"] == {
+    "source": "device_default_band_lock",
+    "complete": True,
+    "lte": [1, 2, 3, 7, 8, 20, 28, 38, 40, 41, 66],
+    "nr_sa": [1, 3, 28, 41, 77, 78, 79],
+    "nr_nsa": [1, 3, 28, 41, 77, 78, 79],
+}
 assert data["battery"]["percent"] == 0
 assert data["nfc"]["switch"] == 0
 assert data["clients"] == {
@@ -1353,6 +1362,27 @@ assert data["thermal"]["zones"] == [
     {"name": "cpuss-0", "celsius": 41.25},
 ]
 assert data["thermal"]["modems"] == []
+'
+
+MOCK_MODEL_NAME=MC8532B \
+MOCK_UCI_NO_BAND_CATALOG=1 \
+ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh" \
+ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh" \
+"$BIN" --once | python3 -c '
+import json, sys
+net = json.load(sys.stdin)["net"]
+assert net["lte_bands"] == "1,3"
+assert net["sa_bands"] == "78"
+assert net["lte_supported_bands"] == ""
+assert net["nr_sa_supported_bands"] == ""
+assert net["nr_nsa_supported_bands"] == ""
+assert net["band_capabilities"] == {
+    "source": "unavailable",
+    "complete": False,
+    "lte": [],
+    "nr_sa": [],
+    "nr_nsa": [],
+}
 '
 
 MOCK_MODEL_NAME=MC8532B \
