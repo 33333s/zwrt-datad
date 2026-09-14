@@ -52,6 +52,8 @@ pub const ACTIONS: &[&str] = &[
     "multiwan.member.set",
     "multiwan.policy.set",
     "multiwan.rule.set",
+    "aggregation.set",
+    "qos.clear",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -388,6 +390,8 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "multiwan.member.set" => multiwan_member(params).await,
         "multiwan.policy.set" => multiwan_policy(params).await,
         "multiwan.rule.set" => multiwan_rule(params).await,
+        "aggregation.set" => aggregation(params).await,
+        "qos.clear" => qos_clear().await,
         _ => Outcome::NotHandled,
     }
 }
@@ -935,7 +939,8 @@ async fn multiwan_policy(params: &Value) -> Outcome {
         }
         for item in &items {
             if !valid_section(item) || state::uci_read(&format!("mwan3.{item}")).await != "member" {
-                return mwan_revert(Outcome::Invalid(format!("unknown mwan3 member: {item}"))).await;
+                return mwan_revert(Outcome::Invalid(format!("unknown mwan3 member: {item}")))
+                    .await;
             }
         }
         let path = format!("mwan3.{section}.use_member");
@@ -974,6 +979,69 @@ async fn multiwan_rule(params: &Value) -> Outcome {
         }
     }
     mwan_finish(&section, changed).await
+}
+
+async fn run_mwan3(verb: &str, required: bool) -> Result<(), String> {
+    let init =
+        std::env::var("ZWRT_DATAD_MWAN3_INIT").unwrap_or_else(|_| "/etc/init.d/mwan3".into());
+    match crate::command::run(&init, [verb], Duration::from_secs(10)).await {
+        Ok(_) => Ok(()),
+        Err(_) if !required => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+async fn aggregation(params: &Value) -> Outcome {
+    let enabled = match boolean(params, "enabled") {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if enabled {
+        if let Err(e) = state::ubus(
+            "zwrt_router.api", "router_set_wan_mode",
+            json!({"opms_wan_mode":"SMULTIWAN","wan_ippass_device_type":"","wan_ippass_device_mac":""}),
+        ).await { return Outcome::Failed(e); }
+        let _ = run_mwan3("stop", false).await;
+    } else {
+        if let Err(e) = state::ubus(
+            "zwrt_router.api",
+            "router_stop_agg_mode",
+            json!({"agg_mode_switch":0}),
+        )
+        .await
+        {
+            return Outcome::Failed(e);
+        }
+        if let Err(e) = state::ubus(
+            "zwrt_router.api", "router_set_wan_mode",
+            json!({"opms_wan_mode":"MULTIWAN","wan_ippass_device_type":"","wan_ippass_device_mac":""}),
+        ).await { return Outcome::Failed(format!("aggregation stopped but MULTIWAN mode switch failed: {e}")); }
+        if let Err(e) = run_mwan3("restart", true).await {
+            return Outcome::Failed(format!(
+                "aggregation disabled but mwan3 restart failed: {e}"
+            ));
+        }
+    }
+    Outcome::Ok(json!({"enabled":enabled}))
+}
+
+async fn qos_clear() -> Outcome {
+    let paths = [
+        std::env::var("ZWRT_DATAD_QOS_LOG").unwrap_or_else(|_| "/data/logfs/key.log".into()),
+        std::env::var("ZWRT_DATAD_QOS_LOG_ROTATED")
+            .unwrap_or_else(|_| "/data/logfs/key.log.0".into()),
+    ];
+    let mut cleared = 0;
+    for path in paths {
+        match tokio::fs::OpenOptions::new().write(true).open(&path).await {
+            Ok(file) => match file.set_len(0).await {
+                Ok(()) => cleared += 1,
+                Err(e) => return Outcome::Failed(format!("failed to clear {path}: {e}")),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Outcome::Failed(format!("failed to clear {path}: {e}")),
+        }
+    }
+    Outcome::Ok(json!({"cleared":true,"files":cleared}))
 }
 
 #[cfg(test)]

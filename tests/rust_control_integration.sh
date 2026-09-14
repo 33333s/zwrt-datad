@@ -15,7 +15,12 @@ export ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
 export MOCK_CALL_LOG="$TMP/calls.log"
 export ZWRT_DATAD_OTA_DISABLE_AUTO=1
+export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
+export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
+export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
 mkdir -p "$TMP/data"
+printf 'fixture\n' >"$ZWRT_DATAD_QOS_LOG"
+printf 'rotated\n' >"$ZWRT_DATAD_QOS_LOG_ROTATED"
 
 "$ROOT/rust/target/debug/zwrt-datad" --bind 127.0.0.1 --port "$PORT" \
     --data-dir "$TMP/data" >"$TMP/server.log" 2>&1 &
@@ -46,6 +51,9 @@ post '{"action":"multiwan.interface.set","params":{"section":"zte_mwan2","enable
 post '{"action":"multiwan.member.set","params":{"section":"zte_mwan2_m1","metric":20,"weight":4}}' >/dev/null
 post '{"action":"multiwan.policy.set","params":{"section":"balanced","last_resort":"default","use_member":"zte_mwan2_m1"}}' >/dev/null
 post '{"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_policy":"balanced","sticky":0,"logging":1}}' >/dev/null
+post '{"action":"aggregation.set","params":{"enabled":true}}' >/dev/null
+post '{"action":"aggregation.set","params":{"enabled":false}}' >/dev/null
+post '{"action":"qos.clear","params":{}}' >/dev/null
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -77,5 +85,7 @@ grep -F 'mwan3.zte_mwan2.track_ip=8.8.8.8' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.zte_mwan2_m1.weight=4' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.balanced.use_member=zte_mwan2_m1' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.default_rule_v4.use_policy=balanced' "$MOCK_CALL_LOG" >/dev/null
+[ ! -s "$ZWRT_DATAD_QOS_LOG" ]
+[ ! -s "$ZWRT_DATAD_QOS_LOG_ROTATED" ]
 
 echo 'rust control HTTP fixture: PASS'
