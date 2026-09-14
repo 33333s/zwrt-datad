@@ -110,7 +110,8 @@ else:
                                  '--lan-bind', '127.0.0.1', '--lan-port', str(lan_port),
                                  '--auth-token-file', str(token)],
                                 cwd=self.root, env=self.env,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True)
         def request(port, path, method='GET', auth=False):
             headers = {'Authorization': 'Bearer fixture-version-token'} if auth else {}
             req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', method=method, headers=headers)
@@ -163,6 +164,7 @@ else:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            self.assertNotIn('select: Interrupted system call', proc.stderr.read())
 
 
 if __name__ == '__main__':

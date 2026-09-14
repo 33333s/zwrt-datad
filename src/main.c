@@ -2906,7 +2906,7 @@ static int build_client_list_from_router(char *out, size_t outlen)
         append_client_entries_from_array(arr, &b, &items);
     }
     if (run_ubus("zwrt_router.api", "router_lan_access_list",
-                 "{\"start_id\":1,\"end_id\":64}", lan, sizeof lan) == 0 &&
+                 "{}", lan, sizeof lan) == 0 &&
         json_get(lan, "lan_access_list_info", arr, sizeof arr)) {
         append_client_entries_from_array(arr, &b, &items);
     }
@@ -5262,6 +5262,7 @@ static void wait_with_http(const struct http_listener *local_listener,
         } while (rc < 0 && errno == EINTR && g_run);
 
         if (rc < 0) {
+            if (errno == EINTR) return;
             perror("select");
             return;
         }
