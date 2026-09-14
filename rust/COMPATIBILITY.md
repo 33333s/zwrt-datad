@@ -7,7 +7,7 @@ The Rust branch is never installed over the production binary until every requir
 | CLI and static ARM64 musl build | implemented | real MU5252 `/tmp` smoke passed |
 | `/healthz`, `/version`, `/state` | MC7523 device shape parity passed; MU5252 TopFlow and all four supported-model read-only fixture matrices pass, including MC8532B UCI fallback | MU5250, MU5252 and MC8532B device golden comparisons pending |
 | change-driven `/events` SSE | implemented; original framing suite passes | reconnect and client-limit tests pending |
-| `/capabilities` | reports only the thirteen currently implemented controls | expand with each verified action until exact parity |
+| `/capabilities` | reports only the fifteen currently implemented controls | expand with each verified action until exact parity |
 | `/ubus`, `/ubus/list`, `/ubus/call` | implemented with validation, timeout, output cap and auth/list shape checks | complete |
 | static and dynamic authentication | static token, LAN Basic login, vendor-token exchange, 48-byte-hex sessions and sliding expiry implemented | supported-device login smoke |
 | normalized device state | MC7523 structure complete; battery, NFC, SMS, thermal, bounded QoS, TopFlow aggregation/multi-WAN/cooling and slot-aware MU5252 modem state ported | finish MU5250 and MC8532B value semantics and normalized SMS payloads |

@@ -19,7 +19,7 @@ use axum::{
 };
 use futures_util::Stream;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     convert::Infallible,
     net::SocketAddr,
@@ -385,8 +385,10 @@ async fn capabilities() -> Json<Value> {
         "events":["state"],
         "controls":[
             "device.login_info",
+            "device.session_status",
             "wifi.status",
             "wifi.dual_band_status",
+            "wifi.txpower.status",
             "sleep.status",
             "usb.status",
             "power.direct_supply.status",
@@ -480,6 +482,9 @@ async fn control(
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
+    if action == "device.session_status" {
+        return control_ok(action, json!({"logged_in":false}));
+    }
     if action == "wifi.dual_band_status" {
         return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
             Ok(value) => {
@@ -511,6 +516,29 @@ async fn control(
                 );
             }
             result.insert(section.into(), Value::Object(item));
+        }
+        return control_ok(action, Value::Object(result));
+    }
+    if action == "wifi.txpower.status" {
+        let model = state::uci_read("zwrt_common_info.common_config.model_name").await;
+        let hardware = state::uci_read("zwrt_common_info.common_config.hardware_version").await;
+        if model != "MU5252" && !hardware.starts_with("MU5252_") {
+            return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"wifi power control is only supported on MU5252"}}))).into_response();
+        }
+        let mut result = Map::new();
+        for (band, section, factory_limit) in [("2g", "wifi0", 19), ("5g", "wifi1", 18)] {
+            let mut values = Vec::new();
+            for option in ["disabled", "txpowerpercent", "txpower", "max_power"] {
+                let raw = state::uci_read(&format!("wireless.{section}.{option}")).await;
+                let Ok(value) = raw.parse::<i64>() else {
+                    return control_failed(
+                        action,
+                        format!("failed to read {band} wifi power configuration"),
+                    );
+                };
+                values.push(value);
+            }
+            result.insert(band.into(), json!({"enabled":values[0]==0,"percent":values[1],"txpower_dbm":values[2],"limit_dbm":values[3],"factory_limit_dbm":factory_limit}));
         }
         return control_ok(action, Value::Object(result));
     }
