@@ -5,7 +5,7 @@ The Rust branch is never installed over the production binary until every requir
 | Area | Rust status | Production gate |
 |---|---|---|
 | CLI and static ARM64 musl build | implemented | real MU5252 `/tmp` smoke passed |
-| `/healthz`, `/version`, `/state` | MC7523 has 273/273 leaf-path parity; MU5252 TopFlow state now covers three modems, slot-aware fallbacks, QoS, aggregation, multi-WAN and cooling | MU5250 and MC8532B golden comparisons plus final MU5252 device comparison pending |
+| `/healthz`, `/version`, `/state` | MC7523 device shape parity passed; MU5252 TopFlow and all four supported-model read-only fixture matrices pass, including MC8532B UCI fallback | MU5250, MU5252 and MC8532B device golden comparisons pending |
 | change-driven `/events` SSE | implemented; original framing suite passes | reconnect and client-limit tests pending |
 | `/capabilities` | reports only the eleven currently implemented controls | expand with each verified action until exact parity |
 | `/ubus`, `/ubus/list`, `/ubus/call` | implemented with validation, timeout, output cap and auth/list shape checks | complete |
