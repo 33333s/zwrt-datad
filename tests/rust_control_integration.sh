@@ -24,6 +24,7 @@ export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
 export ZWRT_DATAD_WIFI_RUNTIME_DIR="$TMP/wifi-runtime"
 export ZWRT_DATAD_VENDOR_WIFI_DIR="$TMP/vendor-wifi"
 export ZWRT_DATAD_NET_CLASS_DIR="$TMP/net"
+export ZWRT_DATAD_PROC_ROOT="$TMP/proc"
 export MOCK_NET_CLASS_DIR="$ZWRT_DATAD_NET_CLASS_DIR"
 export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
 export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
@@ -40,7 +41,7 @@ export ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$TMP/liquid-thermal"
 export ZWRT_DATAD_LIQUID_DRIVE_PATH="$TMP/liquid-drive"
 export ZWRT_DATAD_COOLING_ZONE_PATH="$TMP/zone"
 mkdir -p "$TMP/data"
-mkdir -p "$ZWRT_DATAD_VENDOR_WIFI_DIR" "$ZWRT_DATAD_NET_CLASS_DIR"
+mkdir -p "$ZWRT_DATAD_VENDOR_WIFI_DIR" "$ZWRT_DATAD_NET_CLASS_DIR" "$ZWRT_DATAD_PROC_ROOT"
 printf 'fixture-boot-id\n' >"$TMP/boot-id"
 printf '1\n' >"$MOCK_SIM_SLOT_FILE"
 export ZWRT_DATAD_BOOT_ID_PATH="$TMP/boot-id"
@@ -88,6 +89,18 @@ post() {
 }
 file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+process_gone() {
+    pid=$1
+    attempt=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ ! -e "$ZWRT_DATAD_PROC_ROOT/$pid/cmdline" ]; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 50 ] || return 1
+        sleep 0.02
+    done
 }
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
@@ -138,11 +151,11 @@ post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","s
 grep -F 'ssid=Fixture Extra 2' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
 second_hostapd_pid=$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid")
 [ "$second_hostapd_pid" != "$first_hostapd_pid" ]
-! kill -0 "$first_hostapd_pid" 2>/dev/null
+process_gone "$first_hostapd_pid"
 kill -0 "$second_hostapd_pid"
 post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","enabled":false}}' >/dev/null
 [ ! -e "$ZWRT_DATAD_NET_CLASS_DIR/wlan4" ]
-! kill -0 "$second_hostapd_pid" 2>/dev/null
+process_gone "$second_hostapd_pid"
 mkdir -p "$ZWRT_DATAD_NET_CLASS_DIR/wlan4"
 printf '999\n' >"$ZWRT_DATAD_NET_CLASS_DIR/wlan4/ifindex"
 extra_failure=$(curl -sS -o "$TMP/extra-failure.json" -w '%{http_code}' -H 'content-type: application/json' \

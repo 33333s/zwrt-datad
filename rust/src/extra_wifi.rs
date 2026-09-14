@@ -119,6 +119,16 @@ fn process_owned(section: &str) -> Option<i32> {
     (text.contains("hostapd") && text.contains(conf.to_string_lossy().as_ref())).then_some(pid)
 }
 fn alive(pid: i32) -> bool {
+    let proc_root = env("ZWRT_DATAD_PROC_ROOT", "/proc");
+    let proc_dir = Path::new(&proc_root).join(pid.to_string());
+    if !proc_dir.exists() {
+        return false;
+    }
+    if let Ok(stat) = fs::read_to_string(proc_dir.join("stat")) {
+        if stat.split_whitespace().nth(2) == Some("Z") {
+            return false;
+        }
+    }
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
