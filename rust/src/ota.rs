@@ -14,12 +14,8 @@ use std::{
 };
 use tokio::process::Command;
 
-const NETDISK: &str = "https://pan.ericsfj.com/d/github%20releases/zwrt-datad";
+const NETDISK: &str = "https://pan.ericsfj.com/sd/wN2PJUK8";
 const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/download";
-const NETDISK_MANIFEST: &str = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json?sign=TZsBt-YNMzLwMcS5FX-ksLg2sK_fCNGOWxzaKN_4JOU=:0";
-const NETDISK_SIGNATURE: &str = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json.sig?sign=gvS_X703akHpSbzEZjzWUvLB7yvZsmPgm8RCjKzNSCA=:0";
-const NETDISK_INSTALLER: &str = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/install-datad.sh?sign=8qh7EYrKi_zRCOnHQKNU7k2XxghIxIyiJnoalfNlUss=:0";
-const NETDISK_BINARY: &str = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/zwrt-datad-aarch64?sign=dOcZWpLnxOETF2JboS_3_191tszCrcTI7_khCWUfLqg=:0";
 const PUBLIC_KEY: &str = include_str!("../../cloud/ota_public.pem");
 const IDLE_FOR: Duration = Duration::from_secs(120);
 
@@ -28,6 +24,8 @@ const IDLE_FOR: Duration = Duration::from_secs(120);
 pub struct Config {
     pub enabled: bool,
     pub servers: Vec<String>,
+    #[serde(default = "default_sources")]
+    pub sources: Vec<String>,
 }
 
 impl Default for Config {
@@ -35,8 +33,16 @@ impl Default for Config {
         Self {
             enabled: true,
             servers: Vec::new(),
+            sources: default_sources(),
         }
     }
+}
+
+fn default_sources() -> Vec<String> {
+    ["custom", "netdisk", "github"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,6 +133,7 @@ impl Ota {
             .unwrap_or_default();
         let mut status = read_json::<Status>(&dir.join("ota-state.json")).unwrap_or_default();
         status.current_version = env!("DATAD_VERSION").into();
+        status.source = source_name(&status.source).into();
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
@@ -145,7 +152,7 @@ impl Ota {
     }
 
     pub fn config_json(&self) -> Value {
-        json!({"success":true,"config":self.config,"default_servers":[NETDISK,GITHUB]})
+        json!({"success":true,"config":self.config,"default_servers":["网盘","GitHub"]})
     }
 
     pub fn status_json(&self) -> Value {
@@ -179,11 +186,20 @@ impl Ota {
 
     fn servers(&self) -> Vec<String> {
         let mut seen = HashSet::new();
-        self.config
-            .servers
-            .iter()
+        let enabled: HashSet<_> = self.config.sources.iter().map(String::as_str).collect();
+        let mut ordered = Vec::new();
+        if enabled.contains("custom") {
+            ordered.extend(self.config.servers.iter().map(String::as_str));
+        }
+        if enabled.contains("netdisk") {
+            ordered.push(NETDISK);
+        }
+        if enabled.contains("github") {
+            ordered.push(GITHUB);
+        }
+        ordered
+            .into_iter()
             .map(|value| value.trim().trim_end_matches('/'))
-            .chain([NETDISK, GITHUB])
             .filter(|value| !value.is_empty() && seen.insert((*value).to_owned()))
             .map(str::to_owned)
             .collect()
@@ -231,11 +247,18 @@ impl Ota {
                 base_url: base,
             };
             if !has_update(&candidate) {
-                valid_but_current.get_or_insert(candidate);
+                if valid_but_current
+                    .as_ref()
+                    .is_none_or(|current: &Candidate| {
+                        newer(&candidate.manifest.version, &current.manifest.version)
+                    })
+                {
+                    valid_but_current = Some(candidate);
+                }
                 continue;
             }
             self.status.latest_version = candidate.manifest.version.clone();
-            self.status.source = candidate.base_url.clone();
+            self.status.source = source_name(&candidate.base_url).into();
             self.status.signature_verified = true;
             self.status.wait_reasons.clear();
             self.status.state = "available".into();
@@ -244,8 +267,13 @@ impl Ota {
             return Ok(candidate);
         }
         if let Some(candidate) = valid_but_current {
-            self.status.latest_version = candidate.manifest.version.clone();
-            self.status.source = candidate.base_url.clone();
+            self.status.latest_version =
+                if newer(env!("DATAD_VERSION"), &candidate.manifest.version) {
+                    env!("DATAD_VERSION").into()
+                } else {
+                    candidate.manifest.version.clone()
+                };
+            self.status.source = source_name(&candidate.base_url).into();
             self.status.signature_verified = true;
             self.status.wait_reasons.clear();
             self.status.state = "idle".into();
@@ -337,7 +365,7 @@ impl Ota {
         self.status.next_retry_at = if delay == 0 { 0 } else { now() + delay };
         if let Some(candidate) = candidate {
             self.status.latest_version = candidate.manifest.version.clone();
-            self.status.source = candidate.base_url.clone();
+            self.status.source = source_name(&candidate.base_url).into();
         }
         self.save_status();
     }
@@ -488,6 +516,18 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
             return Err("更新服务器地址重复".into());
         }
     }
+    if config.sources.is_empty() {
+        return Err("至少选择一个更新来源".into());
+    }
+    let mut sources = HashSet::new();
+    for source in &config.sources {
+        if !matches!(source.as_str(), "custom" | "netdisk" | "github") {
+            return Err("更新来源无效".into());
+        }
+        if !sources.insert(source) {
+            return Err("更新来源重复".into());
+        }
+    }
     Ok(())
 }
 
@@ -545,16 +585,19 @@ fn verify(key: &VerifyingKey, message: &[u8], encoded: &[u8]) -> Result<(), Stri
 }
 
 fn source_url(base: &str, name: &str) -> String {
-    if base == NETDISK {
-        match name {
-            "update.json" => return NETDISK_MANIFEST.into(),
-            "update.json.sig" => return NETDISK_SIGNATURE.into(),
-            "install-datad.sh" => return NETDISK_INSTALLER.into(),
-            "zwrt-datad-aarch64" => return NETDISK_BINARY.into(),
-            _ => {}
-        }
-    }
     format!("{}/{}", base.trim_end_matches('/'), name)
+}
+
+pub fn source_name(source: &str) -> &'static str {
+    match source.trim().trim_end_matches('/') {
+        "" => "",
+        "网盘" => "网盘",
+        "GitHub" => "GitHub",
+        "自定义服务器" => "自定义服务器",
+        NETDISK => "网盘",
+        GITHUB => "GitHub",
+        _ => "自定义服务器",
+    }
 }
 
 fn newer(left: &str, right: &str) -> bool {
@@ -645,7 +688,12 @@ mod tests {
     fn public_key_and_defaults_are_valid() {
         parse_public_key(PUBLIC_KEY).unwrap();
         validate_config(&Config::default()).unwrap();
-        assert_eq!(source_url(NETDISK, "update.json"), NETDISK_MANIFEST);
+        assert_eq!(
+            source_url(NETDISK, "update.json"),
+            format!("{NETDISK}/update.json")
+        );
+        assert_eq!(Config::default().sources, default_sources());
+        assert_eq!(source_name(NETDISK), "网盘");
         assert!(newer("9.1.0", "9.0.99"));
     }
 
@@ -659,7 +707,8 @@ mod tests {
             assert!(
                 validate_config(&Config {
                     enabled: true,
-                    servers: vec![server.into()]
+                    servers: vec![server.into()],
+                    ..Default::default()
                 })
                 .is_err()
             );
@@ -771,6 +820,7 @@ mod tests {
             format!("http://{address}/bad"),
             format!("http://{address}/good"),
         ];
+        ota.config.sources = vec!["custom".into()];
         let candidate = ota.check().await.unwrap();
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");

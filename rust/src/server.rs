@@ -720,7 +720,7 @@ async fn ota_check(State(app): State<App>) -> Response {
     match manager.check().await {
         Ok(candidate) => (
             StatusCode::OK,
-            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":candidate.base_url})),
+            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":ota::source_name(&candidate.base_url)})),
         )
             .into_response(),
         Err(error) => (
