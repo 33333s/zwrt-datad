@@ -81,6 +81,10 @@ class BootEntries(unittest.TestCase):
             self.assertIn((ROOT / "version.json").read_text().rstrip(), body)
             self.assertIn((ROOT / "OPENSSL-LICENSE.txt").read_text().rstrip(), body)
             self.assertNotIn("@@", body)
+            self.assertIn('BACKUP="$WORK/rollback"', body)
+            self.assertNotIn('/backups/install-', body)
+            self.assertNotIn('say "备份：$BACKUP"', body)
+            self.assertIn('health() { curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:$1/healthz" >/dev/null 2>&1; }', body)
             self.assertEqual(subprocess.run(["sh", "-n", str(output)]).returncode, 0)
 
 

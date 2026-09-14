@@ -213,6 +213,11 @@ curl -fsS -H 'Authorization: Bearer fixture-private-token' \
 
 grep -F 'zte_nwinfo_api' "$CALL_LOG" | grep -F 'nwinfo_set_netselect' | grep -F 'Only_LTE' >/dev/null
 
+# Match the OEM Web UI contract: LAN access-list calls take an empty object,
+# while the wireless list remains paged.
+grep -F "$(printf 'zwrt_router.api\trouter_lan_access_list\t{}')" "$CALL_LOG" >/dev/null
+grep -F "$(printf 'zwrt_router.api\trouter_wireless_access_list\t{"start_id":1,"end_id":64}')" "$CALL_LOG" >/dev/null
+
 curl -fsS -H 'Authorization: Bearer fixture-private-token' \
     -H 'Content-Type: application/json' \
     -d '{"action":"cellular.set","params":{"roaming":1}}' \

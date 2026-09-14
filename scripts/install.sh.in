@@ -21,7 +21,7 @@ RC_WRITTEN=0
 
 say() { printf '[datad-install] %s\n' "$*"; }
 fail() { say "$*" >&2; exit 1; }
-health() { curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:$1/healthz" >/dev/null; }
+health() { curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:$1/healthz" >/dev/null 2>&1; }
 wait_health() {
     count=0
     while [ "$count" -lt 20 ]; do
@@ -212,7 +212,7 @@ if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-lin
     exit 0
 fi
 
-BACKUP="$DIR/backups/install-$(date +%Y%m%d-%H%M%S)-$$"
+BACKUP="$WORK/rollback"
 mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
 for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt zwrt-datad-cloud cloud-service.sh; do save_file "$DIR/$name" "$name"; done
@@ -283,4 +283,3 @@ rm -f "$DIR/zwrt-datad-cloud" "$DIR/cloud-service.sh" "$DIR/cloud.pid" "$DIR/clo
 SUCCESS=1
 say "安装完成：v$VERSION，$BIN"
 say "自启：sh /data/zwrt-datad/service.sh start"
-say "备份：$BACKUP"

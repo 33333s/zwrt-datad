@@ -24,7 +24,7 @@ process_matches() {
     if [ -n "$actual" ] && { [ "$actual" = "$expected" ] || [ "$actual" = "$BIN" ]; }; then
         return 0
     fi
-    first_arg="$(tr '\000' '\n' < "/proc/$check_pid/cmdline" 2>/dev/null | sed -n '1p')"
+    first_arg="$(tr '\000' '\n' 2>/dev/null < "/proc/$check_pid/cmdline" | sed -n '1p')"
     [ "$first_arg" = "$expected" ] || [ "$first_arg" = "$BIN" ]
 }
 

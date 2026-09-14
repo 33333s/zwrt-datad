@@ -1972,7 +1972,7 @@ static int control_client_access_status(char *result, size_t result_len,
     struct json_buf b = {result, result_len, 0};
     if (!ubus_call("uci", "get", "{\"config\":\"wireless\",\"section\":\"main_2g\"}",
                    config, sizeof config, err, errlen) ||
-        !ubus_call("zwrt_router.api", "router_lan_access_list", "{\"start_id\":1,\"end_id\":64}",
+        !ubus_call("zwrt_router.api", "router_lan_access_list", "{}",
                    lan, sizeof lan, err, errlen) ||
         !ubus_call("zwrt_router.api", "router_wireless_access_list", "{\"start_id\":1,\"end_id\":64}",
                    wifi, sizeof wifi, err, errlen)) return 0;
