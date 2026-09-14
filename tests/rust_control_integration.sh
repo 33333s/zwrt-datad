@@ -16,6 +16,7 @@ export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
 export MOCK_CALL_LOG="$TMP/calls.log"
 export ZWRT_DATAD_OTA_DISABLE_AUTO=1
 export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
+export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
 export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
 export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
 mkdir -p "$TMP/data"
@@ -55,6 +56,8 @@ post '{"action":"aggregation.set","params":{"enabled":true}}' >/dev/null
 post '{"action":"aggregation.set","params":{"enabled":false}}' >/dev/null
 post '{"action":"qos.clear","params":{}}' >/dev/null
 post '{"action":"wifi.txpower.apply","params":{"band":"2g","percent":90,"limit_dbm":19}}' >/dev/null
+post '{"action":"wifi.psm.set","params":{"section":"main_5g","mode":"off"}}' >/dev/null
+post '{"action":"wifi.txpower.set_dbm","params":{"band":"5g","dbm":17}}' >/dev/null
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -91,5 +94,8 @@ grep -F 'mwan3.default_rule_v4.use_policy=balanced' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.wifi0.txpowerpercent=90' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.wifi0.txpower=19' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.wifi0.max_power=19' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'wireless.main_5g.datad_psm=off' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'iw' "$MOCK_CALL_LOG" | grep -F 'dev wlan0 set power_save off' >/dev/null
+grep -F 'wireless.wifi1.datad_txpower_dbm=17' "$MOCK_CALL_LOG" >/dev/null
 
 echo 'rust control HTTP fixture: PASS'

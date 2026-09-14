@@ -31,6 +31,8 @@ pub const ACTIONS: &[&str] = &[
     "wifi.txpower.set_percent",
     "wifi.txpower.set_limit",
     "wifi.txpower.restore_limit",
+    "wifi.psm.set",
+    "wifi.txpower.set_dbm",
     "lan.set",
     "lan.set_mtu",
     "dns.set",
@@ -229,6 +231,8 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "wifi.txpower.set_percent" => wifi_power(params, "percent").await,
         "wifi.txpower.set_limit" => wifi_power(params, "limit").await,
         "wifi.txpower.restore_limit" => wifi_power(params, "restore").await,
+        "wifi.psm.set" => wifi_psm(params).await,
+        "wifi.txpower.set_dbm" => wifi_dbm(params).await,
         "lan.set" => {
             mapped_call(
                 params,
@@ -940,6 +944,192 @@ async fn wifi_power(params: &Value, operation: &str) -> Outcome {
     }
     Outcome::Ok(
         json!({"band":band,"changed":true,"percent":if percent_changed{percent}else{old_percent},"txpower_dbm":if limit_changed{limit}else{old_tx},"limit_dbm":if limit_changed{limit}else{old_limit},"factory_limit_dbm":factory}),
+    )
+}
+
+fn iw_bin() -> String {
+    std::env::var("ZWRT_DATAD_IW_BIN").unwrap_or_else(|_| "/usr/sbin/iw".into())
+}
+async fn advanced_wifi_supported() -> bool {
+    state::uci_read("zwrt_common_info.common_config.model_name").await == "MU5252"
+}
+async fn policy_path(section: &str, option: &str) -> Result<(String, String, String), Outcome> {
+    let main = matches!(section, "main_2g" | "guest_2g" | "main_5g" | "guest_5g");
+    let extra = matches!(section, "datad_ssid_1" | "datad_ssid_2");
+    if !main && !extra {
+        return Err(Outcome::Invalid("invalid advanced Wi-Fi settings".into()));
+    }
+    let package = if extra { "datad_wifi" } else { "wireless" };
+    if extra
+        && state::uci_read(&format!("datad_wifi.{section}"))
+            .await
+            .is_empty()
+    {
+        return Err(Outcome::Invalid("invalid advanced Wi-Fi settings".into()));
+    }
+    let ifname = if extra {
+        if section.ends_with('1') {
+            "wlan4".into()
+        } else {
+            "wlan5".into()
+        }
+    } else {
+        state::uci_read(&format!("wireless.{section}.ifname")).await
+    };
+    Ok((
+        format!("{package}.{section}.{option}"),
+        package.into(),
+        ifname,
+    ))
+}
+async fn restore_policy(path: &str, package: &str, old: &str) {
+    let _ = if old.is_empty() {
+        state::uci_write("delete", path, None).await
+    } else {
+        state::uci_write("set", path, Some(old)).await
+    };
+    let _ = state::uci_write("commit", package, None).await;
+}
+async fn wifi_psm(params: &Value) -> Outcome {
+    if !advanced_wifi_supported().await {
+        return Outcome::Failed("advanced Wi-Fi unsupported by this model".into());
+    }
+    let section = match string(params, "section", true) {
+        Ok(Some(v)) => v,
+        Ok(_) => unreachable!(),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let mode = match string(params, "mode", true) {
+        Ok(Some(v)) if matches!(v.as_str(), "default" | "on" | "off") => v,
+        Ok(_) => return Outcome::Invalid("invalid advanced Wi-Fi settings".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let (path, package, ifname) = match policy_path(&section, "datad_psm").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let old = state::uci_read(&path).await;
+    let write = if mode == "default" {
+        state::uci_write("delete", &path, None).await
+    } else {
+        state::uci_write("set", &path, Some(&mode)).await
+    };
+    if let Err(e) = write {
+        return Outcome::Failed(format!("could not persist advanced Wi-Fi policy: {e}"));
+    }
+    if let Err(e) = state::uci_write("commit", &package, None).await {
+        restore_policy(&path, &package, &old).await;
+        return Outcome::Failed(e);
+    }
+    let mut pending = mode != "default";
+    if mode != "default" && !ifname.is_empty() {
+        let wanted = if mode == "on" { "on" } else { "off" };
+        if crate::command::run(
+            &iw_bin(),
+            ["dev", &ifname, "set", "power_save", wanted],
+            Duration::from_secs(5),
+        )
+        .await
+        .is_err()
+        {
+            restore_policy(&path, &package, &old).await;
+            return Outcome::Failed("advanced Wi-Fi setting could not be applied".into());
+        }
+        let verified = crate::command::run(
+            &iw_bin(),
+            ["dev", &ifname, "get", "power_save"],
+            Duration::from_secs(5),
+        )
+        .await
+        .ok()
+        .is_some_and(|v| String::from_utf8_lossy(&v).contains(&format!("Power save: {wanted}")));
+        if !verified {
+            restore_policy(&path, &package, &old).await;
+            return Outcome::Failed("advanced Wi-Fi setting could not be verified".into());
+        }
+        pending = false;
+    }
+    Outcome::Ok(json!({"section":section,"mode":mode,"saved":true,"pending":pending}))
+}
+async fn wifi_dbm(params: &Value) -> Outcome {
+    if !advanced_wifi_supported().await {
+        return Outcome::Failed("advanced Wi-Fi unsupported by this model".into());
+    }
+    let band = match string(params, "band", true) {
+        Ok(Some(v)) if matches!(v.as_str(), "2g" | "5g") => v,
+        Ok(_) => return Outcome::Invalid("invalid advanced Wi-Fi settings".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let restore = object(params).get("mode").and_then(Value::as_str) == Some("oem");
+    let dbm = if restore {
+        -1
+    } else {
+        match flexible_i64(params, "dbm") {
+            Ok(Some(v @ 1..=30)) => v,
+            Ok(_) => return Outcome::Invalid("dbm must be between 1 and 30".into()),
+            Err(e) => return Outcome::Invalid(e),
+        }
+    };
+    let section = if band == "2g" { "wifi0" } else { "wifi1" };
+    let path = format!("wireless.{section}.datad_txpower_dbm");
+    let old = state::uci_read(&path).await;
+    let write = if restore {
+        state::uci_write("delete", &path, None).await
+    } else {
+        state::uci_write("set", &path, Some(&dbm.to_string())).await
+    };
+    if let Err(e) = write {
+        return Outcome::Failed(e);
+    }
+    if let Err(e) = state::uci_write("commit", "wireless", None).await {
+        restore_policy(&path, "wireless", &old).await;
+        return Outcome::Failed(e);
+    }
+    let status = crate::wifi::advanced_status().await.ok();
+    let mut applied = 0;
+    if let Some(interfaces) = status
+        .as_ref()
+        .and_then(|v| v.get("interfaces"))
+        .and_then(Value::as_array)
+    {
+        for item in interfaces.iter().filter(|v| {
+            v.get("band").and_then(Value::as_str) == Some(&band)
+                && v.get("active").and_then(Value::as_bool) == Some(true)
+        }) {
+            let Some(ifname) = item.get("ifname").and_then(Value::as_str) else {
+                continue;
+            };
+            let target = if restore {
+                state::uci_read(&format!("wireless.{section}.txpower"))
+                    .await
+                    .parse()
+                    .unwrap_or(30)
+            } else {
+                dbm
+            };
+            if crate::command::run(
+                &iw_bin(),
+                [
+                    "dev",
+                    ifname,
+                    "set",
+                    "txpower",
+                    "fixed",
+                    &(target * 100).to_string(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err()
+            {
+                restore_policy(&path, "wireless", &old).await;
+                return Outcome::Failed("advanced Wi-Fi setting could not be applied".into());
+            }
+            applied += 1;
+        }
+    }
+    Outcome::Ok(
+        json!({"band":band,"mode":if restore{"oem"}else{"fixed"},"dbm":if restore{Value::Null}else{json!(dbm)},"saved":true,"pending":!restore&&applied==0,"applied_interfaces":applied}),
     )
 }
 
