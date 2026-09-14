@@ -94,7 +94,9 @@ fn read_i64(path: impl AsRef<Path>) -> i64 {
 fn thermal_zones() -> (i64, Value) {
     let mut zones = Vec::new();
     let mut cpuss = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
+    let root =
+        std::env::var("ZWRT_DATAD_THERMAL_ROOT").unwrap_or_else(|_| "/sys/class/thermal".into());
+    let Ok(entries) = fs::read_dir(root) else {
         return (0, json!([]));
     };
     for entry in entries.flatten() {
@@ -310,8 +312,24 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
     let user_count = ubus("zwrt_router.api", "router_get_user_list_num", json!({})).await;
     let router_status = ubus("zwrt_router.api", "router_get_status_no_auth", json!({})).await;
-    let thermal = ubus("zwrt_bsp.thermal", "list", json!({})).await;
+    let thermal = ubus("zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
     let usb = ubus("zwrt_bsp.usb", "list", json!({})).await;
+    let battery = ubus("zwrt_bsp.battery", "list", json!({})).await;
+    let charger = ubus("zwrt_bsp.charger", "list", json!({})).await;
+    let nfc = ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
+    let sms_capacity = ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
+    let sms_nv = ubus(
+        "zwrt_wms",
+        "zte_libwms_get_sms_data",
+        json!({"page":0,"data_per_page":8,"mem_store":1,"tags":10,"order_by":"order by id desc"}),
+    )
+    .await;
+    let sms_sim = ubus(
+        "zwrt_wms",
+        "zte_libwms_get_sms_data",
+        json!({"page":0,"data_per_page":8,"mem_store":0,"tags":10,"order_by":"order by id desc"}),
+    )
+    .await;
     let lan_if = ubus("network.interface.lan", "status", json!({})).await;
     let wan4_if = ubus("network.interface.zte_wan", "status", json!({})).await;
     let wan6_if = ubus("network.interface.zte_wan6", "status", json!({})).await;
@@ -336,6 +354,15 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let router_status = object(router_status);
     let thermal = object(thermal);
     let usb = object(usb);
+    let battery_ok = battery.is_ok();
+    let battery = object(battery);
+    let charger = object(charger);
+    let nfc_ok = nfc.is_ok();
+    let nfc = object(nfc);
+    let sms_ok = sms_capacity.is_ok();
+    let sms_capacity = object(sms_capacity);
+    let sms_nv = object(sms_nv);
+    let sms_sim = object(sms_sim);
     let lan_if = object(lan_if);
     let wan4_if = object(wan4_if);
     let wan6_if = object(wan6_if);
@@ -375,7 +402,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "mu5252" => "MU5252",
         "mc7523" => "MC7523",
         "mc8532b" => "MC8532B",
-        _ => "LEGACY_COMPAT",
+        _ => "legacy_compat",
     };
     let mut net = Map::new();
     for (to, from) in [
@@ -482,14 +509,45 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
     let cl = clients_from_leases();
     fields.insert("clients".into(),json!({"total":integer(&user_count,"access_total_num"),"wifi":integer(&user_count,"wireless_num"),"lan":integer(&user_count,"lan_num"),"list":cl}));
-    fields.insert("sms".into(), json!({"unread":0,"list":[]}));
+    let hide_battery = matches!(template, "MC7523" | "MC8532B");
+    if !hide_battery
+        && battery_ok
+        && battery
+            .as_object()
+            .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
+    {
+        fields.insert("battery".into(),json!({"percent":integer(&battery,"battery_capacity"),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer(&battery,"battery_time_to_full"),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now")}));
+    }
+    if let Some(mode) = charger
+        .get("direct_power_supply_mode")
+        .and_then(Value::as_str)
+    {
+        fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
+    }
+    if sms_ok {
+        let mut list = Vec::new();
+        for reply in [&sms_nv, &sms_sim] {
+            if let Some(items) = reply.get("list").and_then(Value::as_array) {
+                list.extend(items.iter().take(32 - list.len()).cloned())
+            }
+        }
+        fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
+    }
     fields.insert("traffic".into(), Value::Object(tout));
+    let qos = crate::qos::read_for_plmn(integer(&raw_net, "rmcc"), integer(&raw_net, "rmnc"));
     fields.insert(
         "qos".into(),
-        json!({"qci":0,"ambr_dl":"","ambr_ul":"","usb_mode":string(&usb,"mode")}),
+        json!({"qci":qos.qci,"ambr_dl":qos.ambr_dl,"ambr_ul":qos.ambr_ul,"usb_mode":string(&usb,"mode")}),
     );
     if let Some(s) = wifi {
         fields.insert("wlan".into(),json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")}));
+    }
+    if nfc_ok
+        && nfc.as_object().is_some_and(|v| {
+            v.contains_key("switch") || v.contains_key("ap") || v.contains_key("wifi_ap")
+        })
+    {
+        fields.insert("nfc".into(), json!({"switch":integer(&nfc,"switch")}));
     }
     fields.insert(
         "thermal".into(),
@@ -625,7 +683,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":string(&sim,"sim_imsi"),"msisdn":string(&sim,"msisdn"),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
     fields.insert("modems".into(), json!([]));
     fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
-    fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template,"api_template_supported":i64::from(template!="LEGACY_COMPAT"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
+    let template_label = if template == "legacy_compat" {
+        "Legacy compatibility fallback"
+    } else {
+        template
+    };
+    fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template_label,"api_template_supported":i64::from(template!="legacy_compat"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
     let (cpu_usage_tenths, runtime) = runtime();
     let cpu_usage = if cpu_usage_tenths >= 0 {
         (cpu_usage_tenths + 5) / 10

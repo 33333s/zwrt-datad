@@ -184,13 +184,8 @@ async fn capabilities() -> Json<Value> {
 }
 
 async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = WatchStream::new(app.inner.tx.subscribe()).map(|v| {
-        Ok(Event::default()
-            .event("state")
-            .retry(Duration::from_secs(1))
-            .json_data(v)
-            .unwrap())
-    });
+    let stream = WatchStream::new(app.inner.tx.subscribe())
+        .map(|v| Ok(Event::default().event("state").json_data(v).unwrap()));
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new())
 }
 #[derive(Deserialize)]
