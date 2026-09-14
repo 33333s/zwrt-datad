@@ -205,12 +205,9 @@ impl App {
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/" | "/healthz" | "/auth/login" | "/auth/exchange")
-        || app.inner.token.is_none()
-    {
+    if matches!(path, "/" | "/healthz" | "/auth/login" | "/auth/exchange") {
         return next.run(request).await;
     }
-    let wanted = app.inner.token.as_deref().unwrap_or_default();
     let headers = request.headers();
     let bearer = headers
         .get("authorization")
@@ -222,8 +219,7 @@ async fn authenticate(State(app): State<App>, request: Request, next: Next) -> R
             .find_map(|part| part.strip_prefix("access_token="))
     });
     let presented = [bearer, legacy, query].into_iter().flatten().next();
-    let static_valid =
-        presented.is_some_and(|value| constant_time_eq(value.as_bytes(), wanted.as_bytes()));
+    let static_valid = static_token_valid(app.inner.token.as_deref(), presented);
     let session_valid = if static_valid {
         false
     } else if let Some(value) = presented {
@@ -236,6 +232,12 @@ async fn authenticate(State(app): State<App>, request: Request, next: Next) -> R
     } else {
         (StatusCode::UNAUTHORIZED, Json(json!({"ok":false,"error":{"code":"unauthorized","message":"authentication required"}}))).into_response()
     }
+}
+
+fn static_token_valid(configured: Option<&str>, presented: Option<&str>) -> bool {
+    configured.is_some_and(|wanted| {
+        presented.is_some_and(|value| constant_time_eq(value.as_bytes(), wanted.as_bytes()))
+    })
 }
 
 async fn auth_login(State(app): State<App>, headers: HeaderMap) -> Response {
@@ -790,5 +792,13 @@ mod tests {
     fn version_shape() {
         let v = serde_json::to_value(DatadVersion::default()).unwrap();
         assert_eq!(v["name"], "zwrt-datad");
+    }
+
+    #[test]
+    fn missing_static_token_never_disables_lan_authentication() {
+        assert!(!static_token_valid(None, None));
+        assert!(!static_token_valid(None, Some("anything")));
+        assert!(static_token_valid(Some("secret"), Some("secret")));
+        assert!(!static_token_valid(Some("secret"), Some("wrong")));
     }
 }
