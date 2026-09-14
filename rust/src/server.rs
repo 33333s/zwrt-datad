@@ -20,7 +20,16 @@ use axum::{
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock, watch},
@@ -35,7 +44,7 @@ pub struct App {
 struct Inner {
     snapshot: RwLock<Snapshot>,
     tx: watch::Sender<Snapshot>,
-    interval: Duration,
+    interval_ms: AtomicU64,
     _data_dir: PathBuf,
     token: Option<String>,
     sessions: Mutex<Sessions>,
@@ -62,7 +71,7 @@ impl App {
             inner: Arc::new(Inner {
                 snapshot: RwLock::new(initial),
                 tx,
-                interval,
+                interval_ms: AtomicU64::new(interval.as_millis() as u64),
                 cloud: RwLock::new(Cloud::load(&data_dir)),
                 ota: Mutex::new(Ota::load(&data_dir).map_err(anyhow::Error::msg)?),
                 neighbor: Mutex::new(neighbor),
@@ -81,9 +90,11 @@ impl App {
     fn spawn_sampler(&self) {
         let app = self.clone();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(app.inner.interval);
             loop {
-                timer.tick().await;
+                tokio::time::sleep(Duration::from_millis(
+                    app.inner.interval_ms.load(Ordering::Relaxed),
+                ))
+                .await;
                 app.refresh_snapshot().await;
             }
         });
@@ -120,7 +131,7 @@ impl App {
         });
     }
     async fn refresh_snapshot(&self) {
-        let mut next = state::collect(self.inner.interval.as_millis() as u64).await;
+        let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
         let mut neighbor = self.inner.neighbor.lock().await;
         neighbor
             .tick(next.fields.get("net").unwrap_or(&Value::Null))
@@ -383,7 +394,9 @@ async fn capabilities() -> Json<Value> {
             "client.access",
             "neighbor.status",
             "neighbor.set",
-            "state.refresh"
+            "state.refresh",
+            "state.set_interval",
+            "qos.reload"
         ],
         "rewrite":"rust"
     }))
@@ -583,6 +596,24 @@ async fn control(
         };
     }
     if action == "state.refresh" {
+        let refresh = app.clone();
+        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        return control_ok(action, json!({"queued":true}));
+    }
+    if action == "state.set_interval" {
+        let milliseconds = body
+            .get("params")
+            .and_then(|value| value.get("milliseconds"))
+            .and_then(Value::as_u64);
+        let Some(milliseconds) = milliseconds.filter(|value| (500..=5000).contains(value)) else {
+            return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"milliseconds must be between 500 and 5000"}}))).into_response();
+        };
+        app.inner.interval_ms.store(milliseconds, Ordering::Relaxed);
+        let refresh = app.clone();
+        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        return control_ok(action, json!({"sample_interval_ms":milliseconds}));
+    }
+    if action == "qos.reload" {
         let refresh = app.clone();
         tokio::spawn(async move { refresh.refresh_snapshot().await });
         return control_ok(action, json!({"queued":true}));
