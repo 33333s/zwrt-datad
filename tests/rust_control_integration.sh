@@ -54,6 +54,7 @@ post '{"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_p
 post '{"action":"aggregation.set","params":{"enabled":true}}' >/dev/null
 post '{"action":"aggregation.set","params":{"enabled":false}}' >/dev/null
 post '{"action":"qos.clear","params":{}}' >/dev/null
+post '{"action":"wifi.txpower.apply","params":{"band":"2g","percent":90,"limit_dbm":19}}' >/dev/null
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -87,5 +88,8 @@ grep -F 'mwan3.balanced.use_member=zte_mwan2_m1' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.default_rule_v4.use_policy=balanced' "$MOCK_CALL_LOG" >/dev/null
 [ ! -s "$ZWRT_DATAD_QOS_LOG" ]
 [ ! -s "$ZWRT_DATAD_QOS_LOG_ROTATED" ]
+grep -F 'wireless.wifi0.txpowerpercent=90' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'wireless.wifi0.txpower=19' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'wireless.wifi0.max_power=19' "$MOCK_CALL_LOG" >/dev/null
 
 echo 'rust control HTTP fixture: PASS'

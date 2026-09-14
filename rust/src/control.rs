@@ -27,6 +27,10 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_module",
     "wifi.set_chip",
     "wifi.configure",
+    "wifi.txpower.apply",
+    "wifi.txpower.set_percent",
+    "wifi.txpower.set_limit",
+    "wifi.txpower.restore_limit",
     "lan.set",
     "lan.set_mtu",
     "dns.set",
@@ -221,6 +225,10 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "wifi.configure" => wifi_configure(params).await,
+        "wifi.txpower.apply" => wifi_power(params, "apply").await,
+        "wifi.txpower.set_percent" => wifi_power(params, "percent").await,
+        "wifi.txpower.set_limit" => wifi_power(params, "limit").await,
+        "wifi.txpower.restore_limit" => wifi_power(params, "restore").await,
         "lan.set" => {
             mapped_call(
                 params,
@@ -766,6 +774,173 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         let _ = state::ubus("zwrt_wlan", "kick_macs", json!({"macs":mac})).await;
     }
     Outcome::Ok(json!({"mac":mac,"blocked":block}))
+}
+
+fn flexible_i64(params: &Value, name: &str) -> Result<Option<i64>, String> {
+    match object(params).get(name) {
+        Some(Value::Number(v)) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("invalid {name}")),
+        Some(Value::String(v)) => v
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("invalid {name}")),
+        Some(_) => Err(format!("invalid {name}")),
+        None => Ok(None),
+    }
+}
+async fn restore_wifi_power(section: &str, old: [i64; 3]) -> bool {
+    for (option, value) in ["txpowerpercent", "txpower", "max_power"]
+        .into_iter()
+        .zip(old)
+    {
+        if state::uci_write(
+            "set",
+            &format!("wireless.{section}.{option}"),
+            Some(&value.to_string()),
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    state::uci_write("commit", "wireless", None).await.is_ok()
+        && state::ubus("zwrt_wlan", "reload", json!({})).await.is_ok()
+}
+async fn wifi_power(params: &Value, operation: &str) -> Outcome {
+    let model = state::uci_read("zwrt_common_info.common_config.model_name").await;
+    let hardware = state::uci_read("zwrt_common_info.common_config.hardware_version").await;
+    if model != "MU5252" && !hardware.starts_with("MU5252_") {
+        return Outcome::Invalid("wifi power control is only supported on MU5252".into());
+    }
+    let band = match string(params, "band", true) {
+        Ok(Some(v)) if matches!(v.as_str(), "2g" | "5g") => v,
+        Ok(_) => return Outcome::Invalid("band must be 2g or 5g".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let (section, factory) = if band == "2g" {
+        ("wifi0", 19)
+    } else {
+        ("wifi1", 18)
+    };
+    let read = |option: &str| format!("wireless.{section}.{option}");
+    let (Ok(old_percent), Ok(old_tx), Ok(old_limit)) = (
+        state::uci_read(&read("txpowerpercent"))
+            .await
+            .parse::<i64>(),
+        state::uci_read(&read("txpower")).await.parse::<i64>(),
+        state::uci_read(&read("max_power")).await.parse::<i64>(),
+    ) else {
+        return Outcome::Failed("failed to read existing wifi power configuration".into());
+    };
+    if !state::uci_read(&format!("wireless.{section}.datad_txpower_dbm"))
+        .await
+        .is_empty()
+    {
+        return Outcome::Invalid("dBm policy is active; select OEM power mode first".into());
+    }
+    let mut percent = old_percent;
+    let mut limit = old_limit;
+    let (percent_present, limit_present) = match operation {
+        "apply" => {
+            let p = match flexible_i64(params, "percent") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Invalid(e),
+            };
+            let l = match flexible_i64(params, "limit_dbm") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Invalid(e),
+            };
+            if p.is_none() && l.is_none() {
+                return Outcome::Invalid("percent or limit_dbm is required".into());
+            }
+            if let Some(v) = p {
+                percent = v;
+            }
+            if let Some(v) = l {
+                limit = v;
+            }
+            (p.is_some(), l.is_some())
+        }
+        "percent" => match flexible_i64(params, "percent") {
+            Ok(Some(v)) => {
+                percent = v;
+                (true, false)
+            }
+            Ok(None) => return Outcome::Invalid("missing power value".into()),
+            Err(e) => return Outcome::Invalid(e),
+        },
+        "limit" => match flexible_i64(params, "limit_dbm") {
+            Ok(Some(v)) => {
+                limit = v;
+                (false, true)
+            }
+            Ok(None) => return Outcome::Invalid("missing power value".into()),
+            Err(e) => return Outcome::Invalid(e),
+        },
+        "restore" => {
+            limit = factory;
+            (false, true)
+        }
+        _ => unreachable!(),
+    };
+    if percent_present && (!(10..=100).contains(&percent) || percent % 10 != 0) {
+        return Outcome::Invalid("percent must be 10 to 100 in steps of 10".into());
+    }
+    if limit_present && !(1..=30).contains(&limit) {
+        return Outcome::Invalid("limit_dbm must be between 1 and 30".into());
+    }
+    let percent_changed = percent_present && percent != old_percent;
+    let limit_changed = limit_present && (limit != old_tx || limit != old_limit);
+    if !percent_changed && !limit_changed {
+        return Outcome::Ok(
+            json!({"band":band,"changed":false,"percent":old_percent,"txpower_dbm":old_tx,"limit_dbm":old_limit,"factory_limit_dbm":factory}),
+        );
+    }
+    if percent_changed
+        && state::uci_write(
+            "set",
+            &format!("wireless.{section}.txpowerpercent"),
+            Some(&percent.to_string()),
+        )
+        .await
+        .is_err()
+    {
+        return revert_wireless("failed to stage wifi power configuration".into()).await;
+    }
+    if limit_changed {
+        for option in ["txpower", "max_power"] {
+            if state::uci_write(
+                "set",
+                &format!("wireless.{section}.{option}"),
+                Some(&limit.to_string()),
+            )
+            .await
+            .is_err()
+            {
+                return revert_wireless("failed to stage wifi power configuration".into()).await;
+            }
+        }
+    }
+    if let Err(e) = state::uci_write("commit", "wireless", None).await {
+        return revert_wireless(e).await;
+    }
+    if state::ubus("zwrt_wlan", "reload", json!({})).await.is_err() {
+        let restored = restore_wifi_power(section, [old_percent, old_tx, old_limit]).await;
+        return Outcome::Failed(format!(
+            "wifi reload failed; previous configuration {}",
+            if restored {
+                "restored"
+            } else {
+                "could not be restored"
+            }
+        ));
+    }
+    Outcome::Ok(
+        json!({"band":band,"changed":true,"percent":if percent_changed{percent}else{old_percent},"txpower_dbm":if limit_changed{limit}else{old_tx},"limit_dbm":if limit_changed{limit}else{old_limit},"factory_limit_dbm":factory}),
+    )
 }
 
 fn valid_section(value: &str) -> bool {
