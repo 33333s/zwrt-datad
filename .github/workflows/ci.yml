@@ -83,3 +83,18 @@ jobs:
       - name: Test cloud runtime
         working-directory: cloud
         run: go test -race ./... && go vet ./...
+
+  rust-rewrite:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release
