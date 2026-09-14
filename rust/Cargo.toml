@@ -6,6 +6,7 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"
+aes-gcm = "0.10"
 axum = { version = "0.8", features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
@@ -14,6 +15,8 @@ futures-util = "0.3"
 fs2 = "0.4"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rsa = "0.9"
+rand = "0.8"
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -25,6 +28,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["limit", "trace"] }
 webpki-roots = "1"
+zeroize = "1"
 
 [dev-dependencies]
 rcgen = "0.13"

@@ -10,6 +10,7 @@ mod neighbor_manager;
 mod ota;
 mod qos;
 mod server;
+mod sms;
 mod state;
 mod wifi;
 

@@ -5,8 +5,10 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PORT=${RUST_CONTROL_PORT:-19460}
 TMP=$(mktemp -d)
 PID=
+SMS_PID=
 cleanup() {
     [ -z "$PID" ] || kill "$PID" 2>/dev/null || true
+    [ -z "$SMS_PID" ] || kill "$SMS_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -28,6 +30,7 @@ export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
 export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
+export MOCK_SIM_SLOT_FILE="$TMP/sim-slot"
 export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
 export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
 export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
@@ -39,7 +42,15 @@ export ZWRT_DATAD_COOLING_ZONE_PATH="$TMP/zone"
 mkdir -p "$TMP/data"
 mkdir -p "$ZWRT_DATAD_VENDOR_WIFI_DIR" "$ZWRT_DATAD_NET_CLASS_DIR"
 printf 'fixture-boot-id\n' >"$TMP/boot-id"
+printf '1\n' >"$MOCK_SIM_SLOT_FILE"
 export ZWRT_DATAD_BOOT_ID_PATH="$TMP/boot-id"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/web-private.pem" 2>/dev/null
+openssl pkey -in "$TMP/web-private.pem" -pubout -out "$TMP/web-public.pem" 2>/dev/null
+export MOCK_WEB_PUBLIC_KEY_FILE="$TMP/web-public.pem"
+SMS_PORT=$((PORT + 1))
+"$ROOT/tests/mock_sms_server.py" "$SMS_PORT" "$TMP/sms-http.log" &
+SMS_PID=$!
+export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:$SMS_PORT/goform/goform_set_cmd_process"
 for base in wlan0 wlan1; do
     cat >"$ZWRT_DATAD_VENDOR_WIFI_DIR/hostapd-$base.conf" <<'EOF'
 driver=nl80211
@@ -84,6 +95,11 @@ post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
 post '{"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}' >/dev/null
 post '{"action":"apn.add","params":{"name":"fixture","apn":"internet","auth_mode":0}}' >/dev/null
 post '{"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}' >/dev/null
+post '{"action":"sms.send_raw","params":{"sender":"v3e1","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
+grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$TMP/sms-http.log" >/dev/null
+post '{"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
+post '{"action":"sms.send_raw","params":{"sender":"sim2","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
+[ "$(cat "$MOCK_SIM_SLOT_FILE")" = 2 ]
 post '{"action":"client.rename","params":{"mac":"00:11:22:33:44:55","hostname":"fixture"}}' >/dev/null
 post '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Fixture New","enabled":true}}' >/dev/null
 post '{"action":"client.block","params":{"mac":"00:11:22:33:44:55"}}' >/dev/null
@@ -160,7 +176,7 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" not in d["control"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]'
 
 python3 - "$MOCK_CALL_LOG" <<'PY'
 import json, sys
@@ -174,6 +190,15 @@ expected = {
     ("zwrt_router.api", "router_modify_lan_hostname", '{"hostname":"fixture","mac":"00:11:22:33:44:55"}'),
 }
 assert expected <= calls, expected - calls
+registration = next(json.loads(row[2])["web_enstr"] for row in rows if len(row) == 3 and row[0] == "zwrt_web" and row[1] == "web_http_enstr_set")
+import base64
+assert len(base64.b64decode(registration)) == 256
+sends = [json.loads(row[2]) for row in rows if len(row) == 3 and row[0] == "zwrt_wms" and row[1] == "zte_libwms_send_sms"]
+assert len(sends) == 2
+for send in sends:
+    assert len(base64.b64decode(send["number"])) > 28
+    assert len(base64.b64decode(send["message_body"])) > 28
+    assert "10086" not in send["number"] and "6D4B8BD5" not in send["message_body"]
 PY
 ! grep -F '1;reboot' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.main_2g.ssid=Fixture New' "$MOCK_CALL_LOG" >/dev/null

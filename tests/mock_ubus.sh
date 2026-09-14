@@ -70,6 +70,9 @@ case "$service:$method" in
         printf '%s\n' '{"imei":"860000000000001"}'
         ;;
     zwrt_zte_mdm.api:get_sim_info)
+        if [ -n "${MOCK_SIM_SLOT_FILE:-}" ] && [ -f "$MOCK_SIM_SLOT_FILE" ]; then
+            MOCK_SIM_SLOT=$(cat "$MOCK_SIM_SLOT_FILE")
+        fi
         if [ "${MOCK_ENCRYPTED_SIM:-0}" = '1' ]; then
             printf '{"sim_iccid":"8986000000000000000","sim_imsi":"mfmROY/c1MUtLKr/TBqrpmuNTnYHpNc70Cgl0CWlaUVXuVyARQNas+V9SA==","msisdn":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGw==","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
                 "${MOCK_SIM_SLOT:-1}"
@@ -77,6 +80,12 @@ case "$service:$method" in
             printf '{"sim_iccid":"8986000000000000000","sim_imsi":"460000000000001","msisdn":"%s","sim_states":"ready","current_sim_slot":%s,"support_dual_sim":1}\n' \
                 "${MOCK_SIM_MSISDN:-10086}" "${MOCK_SIM_SLOT:-1}"
         fi
+        ;;
+    zwrt_zte_mdm.api:zwrt_mdm_change_provision_session)
+        if [ -n "${MOCK_SIM_SLOT_FILE:-}" ]; then
+            python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d.get("active_flag")==1 and open(sys.argv[2],"w").write(str(d["active_slot"]))' "$args" "$MOCK_SIM_SLOT_FILE"
+        fi
+        printf '%s\n' '{"result":"success"}'
         ;;
     zwrt_zte_mdm.api:get_v3t_sim_info)
         s1="${MOCK_V3T1_SLOT:-${MOCK_V3T_SLOT:-0}}"
@@ -113,6 +122,18 @@ case "$service:$method" in
         ;;
     zwrt_web:web_login_info)
         printf '%s\n' '{"zte_web_sault":"fixture-salt","login_fail_num":0}'
+        ;;
+    zwrt_web:web_crt_get)
+        python3 -c 'import json,sys; print(json.dumps({"result":open(sys.argv[1]).read()}))' "$MOCK_WEB_PUBLIC_KEY_FILE"
+        ;;
+    zwrt_web:web_http_enstr_set)
+        printf '%s\n' '{"result":0}'
+        ;;
+    zwrt_wms:zte_libwms_send_sms)
+        printf '%s\n' '{"result":"success"}'
+        ;;
+    zwrt_wms:zwrt_wms_get_cmd_status)
+        printf '%s\n' '{"sms_cmd_status_result":3}'
         ;;
     zwrt_router.api:router_get_wifi_isolate)
         printf '%s\n' '{"wifimain24_wifimain5_enable":1,"other_option":7}'
