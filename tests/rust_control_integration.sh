@@ -23,7 +23,23 @@ export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
 export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
+export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
+export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
+export ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$TMP/fan-thermal"
+export ZWRT_DATAD_FAN_COOLING_STATE_PATH="$TMP/fan-state"
+export ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$TMP/liquid-thermal"
+export ZWRT_DATAD_LIQUID_DRIVE_PATH="$TMP/liquid-drive"
+export ZWRT_DATAD_COOLING_ZONE_PATH="$TMP/zone"
 mkdir -p "$TMP/data"
+mkdir -p "$ZWRT_DATAD_COOLING_ZONE_PATH"
+for file in "$ZWRT_DATAD_FAN_PWM_PATH" "$ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH" \
+    "$ZWRT_DATAD_FAN_COOLING_STATE_PATH" "$ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH" \
+    "$ZWRT_DATAD_LIQUID_DRIVE_PATH" "$ZWRT_DATAD_COOLING_ZONE_PATH/mode" \
+    "$ZWRT_DATAD_COOLING_ZONE_PATH/temp" \
+    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_0_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_0_hyst" \
+    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_1_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_1_hyst" \
+    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_hyst"; do : >"$file"; done
+printf '47000\n' >"$ZWRT_DATAD_COOLING_ZONE_PATH/temp"
 printf 'fixture\n' >"$ZWRT_DATAD_QOS_LOG"
 printf 'rotated\n' >"$ZWRT_DATAD_QOS_LOG_ROTATED"
 
@@ -72,6 +88,23 @@ post '{"action":"wireless.config","params":{"band":"5g","country":"HK","channel"
 post '{"action":"wifi.interface.create","params":{"band":"5g","ssid":"Fixture Extra","key":"fixture-extra-key"}}' >/dev/null
 post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","ssid":"Fixture Extra 2","enabled":false}}' >/dev/null
 post '{"action":"wifi.interface.delete","params":{"section":"datad_ssid_1"}}' >/dev/null
+post '{"action":"cooling.fan.set_curve","params":{"points":[{"temperature":40,"pwm":0},{"temperature":45,"pwm":0},{"temperature":50,"pwm":76},{"temperature":60,"pwm":128},{"temperature":70,"pwm":255}]}}' >/dev/null
+[ "$(cat "$ZWRT_DATAD_FAN_PWM_PATH")" = 30 ]
+post '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' >/dev/null
+[ "$(cat "$ZWRT_DATAD_FAN_PWM_PATH")" = 128 ]
+post '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' >/dev/null
+[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/mode")" = enabled ]
+[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp")" = 53000 ]
+post '{"action":"cooling.liquid.set_mode","params":{"mode":"high"}}' >/dev/null
+[ "$(cat "$ZWRT_DATAD_LIQUID_DRIVE_PATH")" = '1023 200 200' ]
+post '{"action":"cooling.liquid.set_enabled","params":{"enabled":false}}' >/dev/null
+[ "$(cat "$ZWRT_DATAD_LIQUID_DRIVE_PATH")" = '0 0 0' ]
+rm -f "$ZWRT_DATAD_FAN_PWM_PATH"
+cooling_status=$(curl -sS -o "$TMP/cooling-bad.json" -w '%{http_code}' -H 'content-type: application/json' \
+    --data-binary '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' \
+    "http://127.0.0.1:$PORT/control")
+[ "$cooling_status" = 502 ]
+[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/mode")" = enabled ]
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -122,5 +155,8 @@ grep -F 'datad_wifi.datad_ssid_1=wifi-iface' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'datad_wifi.datad_ssid_1.ssid=Fixture Extra 2' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'delete datad_wifi.datad_ssid_1' "$MOCK_CALL_LOG" >/dev/null
 [ "$(stat -f '%Lp' "$ZWRT_DATAD_WIFI_CONFIG")" = 600 ]
+grep -F 'fan_mode=1' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
+grep -F 'custom_pwm_5=255' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
+grep -F 'liquid_always_on=0' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 
 echo 'rust control HTTP fixture: PASS'

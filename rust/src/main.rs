@@ -2,6 +2,7 @@ mod auth;
 mod cloud;
 mod command;
 mod control;
+mod cooling;
 mod model;
 mod neighbor;
 mod neighbor_manager;

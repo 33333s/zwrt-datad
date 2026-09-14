@@ -63,6 +63,11 @@ pub const ACTIONS: &[&str] = &[
     "multiwan.rule.set",
     "aggregation.set",
     "qos.clear",
+    "cooling.fan.set_enabled",
+    "cooling.fan.set_mode",
+    "cooling.fan.set_curve",
+    "cooling.liquid.set_enabled",
+    "cooling.liquid.set_mode",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -411,6 +416,15 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "multiwan.rule.set" => multiwan_rule(params).await,
         "aggregation.set" => aggregation(params).await,
         "qos.clear" => qos_clear().await,
+        "cooling.fan.set_enabled"
+        | "cooling.fan.set_mode"
+        | "cooling.fan.set_curve"
+        | "cooling.liquid.set_enabled"
+        | "cooling.liquid.set_mode" => match crate::cooling::execute(action, params).await {
+            Ok(value) => Outcome::Ok(value),
+            Err((true, error)) => Outcome::Invalid(error),
+            Err((false, error)) => Outcome::Failed(error),
+        },
         _ => Outcome::NotHandled,
     }
 }
