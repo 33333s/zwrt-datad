@@ -1,3 +1,4 @@
+mod auth;
 mod cloud;
 mod command;
 mod model;
@@ -77,9 +78,12 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     if let Some(lan_bind) = args.lan_bind {
         let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
-        tokio::try_join!(app.clone().serve(addr, false), app.serve(lan_addr, true))?;
+        tokio::try_join!(
+            app.clone().serve(addr, false, false),
+            app.serve(lan_addr, true, true)
+        )?;
         Ok(())
     } else {
-        app.serve(addr, local_requires_auth).await
+        app.serve(addr, local_requires_auth, false).await
     }
 }

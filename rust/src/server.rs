@@ -1,4 +1,5 @@
 use crate::{
+    auth::{self, Sessions},
     cloud::{Cloud, Update as CloudUpdate},
     model::{DatadVersion, Snapshot, UbusCall},
     neighbor_manager::Manager as NeighborManager,
@@ -7,10 +8,10 @@ use crate::{
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::Request,
     extract::rejection::JsonRejection,
+    extract::{ConnectInfo, Request},
     extract::{Query, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
@@ -36,6 +37,7 @@ struct Inner {
     interval: Duration,
     _data_dir: PathBuf,
     token: Option<String>,
+    sessions: Mutex<Sessions>,
     cloud: RwLock<Cloud>,
     neighbor: Mutex<NeighborManager>,
 }
@@ -63,6 +65,7 @@ impl App {
                 neighbor: Mutex::new(neighbor),
                 _data_dir: data_dir,
                 token,
+                sessions: Mutex::new(Sessions::default()),
             }),
         };
         app.spawn_sampler();
@@ -77,26 +80,34 @@ impl App {
             let mut timer = tokio::time::interval(app.inner.interval);
             loop {
                 timer.tick().await;
-                let mut next = state::collect(app.inner.interval.as_millis() as u64).await;
-                let mut neighbor = app.inner.neighbor.lock().await;
-                neighbor
-                    .tick(next.fields.get("net").unwrap_or(&Value::Null))
-                    .await;
-                next.fields.insert("neighbor".into(), neighbor.status());
-                drop(neighbor);
-                let mut old = app.inner.snapshot.write().await;
-                let mut comparable = next.clone();
-                comparable.ts = old.ts;
-                if comparable != *old {
-                    *old = next.clone();
-                    let _ = app.inner.tx.send(next);
-                } else {
-                    old.ts = next.ts;
-                }
+                app.refresh_snapshot().await;
             }
         });
     }
-    pub async fn serve(self, addr: SocketAddr, require_auth: bool) -> Result<()> {
+    async fn refresh_snapshot(&self) {
+        let mut next = state::collect(self.inner.interval.as_millis() as u64).await;
+        let mut neighbor = self.inner.neighbor.lock().await;
+        neighbor
+            .tick(next.fields.get("net").unwrap_or(&Value::Null))
+            .await;
+        next.fields.insert("neighbor".into(), neighbor.status());
+        drop(neighbor);
+        let mut old = self.inner.snapshot.write().await;
+        let mut comparable = next.clone();
+        comparable.ts = old.ts;
+        if comparable != *old {
+            *old = next.clone();
+            let _ = self.inner.tx.send(next);
+        } else {
+            old.ts = next.ts;
+        }
+    }
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        require_auth: bool,
+        open_auth_routes: bool,
+    ) -> Result<()> {
         let mut router = Router::new()
             .route("/", get(index))
             .route("/healthz", get(health))
@@ -116,6 +127,11 @@ impl App {
                 )
                 .route("/cloud/status", get(cloud_status));
         }
+        if open_auth_routes {
+            router = router
+                .route("/auth/login", post(auth_login))
+                .route("/auth/exchange", post(auth_exchange));
+        }
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
@@ -123,9 +139,12 @@ impl App {
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
-        let result = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown())
-            .await;
+        let result = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown())
+        .await;
         self.inner.neighbor.lock().await.shutdown().await;
         result?;
         Ok(())
@@ -150,15 +169,144 @@ async fn authenticate(State(app): State<App>, request: Request, next: Next) -> R
         q.split('&')
             .find_map(|part| part.strip_prefix("access_token="))
     });
-    if [bearer, legacy, query]
-        .into_iter()
-        .flatten()
-        .any(|value| constant_time_eq(value.as_bytes(), wanted.as_bytes()))
-    {
+    let presented = [bearer, legacy, query].into_iter().flatten().next();
+    let static_valid =
+        presented.is_some_and(|value| constant_time_eq(value.as_bytes(), wanted.as_bytes()));
+    let session_valid = if static_valid {
+        false
+    } else if let Some(value) = presented {
+        app.inner.sessions.lock().await.validate(value)
+    } else {
+        false
+    };
+    if static_valid || session_valid {
         next.run(request).await
     } else {
         (StatusCode::UNAUTHORIZED, Json(json!({"ok":false,"error":{"code":"unauthorized","message":"authentication required"}}))).into_response()
     }
+}
+
+async fn auth_login(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some((username, password)) = basic_credentials(&headers) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":"missing_credentials"})),
+        )
+            .into_response();
+    };
+    if !auth::verify_password(&username, &password).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok":false,"error":"invalid_credentials"})),
+        )
+            .into_response();
+    }
+    match app.inner.sessions.lock().await.issue() {
+        Ok((token, expires_at)) => {
+            (StatusCode::OK, Json(auth::token_reply(token, expires_at))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok":false,"error":"token_issue_failed"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_exchange(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let token = headers
+        .get("x-web-token")
+        .or_else(|| headers.get("x-zte-webtoken"))
+        .and_then(|value| value.to_str().ok());
+    let Some(token) = token.filter(|value| !value.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":"missing_webtoken"})),
+        )
+            .into_response();
+    };
+    let mode = headers
+        .get("x-z-mode")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_default();
+    let tag = headers
+        .get("x-z-tag")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("zwrt-datad");
+    if !auth::verify_webtoken(token, mode, &peer.ip().to_string(), tag).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok":false,"error":"invalid_webtoken"})),
+        )
+            .into_response();
+    }
+    match app.inner.sessions.lock().await.issue() {
+        Ok((token, expires_at)) => {
+            (StatusCode::OK, Json(auth::token_reply(token, expires_at))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok":false,"error":"token_issue_failed"})),
+        )
+            .into_response(),
+    }
+}
+
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let encoded = headers
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    if encoded.len() > 1024 {
+        return None;
+    }
+    let decoded = decode_base64(encoded)?;
+    if decoded.len() > 512 || decoded.contains(&0) {
+        return None;
+    }
+    let separator = decoded.iter().position(|b| *b == b':')?;
+    if separator == 0 {
+        return None;
+    }
+    let username = String::from_utf8(decoded[..separator].to_vec()).ok()?;
+    let password = String::from_utf8(decoded[separator + 1..].to_vec()).ok()?;
+    if username.len() >= 257 || password.len() >= 257 {
+        return None;
+    }
+    Some((username, password))
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let mut acc = 0u32;
+    let mut bits = 0u8;
+    let mut out = Vec::new();
+    for byte in value.bytes().filter(|b| !b.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(digit);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+            acc &= if bits == 0 { 0 } else { (1 << bits) - 1 };
+        }
+    }
+    Some(out)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -194,7 +342,8 @@ async fn capabilities() -> Json<Value> {
             "apn.list",
             "client.access",
             "neighbor.status",
-            "neighbor.set"
+            "neighbor.set",
+            "state.refresh"
         ],
         "rewrite":"rust"
     }))
@@ -392,6 +541,11 @@ async fn control(
                 control_failed(action, error)
             }
         };
+    }
+    if action == "state.refresh" {
+        let refresh = app.clone();
+        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        return control_ok(action, json!({"queued":true}));
     }
     (StatusCode::NOT_IMPLEMENTED, Json(json!({"ok":false,"action":body.get("action"),"error":{"code":"rust_port_in_progress","message":"control adapter has not been migrated"}}))).into_response()
 }
