@@ -57,6 +57,27 @@ func TestNetdiskUsesRawSharedDirectory(t *testing.T) {
 	}
 }
 
+func TestOTAAtomicWriteDoesNotFollowPredictableTempSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ota.json")
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := otaAtomicWrite(path, []byte("safe"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != "keep" {
+		t.Fatalf("predictable temp symlink was followed: %q", got)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "safe" {
+		t.Fatalf("atomic destination = %q", got)
+	}
+}
+
 func TestOTAContinuesPastSignedStaleSource(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	stale := signedOTAServer(t, priv, "0.9.40")

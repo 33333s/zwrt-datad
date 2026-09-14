@@ -210,9 +210,24 @@ func (o *otaManager) saveStatusLocked() {
 	_ = otaAtomicWrite(filepath.Join(o.dir, "ota-state.json"), append(b, '\n'), 0600)
 }
 func otaAtomicWrite(path string, b []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, mode); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".ota-*")
+	if err != nil {
 		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(mode); err == nil {
+		_, err = f.Write(b)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	return os.Rename(tmp, path)
 }

@@ -23,6 +23,8 @@ nohup /data/zwrt-datad/zwrt-datad -i 1000 \
 
 `--auth-token-file` 现在是有效运行参数。文件首行去除首尾空白后作为 Bearer Token；指定了该参数但文件不存在或为空时，进程拒绝启动。`/healthz` 保持公开，其余数据和控制接口要求：
 
+主监听若配置为非回环地址但未启用鉴权，datad 会拒绝启动，避免误把控制接口暴露到网络。对外提供内网访问时使用 `--lan-bind`，该监听始终要求鉴权。
+
 ```http
 Authorization: Bearer <token>
 ```
