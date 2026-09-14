@@ -8,6 +8,7 @@ mod ota;
 mod qos;
 mod server;
 mod state;
+mod wifi;
 
 use anyhow::Result;
 use clap::Parser;

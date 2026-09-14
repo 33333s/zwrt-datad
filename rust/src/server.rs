@@ -392,6 +392,7 @@ async fn capabilities() -> Json<Value> {
             "wifi.status",
             "wifi.dual_band_status",
             "wifi.txpower.status",
+            "wifi.advanced.status",
             "sleep.status",
             "usb.status",
             "power.direct_supply.status",
@@ -544,6 +545,12 @@ async fn control(
             result.insert(band.into(), json!({"enabled":values[0]==0,"percent":values[1],"txpower_dbm":values[2],"limit_dbm":values[3],"factory_limit_dbm":factory_limit}));
         }
         return control_ok(action, Value::Object(result));
+    }
+    if action == "wifi.advanced.status" {
+        return match crate::wifi::advanced_status().await {
+            Ok(value) => control_ok(action, value),
+            Err(error) => control_failed(action, error),
+        };
     }
     if action == "sleep.status" {
         return control_ok(
