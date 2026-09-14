@@ -196,6 +196,7 @@ impl Ota {
         self.status.progress = 0;
         self.save_status();
         let mut errors = Vec::new();
+        let mut valid_but_current = None;
         for base in self.servers() {
             let raw = match self.fetch(&source_url(&base, "update.json"), 1 << 20).await {
                 Ok(value) => value,
@@ -229,16 +230,25 @@ impl Ota {
                 manifest,
                 base_url: base,
             };
+            if !has_update(&candidate) {
+                valid_but_current.get_or_insert(candidate);
+                continue;
+            }
             self.status.latest_version = candidate.manifest.version.clone();
             self.status.source = candidate.base_url.clone();
             self.status.signature_verified = true;
             self.status.wait_reasons.clear();
-            self.status.state = if newer(&candidate.manifest.version, env!("DATAD_VERSION")) {
-                "available"
-            } else {
-                "idle"
-            }
-            .into();
+            self.status.state = "available".into();
+            self.candidate = Some(candidate.clone());
+            self.save_status();
+            return Ok(candidate);
+        }
+        if let Some(candidate) = valid_but_current {
+            self.status.latest_version = candidate.manifest.version.clone();
+            self.status.source = candidate.base_url.clone();
+            self.status.signature_verified = true;
+            self.status.wait_reasons.clear();
+            self.status.state = "idle".into();
             self.candidate = Some(candidate.clone());
             self.save_status();
             return Ok(candidate);
@@ -704,9 +714,28 @@ mod tests {
         };
         let raw = serde_json::to_vec(&manifest).unwrap();
         let signature = STANDARD.encode(signing.sign(&raw).to_bytes());
+        let mut stale_manifest = manifest.clone();
+        stale_manifest.version = "0.0.0".into();
+        stale_manifest.tag = "v0.0.0".into();
+        let stale_raw = serde_json::to_vec(&stale_manifest).unwrap();
+        let stale_signature = STANDARD.encode(signing.sign(&stale_raw).to_bytes());
         let good_raw = raw.clone();
         let good_signature = signature.clone();
         let router = Router::new()
+            .route(
+                "/stale/update.json",
+                get(move || {
+                    let value = stale_raw.clone();
+                    async move { value }
+                }),
+            )
+            .route(
+                "/stale/update.json.sig",
+                get(move || {
+                    let value = stale_signature.clone();
+                    async move { value }
+                }),
+            )
             .route("/bad/update.json", get(|| async { "tampered" }))
             .route(
                 "/bad/update.json.sig",
@@ -738,6 +767,7 @@ mod tests {
         let mut ota = Ota::load(&dir).unwrap();
         ota.key = signing.verifying_key();
         ota.config.servers = vec![
+            format!("http://{address}/stale"),
             format!("http://{address}/bad"),
             format!("http://{address}/good"),
         ];
