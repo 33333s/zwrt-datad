@@ -391,29 +391,35 @@ async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
     Json(app.snapshot().await)
 }
 async fn capabilities() -> Json<Value> {
+    let mut controls = vec![
+        "device.login_info",
+        "device.login",
+        "device.logout",
+        "device.session_status",
+        "device.change_password",
+        "wifi.status",
+        "wifi.dual_band_status",
+        "wifi.txpower.status",
+        "wifi.advanced.status",
+        "wireless.config",
+        "sleep.status",
+        "usb.status",
+        "power.direct_supply.status",
+        "apn.list",
+        "client.access",
+        "neighbor.status",
+        "neighbor.set",
+        "state.refresh",
+        "state.set_interval",
+        "qos.reload",
+    ];
+    controls.extend_from_slice(crate::control::ACTIONS);
     Json(json!({
+        "schema_version":1,
         "protocol":1,
         "events":["state"],
-        "controls":[
-            "device.login_info",
-            "device.login",
-            "device.logout",
-            "device.session_status",
-            "wifi.status",
-            "wifi.dual_band_status",
-            "wifi.txpower.status",
-            "wifi.advanced.status",
-            "sleep.status",
-            "usb.status",
-            "power.direct_supply.status",
-            "apn.list",
-            "client.access",
-            "neighbor.status",
-            "neighbor.set",
-            "state.refresh",
-            "state.set_interval",
-            "qos.reload"
-        ],
+        "control":controls,
+        "controls":controls,
         "rewrite":"rust"
     }))
 }
@@ -553,6 +559,32 @@ async fn control(
             action,
             json!({"logged_in":app.inner.device_session.lock().await.is_some()}),
         );
+    }
+    if action == "device.change_password" {
+        let valid_hash = |name: &str| {
+            body.get("params")
+                .and_then(|v| v.get(name))
+                .and_then(Value::as_str)
+                .filter(|v| v.len() == 64 && v.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .map(|v| v.to_ascii_uppercase())
+        };
+        let (Some(old_hash), Some(new_hash)) = (valid_hash("old_hash"), valid_hash("new_hash"))
+        else {
+            return invalid_parameter(action, "old_hash and new_hash must be SHA-256 hex values");
+        };
+        return match state::ubus(
+            "zwrt_web",
+            "web_change_password",
+            json!({"password_old":old_hash,"password_new":new_hash}),
+        )
+        .await
+        {
+            Ok(value) => {
+                *app.inner.device_session.lock().await = None;
+                control_ok(action, value)
+            }
+            Err(error) => control_failed(action, error),
+        };
     }
     if action == "wifi.dual_band_status" {
         return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
@@ -708,6 +740,16 @@ async fn control(
                 control_failed(action, error)
             }
         };
+    }
+    match crate::control::execute(action, body.get("params").unwrap_or(&json!({}))).await {
+        crate::control::Outcome::Ok(value) => {
+            let refresh = app.clone();
+            tokio::spawn(async move { refresh.refresh_snapshot().await });
+            return control_ok(action, value);
+        }
+        crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
+        crate::control::Outcome::Failed(error) => return control_failed(action, error),
+        crate::control::Outcome::NotHandled => {}
     }
     if action == "state.refresh" {
         let refresh = app.clone();
