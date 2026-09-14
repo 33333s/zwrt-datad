@@ -110,6 +110,15 @@ assert data["net"]["nr_sa_supported_bands"] == "78"
 assert data["net"]["nr_nsa_supported_bands"] == ""
 assert data["battery"]["percent"] == 0
 assert data["nfc"]["switch"] == 0
+assert data["clients"] == {
+    "total": 2,
+    "wifi": 1,
+    "lan": 1,
+    "list": [
+        {"name": "wifi-live", "ip": "192.168.0.2", "mac": "00:11:22:33:44:55"},
+        {"name": "lan-live", "ip": "192.168.0.3", "mac": "00:11:22:33:44:66"},
+    ],
+}
 assert data["thermal"]["cpu_celsius"] == 42
 assert data["thermal"]["zones"] == [
     {"name": "battery", "celsius": 30.0},

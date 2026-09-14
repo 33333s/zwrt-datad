@@ -2893,43 +2893,6 @@ static int append_client_entries_from_array(const char *arr_json, struct buf *ou
     return appended;
 }
 
-static int build_client_list_from_dhcp(char *out, size_t outlen)
-{
-    FILE *fp = fopen("/tmp/dhcp.leases", "r");
-    char line[512];
-    struct buf b = { out, outlen, 0 };
-    int items = 0;
-
-    bappend(&b, "[");
-    if (fp) {
-        while (fgets(line, sizeof line, fp)) {
-            long exp = 0;
-            char mac[32] = "", ip[32] = "", host[96] = "", cid[160] = "";
-            const char *name;
-            if (sscanf(line, "%ld %31s %31s %95s %159s", &exp, mac, ip, host, cid) < 4)
-                continue;
-            (void)exp; (void)cid;
-            name = (host[0] && strcmp(host, "*")) ? host : mac;
-            if (items) bappend(&b, ",");
-            items++;
-            bappend(&b, "{\"name\":\"");
-            bappend_json_esc(&b, name);
-            bappend(&b, "\",\"ip\":\"");
-            bappend_json_esc(&b, ip);
-            bappend(&b, "\",\"mac\":\"");
-            bappend_json_esc(&b, mac);
-            bappend(&b, "\"}");
-        }
-        fclose(fp);
-    }
-    bappend(&b, "]");
-    if (b.len >= b.cap) {
-        if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
-        return 0;
-    }
-    return items;
-}
-
 static int build_client_list_from_router(char *out, size_t outlen)
 {
     char lan[RAW_MAX], wifi[RAW_MAX], arr[RAW_MAX];
@@ -2937,14 +2900,14 @@ static int build_client_list_from_router(char *out, size_t outlen)
     int items = 0;
 
     bappend(&b, "[");
-    if (run_ubus("zwrt_router.api", "router_lan_access_list",
-                 "{\"start_id\":1,\"end_id\":64}", lan, sizeof lan) == 0 &&
-        json_get(lan, "lan_access_list_info", arr, sizeof arr)) {
-        append_client_entries_from_array(arr, &b, &items);
-    }
     if (run_ubus("zwrt_router.api", "router_wireless_access_list",
                  "{\"start_id\":1,\"end_id\":64}", wifi, sizeof wifi) == 0 &&
         json_get(wifi, "wireless_access_list_info", arr, sizeof arr)) {
+        append_client_entries_from_array(arr, &b, &items);
+    }
+    if (run_ubus("zwrt_router.api", "router_lan_access_list",
+                 "{\"start_id\":1,\"end_id\":64}", lan, sizeof lan) == 0 &&
+        json_get(lan, "lan_access_list_info", arr, sizeof arr)) {
         append_client_entries_from_array(arr, &b, &items);
     }
     bappend(&b, "]");
@@ -2957,15 +2920,12 @@ static int build_client_list_from_router(char *out, size_t outlen)
 
 static void build_client_list_json_u60(char *out, size_t outlen)
 {
-    if (build_client_list_from_dhcp(out, outlen) > 0) return;
-    if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+    build_client_list_from_router(out, outlen);
 }
 
 static void build_client_list_json_compat(char *out, size_t outlen)
 {
-    if (build_client_list_from_dhcp(out, outlen) > 0) return;
-    if (build_client_list_from_router(out, outlen) > 0) return;
-    if (outlen >= 3) memcpy(out, "[]", 2), out[2] = 0;
+    build_client_list_from_router(out, outlen);
 }
 
 static void build_client_list_json_for_template(const struct device_template_spec *tpl,
