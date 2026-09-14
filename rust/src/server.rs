@@ -17,7 +17,6 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
-use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -32,7 +31,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, RwLock, watch},
+    sync::{Mutex, RwLock, Semaphore, watch},
 };
 use tokio_stream::{StreamExt, wrappers::WatchStream};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -49,6 +48,7 @@ struct Inner {
     token: Option<String>,
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
+    sse_slots: Arc<Semaphore>,
     cloud: RwLock<Cloud>,
     ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
@@ -85,6 +85,7 @@ impl App {
                 token,
                 sessions: Mutex::new(Sessions::default()),
                 device_session: Mutex::new(None),
+                sse_slots: Arc::new(Semaphore::new(16)),
             }),
         };
         app.inner.cloud.read().await.start(app.inner.tx.subscribe());
@@ -417,10 +418,21 @@ async fn capabilities() -> Json<Value> {
     }))
 }
 
-async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = WatchStream::new(app.inner.tx.subscribe())
-        .map(|v| Ok(Event::default().event("state").json_data(v).unwrap()));
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new())
+async fn events(State(app): State<App>) -> Response {
+    let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok":false,"error":{"code":"sse_client_limit","message":"too many SSE clients"}})),
+        )
+            .into_response();
+    };
+    let stream = WatchStream::new(app.inner.tx.subscribe()).map(move |v| {
+        let _keep_permit_alive = &permit;
+        Ok::<_, Infallible>(Event::default().event("state").json_data(v).unwrap())
+    });
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new())
+        .into_response()
 }
 #[derive(Deserialize)]
 struct ListQuery {
