@@ -25,12 +25,12 @@
 
 ## 当前已适配设备
 
-| 设备型号 | 产品名称 | 模板状态 |
-| --- | --- | --- |
-| `MU5250` | U60 Pro | 正式模板 |
-| `MC8532B` | G5 Pro | 正式模板 |
-| `MU5252` | TopFlow | 正式模板 |
-| `MC7523` | G5 Max WiFi | 正式模板 |
+| 设备型号 | 产品名称 |
+| --- | --- |
+| `MU5250` | U60 Pro |
+| `MC8532B` | G5 Pro |
+| `MU5252` | TopFlow |
+| `MC7523` | G5 Max WiFi |
 
 运行时只有 `device.api_template_supported = 1` 才代表识别到正式模板。不同设备只输出实际支持的状态块；调用方应通过字段是否存在判断能力，不要为缺失功能补 `0`、`-1` 或空对象。
 
@@ -87,16 +87,6 @@ curl -N http://127.0.0.1:9460/events
 9460 是设备本机接口。9461 是内网接口，读取数据前需要通过 `/auth/login` 或 `/auth/exchange` 获取 Bearer Token；详细鉴权方式见 [`docs/API.md`](docs/API.md)。
 
 > **安全提示：** `POST /ubus/call` 可以访问运行时注册的 ubus 方法，其中可能包含修改网络、断开连接或重启设备的写操作。只应向受信任的管理程序开放，并由调用方限制入口和进行必要确认。
-
-## 构建
-
-需要 POSIX shell 和 aarch64 musl 工具链：
-
-```sh
-bash scripts/build.sh
-```
-
-构建产物位于仓库根目录和 `build/`。GitHub Actions 会运行完整检查；测试入口位于 `tests/`。
 
 ## 文档
 

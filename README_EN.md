@@ -25,12 +25,12 @@ Device templates isolate firmware differences so consumers do not need to poll v
 
 ## Supported devices
 
-| Model | Product | Support level |
-| --- | --- | --- |
-| `MU5250` | U60 Pro | Supported template |
-| `MC8532B` | G5 Pro | Supported template |
-| `MU5252` | TopFlow | Supported template |
-| `MC7523` | G5 Max WiFi | Supported template |
+| Model | Product |
+| --- | --- |
+| `MU5250` | U60 Pro |
+| `MC8532B` | G5 Pro |
+| `MU5252` | TopFlow |
+| `MC7523` | G5 Max WiFi |
 
 At runtime, `device.api_template_supported = 1` means that a supported template was selected. Each model only exposes state blocks that the device actually supports. Consumers should test for field presence instead of inventing `0`, `-1`, or empty placeholder objects.
 
@@ -87,16 +87,6 @@ curl -N http://127.0.0.1:9460/events
 Port 9460 is the loopback API. The LAN API on port 9461 requires a Bearer Token obtained through `/auth/login` or `/auth/exchange`; see [`docs/API.md`](docs/API.md) for authentication details.
 
 > **Security:** `POST /ubus/call` can invoke runtime-registered ubus methods, including writes that may reconfigure networking, disconnect the device, or reboot it. Expose it only to trusted management clients and enforce confirmation and policy in the caller.
-
-## Build
-
-A POSIX shell and an aarch64 musl toolchain are required:
-
-```sh
-bash scripts/build.sh
-```
-
-Build outputs are written to the repository root and `build/`. GitHub Actions runs the full checks; test entry points are available under `tests/`.
 
 ## Documentation
 
