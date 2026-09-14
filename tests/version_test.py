@@ -88,6 +88,13 @@ else:
         self.assertEqual(state['system']['sw_version'], FIRMWARE)
         self.assertFalse(state['neighbor']['collector_running'])
 
+    def test_refuses_unauthenticated_non_loopback_listener(self):
+        result = subprocess.run([str(BIN), '--bind', '0.0.0.0', '--port', '0'],
+                                cwd=self.root, env=self.env, text=True,
+                                capture_output=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('refusing unauthenticated non-loopback listener', result.stderr)
+
     def test_http_sse_and_lan_auth_share_binary_version(self):
         sockets = [socket.socket(), socket.socket()]
         try:
