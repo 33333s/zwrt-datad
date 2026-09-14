@@ -19,6 +19,15 @@ use clap::Parser;
 use server::App;
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()> {
+    if !addr.ip().is_loopback() && !require_auth {
+        anyhow::bail!(
+            "refusing unauthenticated non-loopback listener {addr}; use --auth-token-file or --lan-bind"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zwrt-datad", version = env!("DATAD_VERSION"))]
 struct Args {
@@ -83,6 +92,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
+    validate_listener_security(addr, local_requires_auth)?;
     if let Some(lan_bind) = args.lan_bind {
         let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
         tokio::try_join!(
@@ -92,5 +102,19 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         app.serve(addr, local_requires_auth, false).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_unauthenticated_non_loopback_listener() {
+        assert!(validate_listener_security("0.0.0.0:9460".parse().unwrap(), false).is_err());
+        assert!(validate_listener_security("192.168.0.1:9460".parse().unwrap(), false).is_err());
+        assert!(validate_listener_security("127.0.0.1:9460".parse().unwrap(), false).is_ok());
+        assert!(validate_listener_security("[::1]:9460".parse().unwrap(), false).is_ok());
+        assert!(validate_listener_security("0.0.0.0:9460".parse().unwrap(), true).is_ok());
     }
 }

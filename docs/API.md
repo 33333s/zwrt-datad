@@ -196,6 +196,8 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 - `--lan-port <port>`：内网监听端口，默认 `9461`
 - `--auth-token-file <path>`：兼容静态 Token 文件
 
+主监听地址不是回环地址时必须通过 `--auth-token-file` 启用鉴权，否则进程拒绝启动。需要同时提供本机免鉴权接口和内网接口时，应保留主监听为 `127.0.0.1`，并使用 `--lan-bind` 开启始终鉴权的内网监听。
+
 ```sh
 /data/zwrt-datad/zwrt-datad -i 1000 -b 127.0.0.1 -p 9460 \
   --lan-bind 0.0.0.0 --lan-port 9461 \
