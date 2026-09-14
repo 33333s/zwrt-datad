@@ -2,13 +2,15 @@ use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
+    ffi::CString,
     fs,
     path::Path,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 fn ubus_bin() -> String {
-    std::env::var("ZWRT_DATAD_UBUS_BIN").unwrap_or_else(|_| "/usr/bin/ubus".into())
+    std::env::var("ZWRT_DATAD_UBUS_BIN").unwrap_or_else(|_| "/bin/ubus".into())
 }
 fn uci_bin() -> String {
     std::env::var("ZWRT_DATAD_UCI_BIN").unwrap_or_else(|_| "/sbin/uci".into())
@@ -153,68 +155,173 @@ fn memory_fields(info: &Value) -> (i64, i64, i64) {
     (t, a, if t > 0 { (t - a) * 100 / t } else { -1 })
 }
 
+type CpuCounters = BTreeMap<String, (u64, u64)>;
+static CPU_PREVIOUS: OnceLock<Mutex<CpuCounters>> = OnceLock::new();
+
+fn count_lines(path: &str, header: bool) -> u64 {
+    let count = fs::read_to_string(path)
+        .map(|v| v.lines().count() as u64)
+        .unwrap_or_default();
+    count.saturating_sub(u64::from(header && count > 0))
+}
+
+fn tcp_active() -> u64 {
+    fs::read_to_string("/proc/net/tcp")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter(|line| line.split_whitespace().nth(3) == Some("01"))
+        .count() as u64
+}
+
+fn meminfo() -> Value {
+    let mut values = BTreeMap::new();
+    let contents = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    for line in contents.lines() {
+        if let Some((key, rest)) = line.split_once(':') {
+            values.insert(
+                key.to_owned(),
+                rest.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    json!({"total":values.get("MemTotal").copied().unwrap_or_default(),"free":values.get("MemFree").copied().unwrap_or_default(),"available":values.get("MemAvailable").copied().unwrap_or_default(),"buffers":values.get("Buffers").copied().unwrap_or_default(),"cached":values.get("Cached").copied().unwrap_or_default(),"swap_total":values.get("SwapTotal").copied().unwrap_or_default(),"swap_free":values.get("SwapFree").copied().unwrap_or_default()})
+}
+
+fn storage() -> Value {
+    let Ok(path) = CString::new("/data") else {
+        return json!({"total":0,"used":0,"available":0});
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return json!({"total":0,"used":0,"available":0});
+    }
+    let block = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    } as u64;
+    let total = block.saturating_mul(stat.f_blocks as u64);
+    let free = block.saturating_mul(stat.f_bfree as u64);
+    json!({"total":total,"used":total.saturating_sub(free),"available":block.saturating_mul(stat.f_bavail as u64)})
+}
+
+fn runtime() -> (i64, Value) {
+    let mut current = BTreeMap::new();
+    for line in fs::read_to_string("/proc/stat").unwrap_or_default().lines() {
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else { continue };
+        if label != "cpu"
+            && !label
+                .strip_prefix("cpu")
+                .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let nums: Vec<u64> = parts
+            .take(8)
+            .map(|v| v.parse().unwrap_or_default())
+            .collect();
+        if nums.len() < 4 {
+            continue;
+        }
+        let total: u64 = nums.iter().sum();
+        let idle = nums[3] + nums.get(4).copied().unwrap_or_default();
+        current.insert(label.to_owned(), (total, idle));
+    }
+    let previous = CPU_PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut old = previous.lock().unwrap();
+    let mut usage = Map::new();
+    let mut total_usage = -1;
+    for (label, (total, idle)) in &current {
+        let value = old
+            .get(label)
+            .and_then(|(ot, oi)| {
+                let dt = total.saturating_sub(*ot);
+                let di = idle.saturating_sub(*oi);
+                (dt > 0).then(|| ((dt.saturating_sub(di)) * 1000 / dt) as i64)
+            })
+            .unwrap_or(-1);
+        if label == "cpu" {
+            total_usage = value
+        } else {
+            usage.insert(label.clone(), json!(value));
+        }
+    }
+    *old = current;
+    drop(old);
+    let mut freqs = Map::new();
+    for core in usage.keys() {
+        let root = format!("/sys/devices/system/cpu/{core}/cpufreq");
+        let mut cur = read_i64(format!("{root}/scaling_cur_freq"));
+        let mut max = read_i64(format!("{root}/scaling_max_freq"));
+        if cur == 0 {
+            cur = read_i64(format!("{root}/cpuinfo_cur_freq"))
+        }
+        if max == 0 {
+            max = read_i64(format!("{root}/cpuinfo_max_freq"))
+        }
+        freqs.insert(core.clone(), json!({"cur":cur/1000,"max":max/1000}));
+    }
+    let active = tcp_active();
+    let tcp4 = count_lines("/proc/net/tcp", true);
+    let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)});
+    (
+        total_usage,
+        json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":[],"memory_kb":meminfo(),"storage":storage(),"connections":connections,"link_rates":[],"throughput":{"rx_bps":0,"tx_bps":0,"window_ms":0}}),
+    )
+}
+
 pub async fn collect(sample_interval_ms: u64) -> Snapshot {
-    let (
-        common,
-        board,
-        info,
-        net,
-        traffic,
-        accounting,
-        limit,
-        clear_day,
-        sim,
-        imei,
-        user_count,
-        router_status,
-        thermal,
-        usb,
-        lan_if,
-        wan4_if,
-        wan6_if,
-        lan_config,
-        cellular,
-    ) = tokio::join!(
-        ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})),
-        ubus("system", "board", json!({})),
-        ubus("system", "info", json!({})),
-        ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})),
-        ubus(
-            "zwrt_data",
-            "get_wwandst",
-            json!({"source_module":"deviceui","cid":1,"type":1})
-        ),
-        ubus(
-            "zwrt_data",
-            "get_wwandst",
-            json!({"source_module":"web","cid":1,"type":4})
-        ),
-        ubus(
-            "zwrt_data",
-            "get_wwandst_monthlimit",
-            json!({"source_module":"web","cid":1})
-        ),
-        ubus(
-            "zwrt_data",
-            "get_wwandst_clearday",
-            json!({"source_module":"web","cid":1})
-        ),
-        ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})),
-        ubus("zwrt_zte_mdm.api", "get_imei", json!({})),
-        ubus("zwrt_router.api", "router_get_user_list_num", json!({})),
-        ubus("zwrt_router.api", "router_get_status_no_auth", json!({})),
-        ubus("zwrt_bsp.thermal", "list", json!({})),
-        ubus("zwrt_bsp.usb", "list", json!({})),
-        ubus("network.interface.lan", "status", json!({})),
-        ubus("network.interface.zte_wan", "status", json!({})),
-        ubus("network.interface.zte_wan6", "status", json!({})),
-        ubus("zwrt_router.api", "router_get_lan_info", json!({})),
-        ubus(
-            "zwrt_data",
-            "get_wwaniface",
-            json!({"source_module":"web","cid":1,"connect_status":""})
-        )
-    );
+    // Vendor ubus implementations on these devices lose replies under a large
+    // burst of concurrent clients, so state collection is deliberately serial.
+    let common = ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;
+    let board = ubus("system", "board", json!({})).await;
+    let info = ubus("system", "info", json!({})).await;
+    let net = ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
+    let traffic = ubus(
+        "zwrt_data",
+        "get_wwandst",
+        json!({"source_module":"deviceui","cid":1,"type":1}),
+    )
+    .await;
+    let accounting = ubus(
+        "zwrt_data",
+        "get_wwandst",
+        json!({"source_module":"web","cid":1,"type":4}),
+    )
+    .await;
+    let limit = ubus(
+        "zwrt_data",
+        "get_wwandst_monthlimit",
+        json!({"source_module":"web","cid":1}),
+    )
+    .await;
+    let clear_day = ubus(
+        "zwrt_data",
+        "get_wwandst_clearday",
+        json!({"source_module":"web","cid":1}),
+    )
+    .await;
+    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
+    let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
+    let user_count = ubus("zwrt_router.api", "router_get_user_list_num", json!({})).await;
+    let router_status = ubus("zwrt_router.api", "router_get_status_no_auth", json!({})).await;
+    let thermal = ubus("zwrt_bsp.thermal", "list", json!({})).await;
+    let usb = ubus("zwrt_bsp.usb", "list", json!({})).await;
+    let lan_if = ubus("network.interface.lan", "status", json!({})).await;
+    let wan4_if = ubus("network.interface.zte_wan", "status", json!({})).await;
+    let wan6_if = ubus("network.interface.zte_wan6", "status", json!({})).await;
+    let lan_config = ubus("zwrt_router.api", "router_get_lan_info", json!({})).await;
+    let cellular = ubus(
+        "zwrt_data",
+        "get_wwaniface",
+        json!({"source_module":"web","cid":1,"connect_status":""}),
+    )
+    .await;
     let common = object(common);
     let board = object(board);
     let info = object(info);
@@ -372,7 +479,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     };
     let mut fields = Map::new();
     fields.insert("net".into(), Value::Object(net));
-    fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":0,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":0,"age_ms":0,"source":""}));
+    fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
     let cl = clients_from_leases();
     fields.insert("clients".into(),json!({"total":integer(&user_count,"access_total_num"),"wifi":integer(&user_count,"wireless_num"),"lan":integer(&user_count,"lan_num"),"list":cl}));
     fields.insert("sms".into(), json!({"unread":0,"list":[]}));
@@ -436,6 +543,76 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ("serial_number", "zwrt_tr069.DeviceInfo.SerialNumber"),
         ("mtu", "zwrt_router.network.mtu"),
         ("mss", "zwrt_router.network.mss"),
+        ("sim_states", "zwrt_zte_mdm.sim_info.sim_states"),
+        ("modem_main_state", "zwrt_zte_mdm.sim_info.modem_main_state"),
+        ("pin_status", "zwrt_zte_mdm.sim_info.pin_status"),
+        (
+            "hardware_version_ci",
+            "zwrt_common_info.common_config.hardware_version",
+        ),
+        ("login_fail_num", "zwrt_web.config.login_fail_num"),
+        (
+            "login_fail_lock_timeout",
+            "zwrt_web.config.login_fail_lock_timeout",
+        ),
+        ("day_tx_bytes", "zwrt_data_commit.wwancid1dst.day_tx_bytes"),
+        ("day_rx_bytes", "zwrt_data_commit.wwancid1dst.day_rx_bytes"),
+        ("day_time", "zwrt_data_commit.wwancid1dst.day_time"),
+        (
+            "month_tx_bytes",
+            "zwrt_data_commit.wwancid1dst.month_tx_bytes",
+        ),
+        (
+            "month_rx_bytes",
+            "zwrt_data_commit.wwancid1dst.month_rx_bytes",
+        ),
+        ("month_time", "zwrt_data_commit.wwancid1dst.month_time"),
+        (
+            "total_tx_bytes",
+            "zwrt_data_commit.wwancid1dst.total_tx_bytes",
+        ),
+        (
+            "total_rx_bytes",
+            "zwrt_data_commit.wwancid1dst.total_rx_bytes",
+        ),
+        ("total_time", "zwrt_data_commit.wwancid1dst.total_time"),
+        ("radio_network_type", "zte_nwinfo.sys_info.network_type"),
+        ("radio_signalbar", "zte_nwinfo.signal_strength.signalbar"),
+        (
+            "radio_operator",
+            "zte_nwinfo.plmn_info.network_provider_fullname",
+        ),
+        ("radio_lte_band", "zte_nwinfo.wan_active_band.GWLSA_band"),
+        ("radio_nr_band", "zte_nwinfo.wan_active_band.odu_nrband"),
+        ("radio_lte_rsrp", "zte_nwinfo.signal_strength.lte_rsrp"),
+        ("radio_lte_rsrq", "zte_nwinfo.signal_strength.lte_rsrq"),
+        ("radio_lte_snr", "zte_nwinfo.signal_strength.lte_snr"),
+        ("radio_nr_rsrp", "zte_nwinfo.signal_strength.nr5g_rsrp"),
+        ("radio_nr_rsrq", "zte_nwinfo.signal_strength.nr5g_rsrq"),
+        ("radio_nr_snr", "zte_nwinfo.signal_strength.nr5g_snr"),
+        ("radio_lte_cell_id", "zte_nwinfo.cell_info.cell_id"),
+        ("radio_lte_pci", "zte_nwinfo.cell_info.lte_pci"),
+        (
+            "radio_lte_channel",
+            "zte_nwinfo.cell_info.wan_active_channel",
+        ),
+        ("radio_nr_pci", "zte_nwinfo.cell_info.nr5g_pci"),
+        (
+            "radio_nr_channel",
+            "zte_nwinfo.cell_info.nr5g_action_channel",
+        ),
+        ("radio_nr_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth"),
+        ("radio_lteca", "zte_nwinfo.sys_info.lteca"),
+        ("radio_net_select", "zte_nwinfo.sys_info.net_select"),
+        (
+            "radio_nr_sa_bands",
+            "zte_nwinfo.band_lock.nr5g_sa_band_lock",
+        ),
+        (
+            "radio_nr_nsa_bands",
+            "zte_nwinfo.band_lock.nr5g_nsa_band_lock",
+        ),
+        ("radio_lte_bands", "zte_nwinfo.band_lock.lte_ext_band_lock"),
     ];
     let mut ui = Map::new();
     for (k, p) in UF {
@@ -449,9 +626,15 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("modems".into(), json!([]));
     fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
     fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template,"api_template_supported":i64::from(template!="LEGACY_COMPAT"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
-    fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":-1,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
+    let (cpu_usage_tenths, runtime) = runtime();
+    let cpu_usage = if cpu_usage_tenths >= 0 {
+        (cpu_usage_tenths + 5) / 10
+    } else {
+        -1
+    };
+    fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":cpu_usage,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
     fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
-    fields.insert("runtime".into(),json!({"cpu_usage_tenths":-1,"cpu_cores":{},"cpu_freq_mhz":{},"thermal_zones":[],"memory_kb":{},"storage":{},"connections":{},"throughput":{}}));
+    fields.insert("runtime".into(), runtime);
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)

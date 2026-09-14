@@ -38,6 +38,18 @@ async fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("--neighbor-parse") {
         std::process::exit(neighbor::parse_cli(&raw[2..]));
     }
+    if raw.get(1).map(String::as_str) == Some("--compare-state-shape") {
+        match model::compare_state_shape(&raw[2..]) {
+            Ok(value) => {
+                println!("{}", serde_json::to_string(&value)?);
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(64);
+            }
+        }
+    }
     let args = Args::parse();
     let interval = Duration::from_millis(args.interval.clamp(500, 5000));
     let _ = (
