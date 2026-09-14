@@ -40,6 +40,8 @@ post '{"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}' >/dev
 post '{"action":"apn.add","params":{"name":"fixture","apn":"internet","auth_mode":0}}' >/dev/null
 post '{"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}' >/dev/null
 post '{"action":"client.rename","params":{"mac":"00:11:22:33:44:55","hostname":"fixture"}}' >/dev/null
+post '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Fixture New","enabled":true}}' >/dev/null
+post '{"action":"client.block","params":{"mac":"00:11:22:33:44:55"}}' >/dev/null
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \
@@ -64,5 +66,7 @@ expected = {
 assert expected <= calls, expected - calls
 PY
 ! grep -F '1;reboot' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'wireless.main_2g.ssid=Fixture New' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'wireless.main_2g.denymaclist=00:11:22:33:44:55' "$MOCK_CALL_LOG" >/dev/null
 
 echo 'rust control HTTP fixture: PASS'

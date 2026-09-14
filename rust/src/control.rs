@@ -25,6 +25,7 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_dual_band",
     "wifi.set_module",
     "wifi.set_chip",
+    "wifi.configure",
     "lan.set",
     "lan.set_mtu",
     "dns.set",
@@ -44,6 +45,8 @@ pub const ACTIONS: &[&str] = &[
     "sms.mark_read",
     "client.kick",
     "client.rename",
+    "client.block",
+    "client.unblock",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -210,6 +213,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             )
             .await
         }
+        "wifi.configure" => wifi_configure(params).await,
         "lan.set" => {
             mapped_call(
                 params,
@@ -373,6 +377,8 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "client.rename" => client_rename(params).await,
+        "client.block" => client_access(params, true).await,
+        "client.unblock" => client_access(params, false).await,
         _ => Outcome::NotHandled,
     }
 }
@@ -625,6 +631,128 @@ async fn client_rename(params: &Value) -> Outcome {
         json!({"mac":mac,"hostname":hostname}),
     )
     .await
+}
+
+async fn revert_wireless(error: String) -> Outcome {
+    let _ = state::uci_write("revert", "wireless", None).await;
+    Outcome::Failed(error)
+}
+
+async fn wifi_configure(params: &Value) -> Outcome {
+    let section = match string(params, "section", true) {
+        Ok(Some(v)) if matches!(v.as_str(), "main_2g" | "main_5g" | "guest_2g" | "guest_5g") => v,
+        Ok(_) => return Outcome::Invalid("unsupported wifi section".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let mut updates = Vec::new();
+    for field in [
+        "ssid",
+        "encryption",
+        "key",
+        "pmf",
+        "maxassoc",
+        "hidden",
+        "isolate",
+    ] {
+        match string(params, field, false) {
+            Ok(Some(value)) => updates.push((field, value)),
+            Ok(None) => {}
+            Err(e) => return Outcome::Invalid(e),
+        }
+    }
+    if let Some(enabled) = object(params).get("enabled") {
+        let enabled = match enabled {
+            Value::Bool(v) => *v,
+            Value::Number(v) if v.as_i64() == Some(0) => false,
+            Value::Number(v) if v.as_i64() == Some(1) => true,
+            _ => return Outcome::Invalid("enabled must be boolean or 0/1".into()),
+        };
+        updates.push(("disabled", if enabled { "0" } else { "1" }.into()));
+    }
+    if updates.is_empty() {
+        return Outcome::Invalid("no wifi fields supplied".into());
+    }
+    for (field, value) in &updates {
+        let valid = match *field {
+            "ssid" => !value.is_empty() && value.len() <= 32 && !value.contains(['\r', '\n']),
+            "encryption" => matches!(
+                value.as_str(),
+                "none"
+                    | "psk2+ccmp"
+                    | "sae-mixed"
+                    | "sae"
+                    | "psk-mixed+tkip+ccmp"
+                    | "psk2"
+                    | "psk-mixed"
+            ),
+            "key" => {
+                value.is_empty()
+                    || ((8..=63).contains(&value.len()) && !value.contains(['\r', '\n']))
+            }
+            "hidden" | "isolate" => matches!(value.as_str(), "0" | "1"),
+            _ => value.len() <= 128 && !value.contains(['\r', '\n']),
+        };
+        if !valid {
+            return Outcome::Invalid(format!("invalid Wi-Fi {field}"));
+        }
+    }
+    let mut changed = false;
+    for (field, value) in updates {
+        if field == "key" && value.is_empty() {
+            continue;
+        }
+        let path = format!("wireless.{section}.{field}");
+        if state::uci_read(&path).await == value {
+            continue;
+        }
+        if let Err(e) = state::uci_write("set", &path, Some(&value)).await {
+            return revert_wireless(e).await;
+        }
+        changed = true;
+    }
+    if !changed {
+        return Outcome::Ok(json!({"section":section,"changed":false}));
+    }
+    if let Err(e) = state::uci_write("commit", "wireless", None).await {
+        return revert_wireless(e).await;
+    }
+    if let Err(e) = state::ubus("zwrt_wlan", "reload", json!({})).await {
+        return Outcome::Failed(format!(
+            "wifi configuration committed but reload failed: {e}"
+        ));
+    }
+    Outcome::Ok(json!({"section":section,"changed":true}))
+}
+
+async fn client_access(params: &Value, block: bool) -> Outcome {
+    let mac = match string(params, "mac", true) {
+        Ok(Some(v)) if valid_mac(&v) => v.to_ascii_lowercase(),
+        Ok(_) => return Outcome::Invalid("invalid mac address".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    for section in ["main_2g", "main_5g", "guest_2g", "guest_5g"] {
+        let filter = format!("wireless.{section}.macfilter");
+        let list = format!("wireless.{section}.denymaclist");
+        if let Err(e) = state::uci_write("set", &filter, Some("deny")).await {
+            return revert_wireless(e).await;
+        }
+        let _ = state::uci_write("del_list", &list, Some(&mac)).await;
+        if block {
+            if let Err(e) = state::uci_write("add_list", &list, Some(&mac)).await {
+                return revert_wireless(e).await;
+            }
+        }
+    }
+    if let Err(e) = state::uci_write("commit", "wireless", None).await {
+        return revert_wireless(e).await;
+    }
+    if let Err(e) = state::ubus("zwrt_wlan", "reload", json!({})).await {
+        return Outcome::Failed(format!("client policy committed but reload failed: {e}"));
+    }
+    if block {
+        let _ = state::ubus("zwrt_wlan", "kick_macs", json!({"macs":mac})).await;
+    }
+    Outcome::Ok(json!({"mac":mac,"blocked":block}))
 }
 
 #[cfg(test)]

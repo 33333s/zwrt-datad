@@ -73,6 +73,33 @@ pub async fn uci_read(path: &str) -> String {
         .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
         .unwrap_or_default()
 }
+pub async fn uci_write(operation: &str, path: &str, value: Option<&str>) -> Result<(), String> {
+    if !matches!(
+        operation,
+        "set" | "add_list" | "del_list" | "delete" | "commit" | "revert"
+    ) || path.is_empty()
+        || path.len() > 256
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@[]".contains(&b))
+        || value.is_some_and(|v| v.len() > 8192 || v.contains(['\0', '\r', '\n']))
+    {
+        return Err("invalid UCI mutation".into());
+    }
+    let mut args = vec![operation.to_owned()];
+    if matches!(operation, "set" | "add_list" | "del_list") {
+        let Some(value) = value else {
+            return Err("missing UCI value".into());
+        };
+        args.push(format!("{path}={value}"));
+    } else {
+        args.push(path.to_owned());
+    }
+    command::run(&uci_bin(), args, Duration::from_secs(5))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
 fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
     sets.iter()
         .find_map(|s| s.get(path))
