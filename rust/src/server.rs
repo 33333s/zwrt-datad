@@ -48,9 +48,15 @@ struct Inner {
     _data_dir: PathBuf,
     token: Option<String>,
     sessions: Mutex<Sessions>,
+    device_session: Mutex<Option<DeviceSession>>,
     cloud: RwLock<Cloud>,
     ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
+}
+
+struct DeviceSession {
+    _token: String,
+    _password_hash: String,
 }
 
 impl App {
@@ -78,6 +84,7 @@ impl App {
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
+                device_session: Mutex::new(None),
             }),
         };
         app.inner.cloud.read().await.start(app.inner.tx.subscribe());
@@ -388,6 +395,8 @@ async fn capabilities() -> Json<Value> {
         "events":["state"],
         "controls":[
             "device.login_info",
+            "device.login",
+            "device.logout",
             "device.session_status",
             "wifi.status",
             "wifi.dual_band_status",
@@ -486,8 +495,52 @@ async fn control(
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
-    if action == "device.session_status" {
+    if action == "device.login" {
+        let password_hash = body
+            .get("params")
+            .and_then(|value| value.get("password_hash"))
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        let Some(password_hash) = password_hash else {
+            return invalid_parameter(
+                action,
+                "password_hash must be a 64 character SHA-256 hex value",
+            );
+        };
+        let password_hash = password_hash.to_ascii_uppercase();
+        return match state::ubus("zwrt_web", "web_login", json!({"password":password_hash})).await {
+            Ok(value)
+                if value.get("result").and_then(Value::as_i64) == Some(0)
+                    && value
+                        .get("ubus_rpc_session")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.is_empty()) =>
+            {
+                let token = value["ubus_rpc_session"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                *app.inner.device_session.lock().await = Some(DeviceSession {
+                    _token: token,
+                    _password_hash: password_hash,
+                });
+                control_ok(action, value)
+            }
+            Ok(_) => control_failed(action, "device login rejected".into()),
+            Err(error) => control_failed(action, error),
+        };
+    }
+    if action == "device.logout" {
+        *app.inner.device_session.lock().await = None;
         return control_ok(action, json!({"logged_in":false}));
+    }
+    if action == "device.session_status" {
+        return control_ok(
+            action,
+            json!({"logged_in":app.inner.device_session.lock().await.is_some()}),
+        );
     }
     if action == "wifi.dual_band_status" {
         return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
@@ -682,6 +735,14 @@ fn control_failed(action: &str, error: String) -> Response {
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}})),
+    )
+        .into_response()
+}
+
+fn invalid_parameter(action: &str, message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":message}})),
     )
         .into_response()
 }
