@@ -14,6 +14,6 @@ The Rust branch is never installed over the production binary until every requir
 | allow-listed device controls | ten read-only/session neighbor actions implemented; malformed JSON parity implemented | mutating actions require fixture, readback, rollback and error-code parity |
 | bounded neighbor QTrace parser | parser and lifecycle implemented; original parser and HTTP suites pass | final supported-device smoke |
 | cloud config | validation, password redaction, atomic 0600 persistence and LAN isolation implemented | MQTT/TLS reporting and WebSocket tunnel runtime |
-| signed OTA | pure Rust config/status/check/update, custom-first source ordering, Ed25519 manifest verification, installer SHA-256, >10% battery and idle safety gates, retry state and result reconciliation implemented | ARM64 `/tmp` endpoint smoke; never invoke install on a test device |
+| signed OTA | pure Rust config/status/check/update, custom-first source ordering, Ed25519 manifest verification, installer SHA-256, >10% battery and idle safety gates, retry state and result reconciliation implemented; MC7523 `/tmp` default-source check verified a real signature | never invoke install on a test device; final production-only upgrade/rollback acceptance remains |
 
 No Rust code may call the legacy datad binary or link the legacy C/Go objects. During migration, device execution is read-only on a separate port unless a control adapter has its own fixture and rollback tests.
