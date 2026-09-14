@@ -44,15 +44,64 @@ func signedOTAServer(t *testing.T, key ed25519.PrivateKey, version string) *http
 	}))
 }
 
-func TestNetdiskUsesPerFileSignedURLs(t *testing.T) {
+func TestNetdiskUsesRawSharedDirectory(t *testing.T) {
 	for _, name := range []string{"update.json", "update.json.sig", "install-datad.sh", "zwrt-datad-aarch64"} {
 		u := sourceURL(otaNetdisk, name)
-		if !strings.HasPrefix(u, "https://") || !strings.Contains(u, "sign=") {
-			t.Fatalf("%s does not use a signed URL", name)
+		want := "https://pan.ericsfj.com/sd/wN2PJUK8/" + name
+		if u != want {
+			t.Fatalf("%s = %q, want %q", name, u, want)
 		}
 	}
 	if got := sourceURL("https://custom.example/base", "update.json"); got != "https://custom.example/base/update.json" {
 		t.Fatal(got)
+	}
+}
+
+func TestOTAContinuesPastSignedStaleSource(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	stale := signedOTAServer(t, priv, "0.9.40")
+	defer stale.Close()
+	latest := signedOTAServer(t, priv, "0.9.44")
+	defer latest.Close()
+
+	oldVersion := version
+	version = "0.9.42"
+	defer func() { version = oldVersion }()
+	o := &otaManager{dir: t.TempDir(), config: otaConfig{Enabled: true, Servers: []string{stale.URL, latest.URL}}, status: otaStatus{State: "idle"}, client: latest.Client(), pub: pub}
+	o.client.Timeout = 2 * time.Second
+	c, err := o.check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BaseURL != latest.URL || c.Manifest.Version != "0.9.44" {
+		t.Fatalf("stale signed source blocked newer source: %#v", c)
+	}
+	if o.status.LatestVersion != "0.9.44" || o.status.Source != "自定义服务器" || o.status.State != "available" {
+		t.Fatalf("unexpected status: %#v", o.status)
+	}
+}
+
+func TestOTASourceNamesNeverExposeURLs(t *testing.T) {
+	cases := map[string]string{
+		otaNetdisk:                       "网盘",
+		otaGitHub:                        "GitHub",
+		"https://updates.example/custom": "自定义服务器",
+	}
+	for source, want := range cases {
+		if got := otaSourceName(source); got != want {
+			t.Fatalf("otaSourceName(%q) = %q, want %q", source, got, want)
+		}
+	}
+}
+
+func TestOTAStatusNeverReportsLatestBelowCurrent(t *testing.T) {
+	oldVersion := version
+	version = "0.9.42"
+	defer func() { version = oldVersion }()
+	o := &otaManager{dir: t.TempDir(), status: otaStatus{State: "checking"}}
+	o.acceptCandidate(&otaCandidate{Manifest: otaManifest{Version: "0.9.40"}, BaseURL: otaNetdisk})
+	if o.status.LatestVersion != "0.9.42" || o.status.State != "idle" {
+		t.Fatalf("stale source regressed latest status: %#v", o.status)
 	}
 }
 
@@ -108,6 +157,27 @@ func TestOTAConfigDefaultsEnabledAndPersists(t *testing.T) {
 	b, err := osRead(filepath.Join(dir, "ota.json"))
 	if err != nil || !strings.Contains(string(b), "updates.example") {
 		t.Fatalf("config not persisted: %v %s", err, b)
+	}
+}
+
+func TestOTASourceSelectionControlsServerList(t *testing.T) {
+	o := &otaManager{config: otaConfig{Enabled: true, Servers: []string{"https://custom.example/base"}, Sources: []string{"netdisk", "github"}}}
+	got := o.servers()
+	want := []string{otaNetdisk, otaGitHub}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("servers() = %v, want %v", got, want)
+	}
+
+	o.config.Sources = nil
+	got = o.servers()
+	if len(got) != 3 || got[0] != "https://custom.example/base" || got[1] != otaNetdisk || got[2] != otaGitHub {
+		t.Fatalf("legacy config did not default to all sources: %v", got)
+	}
+}
+
+func TestOTARejectsNoSelectedSources(t *testing.T) {
+	if err := validateOTAConfig(otaConfig{Sources: []string{}}); err == nil {
+		t.Fatal("empty source selection was accepted")
 	}
 }
 
