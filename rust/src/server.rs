@@ -80,6 +80,7 @@ impl App {
                 sessions: Mutex::new(Sessions::default()),
             }),
         };
+        app.inner.cloud.read().await.start(app.inner.tx.subscribe());
         app.spawn_sampler();
         app.spawn_ota();
         Ok(app)

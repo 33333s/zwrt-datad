@@ -39,6 +39,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    cloud::init_crypto();
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(String::as_str) == Some("--neighbor-parse") {
         std::process::exit(neighbor::parse_cli(&raw[2..]));
