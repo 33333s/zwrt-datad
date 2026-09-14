@@ -3,6 +3,7 @@ mod cloud;
 mod command;
 mod control;
 mod cooling;
+mod extra_wifi;
 mod model;
 mod neighbor;
 mod neighbor_manager;

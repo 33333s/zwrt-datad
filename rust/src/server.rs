@@ -67,6 +67,7 @@ impl App {
         neighbor_enabled: bool,
     ) -> Result<Self> {
         crate::cooling::tick().await;
+        crate::extra_wifi::tick().await;
         let mut initial = state::collect(interval.as_millis() as u64).await;
         let mut neighbor = NeighborManager::new(neighbor_enabled);
         neighbor
@@ -142,6 +143,7 @@ impl App {
     }
     async fn refresh_snapshot(&self) {
         crate::cooling::tick().await;
+        crate::extra_wifi::tick().await;
         let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
         let mut neighbor = self.inner.neighbor.lock().await;
         neighbor

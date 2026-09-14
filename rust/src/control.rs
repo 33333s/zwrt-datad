@@ -1424,11 +1424,35 @@ async fn extra_wifi(params: &Value, operation: &str) -> Outcome {
             Err(e) => return Outcome::Invalid(e),
         }
     };
+    let old = if operation == "create" {
+        None
+    } else {
+        Some(crate::extra_wifi::Config {
+            section: section.clone(),
+            band: extra_value(&section, "band").await,
+            ssid: extra_value(&section, "ssid").await,
+            encryption: extra_value(&section, "encryption").await,
+            key: extra_value(&section, "key").await,
+            enabled: extra_value(&section, "disabled").await != "1",
+            hidden: extra_value(&section, "hidden").await == "1",
+            isolate: extra_value(&section, "isolate").await == "1",
+        })
+    };
     if operation == "delete" {
+        if let Err(e) = crate::extra_wifi::stop(&section).await {
+            return Outcome::Failed(format!("could not stop extra SSID: {e}"));
+        }
         if let Err(e) = state::uci_write("delete", &format!("datad_wifi.{section}"), None).await {
+            if let Some(old) = &old {
+                let _ = crate::extra_wifi::apply(old).await;
+            }
             return Outcome::Failed(e);
         }
         if let Err(e) = state::uci_write("commit", "datad_wifi", None).await {
+            let _ = state::uci_write("revert", "datad_wifi", None).await;
+            if let Some(old) = &old {
+                let _ = crate::extra_wifi::apply(old).await;
+            }
             return Outcome::Failed(e);
         }
         return Outcome::Ok(json!({"section":section,"changed":true,"deleted":true}));
@@ -1548,6 +1572,46 @@ async fn extra_wifi(params: &Value, operation: &str) -> Outcome {
     ];
     if let Err(e) = write_extra(&section, &values).await {
         return Outcome::Failed(format!("could not save extra SSID: {e}"));
+    }
+    let current = crate::extra_wifi::Config {
+        section: section.clone(),
+        band: values[0].1.clone(),
+        ssid: values[1].1.clone(),
+        encryption: values[2].1.clone(),
+        key: values[3].1.clone(),
+        enabled: enabled == 1,
+        hidden: hidden == 1,
+        isolate: isolate == 1,
+    };
+    let runtime_result = match crate::extra_wifi::stop(&section).await {
+        Ok(()) => {
+            crate::extra_wifi::reset_attempts(&section).await;
+            crate::extra_wifi::apply(&current).await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = runtime_result {
+        let _ = crate::extra_wifi::stop(&section).await;
+        if let Some(old) = &old {
+            let old_values = [
+                ("band", old.band.clone()),
+                ("ssid", old.ssid.clone()),
+                ("encryption", old.encryption.clone()),
+                ("key", old.key.clone()),
+                ("disabled", i64::from(!old.enabled).to_string()),
+                ("hidden", i64::from(old.hidden).to_string()),
+                ("isolate", i64::from(old.isolate).to_string()),
+                ("datad_psm", values[7].1.clone()),
+            ];
+            let _ = write_extra(&section, &old_values).await;
+            let _ = crate::extra_wifi::apply(old).await;
+        } else {
+            let _ = state::uci_write("delete", &format!("datad_wifi.{section}"), None).await;
+            let _ = state::uci_write("commit", "datad_wifi", None).await;
+        }
+        return Outcome::Failed(format!(
+            "extra SSID could not start; previous configuration restored: {e}"
+        ));
     }
     Outcome::Ok(json!({"section":section,"saved":true,"changed":true,"pending":enabled==1}))
 }
