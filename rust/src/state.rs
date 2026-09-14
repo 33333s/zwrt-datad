@@ -589,6 +589,8 @@ fn meminfo() -> Value {
     json!({"total":values.get("MemTotal").copied().unwrap_or_default(),"free":values.get("MemFree").copied().unwrap_or_default(),"available":values.get("MemAvailable").copied().unwrap_or_default(),"buffers":values.get("Buffers").copied().unwrap_or_default(),"cached":values.get("Cached").copied().unwrap_or_default(),"swap_total":values.get("SwapTotal").copied().unwrap_or_default(),"swap_free":values.get("SwapFree").copied().unwrap_or_default()})
 }
 
+// libc exposes statvfs counters with different integer widths across targets.
+#[allow(clippy::unnecessary_cast)]
 fn storage() -> Value {
     let Ok(path) = CString::new("/data") else {
         return json!({"total":0,"used":0,"available":0});
