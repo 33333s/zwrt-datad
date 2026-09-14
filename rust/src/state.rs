@@ -1,33 +1,457 @@
 use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 fn ubus_bin() -> String {
     std::env::var("ZWRT_DATAD_UBUS_BIN").unwrap_or_else(|_| "/usr/bin/ubus".into())
 }
-
-pub async fn collect() -> Snapshot {
-    let mut fields = Map::new();
-    let info = ubus("system", "info", json!({}))
-        .await
-        .unwrap_or_else(|_| json!({}));
-    let common = ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({}))
-        .await
-        .unwrap_or_else(|_| json!({}));
-    let mut system = info.as_object().cloned().unwrap_or_default();
-    if let Some(version) = common.get("wa_inner_version").and_then(Value::as_str) {
-        system.insert("sw_version".into(), json!(version));
+fn uci_bin() -> String {
+    std::env::var("ZWRT_DATAD_UCI_BIN").unwrap_or_else(|_| "/sbin/uci".into())
+}
+fn object(v: Result<Value, String>) -> Value {
+    v.unwrap_or_else(|_| json!({}))
+}
+fn string(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::String(x)) => x.clone(),
+        Some(Value::Number(x)) => x.to_string(),
+        Some(Value::Bool(x)) => x.to_string(),
+        _ => String::new(),
     }
-    fields.insert("system".into(), Value::Object(system));
-    let network = ubus("network.interface", "dump", json!({})).await;
-    fields.insert(
-        "network".into(),
-        network.unwrap_or_else(|e| json!({"available":false,"error":e})),
+}
+fn integer(v: &Value, key: &str) -> i64 {
+    match v.get(key) {
+        Some(Value::Number(x)) => x.as_i64().unwrap_or_default(),
+        Some(Value::String(x)) => x.parse().unwrap_or_default(),
+        Some(Value::Bool(x)) => i64::from(*x),
+        _ => 0,
+    }
+}
+fn interface(v: &Value) -> Value {
+    json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
+}
+
+async fn uci_show(package: &str) -> BTreeMap<String, String> {
+    if validate_name(package).is_err() {
+        return BTreeMap::new();
+    }
+    let Ok(raw) = command::run(&uci_bin(), ["-q", "show", package], Duration::from_secs(5)).await
+    else {
+        return BTreeMap::new();
+    };
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .filter_map(|line| {
+            let (k, raw) = line.split_once('=')?;
+            let v = raw
+                .strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+                .unwrap_or(raw);
+            Some((k.into(), v.into()))
+        })
+        .collect()
+}
+fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
+    sets.iter()
+        .find_map(|s| s.get(path))
+        .map(String::as_str)
+        .unwrap_or_default()
+}
+fn normalize_profile(v: &str) -> String {
+    let mut out = String::new();
+    let mut sep = true;
+    for c in v.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            sep = false
+        } else if !sep && matches!(c, '-' | '_' | ' ' | '/' | '.') {
+            out.push('_');
+            sep = true
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "unknown".into()
+    } else {
+        out
+    }
+}
+fn read_i64(path: impl AsRef<Path>) -> i64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_default()
+}
+fn thermal_zones() -> (i64, Value) {
+    let mut zones = Vec::new();
+    let mut cpuss = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
+        return (0, json!([]));
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("thermal_zone")
+        {
+            continue;
+        }
+        let name = fs::read_to_string(p.join("type"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let raw = read_i64(p.join("temp"));
+        if name.is_empty() || raw <= 0 || raw > 200_000 {
+            continue;
+        }
+        let c = if raw >= 1000 {
+            raw as f64 / 1000.0
+        } else {
+            raw as f64
+        };
+        if name.starts_with("cpuss") {
+            cpuss.push(c)
+        }
+        zones.push(json!({"name":name,"celsius":c}));
+    }
+    zones.sort_by_key(|a| string(a, "name"));
+    let cpu = if cpuss.is_empty() {
+        zones
+            .iter()
+            .filter_map(|v| v.get("celsius").and_then(Value::as_f64))
+            .fold(0.0, f64::max)
+    } else {
+        cpuss.iter().sum::<f64>() / cpuss.len() as f64
+    };
+    (cpu.round() as i64, Value::Array(zones))
+}
+fn clients_from_leases() -> Value {
+    Value::Array(
+        fs::read_to_string("/tmp/dhcp.leases")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let p: Vec<_> = line.split_whitespace().collect();
+                (p.len() >= 4)
+                    .then(|| json!({"name":if p[3]=="*"{""}else{p[3]},"ip":p[2],"mac":p[1]}))
+            })
+            .collect(),
+    )
+}
+fn memory_fields(info: &Value) -> (i64, i64, i64) {
+    let m = info.get("memory").unwrap_or(&Value::Null);
+    let t = integer(m, "total");
+    let a = integer(m, "available");
+    (t, a, if t > 0 { (t - a) * 100 / t } else { -1 })
+}
+
+pub async fn collect(sample_interval_ms: u64) -> Snapshot {
+    let (
+        common,
+        board,
+        info,
+        net,
+        traffic,
+        accounting,
+        limit,
+        clear_day,
+        sim,
+        imei,
+        user_count,
+        router_status,
+        thermal,
+        usb,
+        lan_if,
+        wan4_if,
+        wan6_if,
+        lan_config,
+        cellular,
+    ) = tokio::join!(
+        ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})),
+        ubus("system", "board", json!({})),
+        ubus("system", "info", json!({})),
+        ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})),
+        ubus(
+            "zwrt_data",
+            "get_wwandst",
+            json!({"source_module":"deviceui","cid":1,"type":1})
+        ),
+        ubus(
+            "zwrt_data",
+            "get_wwandst",
+            json!({"source_module":"web","cid":1,"type":4})
+        ),
+        ubus(
+            "zwrt_data",
+            "get_wwandst_monthlimit",
+            json!({"source_module":"web","cid":1})
+        ),
+        ubus(
+            "zwrt_data",
+            "get_wwandst_clearday",
+            json!({"source_module":"web","cid":1})
+        ),
+        ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})),
+        ubus("zwrt_zte_mdm.api", "get_imei", json!({})),
+        ubus("zwrt_router.api", "router_get_user_list_num", json!({})),
+        ubus("zwrt_router.api", "router_get_status_no_auth", json!({})),
+        ubus("zwrt_bsp.thermal", "list", json!({})),
+        ubus("zwrt_bsp.usb", "list", json!({})),
+        ubus("network.interface.lan", "status", json!({})),
+        ubus("network.interface.zte_wan", "status", json!({})),
+        ubus("network.interface.zte_wan6", "status", json!({})),
+        ubus("zwrt_router.api", "router_get_lan_info", json!({})),
+        ubus(
+            "zwrt_data",
+            "get_wwaniface",
+            json!({"source_module":"web","cid":1,"connect_status":""})
+        )
     );
-    fields.insert(
-        "neighbor".into(),
-        json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[]}),
+    let common = object(common);
+    let board = object(board);
+    let info = object(info);
+    let raw_net = object(net);
+    let traffic = object(traffic);
+    let accounting = object(accounting);
+    let limit = object(limit);
+    let clear_day = object(clear_day);
+    let sim = object(sim);
+    let imei = object(imei);
+    let user_count = object(user_count);
+    let router_status = object(router_status);
+    let thermal = object(thermal);
+    let usb = object(usb);
+    let lan_if = object(lan_if);
+    let wan4_if = object(wan4_if);
+    let wan6_if = object(wan6_if);
+    let lan_config = object(lan_config);
+    let cellular = object(cellular);
+    let packages = [
+        "zwrt_zte_mdm",
+        "zwrt_common_info",
+        "network",
+        "dhcp",
+        "zwrt_data_commit",
+        "system",
+        "zwrt_web",
+        "zwrt_tr069",
+        "zwrt_router",
+        "zte_nwinfo",
+        "wireless",
+    ];
+    let mut uci_sets = Vec::new();
+    for p in packages {
+        uci_sets.push(uci_show(p).await)
+    }
+    let model_name = string(&common, "model_name");
+    let hardware_version = string(&common, "hardware_version");
+    let profile_source = if !model_name.is_empty() {
+        "model_name"
+    } else {
+        "hardware_version"
+    };
+    let profile = normalize_profile(if !model_name.is_empty() {
+        &model_name
+    } else {
+        &hardware_version
+    });
+    let template = match profile.as_str() {
+        "mu5250" => "MU5250",
+        "mu5252" => "MU5252",
+        "mc7523" => "MC7523",
+        "mc8532b" => "MC8532B",
+        _ => "LEGACY_COMPAT",
+    };
+    let mut net = Map::new();
+    for (to, from) in [
+        ("type", "network_type"),
+        ("roaming", "simcard_roam"),
+        ("operator", "network_provider_fullname"),
+        ("band", "wan_active_band"),
+        ("nr_band", "nr5g_action_band"),
+        ("nr_snr", "nr5g_snr"),
+        ("lte_snr", "lte_snr"),
+        ("nr_bw", "nr5g_bandwidth"),
+        ("nrca", "nrca"),
+        ("lteca", "lteca"),
+        ("ltecasig", "ltecasig"),
+        ("net_select", "net_select"),
+        ("sa_bands", "nr5g_sa_band_lock"),
+        ("nsa_bands", "nr5g_nsa_band_lock"),
+        ("lte_bands", "lte_band"),
+        ("lte_supported_bands", "lte_band"),
+        ("nr_sa_supported_bands", "nr5g_sa_band_lock"),
+        ("nr_nsa_supported_bands", "nr5g_nsa_band_lock"),
+    ] {
+        net.insert(to.into(), json!(string(&raw_net, from)));
+    }
+    for (to, from) in [
+        ("bars", "signalbar"),
+        ("nr_rsrp", "nr5g_rsrp"),
+        ("nr_rsrq", "nr5g_rsrq"),
+        ("nr_rssi", "nr5g_rssi"),
+        ("lte_rsrp", "lte_rsrp"),
+        ("lte_rsrq", "lte_rsrq"),
+        ("lte_rssi", "lte_rssi"),
+        ("rssi", "rssi"),
+        ("mcc", "rmcc"),
+        ("mnc", "rmnc"),
+        ("lte_pci", "lte_pci"),
+        ("lte_cell_id", "cell_id"),
+        ("lte_channel", "wan_active_channel"),
+        ("nr_pci", "nr5g_pci"),
+        ("nr_cell_id", "nr5g_cell_id"),
+        ("nr_channel", "nr5g_action_channel"),
+    ] {
+        net.insert(to.into(), json!(integer(&raw_net, from)));
+    }
+    net.insert(
+        "wan_status".into(),
+        json!(string(&router_status, "current_wan_status")),
     );
+    net.insert("HSR".into(), json!(false));
+    let mut tout = Map::new();
+    for (to, from) in [
+        ("rx_speed", "real_rx_speed"),
+        ("tx_speed", "real_tx_speed"),
+        ("max_rx_speed", "real_max_rx_speed"),
+        ("max_tx_speed", "real_max_tx_speed"),
+        ("rx_bytes", "real_rx_bytes"),
+        ("tx_bytes", "real_tx_bytes"),
+        ("session_time", "real_time"),
+    ] {
+        tout.insert(to.into(), json!(integer(&traffic, from)));
+    }
+    for key in [
+        "day_rx_bytes",
+        "day_tx_bytes",
+        "month_rx_bytes",
+        "month_tx_bytes",
+        "total_rx_bytes",
+        "total_tx_bytes",
+    ] {
+        tout.insert(key.into(), json!(integer(&accounting, key)));
+    }
+    tout.insert("limit".into(), limit);
+    tout.insert("clear_day".into(), clear_day);
+    let wifi = ["main_2g", "main_5g"]
+        .into_iter()
+        .find(|s| {
+            !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty()
+                && uci_get(&uci_sets, &format!("wireless.{s}.disabled")) != "1"
+        })
+        .or_else(|| {
+            ["main_2g", "main_5g"]
+                .into_iter()
+                .find(|s| !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty())
+        });
+    let (cpu_sys, zones) = thermal_zones();
+    let cpu_temp = ["cpuss_temp", "cpu_temp", "temperature", "temp"]
+        .into_iter()
+        .map(|k| integer(&thermal, k))
+        .find(|v| *v > 0)
+        .map(|v| if v >= 1000 { (v + 500) / 1000 } else { v })
+        .unwrap_or(cpu_sys);
+    let (mt, ma, mp) = memory_fields(&info);
+    let release = board.get("release").unwrap_or(&Value::Null);
+    let sw = {
+        let a = string(&common, "wa_inner_version");
+        if a.is_empty() {
+            string(&common, "integrate_version")
+        } else {
+            a
+        }
+    };
+    let mut fields = Map::new();
+    fields.insert("net".into(), Value::Object(net));
+    fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":0,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":0,"age_ms":0,"source":""}));
+    let cl = clients_from_leases();
+    fields.insert("clients".into(),json!({"total":integer(&user_count,"access_total_num"),"wifi":integer(&user_count,"wireless_num"),"lan":integer(&user_count,"lan_num"),"list":cl}));
+    fields.insert("sms".into(), json!({"unread":0,"list":[]}));
+    fields.insert("traffic".into(), Value::Object(tout));
+    fields.insert(
+        "qos".into(),
+        json!({"qci":0,"ambr_dl":"","ambr_ul":"","usb_mode":string(&usb,"mode")}),
+    );
+    if let Some(s) = wifi {
+        fields.insert("wlan".into(),json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")}));
+    }
+    fields.insert(
+        "thermal".into(),
+        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[]}),
+    );
+    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":interface(&wan4_if),"wan6":interface(&wan6_if),"lan_config":lan_config,"cellular":cellular}));
+    const UF: &[(&str, &str)] = &[
+        ("iccid", "zwrt_zte_mdm.sim_info.sim_iccid"),
+        ("imsi", "zwrt_zte_mdm.sim_info.sim_imsi"),
+        ("msisdn", "zwrt_zte_mdm.sim_info.msisdn"),
+        ("mcc", "zwrt_zte_mdm.sim_info.mdm_mcc"),
+        ("mnc", "zwrt_zte_mdm.sim_info.mdm_mnc"),
+        ("imei", "zwrt_zte_mdm.device_info.imei"),
+        ("mac_address", "zwrt_zte_mdm.device_info.wlan_mac_address"),
+        ("modem_msn", "zwrt_zte_mdm.device_info.modem_msn"),
+        (
+            "wa_inner_version",
+            "zwrt_common_info.common_config.wa_inner_version",
+        ),
+        (
+            "integrate_version",
+            "zwrt_common_info.common_config.integrate_version",
+        ),
+        (
+            "common_model_name",
+            "zwrt_common_info.common_config.model_name",
+        ),
+        (
+            "device_alias_name",
+            "zwrt_common_info.common_config.device_alias_name",
+        ),
+        (
+            "device_market_name",
+            "zwrt_common_info.common_config.device_market_name",
+        ),
+        ("lan_ipaddr", "network.lan.ipaddr"),
+        ("lan_netmask", "network.lan.netmask"),
+        ("wan_dns", "network.zte_wan.dns"),
+        ("dhcpEnabled", "dhcp.lan.ignore"),
+        ("dhcpStart", "dhcp.lan.zte_start"),
+        ("dhcpEnd", "dhcp.lan.zte_end"),
+        ("dhcpLease_hour", "dhcp.lan.leasetime"),
+        ("hostname", "system.@system[0].hostname"),
+        ("timezone", "system.@system[0].timezone"),
+        ("web_language", "zwrt_web.setting.web_language"),
+        ("login_timeout", "zwrt_web.config.login_timeout"),
+        ("device_model", "zwrt_tr069.DeviceInfo.ModelName"),
+        ("device_manufacturer", "zwrt_tr069.DeviceInfo.Manufacturer"),
+        ("hardware_version", "zwrt_tr069.DeviceInfo.HardwareVersion"),
+        ("software_version", "zwrt_tr069.DeviceInfo.SoftwareVersion"),
+        ("serial_number", "zwrt_tr069.DeviceInfo.SerialNumber"),
+        ("mtu", "zwrt_router.network.mtu"),
+        ("mss", "zwrt_router.network.mss"),
+    ];
+    let mut ui = Map::new();
+    for (k, p) in UF {
+        let v = uci_get(&uci_sets, p);
+        if !v.is_empty() {
+            ui.insert((*k).into(), json!(v));
+        }
+    }
+    fields.insert("uci_device_info".into(), Value::Object(ui));
+    fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":string(&sim,"sim_imsi"),"msisdn":string(&sim,"msisdn"),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
+    fields.insert("modems".into(), json!([]));
+    fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
+    fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template,"api_template_supported":i64::from(template!="LEGACY_COMPAT"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
+    fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":-1,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
+    fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
+    fields.insert("runtime".into(),json!({"cpu_usage_tenths":-1,"cpu_cores":{},"cpu_freq_mhz":{},"thermal_zones":[],"memory_kb":{},"storage":{},"connections":{},"throughput":{}}));
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -54,7 +478,6 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
     .map_err(|e| e.to_string())?;
     serde_json::from_slice(&raw).map_err(|e| format!("invalid ubus JSON: {e}"))
 }
-
 pub async fn ubus_list(verbose: bool) -> Result<Value, String> {
     let args: Vec<&str> = if verbose {
         vec!["-v", "list"]
@@ -66,15 +489,30 @@ pub async fn ubus_list(verbose: bool) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     Ok(json!({"ok":true,"verbose":verbose,"output":String::from_utf8_lossy(&raw)}))
 }
-
-fn validate_name(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
+fn validate_name(v: &str) -> Result<(), String> {
+    if v.is_empty()
+        || v.len() > 128
+        || !v
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
         return Err("invalid ubus name".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn profile() {
+        assert_eq!(normalize_profile("MC7523 HW1.0"), "mc7523_hw1_0");
+        assert_eq!(normalize_profile("MU5250"), "mu5250")
+    }
+    #[test]
+    fn iface() {
+        let v = interface(&json!({}));
+        assert_eq!(v["up"], false);
+        assert_eq!(v["ipv4"], json!([]))
+    }
 }

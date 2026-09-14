@@ -37,7 +37,7 @@ struct Inner {
 
 impl App {
     pub async fn new(data_dir: PathBuf, interval: Duration, token: Option<String>) -> Result<Self> {
-        let initial = state::collect().await;
+        let initial = state::collect(interval.as_millis() as u64).await;
         let (tx, _) = watch::channel(initial.clone());
         let app = Self {
             inner: Arc::new(Inner {
@@ -60,7 +60,7 @@ impl App {
             let mut timer = tokio::time::interval(app.inner.interval);
             loop {
                 timer.tick().await;
-                let next = state::collect().await;
+                let next = state::collect(app.inner.interval.as_millis() as u64).await;
                 let mut old = app.inner.snapshot.write().await;
                 let mut comparable = next.clone();
                 comparable.ts = old.ts;
