@@ -3,6 +3,7 @@ use crate::{
     cloud::{Cloud, Update as CloudUpdate},
     model::{DatadVersion, Snapshot, UbusCall},
     neighbor_manager::Manager as NeighborManager,
+    ota::{self, Config as OtaConfig, Ota},
     state,
 };
 use anyhow::Result;
@@ -39,6 +40,7 @@ struct Inner {
     token: Option<String>,
     sessions: Mutex<Sessions>,
     cloud: RwLock<Cloud>,
+    ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
 }
 
@@ -62,6 +64,7 @@ impl App {
                 tx,
                 interval,
                 cloud: RwLock::new(Cloud::load(&data_dir)),
+                ota: Mutex::new(Ota::load(&data_dir).map_err(anyhow::Error::msg)?),
                 neighbor: Mutex::new(neighbor),
                 _data_dir: data_dir,
                 token,
@@ -69,6 +72,7 @@ impl App {
             }),
         };
         app.spawn_sampler();
+        app.spawn_ota();
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {
@@ -81,6 +85,37 @@ impl App {
             loop {
                 timer.tick().await;
                 app.refresh_snapshot().await;
+            }
+        });
+    }
+    fn spawn_ota(&self) {
+        if std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").as_deref() == Ok("1") {
+            return;
+        }
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            loop {
+                let snapshot = serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null);
+                let mut manager = app.inner.ota.lock().await;
+                manager.reconcile_install_result();
+                if manager.should_auto_check() && manager.begin_update().is_ok() {
+                    manager.mark_auto_check();
+                    let _ = manager.check().await;
+                    manager.finish_update();
+                }
+                if let Some(candidate) = manager.auto_candidate() {
+                    if manager.begin_update().is_ok() {
+                        if let Err(error) = manager.install(&candidate, &snapshot, false).await {
+                            if !error.starts_with("等待安装条件:") {
+                                manager.fail(Some(&candidate), error);
+                            }
+                        }
+                        manager.finish_update();
+                    }
+                }
+                drop(manager);
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
@@ -126,6 +161,11 @@ impl App {
                     get(cloud_config_get).post(cloud_config_post),
                 )
                 .route("/cloud/status", get(cloud_status));
+            router = router
+                .route("/ota/config", get(ota_config_get).post(ota_config_post))
+                .route("/ota/status", get(ota_status))
+                .route("/ota/check", post(ota_check))
+                .route("/ota/update", post(ota_update));
         }
         if open_auth_routes {
             router = router
@@ -583,6 +623,85 @@ async fn cloud_config_post(State(app): State<App>, Json(update): Json<CloudUpdat
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
     }
+}
+async fn ota_config_get(State(app): State<App>) -> Json<Value> {
+    Json(app.inner.ota.lock().await.config_json())
+}
+async fn ota_status(State(app): State<App>) -> Json<Value> {
+    Json(app.inner.ota.lock().await.status_json())
+}
+async fn ota_config_post(
+    State(app): State<App>,
+    payload: Result<Json<OtaConfig>, JsonRejection>,
+) -> Response {
+    let Json(config) = match payload {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"success":false,"error":"配置格式无效"})),
+            )
+                .into_response();
+        }
+    };
+    match app.inner.ota.lock().await.update_config(config) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"success":false,"error":error})),
+        )
+            .into_response(),
+    }
+}
+async fn ota_check(State(app): State<App>) -> Response {
+    let mut manager = app.inner.ota.lock().await;
+    match manager.check().await {
+        Ok(candidate) => (
+            StatusCode::OK,
+            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":candidate.base_url})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"success":false,"error":error})),
+        )
+            .into_response(),
+    }
+}
+async fn ota_update(State(app): State<App>) -> Response {
+    {
+        let mut manager = app.inner.ota.lock().await;
+        if let Err(error) = manager.begin_update() {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"success":false,"error":error})),
+            )
+                .into_response();
+        }
+    }
+    let task = app.clone();
+    tokio::spawn(async move {
+        let snapshot = serde_json::to_value(task.snapshot().await).unwrap_or(Value::Null);
+        let mut manager = task.inner.ota.lock().await;
+        match manager.check().await {
+            Ok(candidate) if !ota::has_update(&candidate) => {
+                manager.fail(Some(&candidate), "当前已是最新版本".into());
+            }
+            Ok(candidate) => match manager.install(&candidate, &snapshot, true).await {
+                Ok(()) => {}
+                Err(error) => {
+                    manager.fail(Some(&candidate), error);
+                }
+            },
+            Err(error) => manager.fail(None, error),
+        }
+        manager.finish_update();
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"success":true,"status":"started"})),
+    )
+        .into_response()
 }
 fn result(value: Result<Value, String>) -> Response {
     match value {

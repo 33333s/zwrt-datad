@@ -4,6 +4,7 @@ mod command;
 mod model;
 mod neighbor;
 mod neighbor_manager;
+mod ota;
 mod qos;
 mod server;
 mod state;
