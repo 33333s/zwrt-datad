@@ -5,11 +5,11 @@ The Rust branch is never installed over the production binary until every requir
 | Area | Rust status | Production gate |
 |---|---|---|
 | CLI and static ARM64 musl build | implemented | real MU5252 `/tmp` smoke passed |
-| `/healthz`, `/version`, `/state` | foundation implemented | normalized schema comparison pending |
+| `/healthz`, `/version`, `/state` | build-time identity and firmware separation pass original suite | full normalized schema comparison pending |
 | change-driven `/events` SSE | implemented | reconnect and client-limit tests pending |
 | `/capabilities` | foundation implemented | exact action list pending |
 | `/ubus`, `/ubus/list`, `/ubus/call` | implemented with validation, timeout and output cap | auth/list shape parity pending |
-| authentication and LAN listener | pending | login/exchange/token expiry parity |
+| static token authentication and LAN listener | implemented; original version/SSE suite passes | login/exchange and rotating session expiry pending |
 | normalized device state | pending | MU5250, MU5252, MC7523, MC8532B golden comparisons |
 | allow-listed device controls | pending | readback, rollback and error-code parity |
 | bounded neighbor QTrace parser | implemented; original 20-case golden suite passes | real capture replay passes; collector lifecycle pending |

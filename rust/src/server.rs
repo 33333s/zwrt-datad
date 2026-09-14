@@ -5,8 +5,10 @@ use crate::{
 use anyhow::Result;
 use axum::{
     Json, Router,
+    extract::Request,
     extract::{Query, State},
     http::{Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
@@ -30,10 +32,11 @@ struct Inner {
     tx: watch::Sender<Snapshot>,
     interval: Duration,
     _data_dir: PathBuf,
+    token: Option<String>,
 }
 
 impl App {
-    pub async fn new(data_dir: PathBuf, interval: Duration) -> Result<Self> {
+    pub async fn new(data_dir: PathBuf, interval: Duration, token: Option<String>) -> Result<Self> {
         let initial = state::collect().await;
         let (tx, _) = watch::channel(initial.clone());
         let app = Self {
@@ -42,6 +45,7 @@ impl App {
                 tx,
                 interval,
                 _data_dir: data_dir,
+                token,
             }),
         };
         app.spawn_sampler();
@@ -69,8 +73,8 @@ impl App {
             }
         });
     }
-    pub async fn serve(self, addr: SocketAddr) -> Result<()> {
-        let router = Router::new()
+    pub async fn serve(self, addr: SocketAddr, require_auth: bool) -> Result<()> {
+        let mut router = Router::new()
             .route("/", get(index))
             .route("/healthz", get(health))
             .route("/version", get(version))
@@ -80,7 +84,11 @@ impl App {
             .route("/ubus", get(ubus_list))
             .route("/ubus/list", get(ubus_list))
             .route("/ubus/call", post(ubus_call))
-            .route("/control", post(control))
+            .route("/control", post(control));
+        if require_auth {
+            router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
+        }
+        let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
@@ -89,6 +97,42 @@ impl App {
             .await?;
         Ok(())
     }
+}
+
+async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if matches!(path, "/" | "/healthz" | "/auth/login" | "/auth/exchange")
+        || app.inner.token.is_none()
+    {
+        return next.run(request).await;
+    }
+    let wanted = app.inner.token.as_deref().unwrap_or_default();
+    let headers = request.headers();
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let legacy = headers.get("x-auth-token").and_then(|v| v.to_str().ok());
+    let query = request.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|part| part.strip_prefix("access_token="))
+    });
+    if [bearer, legacy, query]
+        .into_iter()
+        .flatten()
+        .any(|value| constant_time_eq(value.as_bytes(), wanted.as_bytes()))
+    {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, Json(json!({"ok":false,"error":{"code":"unauthorized","message":"authentication required"}}))).into_response()
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 async fn index() -> &'static str {

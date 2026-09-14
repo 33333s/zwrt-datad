@@ -28,7 +28,7 @@ struct Args {
     bind: String,
     #[arg(short = 'p', long = "port", default_value_t = 9460)]
     port: u16,
-    #[arg(long, default_value = "/data/zwrt-datad")]
+    #[arg(long, env = "ZWRT_DATAD_DIR", default_value = "/data/zwrt-datad")]
     data_dir: PathBuf,
 }
 
@@ -46,11 +46,25 @@ async fn main() -> Result<()> {
         &args.lan_bind,
         args.lan_port,
     );
-    let app = App::new(args.data_dir, interval).await?;
+    let token = match args.auth_token_file {
+        Some(path) => std::fs::read_to_string(path)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+        None => None,
+    };
+    let local_requires_auth = args.lan_bind.is_none() && token.is_some();
+    let app = App::new(args.data_dir, interval, token).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
     }
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
-    app.serve(addr).await
+    if let Some(lan_bind) = args.lan_bind {
+        let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
+        tokio::try_join!(app.clone().serve(addr, false), app.serve(lan_addr, true))?;
+        Ok(())
+    } else {
+        app.serve(addr, local_requires_auth).await
+    }
 }
