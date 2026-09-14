@@ -1,96 +1,103 @@
 # zwrt-datad
 
-`zwrt-datad` 是面向中兴便携式 5G 路由设备的数据与控制服务。它统一采集
-`ubus`、`uci`、`sysfs` 和必要的设备日志，输出稳定的 JSON 状态，并通过
-HTTP/SSE 向 UFI 等本机应用提供数据与受控操作。
+面向中兴 ARM64 5G 路由设备的统一数据与控制服务。
 
-## 功能
+[English](README_EN.md) · [最新版本](https://github.com/33333s/zwrt-datad/releases/latest) · [API 文档](docs/API.md)
 
-- `GET /state`：读取完整状态快照
-- `GET /events`：通过 SSE 订阅状态变化
-- `GET /healthz`：健康检查
-- `GET /capabilities`：读取当前机型支持的操作
-- `POST /control`：执行白名单控制动作
-- `GET /ubus`、`POST /ubus/call`：访问当前设备注册的 ubus 接口
-- `/ota/*`：检查和安装经过 Ed25519 与 SHA-256 校验的 datad 更新
+## 项目介绍
 
-目前包含以下正式设备模板：
+`zwrt-datad` 运行在设备本机，统一读取 `ubus`、`uci`、`sysfs` 和必要的设备日志，把不同机型的底层接口整理成稳定的 JSON 状态，并通过 HTTP 与 SSE 提供给 UFI、WebUI、脚本或其他本机服务。
 
-| 型号 | 产品 |
+项目使用机型模板隔离固件差异。上层应用不需要为每台设备重复轮询厂商接口，也不需要自行解析日志。datad 只负责设备数据、设备控制和自身更新，不包含前端页面、插件系统或 UFI 业务。
+
+## 主要功能
+
+- 聚合设备、系统、CPU、内存、存储、温度、电池和运行状态
+- 聚合 SIM、移动网络、信号、频段、流量、QoS、Wi-Fi、客户端和短信数据
+- `GET /state` 提供完整 JSON 快照，`GET /events` 通过 SSE 推送变化
+- 按机型模板规范化字段，并通过 `/capabilities` 暴露当前能力
+- 通过 `POST /control` 执行经过约束的蜂窝、Wi-Fi、APN、短信、电源和设备控制
+- 提供设备当前注册的 ubus 查询与调用接口，供受信任的管理应用使用
+- 可选邻小区采集，具有独立 worker、容量限制、过期处理和进程隔离
+- 可选 NMS 云端连接与远程服务入口
+- 内置 datad 自更新，使用 Ed25519 签名和 SHA-256 校验更新清单与二进制
+- 单进程、静态 ARM64 发布，默认每秒生成一次状态快照
+
+## 当前已适配设备
+
+| 设备型号 | 产品名称 |
 | --- | --- |
 | `MU5250` | U60 Pro |
 | `MC8532B` | G5 Pro |
 | `MU5252` | TopFlow |
 | `MC7523` | G5 Max WiFi |
 
-模板只输出设备实际支持的状态块。调用方应通过字段是否存在判断能力，不应给
-不支持的功能补 `0`、`-1` 或空对象。
+运行时只有 `device.api_template_supported = 1` 才代表识别到正式模板。不同设备只输出实际支持的状态块；调用方应通过字段是否存在判断能力，不要为缺失功能补 `0`、`-1` 或空对象。
 
-## 安装
+各机型的数据来源和差异见 [`docs/models/`](docs/models/)。其他机型可能进入兼容模板，但不代表已经完成适配。
 
-在 ARM64 设备上以 root 执行：
+## 一键安装或升级
+
+要求设备为 ARM64/aarch64、使用 root 执行，并可写入 `/data`：
 
 ```sh
 curl -4fL --retry 3 \
   'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' \
-  -o /tmp/install-datad.sh
+  -o /tmp/install-datad.sh && \
 sh /tmp/install-datad.sh
 ```
 
-安装目录固定为 `/data/zwrt-datad`。服务由
-`/data/zwrt-datad/service.sh` 管理，并从 `/etc/rc.local` 启动；不会安装
-datad 自己的 `/etc/init.d` 脚本。
+重复执行同一命令即可升级到最新版。安装器会：
+
+1. 下载发布二进制并校验固定的 SHA-256。
+2. 在临时端口启动候选版本，检查 `/healthz` 和 `/state`。
+3. 备份已有安装，原子写入 `/data/zwrt-datad`。
+4. 清理旧版重复启动项，并在 `/etc/rc.local` 写入唯一启动命令。
+5. 启动正式服务，检查 9460/9461 健康状态和单进程状态。
+6. 任一步骤失败时恢复原文件和原服务。
+
+datad 不安装自己的 `/etc/init.d` 脚本。安装器需要设备提供 `curl`、`sha256sum`、`awk`、`cmp`、`stat`、`flock`、`mktemp`、`readlink` 和 `od`。
+
+## 服务管理
 
 ```sh
-sh /data/zwrt-datad/service.sh start
 sh /data/zwrt-datad/service.sh status
+sh /data/zwrt-datad/service.sh start
 sh /data/zwrt-datad/service.sh restart
+sh /data/zwrt-datad/service.sh stop
 ```
 
-更完整的运行和日志说明见 [`docs/RUNTIME.md`](docs/RUNTIME.md)。
+默认路径：
 
-## 访问
+- 程序：`/data/zwrt-datad/zwrt-datad`
+- 日志：`/data/zwrt-datad/zwrt-datad.log`
+- PID：`/data/zwrt-datad/zwrt-datad.pid`
+- 本机 API：`http://127.0.0.1:9460`
+- 内网 API：`http://<设备 IP>:9461`
 
-默认监听：
-
-- `127.0.0.1:9460`：本机接口
-- `<设备内网 IP>:9461`：需要登录后取得 Bearer Token 的内网接口
+## 快速检查
 
 ```sh
 curl -fsS http://127.0.0.1:9460/healthz
+curl -fsS http://127.0.0.1:9460/version
 curl -fsS http://127.0.0.1:9460/state
 curl -N http://127.0.0.1:9460/events
 ```
 
-内网调用方可通过 `POST /auth/login` 或 `POST /auth/exchange` 获取 Token。
-详细路由和鉴权方式见 [`docs/API.md`](docs/API.md)。
+9460 是设备本机接口。9461 是内网接口，读取数据前需要通过 `/auth/login` 或 `/auth/exchange` 获取 Bearer Token；详细鉴权方式见 [`docs/API.md`](docs/API.md)。
 
-> `POST /ubus/call` 可以调用设备注册的写方法，包括可能导致断网、重启或配置
-> 变化的方法。面向用户的应用必须自行限制入口并进行必要确认。
-
-## 构建与测试
-
-需要 POSIX shell 和 aarch64 musl 工具链：
-
-```sh
-bash scripts/build.sh
-```
-
-GitHub Actions 会执行完整检查。本地开发和测试入口见仓库内的 `tests/`。
+> **安全提示：** `POST /ubus/call` 可以访问运行时注册的 ubus 方法，其中可能包含修改网络、断开连接或重启设备的写操作。只应向受信任的管理程序开放，并由调用方限制入口和进行必要确认。
 
 ## 文档
 
-- [`docs/API.md`](docs/API.md)：HTTP/SSE 接口
-- [`docs/CONTROL_API.md`](docs/CONTROL_API.md)：控制动作
+- [`docs/API.md`](docs/API.md)：HTTP、SSE、鉴权与命令行参数
 - [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)：状态字段契约
-- [`docs/models/`](docs/models/)：设备模板与字段来源
-- [`docs/CLOUD.md`](docs/CLOUD.md)：可选 NMS 云端连接
-- [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md)：可选邻区采集
+- [`docs/CONTROL_API.md`](docs/CONTROL_API.md)：设备控制动作与安全边界
+- [`docs/models/`](docs/models/)：已适配设备模板
 - [`docs/RUNTIME.md`](docs/RUNTIME.md)：运行、日志与服务管理
+- [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md)：可选邻区采集
+- [`docs/CLOUD.md`](docs/CLOUD.md)：可选 NMS 云端连接
 
-## 许可
+## 许可与贡献者
 
-项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见
-[`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)。
-
-项目贡献者及署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
+项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见 [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。

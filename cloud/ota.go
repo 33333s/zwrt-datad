@@ -25,13 +25,9 @@ import (
 )
 
 const (
-	otaNetdisk          = "https://pan.ericsfj.com/d/github%20releases/zwrt-datad"
-	otaGitHub           = "https://github.com/33333s/zwrt-datad/releases/latest/download"
-	otaNetdiskManifest  = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json?sign=TZsBt-YNMzLwMcS5FX-ksLg2sK_fCNGOWxzaKN_4JOU=:0"
-	otaNetdiskSignature = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/update.json.sig?sign=gvS_X703akHpSbzEZjzWUvLB7yvZsmPgm8RCjKzNSCA=:0"
-	otaNetdiskInstaller = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/install-datad.sh?sign=8qh7EYrKi_zRCOnHQKNU7k2XxghIxIyiJnoalfNlUss=:0"
-	otaNetdiskBinary    = "https://pan.ericsfj.com/p/%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8%E4%BA%91%E7%9B%982/cherry%20studio/github%20releases/zwrt-datad/zwrt-datad-aarch64?sign=dOcZWpLnxOETF2JboS_3_191tszCrcTI7_khCWUfLqg=:0"
-	otaIdleFor          = 2 * time.Minute
+	otaNetdisk = "https://pan.ericsfj.com/sd/wN2PJUK8"
+	otaGitHub  = "https://github.com/33333s/zwrt-datad/releases/latest/download"
+	otaIdleFor = 2 * time.Minute
 )
 
 var errWaitingIdle = errors.New("waiting for idle conditions")
@@ -42,6 +38,7 @@ var otaPublicPEM []byte
 type otaConfig struct {
 	Enabled bool     `json:"enabled"`
 	Servers []string `json:"servers"`
+	Sources []string `json:"sources"`
 }
 
 type otaArtifact struct {
@@ -105,12 +102,13 @@ func newOTAManager(dir, stateURL string) (*otaManager, error) {
 	if !ok {
 		return nil, errors.New("OTA 公钥类型无效")
 	}
-	o := &otaManager{dir: dir, stateURL: stateURL, config: otaConfig{Enabled: true},
+	o := &otaManager{dir: dir, stateURL: stateURL, config: otaConfig{Enabled: true, Sources: defaultOTASources()},
 		status: otaStatus{State: "idle", CurrentVersion: version},
 		client: &http.Client{Timeout: 45 * time.Second}, pub: pub}
 	if b, err := os.ReadFile(filepath.Join(dir, "ota.json")); err == nil {
 		var cfg otaConfig
 		if json.Unmarshal(b, &cfg) == nil && validateOTAConfig(cfg) == nil {
+			normalizeOTAConfig(&cfg)
 			o.config = cfg
 		}
 	}
@@ -118,6 +116,7 @@ func newOTAManager(dir, stateURL string) (*otaManager, error) {
 		var st otaStatus
 		if json.Unmarshal(b, &st) == nil {
 			st.CurrentVersion = version
+			st.Source = otaSourceName(st.Source)
 			o.status = st
 		}
 	}
@@ -140,16 +139,59 @@ func validateOTAConfig(c otaConfig) error {
 		}
 		seen[s] = true
 	}
+	if c.Sources != nil {
+		if len(c.Sources) == 0 {
+			return errors.New("至少选择一个更新来源")
+		}
+		seenSources := map[string]bool{}
+		for _, source := range c.Sources {
+			if source != "custom" && source != "netdisk" && source != "github" {
+				return errors.New("更新来源无效")
+			}
+			if seenSources[source] {
+				return errors.New("更新来源重复")
+			}
+			seenSources[source] = true
+		}
+	}
 	return nil
+}
+
+func defaultOTASources() []string {
+	return []string{"custom", "netdisk", "github"}
+}
+
+func normalizeOTAConfig(c *otaConfig) {
+	if c.Sources == nil {
+		c.Sources = defaultOTASources()
+	}
 }
 
 func (o *otaManager) servers() []string {
 	o.mu.Lock()
 	custom := append([]string(nil), o.config.Servers...)
+	sources := append([]string(nil), o.config.Sources...)
 	o.mu.Unlock()
+	if sources == nil {
+		sources = defaultOTASources()
+	}
+	enabled := map[string]bool{}
+	for _, source := range sources {
+		enabled[source] = true
+	}
 	out := make([]string, 0, len(custom)+2)
 	seen := map[string]bool{}
-	for _, s := range append(custom, otaNetdisk, otaGitHub) {
+	ordered := make([]string, 0, len(custom)+2)
+	if enabled["custom"] {
+		ordered = append(ordered, custom...)
+	}
+	if enabled["netdisk"] {
+		ordered = append(ordered, otaNetdisk)
+	}
+	if enabled["github"] {
+		ordered = append(ordered, otaGitHub)
+	}
+	for _, s := range ordered {
 		s = strings.TrimRight(strings.TrimSpace(s), "/")
 		if s != "" && !seen[s] {
 			seen[s] = true
@@ -180,7 +222,8 @@ func (o *otaManager) configAPI(w http.ResponseWriter, r *http.Request) {
 		o.mu.Lock()
 		cfg := o.config
 		o.mu.Unlock()
-		writeOTAJSON(w, 200, map[string]any{"success": true, "config": cfg, "default_servers": []string{otaNetdisk, otaGitHub}})
+		normalizeOTAConfig(&cfg)
+		writeOTAJSON(w, 200, map[string]any{"success": true, "config": cfg, "default_servers": []string{"网盘", "GitHub"}})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -195,6 +238,7 @@ func (o *otaManager) configAPI(w http.ResponseWriter, r *http.Request) {
 		writeOTAJSON(w, 400, map[string]any{"success": false, "error": err.Error()})
 		return
 	}
+	normalizeOTAConfig(&cfg)
 	for i := range cfg.Servers {
 		cfg.Servers[i] = strings.TrimRight(strings.TrimSpace(cfg.Servers[i]), "/")
 	}
@@ -231,7 +275,7 @@ func (o *otaManager) checkAPI(w http.ResponseWriter, r *http.Request) {
 		writeOTAJSON(w, 502, map[string]any{"success": false, "error": err.Error()})
 		return
 	}
-	writeOTAJSON(w, 200, map[string]any{"success": true, "has_update": newer(c.Manifest.Version, version), "manifest": c.Manifest, "source": c.BaseURL})
+	writeOTAJSON(w, 200, map[string]any{"success": true, "has_update": newer(c.Manifest.Version, version), "manifest": c.Manifest, "source": otaSourceName(c.BaseURL)})
 }
 func (o *otaManager) updateAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -274,41 +318,40 @@ func (o *otaManager) check(ctx context.Context) (*otaCandidate, error) {
 	o.saveStatusLocked()
 	o.mu.Unlock()
 	var errs []string
+	var fallback *otaCandidate
 	for _, base := range o.servers() {
+		label := otaSourceName(base)
 		raw, err := o.fetch(ctx, sourceURL(base, "update.json"), 1<<20)
 		if err != nil {
-			errs = append(errs, base+": "+err.Error())
+			errs = append(errs, label+": "+err.Error())
 			continue
 		}
 		sigb, err := o.fetch(ctx, sourceURL(base, "update.json.sig"), 4096)
 		if err != nil {
-			errs = append(errs, base+": "+err.Error())
+			errs = append(errs, label+": "+err.Error())
 			continue
 		}
 		sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigb)))
 		if err != nil || !ed25519.Verify(o.pub, raw, sig) {
-			errs = append(errs, base+": 签名校验失败")
+			errs = append(errs, label+": 签名校验失败")
 			continue
 		}
 		var m otaManifest
 		if json.Unmarshal(raw, &m) != nil || validateManifest(m) != nil {
-			errs = append(errs, base+": 清单无效")
+			errs = append(errs, label+": 清单无效")
 			continue
 		}
 		c := &otaCandidate{Manifest: m, BaseURL: base}
-		o.mu.Lock()
-		o.candidate = c
-		o.status.LatestVersion = m.Version
-		o.status.Source = base
-		o.status.SignatureOK = true
-		o.status.WaitReasons = nil
-		o.status.State = "idle"
-		if newer(m.Version, version) {
-			o.status.State = "available"
+		if !newer(m.Version, version) {
+			if fallback == nil || newer(m.Version, fallback.Manifest.Version) {
+				fallback = c
+			}
+			continue
 		}
-		o.saveStatusLocked()
-		o.mu.Unlock()
-		return c, nil
+		return o.acceptCandidate(c), nil
+	}
+	if fallback != nil {
+		return o.acceptCandidate(fallback), nil
 	}
 	err := errors.New("所有更新服务器均不可用或签名无效: " + strings.Join(errs, "; "))
 	o.mu.Lock()
@@ -317,6 +360,26 @@ func (o *otaManager) check(ctx context.Context) (*otaCandidate, error) {
 	o.saveStatusLocked()
 	o.mu.Unlock()
 	return nil, err
+}
+
+func (o *otaManager) acceptCandidate(c *otaCandidate) *otaCandidate {
+	m := c.Manifest
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.candidate = c
+	o.status.LatestVersion = m.Version
+	if newer(version, m.Version) {
+		o.status.LatestVersion = version
+	}
+	o.status.Source = otaSourceName(c.BaseURL)
+	o.status.SignatureOK = true
+	o.status.WaitReasons = nil
+	o.status.State = "idle"
+	if newer(m.Version, version) {
+		o.status.State = "available"
+	}
+	o.saveStatusLocked()
+	return c
 }
 
 func validateManifest(m otaManifest) error {
@@ -333,19 +396,21 @@ func validateManifest(m otaManifest) error {
 }
 
 func sourceURL(base, name string) string {
-	if base == otaNetdisk {
-		switch name {
-		case "update.json":
-			return otaNetdiskManifest
-		case "update.json.sig":
-			return otaNetdiskSignature
-		case "install-datad.sh":
-			return otaNetdiskInstaller
-		case "zwrt-datad-aarch64":
-			return otaNetdiskBinary
-		}
-	}
 	return strings.TrimRight(base, "/") + "/" + url.PathEscape(name)
+}
+
+func otaSourceName(source string) string {
+	source = strings.TrimRight(strings.TrimSpace(source), "/")
+	switch source {
+	case "", "网盘", "GitHub", "自定义服务器":
+		return source
+	case otaNetdisk:
+		return "网盘"
+	case otaGitHub:
+		return "GitHub"
+	default:
+		return "自定义服务器"
+	}
 }
 
 func (o *otaManager) fetch(ctx context.Context, u string, max int64) ([]byte, error) {
@@ -355,6 +420,10 @@ func (o *otaManager) fetch(ctx context.Context, u string, max int64) ([]byte, er
 	}
 	resp, err := o.client.Do(req)
 	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return nil, urlErr.Err
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -541,7 +610,7 @@ func (o *otaManager) fail(c *otaCandidate, err error) {
 	}
 	if c != nil {
 		o.status.LatestVersion = c.Manifest.Version
-		o.status.Source = c.BaseURL
+		o.status.Source = otaSourceName(c.BaseURL)
 	}
 	o.saveStatusLocked()
 }
