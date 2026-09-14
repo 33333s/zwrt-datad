@@ -12,7 +12,7 @@ The Rust branch is never installed over the production binary until every requir
 | authentication and LAN listener | pending | login/exchange/token expiry parity |
 | normalized device state | pending | MU5250, MU5252, MC7523, MC8532B golden comparisons |
 | allow-listed device controls | pending | readback, rollback and error-code parity |
-| neighbor collection and parser | pending | bounded fuzzing and real capture replay |
+| bounded neighbor QTrace parser | implemented; original 20-case golden suite passes | real capture replay passes; collector lifecycle pending |
 | cloud MQTT/WebSocket | pending | protocol and failure-state parity |
 | signed OTA | pending | Ed25519, safety gates, rollback and source ordering |
 

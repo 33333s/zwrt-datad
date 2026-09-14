@@ -11,7 +11,7 @@ impl Default for DatadVersion {
     fn default() -> Self {
         Self {
             name: "zwrt-datad",
-            version: env!("CARGO_PKG_VERSION"),
+            version: env!("DATAD_VERSION"),
         }
     }
 }

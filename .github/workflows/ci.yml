@@ -96,5 +96,7 @@ jobs:
           components: clippy,rustfmt
       - run: cargo fmt --check
       - run: cargo test --locked
+      - run: cargo build --locked
+      - run: python3 ../tests/neighbor_parser_test.py target/debug/zwrt-datad
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
