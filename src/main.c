@@ -18,6 +18,7 @@
 #include "web_crypto.h"
 #include "password_auth.h"
 #include "cloud_proxy.h"
+#include "webshell.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -5101,6 +5102,15 @@ static int request_is_authorized(const char *req, const char *query,
         auth_token_is_valid(auth, token);
 }
 
+static int request_is_authorized_without_query(const char *req,
+                                               struct auth_state *auth)
+{
+    char token[HTTP_TOKEN_MAX];
+    if (!request_header_bearer_token(req, token, sizeof token) &&
+        !http_header_value(req, "X-Auth-Token", token, sizeof token)) return 0;
+    return auth_token_is_valid(auth, token);
+}
+
 static int valid_ubus_identifier(const char *value)
 {
     if (!value || !*value) return 0;
@@ -5301,7 +5311,8 @@ static void broadcast_sse_snapshot(struct sse_client *clients, size_t nclients,
 static void accept_ready_http_clients(const struct http_listener *listener,
                                       struct sse_client *clients, size_t nclients,
                                       const char *snap, size_t snap_len,
-                                      struct auth_state *auth)
+                                      struct auth_state *auth,
+                                      struct webshell_manager *webshell)
 {
     char req[HTTP_REQ_MAX];
     char method[16];
@@ -5366,6 +5377,8 @@ static void accept_ready_http_clients(const struct http_listener *listener,
                                       "POST /ota/update   -> install signed update\n"
                                       "POST /auth/login   -> Basic login on LAN listener\n"
                                       "POST /auth/exchange -> vendor token exchange on LAN listener\n"
+                                      "GET  /webshell/status -> loopback authenticated WebShell status\n"
+                                      "GET  /webshell     -> loopback authenticated WebSocket PTY\n"
                                       "GET  /healthz      -> ok\n");
             close(cli_fd);
             continue;
@@ -5378,6 +5391,19 @@ static void accept_ready_http_clients(const struct http_listener *listener,
             continue;
         }
 
+        if (!strcmp(path, "/webshell") || !strcmp(path, "/webshell/status")) {
+            if (listener->lan_only || !peer_is_loopback(&peer)) {
+                write_http_error(cli_fd, 403, "Forbidden");
+                close(cli_fd);
+                continue;
+            }
+            if (!request_is_authorized_without_query(req, auth)) {
+                write_http_unauthorized(cli_fd);
+                close(cli_fd);
+                continue;
+            }
+        }
+
         if (open_auth_route && !strcmp(path, "/auth/login")) {
             handle_auth_login(cli_fd, req, query, auth);
             close(cli_fd);
@@ -5386,6 +5412,37 @@ static void accept_ready_http_clients(const struct http_listener *listener,
 
         if (open_auth_route && !strcmp(path, "/auth/exchange")) {
             handle_auth_exchange(cli_fd, req, query, &peer, auth);
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/webshell/status")) {
+            char body[192];
+            size_t body_len;
+            if (strcmp(method, "GET") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+            } else {
+                body_len = webshell_status_json(webshell, body, sizeof body);
+                if (!body_len) write_http_error(cli_fd, 500, "Internal Server Error");
+                else (void)write_http_json(cli_fd, body, body_len);
+            }
+            close(cli_fd);
+            continue;
+        }
+
+        if (!strcmp(path, "/webshell")) {
+            int upgraded;
+            if (strcmp(method, "GET") != 0) {
+                write_http_error(cli_fd, 405, "Method Not Allowed");
+                close(cli_fd);
+                continue;
+            }
+            upgraded = webshell_upgrade(webshell, cli_fd, req);
+            if (upgraded == 1) continue;
+            if (upgraded == -2) write_http_error(cli_fd, 404, "Not Found");
+            else if (upgraded == -3) write_http_error(cli_fd, 503, "Too Many Clients");
+            else if (upgraded == 0) write_http_error(cli_fd, 400, "Bad Request");
+            else write_http_error(cli_fd, 500, "Internal Server Error");
             close(cli_fd);
             continue;
         }
@@ -5525,7 +5582,8 @@ static void wait_with_http(const struct http_listener *local_listener,
                            const struct http_listener *lan_listener,
                            struct sse_client *clients, size_t nclients,
                            const char *snap, size_t snap_len, int wait_ms,
-                           struct auth_state *auth)
+                           struct auth_state *auth,
+                           struct webshell_manager *webshell)
 {
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -5548,11 +5606,12 @@ static void wait_with_http(const struct http_listener *local_listener,
         }
         if (sec < 0 || (sec == 0 && nsec <= 0)) return;
 
-        fd_set rfds;
+        fd_set rfds, wfds;
         struct timeval tv;
         int rc, maxfd = -1;
 
         FD_ZERO(&rfds);
+        FD_ZERO(&wfds);
         if (local_listener && local_listener->fd >= 0) {
             FD_SET(local_listener->fd, &rfds);
             maxfd = local_listener->fd;
@@ -5566,11 +5625,12 @@ static void wait_with_http(const struct http_listener *local_listener,
             FD_SET(clients[i].fd, &rfds);
             if (clients[i].fd > maxfd) maxfd = clients[i].fd;
         }
+        webshell_add_fds(webshell, &rfds, &wfds, &maxfd);
 
         tv.tv_sec = sec;
         tv.tv_usec = nsec / 1000;
         do {
-            rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+            rc = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
         } while (rc < 0 && errno == EINTR && g_run);
 
         if (rc < 0) {
@@ -5578,16 +5638,21 @@ static void wait_with_http(const struct http_listener *local_listener,
             perror("select");
             return;
         }
-        if (rc == 0) continue;
+        if (rc == 0) {
+            webshell_expire(webshell, time(NULL));
+            continue;
+        }
 
         if (local_listener && local_listener->fd >= 0 && FD_ISSET(local_listener->fd, &rfds))
-            accept_ready_http_clients(local_listener, clients, nclients, snap, snap_len, auth);
+            accept_ready_http_clients(local_listener, clients, nclients, snap, snap_len, auth, webshell);
         if (lan_listener && lan_listener->fd >= 0 && FD_ISSET(lan_listener->fd, &rfds))
-            accept_ready_http_clients(lan_listener, clients, nclients, snap, snap_len, auth);
+            accept_ready_http_clients(lan_listener, clients, nclients, snap, snap_len, auth, webshell);
         for (size_t i = 0; i < nclients; i++) {
             if (clients[i].fd >= 0 && FD_ISSET(clients[i].fd, &rfds))
                 drain_or_close_sse_client(&clients[i]);
         }
+        webshell_process_ready(webshell, &rfds, &wfds);
+        webshell_expire(webshell, time(NULL));
     }
 }
 
@@ -5617,7 +5682,7 @@ static const char *json_skip_ts(const char *snap, size_t len, size_t *out_len)
 int datad_main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--neighbor-parse")) return neighbor_parse_cli(argc - 2, argv + 2);
-    int once = 0, interval_ms = 1000, neighbor_enabled = -1;
+    int once = 0, interval_ms = 1000, neighbor_enabled = -1, webshell_enabled = 0;
     const char *neighbor_config = NULL;
     const char *bind_addr = HTTP_BIND_ADDR;
     const char *lan_bind_addr = NULL;
@@ -5636,6 +5701,7 @@ int datad_main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "--neighbor")) neighbor_enabled = 1;
+        else if (!strcmp(argv[i], "--webshell")) webshell_enabled = 1;
         else if (!strcmp(argv[i], "--neighbor-config") && i + 1 < argc) neighbor_config = argv[++i];
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bind")) && i + 1 < argc)
@@ -5653,7 +5719,7 @@ int datad_main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: zwrt-datad [--once] [-i ms] [-b addr] [-p port] "
                  "[--lan-bind addr] [--lan-port port] [--auth-token-file path] "
-                 "[--neighbor] [--neighbor-config path]\n"
+                 "[--neighbor] [--neighbor-config path] [--webshell]\n"
                  "       zwrt-datad --neighbor-parse FILE.qmdl [FILE.qmdl ...]\n"
                  "       zwrt-datad --version | -V");
             return 0;
@@ -5682,10 +5748,12 @@ int datad_main(int argc, char **argv)
     struct http_listener local_listener = {-1, 0, 0};
     struct http_listener lan_listener = {-1, 1, 1};
     struct auth_state auth;
+    static struct webshell_manager webshell;
     int cloud_started = 0;
     struct sse_client clients[HTTP_MAX_CLIENTS];
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) clients[i].fd = -1;
     auth_state_init(&auth);
+    webshell_manager_init(&webshell, webshell_enabled && !once);
 
     if (!once) {
         int token_loaded = auth_load_static_token(&auth, auth_token_file) == 0;
@@ -5860,7 +5928,7 @@ int datad_main(int argc, char **argv)
             }
 
             wait_with_http(&local_listener, &lan_listener, clients, HTTP_MAX_CLIENTS,
-                           snap, snap_len, interval_ms, &auth);
+                           snap, snap_len, interval_ms, &auth, &webshell);
         }
         cycle++;
     } while (g_run);
@@ -5868,6 +5936,7 @@ int datad_main(int argc, char **argv)
     neighbor_manager_stop();
     if (cloud_started) cloud_runtime_stop();
     if (g_topflow_multimodem_enabled) control_release_cooling_state();
+    webshell_stop(&webshell);
     for (size_t i = 0; i < HTTP_MAX_CLIENTS; i++) sse_client_close(&clients[i]);
     if (lan_listener.fd >= 0) close(lan_listener.fd);
     if (local_listener.fd >= 0) close(local_listener.fd);

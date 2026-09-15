@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.48",
+    "version": "0.9.49",
     "asset": "zwrt-datad-aarch64",
-    "notes": "从设备默认频段目录读取完整 LTE、NR SA 和 NR NSA 支持能力，与当前锁频配置分离"
+    "notes": "新增仅限回环、强制鉴权的 WebSocket PTY WebShell 接口"
   }
 }

@@ -89,11 +89,11 @@ start() {
     cd "$SERVICE_DIR" || return 1
     stop_legacy_cloud
     if [ -s "$TOKEN_FILE" ]; then
-        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 \
+        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
             --lan-bind 0.0.0.0 --lan-port 9461 --auth-token-file "$TOKEN_FILE" \
             >> "$LOG_FILE" 2>&1 </dev/null &
     else
-        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 \
+        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
             --lan-bind 0.0.0.0 --lan-port 9461 \
             >> "$LOG_FILE" 2>&1 </dev/null &
     fi
