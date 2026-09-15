@@ -1,4 +1,5 @@
 use crate::neighbor;
+use crate::qtrace_mask::QTRACE_MASK;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
@@ -154,18 +155,7 @@ impl Manager {
         fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
         fs::set_permissions(&ring, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
         let mask = run.join("qtrace.cfg");
-        let mut bytes = Vec::new();
-        for token in include_str!("../../src/neighbor/qtrace_mask.h")
-            .split(|c: char| c == ',' || c.is_whitespace() || c == '{' || c == '}' || c == ';')
-        {
-            if let Some(hex) = token.trim().strip_prefix("0x")
-                && hex.len() == 2
-                && let Ok(v) = u8::from_str_radix(hex, 16)
-            {
-                bytes.push(v)
-            }
-        }
-        fs::write(&mask, bytes).map_err(|e| e.to_string())?;
+        fs::write(&mask, QTRACE_MASK).map_err(|e| e.to_string())?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)

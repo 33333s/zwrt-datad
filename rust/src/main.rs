@@ -9,6 +9,7 @@ mod neighbor;
 mod neighbor_manager;
 mod ota;
 mod qos;
+mod qtrace_mask;
 mod server;
 mod sms;
 mod state;

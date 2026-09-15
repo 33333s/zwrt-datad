@@ -1549,6 +1549,9 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
     )
     .await
     .map_err(|e| e.to_string())?;
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
     serde_json::from_slice(&raw).map_err(|e| format!("invalid ubus JSON: {e}"))
 }
 pub async fn ubus_list(verbose: bool) -> Result<Value, String> {

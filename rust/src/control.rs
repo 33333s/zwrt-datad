@@ -94,10 +94,12 @@ fn integer(params: &Value, name: &str, required: bool) -> Result<Option<i64>, St
     }
 }
 fn boolean(params: &Value, name: &str) -> Result<bool, String> {
-    object(params)
-        .get(name)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{name} must be boolean"))
+    match object(params).get(name) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Number(value)) if value.as_i64() == Some(0) => Ok(false),
+        Some(Value::Number(value)) if value.as_i64() == Some(1) => Ok(true),
+        _ => Err(format!("{name} must be boolean or 0/1")),
+    }
 }
 fn mapped(params: &Value, specs: &[(&str, &str, bool, bool)]) -> Result<Value, String> {
     let mut args = Map::new();

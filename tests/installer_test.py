@@ -79,7 +79,8 @@ class BootEntries(unittest.TestCase):
             body = output.read_text()
             self.assertIn((ROOT / "scripts/service.sh").read_text().rstrip(), body)
             self.assertIn((ROOT / "version.json").read_text().rstrip(), body)
-            self.assertIn((ROOT / "OPENSSL-LICENSE.txt").read_text().rstrip(), body)
+            self.assertNotIn("@@LICENSE@@", body)
+            self.assertNotIn("DATAD_LICENSE_EOF", body)
             self.assertNotIn("@@", body)
             self.assertEqual(subprocess.run(["sh", "-n", str(output)]).returncode, 0)
 

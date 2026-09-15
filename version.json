@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.0",
+    "version": "0.10.1",
     "asset": "zwrt-datad-aarch64",
-    "notes": "Rust 实现成为 main 唯一发布版本，C/Go 实现归档到 c 分支"
+    "notes": "main 移除归档的 C/Go 实现，仅保留 Rust 生产代码与必要工具"
   }
 }

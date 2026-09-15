@@ -16,7 +16,7 @@ use tokio::process::Command;
 
 const NETDISK: &str = "https://pan.ericsfj.com/sd/wN2PJUK8";
 const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/download";
-const PUBLIC_KEY: &str = include_str!("../../cloud/ota_public.pem");
+const PUBLIC_KEY: &str = include_str!("../ota_public.pem");
 const IDLE_FOR: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

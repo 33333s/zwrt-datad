@@ -382,7 +382,7 @@ fn match_live(configured: &mut [Interface], live: &[Live]) {
             .iter()
             .copied()
             .find(|index| live[*index].name == item.configured)
-            .or_else(|| (matches.len() == 1).then_some(matches[0]));
+            .or_else(|| matches.first().copied().filter(|_| matches.len() == 1));
     }
     let mut seen = HashSet::new();
     let duplicates: HashSet<_> = configured
@@ -515,6 +515,13 @@ mod tests {
         match_live(&mut configured, &live);
         assert_eq!(configured[0].live, None);
         assert_eq!(configured[1].live, None);
+    }
+
+    #[test]
+    fn missing_live_ap_does_not_panic_or_match() {
+        let mut configured = vec![configured_fixture()];
+        match_live(&mut configured, &[]);
+        assert_eq!(configured[0].live, None);
     }
 
     #[test]

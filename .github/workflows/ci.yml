@@ -8,86 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.13'
-      - name: Test standard installer and boot entry normalization
-        run: python3 tests/installer_test.py
-      - name: Generate binary version from release manifest
-        run: python3 scripts/generate-version.py
-      - name: Build integrated datad with strict warnings
-        run: |
-          root="$PWD"
-          mkdir -p build/datad-host
-          for source in src/*.c src/neighbor/*.c; do
-            object="build/datad-host/${source//\//_}.o"
-            cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
-              -DWEB_CRYPTO_STATIC -DCLOUD_EMBEDDED -DDATAD_EMBEDDED \
-              -Iinclude -c "$source" -o "$object"
-          done
-          ar rcs build/datad-host/libdatad.a build/datad-host/*.o
-          version="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
-          cd cloud
-          CGO_ENABLED=1 CC=cc CGO_CFLAGS="-I$root/include" \
-          CGO_LDFLAGS="$root/build/datad-host/libdatad.a -lm -lcrypto -ldl -pthread" \
-            go build -tags datad_embedded,netgo,osusergo -trimpath \
-            -ldflags="-s -w -X main.version=$version" -o ../zwrt-datad-test .
-      - name: Test in-process cloud API
-        run: python3 tests/cloud_embedded_test.py ./zwrt-datad-test
-      - name: Test running version via CLI, HTTP and SSE
-        run: python3 tests/version_test.py ./zwrt-datad-test
-      - name: Test neighbor parsing, lifecycle and direct supply
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/neighbor_stream_test.c src/neighbor/parser.c -lm -o /tmp/neighbor-stream-test
-          /tmp/neighbor-stream-test
-          python3 tests/neighbor_parser_test.py ./zwrt-datad-test
-          python3 tests/neighbor_http_test.py ./zwrt-datad-test
-          python3 tests/direct_supply_test.py ./zwrt-datad-test
-      - name: Test SMS crypto backend
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -DWEB_CRYPTO_STATIC -Iinclude tests/web_crypto_test.c src/web_crypto.c -lcrypto -o web-crypto-test
-          ./web-crypto-test
-      - name: Test custom QUIC aggregation
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            tests/custom_aggregation_test.c src/password_auth.c src/cloud_proxy.c src/json.c \
-            src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c -lm -ldl -o /tmp/custom-aggregation-test
-          /tmp/custom-aggregation-test
-      - name: Test wireless policy and interface mapping
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/wifi_control_test.c src/wifi_control.c src/json.c -o wifi-control-test
-          ./wifi-control-test
-      - name: Test password challenge hashing
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/password_auth_test.c src/password_auth.c -o password-auth-test
-          ./password-auth-test
-      - name: Test JSON helpers
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
-            tests/json_test.c src/json.c -o json-test
-          ./json-test
-      - name: Test command timeout
-        run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
-            -DDEVICE_COMMAND_TIMEOUT_MS=150 -Iinclude \
-            tests/device_exec_test.c src/device_exec.c -o device-exec-test
-          ./device-exec-test
-      - name: Validate one-shot snapshot
-        run: |
-          ./zwrt-datad-test --once | python3 -m json.tool >/dev/null
-      - name: Exercise HTTP and control API
-        run: |
-          chmod +x tests/integration.sh tests/mock_ubus.sh tests/mock_uci.sh
-          tests/integration.sh ./zwrt-datad-test
-      - name: Test cloud runtime
-        working-directory: cloud
-        run: go test -race ./... && go vet ./...
-
-  rust-rewrite:
+  rust:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -100,13 +21,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo build --locked
+      - run: python3 ../tests/installer_test.py
       - run: python3 ../tests/rust_webshell_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_webshell_memory_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/rust_sse_limit_test.py target/debug/zwrt-datad
       - run: sh ../tests/service_token_test.sh target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_parser_test.py target/debug/zwrt-datad
       - run: python3 ../tests/version_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_embedded_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
       - run: ../tests/rust_control_integration.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
