@@ -282,8 +282,16 @@ def main():
             assert header.startswith(b"HTTP/1.1 101"), header
             recv_frame(ping, pending)
             ping.sendall(masked_frame(9, b"probe"))
-            opcode, payload, _ = recv_frame(ping)
-            assert opcode == 10 and payload == b"probe", (opcode, payload)
+            deadline = time.monotonic() + 3
+            while True:
+                ping.settimeout(max(0.1, deadline - time.monotonic()))
+                opcode, payload, _ = recv_frame(ping)
+                if opcode == 10:
+                    assert payload == b"probe", payload
+                    break
+                assert opcode == 2, (opcode, payload)
+                if time.monotonic() >= deadline:
+                    raise AssertionError("WebSocket pong was not received")
             ping.close()
 
             sessions = []
