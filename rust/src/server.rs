@@ -5,18 +5,20 @@ use crate::{
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
     state,
+    webshell::WebShell,
 };
 use anyhow::Result;
 use axum::{
     Json, Router,
     extract::rejection::JsonRejection,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, Extension, Request, WebSocketUpgrade},
     extract::{Query, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -52,6 +54,12 @@ struct Inner {
     cloud: RwLock<Cloud>,
     ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
+    webshell: WebShell,
+}
+
+#[derive(Clone, Copy)]
+struct ListenerPolicy {
+    lan_only: bool,
 }
 
 struct DeviceSession {
@@ -65,6 +73,7 @@ impl App {
         interval: Duration,
         token: Option<String>,
         neighbor_enabled: bool,
+        webshell_enabled: bool,
     ) -> Result<Self> {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
@@ -88,6 +97,7 @@ impl App {
                 sessions: Mutex::new(Sessions::default()),
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
+                webshell: WebShell::new(webshell_enabled),
             }),
         };
         app.inner.cloud.read().await.start(app.inner.tx.subscribe());
@@ -178,6 +188,9 @@ impl App {
             .route("/ubus/list", get(ubus_list))
             .route("/ubus/call", post(ubus_call))
             .route("/control", post(control));
+        router = router
+            .route("/webshell/status", get(webshell_status))
+            .route("/webshell", get(webshell_upgrade));
         if !require_auth {
             router = router
                 .route(
@@ -201,6 +214,9 @@ impl App {
         }
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
+            .layer(Extension(ListenerPolicy {
+                lan_only: open_auth_routes,
+            }))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
         let result = axum::serve(
@@ -213,6 +229,117 @@ impl App {
         result?;
         Ok(())
     }
+}
+
+async fn webshell_auth(app: &App, headers: &HeaderMap) -> bool {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let legacy = headers
+        .get("x-auth-token")
+        .and_then(|value| value.to_str().ok());
+    let Some(presented) = bearer.or(legacy) else {
+        return false;
+    };
+    static_token_valid(app.inner.token.as_deref(), Some(presented))
+        || app.inner.sessions.lock().await.validate(presented)
+}
+
+fn webshell_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"ok":false,"error":{"code":code,"message":message}})),
+    )
+        .into_response()
+}
+
+async fn webshell_status(
+    State(app): State<App>,
+    Extension(policy): Extension<ListenerPolicy>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if policy.lan_only || !peer.ip().is_loopback() {
+        return webshell_error(
+            StatusCode::FORBIDDEN,
+            "loopback_only",
+            "WebShell is loopback only",
+        );
+    }
+    if !webshell_auth(&app, &headers).await {
+        return webshell_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication required",
+        );
+    }
+    if !app.inner.webshell.enabled() {
+        return webshell_error(StatusCode::NOT_FOUND, "disabled", "WebShell is disabled");
+    }
+    Json(app.inner.webshell.status()).into_response()
+}
+
+async fn webshell_upgrade(
+    State(app): State<App>,
+    Extension(policy): Extension<ListenerPolicy>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if policy.lan_only || !peer.ip().is_loopback() {
+        return webshell_error(
+            StatusCode::FORBIDDEN,
+            "loopback_only",
+            "WebShell is loopback only",
+        );
+    }
+    if !webshell_auth(&app, &headers).await {
+        return webshell_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication required",
+        );
+    }
+    if !app.inner.webshell.enabled() {
+        return webshell_error(StatusCode::NOT_FOUND, "disabled", "WebShell is disabled");
+    }
+    if !valid_websocket_key(&headers) {
+        return webshell_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_websocket_key",
+            "Sec-WebSocket-Key must be canonical base64 for 16 bytes",
+        );
+    }
+    let Some(permit) = app.inner.webshell.try_acquire() else {
+        return webshell_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session_limit",
+            "too many WebShell sessions",
+        );
+    };
+    let shell = app.inner.webshell.clone();
+    ws.read_buffer_size(crate::webshell::MAX_MESSAGE_SIZE)
+        .write_buffer_size(8 * 1024)
+        .max_write_buffer_size(64 * 1024)
+        .max_message_size(crate::webshell::MAX_MESSAGE_SIZE)
+        .max_frame_size(crate::webshell::MAX_MESSAGE_SIZE)
+        .accept_unmasked_frames(false)
+        .on_upgrade(move |socket| shell.serve(socket, permit))
+        .into_response()
+}
+
+fn valid_websocket_key(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    BASE64
+        .decode(value)
+        .ok()
+        .is_some_and(|decoded| decoded.len() == 16 && BASE64.encode(decoded) == value)
 }
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {

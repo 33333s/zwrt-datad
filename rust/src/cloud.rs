@@ -1,15 +1,20 @@
 use crate::model::Snapshot;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
-use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, Outgoing, QoS, Transport};
-use rustls::{ClientConfig, RootCertStore};
+use rumqttc::{
+    AsyncClient, Event, Incoming, LastWill, MqttOptions, Outgoing, PublishOptions, QoS, Transport,
+};
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, pem::PemObject},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::{BufReader, Write},
+    io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Once},
@@ -288,9 +293,9 @@ async fn session(
     };
     let id_hash = Sha256::digest(root(config).as_bytes());
     let client_id = format!("datad-{}", hex(&id_hash[..12]));
-    let mut options = MqttOptions::new(client_id, host, port);
-    options.set_credentials(&config.username, &config.password);
-    options.set_keep_alive(Duration::from_secs(30));
+    let mut options = MqttOptions::new(client_id, (host, port));
+    options.set_credentials(config.username.clone(), config.password.clone());
+    options.set_keep_alive(30);
     options.set_clean_session(true);
     options.set_last_will(LastWill::new(
         format!("{}/status", root(config)),
@@ -303,7 +308,7 @@ async fn session(
     } else {
         Transport::tls(config.ca_pem.as_bytes().to_vec(), None, None)
     });
-    let (client, mut eventloop) = AsyncClient::new(options, 32);
+    let (client, mut eventloop) = AsyncClient::builder(options).capacity(32).build();
     if client
         .subscribe(
             format!("{}/command/request", root(config)),
@@ -434,9 +439,8 @@ async fn publish(client: &AsyncClient, topic: String, payload: Value) -> Result<
     client
         .publish(
             topic,
-            QoS::AtLeastOnce,
-            false,
             envelope(payload).to_string(),
+            PublishOptions::at_least_once(),
         )
         .await
         .map_err(|error| error.to_string())
@@ -667,7 +671,11 @@ async fn bridge_pipe(
             read = tcp_read.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => return false,
                 Ok(size) => {
-                    if ws_write.send(Message::Binary(buffer[..size].to_vec())).await.is_err() {
+                    if ws_write
+                        .send(Message::Binary(buffer[..size].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         return false;
                     }
                 },
@@ -680,9 +688,8 @@ fn websocket_tls(config: &Config) -> Result<Arc<ClientConfig>, String> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if !config.ca_pem.is_empty() {
-        let mut reader = BufReader::new(config.ca_pem.as_bytes());
         let mut added = 0usize;
-        for certificate in rustls_pemfile::certs(&mut reader) {
+        for certificate in CertificateDer::pem_slice_iter(config.ca_pem.as_bytes()) {
             roots
                 .add(certificate.map_err(|_| "CA 证书无效")?)
                 .map_err(|_| "CA 证书无效")?;
@@ -1085,7 +1092,7 @@ mod tests {
             .await
             .unwrap();
             socket
-                .send(Message::Binary(b"ufi-test".to_vec()))
+                .send(Message::Binary(b"ufi-test".to_vec().into()))
                 .await
                 .unwrap();
             let message = socket.next().await.unwrap().unwrap();
@@ -1122,7 +1129,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            b"ufi-test"
+            b"ufi-test".as_slice()
         );
         websocket_server.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), pipe)

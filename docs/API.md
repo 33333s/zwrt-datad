@@ -24,7 +24,30 @@ X-Auth-Token: <token>
 
 原生 `EventSource` 无法设置请求头时，也可以使用 `?access_token=<token>`。
 
+`/webshell` 是例外：它只接受 `Authorization: Bearer` 或 `X-Auth-Token`
+请求头，不接受 URL 查询参数中的 Token。
+
 ## Routes
+
+### `GET /webshell/status`
+
+返回 WebShell 是否启用、当前会话数、会话上限和协议版本。该接口和
+`/webshell` 均只允许从 `127.0.0.1:9460` 访问，即使回环访问也必须携带
+有效 Token；LAN 监听 `9461` 固定返回 `403`。
+
+```json
+{"enabled":true,"active_sessions":0,"max_sessions":4,"protocol":"websocket-binary-v1"}
+```
+
+### `GET /webshell`
+
+升级为 WebSocket 后创建独立 PTY，并启动固定的系统交互 Shell。服务端不接受
+可执行文件、命令行或环境变量参数。客户端二进制帧写入 PTY，服务端二进制帧
+返回 PTY 输出；文本帧只接受 `{"type":"resize","cols":120,"rows":40}`。
+最多 4 个并发会话，聚合消息最多 16384 字节，空闲 15 分钟自动断开。
+
+浏览器原生 `WebSocket` 不能自行设置 Authorization 请求头，因此 UFI 应由后端
+在设备内连接该回环接口并代理已认证会话，不得把 datad Token 放进 URL。
 
 ### `POST /auth/login`
 

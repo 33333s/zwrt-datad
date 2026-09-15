@@ -12,6 +12,7 @@ mod qos;
 mod server;
 mod sms;
 mod state;
+mod webshell;
 mod wifi;
 
 use anyhow::Result;
@@ -35,6 +36,8 @@ struct Args {
     once: bool,
     #[arg(long)]
     neighbor: bool,
+    #[arg(long)]
+    webshell: bool,
     #[arg(long)]
     auth_token_file: Option<PathBuf>,
     #[arg(long)]
@@ -86,7 +89,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
-    let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
+    let app = App::new(args.data_dir, interval, token, args.neighbor, args.webshell).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
