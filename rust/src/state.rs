@@ -134,6 +134,20 @@ fn valid_msisdn(value: &str) -> bool {
     let digits = value.strip_prefix('+').unwrap_or(value);
     (3..=32).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
+fn topflow_active_subid(common: &Value, sim: &Value) -> Option<i64> {
+    let model = string(common, "model_name");
+    let hardware = string(common, "hardware_version");
+    if model != "MU5252" && !hardware.starts_with("MU5252_") {
+        return None;
+    }
+    Some(integer(sim, "current_sim_slot").clamp(1, 6))
+}
+fn add_subid(mut args: Value, subid: Option<i64>) -> Value {
+    if let Some(subid) = subid {
+        args["subid"] = json!(subid);
+    }
+    args
+}
 fn realtime_traffic(value: &Value) -> Value {
     json!({
         "rx_speed":integer(value,"real_rx_speed"),
@@ -1057,22 +1071,33 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let board = ubus("system", "board", json!({})).await;
     let info = ubus("system", "info", json!({})).await;
     let net = ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
+    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
+    let active_subid = match (common.as_ref(), sim.as_ref()) {
+        (Ok(common), Ok(sim)) => topflow_active_subid(common, sim),
+        _ => None,
+    };
     let traffic = ubus(
         "zwrt_data",
         "get_wwandst",
-        json!({"source_module":"deviceui","cid":1,"type":1}),
+        add_subid(
+            json!({"source_module":"deviceui","cid":1,"type":1}),
+            active_subid,
+        ),
     )
     .await;
     let accounting = ubus(
         "zwrt_data",
         "get_wwandst",
-        json!({"source_module":"web","cid":1,"type":4}),
+        add_subid(
+            json!({"source_module":"web","cid":1,"type":4}),
+            active_subid,
+        ),
     )
     .await;
     let limit = ubus(
         "zwrt_data",
         "get_wwandst_monthlimit",
-        json!({"source_module":"web","cid":1}),
+        add_subid(json!({"source_module":"web","cid":1}), active_subid),
     )
     .await;
     let clear_day = ubus(
@@ -1081,7 +1106,6 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         json!({"source_module":"web","cid":1}),
     )
     .await;
-    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
     let lan_clients = ubus(
         "zwrt_router.api",
@@ -1116,13 +1140,35 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     )
     .await;
     let lan_if = ubus("network.interface.lan", "status", json!({})).await;
-    let wan4_if = ubus("network.interface.zte_wan", "status", json!({})).await;
-    let wan6_if = ubus("network.interface.zte_wan6", "status", json!({})).await;
+    let wan4_if = ubus(
+        if active_subid.is_some() {
+            "network.interface.zte_mwan2"
+        } else {
+            "network.interface.zte_wan"
+        },
+        "status",
+        json!({}),
+    )
+    .await;
+    let wan6_if = ubus(
+        if active_subid.is_some() {
+            "network.interface.zte_mwan2_6"
+        } else {
+            "network.interface.zte_wan6"
+        },
+        "status",
+        json!({}),
+    )
+    .await;
     let lan_config = ubus("zwrt_router.api", "router_get_lan_info", json!({})).await;
     let cellular = ubus(
         "zwrt_data",
         "get_wwaniface",
-        json!({"source_module":"web","cid":1,"connect_status":""}),
+        if active_subid.is_some() {
+            add_subid(json!({"source_module":"web","cid":1}), active_subid)
+        } else {
+            json!({"source_module":"web","cid":1,"connect_status":""})
+        },
     )
     .await;
     let common = object(common);
@@ -1269,6 +1315,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "month_tx_bytes",
         "total_rx_bytes",
         "total_tx_bytes",
+        "month_time",
     ] {
         tout.insert(key.into(), json!(integer(&accounting, key)));
     }
@@ -1853,6 +1900,30 @@ mod tests {
         assert_eq!(lan, 0);
         assert_eq!(items.as_array().unwrap().len(), 1);
         assert_eq!(items[0]["mac"], "aa:bb:cc:dd:ee:ff");
+    }
+    #[test]
+    fn topflow_uses_current_sim_slot_as_subid() {
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"model_name":"MU5252"}),
+                &json!({"current_sim_slot":3})
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"hardware_version":"MU5252_HW1.0"}),
+                &json!({"current_sim_slot":0})
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"model_name":"MU5250"}),
+                &json!({"current_sim_slot":1})
+            ),
+            None
+        );
     }
     #[test]
     fn custom_icg_groups_fresh_quic_lanes_by_physical_path() {
