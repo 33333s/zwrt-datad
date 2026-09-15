@@ -158,12 +158,11 @@ impl Manager {
         for token in include_str!("../../src/neighbor/qtrace_mask.h")
             .split(|c: char| c == ',' || c.is_whitespace() || c == '{' || c == '}' || c == ';')
         {
-            if let Some(hex) = token.trim().strip_prefix("0x") {
-                if hex.len() == 2 {
-                    if let Ok(v) = u8::from_str_radix(hex, 16) {
-                        bytes.push(v)
-                    }
-                }
+            if let Some(hex) = token.trim().strip_prefix("0x")
+                && hex.len() == 2
+                && let Ok(v) = u8::from_str_radix(hex, 16)
+            {
+                bytes.push(v)
             }
         }
         fs::write(&mask, bytes).map_err(|e| e.to_string())?;
@@ -224,14 +223,14 @@ impl Manager {
             }
             self.context = context;
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Ok(Some(status)) = child.try_wait() {
-                self.latest["status"] = json!("error");
-                self.latest["reason"] = json!("collector_exited");
-                self.latest["exit_code"] = json!(status.code());
-                self.child = None;
-                return;
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.latest["status"] = json!("error");
+            self.latest["reason"] = json!("collector_exited");
+            self.latest["exit_code"] = json!(status.code());
+            self.child = None;
+            return;
         }
         let Some(run) = &self.run else { return };
         let ring = run.join("ring");

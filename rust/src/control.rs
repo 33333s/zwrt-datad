@@ -789,10 +789,8 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
             return revert_wireless(e).await;
         }
         let _ = state::uci_write("del_list", &list, Some(&mac)).await;
-        if block {
-            if let Err(e) = state::uci_write("add_list", &list, Some(&mac)).await {
-                return revert_wireless(e).await;
-            }
+        if block && let Err(e) = state::uci_write("add_list", &list, Some(&mac)).await {
+            return revert_wireless(e).await;
         }
     }
     if let Err(e) = state::uci_write("commit", "wireless", None).await {
@@ -1255,14 +1253,13 @@ async fn wireless_config(params: &Value) -> Outcome {
             json!({"changed":false,"band":band,"country":country.unwrap_or(old0),"channel":channel.map(|v|v.to_string()).unwrap_or(old_channel)}),
         );
     }
-    if !country_changed {
-        if let Some(v) = channel {
-            if !status_channels(&initial, &band).contains(&v) {
-                return Outcome::Invalid(format!(
-                    "channel {v} is not permitted for {band} under country {old0}"
-                ));
-            }
-        }
+    if !country_changed
+        && let Some(v) = channel
+        && !status_channels(&initial, &band).contains(&v)
+    {
+        return Outcome::Invalid(format!(
+            "channel {v} is not permitted for {band} under country {old0}"
+        ));
     }
     if country_changed {
         let value = country.as_deref().unwrap();
@@ -1399,12 +1396,11 @@ async fn extra_wifi(params: &Value, operation: &str) -> Outcome {
     if !advanced_wifi_supported().await {
         return Outcome::Failed("advanced Wi-Fi unsupported by this model".into());
     }
-    if operation == "configure" {
-        if let Some(section) = object(params).get("section").and_then(Value::as_str) {
-            if matches!(section, "main_2g" | "main_5g" | "guest_2g" | "guest_5g") {
-                return wifi_configure(params).await;
-            }
-        }
+    if operation == "configure"
+        && let Some(section) = object(params).get("section").and_then(Value::as_str)
+        && matches!(section, "main_2g" | "main_5g" | "guest_2g" | "guest_5g")
+    {
+        return wifi_configure(params).await;
     }
     let section = if operation == "create" {
         if !extra_exists("datad_ssid_1").await {

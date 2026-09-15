@@ -136,15 +136,15 @@ impl App {
                     let _ = manager.check().await;
                     manager.finish_update();
                 }
-                if let Some(candidate) = manager.auto_candidate() {
-                    if manager.begin_update().is_ok() {
-                        if let Err(error) = manager.install(&candidate, &snapshot, false).await {
-                            if !error.starts_with("等待安装条件:") {
-                                manager.fail(Some(&candidate), error);
-                            }
-                        }
-                        manager.finish_update();
+                if let Some(candidate) = manager.auto_candidate()
+                    && manager.begin_update().is_ok()
+                {
+                    if let Err(error) = manager.install(&candidate, &snapshot, false).await
+                        && !error.starts_with("等待安装条件:")
+                    {
+                        manager.fail(Some(&candidate), error);
                     }
+                    manager.finish_update();
                 }
                 drop(manager);
                 tokio::time::sleep(Duration::from_secs(60)).await;

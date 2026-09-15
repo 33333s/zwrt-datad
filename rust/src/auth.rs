@@ -91,10 +91,10 @@ pub async fn verify_webtoken(token: &str, mode: i64, remote: &str, tag: &str) ->
     }
     let args = json!({"webtoken":token,"zmode":mode,"web_remote_addr":remote,"z-tag":tag});
     for method in ["webtoken_check", "web_security_check"] {
-        if let Ok(reply) = state::ubus("zwrt_web", method, args.clone()).await {
-            if indicates_success(&reply) {
-                return true;
-            }
+        if let Ok(reply) = state::ubus("zwrt_web", method, args.clone()).await
+            && indicates_success(&reply)
+        {
+            return true;
         }
     }
     false

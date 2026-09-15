@@ -67,10 +67,10 @@ fn read_tail(path: &Path) -> Option<String> {
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::with_capacity((size - start) as usize);
     file.take(MAX_LOG_BYTES).read_to_end(&mut bytes).ok()?;
-    if start > 0 {
-        if let Some(pos) = bytes.iter().position(|b| *b == b'\n') {
-            bytes.drain(..=pos);
-        }
+    if start > 0
+        && let Some(pos) = bytes.iter().position(|b| *b == b'\n')
+    {
+        bytes.drain(..=pos);
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -132,17 +132,17 @@ fn parse_logs(paths: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
                 pending_left = 0;
                 line_candidate = Some(idx);
             }
-            if lower.contains("qci") {
-                if let Some(qci) = integer_after_ci(&lower, "qci") {
-                    if let Some(idx) = context.filter(|_| context_left > 0) {
-                        candidates[idx].qci = Some(qci);
-                    } else if lower.contains("default bearer qci") {
-                        pending_qci = Some(qci);
-                        pending_left = 4;
-                        fallback.qci.get_or_insert(qci);
-                    } else {
-                        fallback.qci.get_or_insert(qci);
-                    }
+            if lower.contains("qci")
+                && let Some(qci) = integer_after_ci(&lower, "qci")
+            {
+                if let Some(idx) = context.filter(|_| context_left > 0) {
+                    candidates[idx].qci = Some(qci);
+                } else if lower.contains("default bearer qci") {
+                    pending_qci = Some(qci);
+                    pending_left = 4;
+                    fallback.qci.get_or_insert(qci);
+                } else {
+                    fallback.qci.get_or_insert(qci);
                 }
             }
             if let Some(idx) = line_candidate {

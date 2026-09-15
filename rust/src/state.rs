@@ -248,14 +248,14 @@ fn tcp_aggregation_summary() -> (usize, String, u16, bool) {
             if let Some((_, port)) = local {
                 listeners.push(u16::from_str_radix(port, 16).unwrap_or_default());
             }
-        } else if columns[3] == "01" {
-            if let (Some((_, local_port)), Some((address, remote_port))) = (local, remote) {
-                established.push((
-                    u16::from_str_radix(local_port, 16).unwrap_or_default(),
-                    address.to_owned(),
-                    u16::from_str_radix(remote_port, 16).unwrap_or_default(),
-                ));
-            }
+        } else if columns[3] == "01"
+            && let (Some((_, local_port)), Some((address, remote_port))) = (local, remote)
+        {
+            established.push((
+                u16::from_str_radix(local_port, 16).unwrap_or_default(),
+                address.to_owned(),
+                u16::from_str_radix(remote_port, 16).unwrap_or_default(),
+            ));
         }
     }
     let outgoing: Vec<_> = established
@@ -1351,15 +1351,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
                     Duration::from_secs(5),
                 )
                 .await
+                    && let Some(parsed) = crate::qos::parse_external(&String::from_utf8_lossy(&raw))
                 {
-                    if let Some(parsed) = crate::qos::parse_external(&String::from_utf8_lossy(&raw))
-                    {
-                        ext_qos = parsed;
-                        sampled_at = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                    }
+                    ext_qos = parsed;
+                    sampled_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
                 }
                 if let Ok(raw) = command::run(
                     adb,

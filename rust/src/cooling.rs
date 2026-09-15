@@ -46,10 +46,10 @@ async fn load() -> Config {
     };
     let mut map = BTreeMap::new();
     for line in raw.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            if let Ok(v) = v.parse() {
-                map.insert(k.to_owned(), v);
-            }
+        if let Some((k, v)) = line.split_once('=')
+            && let Ok(v) = v.parse()
+        {
+            map.insert(k.to_owned(), v);
         }
     }
     let mut c = Config::default();

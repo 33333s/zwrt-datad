@@ -351,13 +351,11 @@ async fn session(
                     }
                 }
                 Ok(Event::Incoming(Incoming::Publish(message))) if connected => {
-                    if !message.retain && message.payload.len() <= 8192 {
-                        if let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload) {
-                            if let Some(result) = bridge.receive(command).await {
+                    if !message.retain && message.payload.len() <= 8192
+                        && let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload)
+                            && let Some(result) = bridge.receive(command).await {
                                 let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                             }
-                        }
-                    }
                 }
                 Ok(_) => {},
                 Err(_) => { bridge.shutdown(); return SessionEnd::Failed; }

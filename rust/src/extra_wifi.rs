@@ -124,10 +124,10 @@ fn alive(pid: i32) -> bool {
     if !proc_dir.exists() {
         return false;
     }
-    if let Ok(stat) = fs::read_to_string(proc_dir.join("stat")) {
-        if stat.split_whitespace().nth(2) == Some("Z") {
-            return false;
-        }
+    if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
+        && stat.split_whitespace().nth(2) == Some("Z")
+    {
+        return false;
     }
     unsafe { libc::kill(pid, 0) == 0 }
 }
