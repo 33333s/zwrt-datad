@@ -28,7 +28,6 @@ values = {
     "DOWNLOAD_URL": args.url,
     "SERVICE": (root / "scripts/service.sh").read_text(),
     "MANIFEST": manifest_bytes.decode(),
-    "LICENSE": (root / "OPENSSL-LICENSE.txt").read_text(),
     "RC_AWK": (root / "scripts/rc-local-datad.awk").read_text(),
 }
 text = (root / "scripts/install.sh.in").read_text()

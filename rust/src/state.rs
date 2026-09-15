@@ -134,6 +134,20 @@ fn valid_msisdn(value: &str) -> bool {
     let digits = value.strip_prefix('+').unwrap_or(value);
     (3..=32).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
+fn topflow_active_subid(common: &Value, sim: &Value) -> Option<i64> {
+    let model = string(common, "model_name");
+    let hardware = string(common, "hardware_version");
+    if model != "MU5252" && !hardware.starts_with("MU5252_") {
+        return None;
+    }
+    Some(integer(sim, "current_sim_slot").clamp(1, 6))
+}
+fn add_subid(mut args: Value, subid: Option<i64>) -> Value {
+    if let Some(subid) = subid {
+        args["subid"] = json!(subid);
+    }
+    args
+}
 fn realtime_traffic(value: &Value) -> Value {
     json!({
         "rx_speed":integer(value,"real_rx_speed"),
@@ -276,6 +290,202 @@ fn tcp_aggregation_summary() -> (usize, String, u16, bool) {
         .unwrap_or_default();
     (outgoing.len(), ip, port, true)
 }
+fn proc_find_command(command: &str) -> Option<u32> {
+    let root = std::env::var("ZWRT_DATAD_PROC_ROOT").unwrap_or_else(|_| "/proc".into());
+    fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
+            (comm.trim() == command).then_some(pid)
+        })
+}
+fn proc_cmdline_contains(needle: &str) -> bool {
+    let root = std::env::var("ZWRT_DATAD_PROC_ROOT").unwrap_or_else(|_| "/proc".into());
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry.file_name().to_string_lossy().parse::<u32>().is_ok()
+                && fs::read(entry.path().join("cmdline"))
+                    .ok()
+                    .is_some_and(|raw| String::from_utf8_lossy(&raw).contains(needle))
+        })
+}
+async fn ipv4_interfaces() -> BTreeMap<String, String> {
+    let ip_bin = std::env::var("ZWRT_DATAD_IP_BIN").unwrap_or_else(|_| "/sbin/ip".into());
+    let Ok(raw) = command::run(&ip_bin, ["-j", "addr", "show"], Duration::from_secs(5)).await
+    else {
+        return BTreeMap::new();
+    };
+    let Ok(items) = serde_json::from_slice::<Value>(&raw) else {
+        return BTreeMap::new();
+    };
+    let mut interfaces = BTreeMap::new();
+    for item in items.as_array().into_iter().flatten() {
+        let name = string(item, "ifname");
+        for address in item
+            .get("addr_info")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if string(address, "family") == "inet" {
+                let local = string(address, "local");
+                if !local.is_empty() && !name.is_empty() {
+                    interfaces.insert(local, name.clone());
+                }
+            }
+        }
+    }
+    interfaces
+}
+fn value_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+fn custom_aggregation(
+    status: &Value,
+    interfaces: &BTreeMap<String, String>,
+    pid: u32,
+    now: u64,
+    enabled: bool,
+    mode: &str,
+    mwan_running: bool,
+) -> Value {
+    #[derive(Default)]
+    struct PathSummary {
+        ip: String,
+        interface: String,
+        lanes: usize,
+        online: usize,
+        rates: usize,
+        rx: f64,
+        tx: f64,
+        rtt: f64,
+        sent: f64,
+        lost: f64,
+        loss_samples: usize,
+        uptime: f64,
+        uptime_samples: usize,
+    }
+
+    let timestamp = status
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let fresh = integer(status, "schema") == 1
+        && integer(status, "pid") == i64::from(pid)
+        && now.checked_sub(timestamp).is_some_and(|age| age <= 5);
+    let mut paths: Vec<PathSummary> = Vec::new();
+    let mut server_ip = String::new();
+    let mut server_port = 0_u64;
+    if fresh {
+        for lane in status
+            .get("lanes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let ip = string(lane, "local_ip");
+            if ip.is_empty() {
+                continue;
+            }
+            if server_ip.is_empty() {
+                server_ip = string(lane, "server_ip");
+                server_port = lane
+                    .get("server_port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+            }
+            let index = paths
+                .iter()
+                .position(|path| path.ip == ip)
+                .unwrap_or_else(|| {
+                    paths.push(PathSummary {
+                        interface: interfaces.get(&ip).cloned().unwrap_or_default(),
+                        ip: ip.clone(),
+                        ..PathSummary::default()
+                    });
+                    paths.len() - 1
+                });
+            let path = &mut paths[index];
+            path.lanes += 1;
+            if !parse_bool(lane, "online") {
+                continue;
+            }
+            path.online += 1;
+            if let (Some(rx), Some(tx)) = (value_f64(lane, "rx_bps"), value_f64(lane, "tx_bps")) {
+                path.rates += 1;
+                path.rx += rx;
+                path.tx += tx;
+            }
+            path.rtt += value_f64(lane, "rtt_us").unwrap_or_default() / 1000.0;
+            if let (Some(sent), Some(lost)) = (
+                value_f64(lane, "sent_packets"),
+                value_f64(lane, "lost_packets"),
+            ) {
+                path.sent += sent;
+                path.lost += lost;
+                path.loss_samples += 1;
+            }
+            if let Some(uptime) = value_f64(lane, "uptime_seconds") {
+                path.uptime = path.uptime.max(uptime);
+                path.uptime_samples += 1;
+            }
+        }
+    }
+    let online_path_count = paths.iter().filter(|path| path.online > 0).count();
+    let tunnel_count: usize = paths.iter().map(|path| path.online).sum();
+    let paths: Vec<Value> = paths
+        .into_iter()
+        .map(|path| {
+            let label = match path.interface.as_str() {
+                "rmnet_data0" => "X75",
+                "V3E1net0" => "V3E1",
+                "V3E2net0" => "V3E2",
+                "eth0" => "Ethernet",
+                _ => &path.ip,
+            };
+            let mut value = json!({
+                "id":path.ip,"label":label,"interface":path.interface,
+                "online":path.online>0,"quic_tunnel_count":path.online,
+                "configured_tunnels":path.lanes
+            });
+            if path.online > 0 {
+                value["latency_ms"] = json!(path.rtt / path.online as f64);
+            }
+            if path.online > 0 && path.rates == path.online {
+                value["rx_bps"] = json!(path.rx);
+                value["tx_bps"] = json!(path.tx);
+            }
+            if path.online > 0 && path.loss_samples == path.online && path.sent > 0.0 {
+                value["packet_loss_percent"] = json!(100.0 * path.lost / path.sent);
+                value["packet_loss_source"] = json!("quic_tx_lifetime");
+            }
+            if path.online > 0 && path.uptime_samples == path.online {
+                value["uptime_seconds"] = json!(path.uptime);
+            }
+            value
+        })
+        .collect();
+    json!({
+        "enabled":enabled,"mode":mode,"source":"icg-v3","transport":"quic",
+        "state":if !enabled{"disabled"}else if tunnel_count>0{"online"}else{"waiting"},
+        "online":enabled&&tunnel_count>0,"telemetry_fresh":fresh,
+        "controller":{"icg_process_running":true,"mwan3_running":mwan_running},
+        "quic_tunnel_count":tunnel_count,"path_count":paths.len(),
+        "online_path_count":online_path_count,
+        "server":{"source":"runtime","ip":server_ip,"udp_port":server_port},
+        "traffic":{"remaining_bytes":Value::Null,"source":"unavailable"},"paths":paths
+    })
+}
 fn split_uci_list(value: &str) -> Vec<String> {
     value
         .split("' '")
@@ -351,12 +561,16 @@ fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool
     json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
 }
 fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
-    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH").unwrap_or_default();
+    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH")
+        .unwrap_or_else(|_| "/sys/class/thermal/thermal_zone0".into());
     let pwm_path = std::env::var("ZWRT_DATAD_FAN_PWM_PATH")
         .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/pwm1".into());
-    let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH").unwrap_or_default();
-    let liquid_thermal_path =
-        std::env::var("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH").unwrap_or_default();
+    let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH")
+        .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/device/thermal_enable".into());
+    let liquid_thermal_path = std::env::var("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH")
+        .unwrap_or_else(|_| "/sys/class/leds/aw_vibrator/thermal_enable".into());
+    let liquid_state_path = std::env::var("ZWRT_DATAD_LIQUID_COOLING_STATE_PATH")
+        .unwrap_or_else(|_| "/sys/class/thermal/cooling_device6/cur_state".into());
     let config_path = std::env::var("ZWRT_DATAD_COOLING_CONFIG")
         .unwrap_or_else(|_| "/data/zwrt-datad/cooling.conf".into());
     let config: BTreeMap<String, i64> = fs::read_to_string(config_path)
@@ -392,6 +606,7 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
     let liquid_thermal = fs::read_to_string(liquid_thermal_path)
         .unwrap_or_default()
         .contains("thermal_enable:1");
+    let liquid_kernel_state = read_i64(liquid_state_path).clamp(0, 2);
     let mut factory = Vec::new();
     for (index, fallback_pwm) in [76, 128, 179].into_iter().enumerate() {
         let temperature = read_i64(format!("{zone}/trip_point_{index}_temp"));
@@ -420,9 +635,24 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         custom.clone()
     };
     let liquid_level = config.get("liquid_level").copied().unwrap_or(1).clamp(1, 2);
+    let effective_liquid_level = if liquid_always {
+        liquid_level
+    } else {
+        liquid_kernel_state
+    };
+    let liquid_speed = match effective_liquid_level {
+        1 => 30,
+        2 => 100,
+        _ => 0,
+    };
+    let liquid_amplitude = match effective_liquid_level {
+        1 => 60,
+        2 => 200,
+        _ => 0,
+    };
     json!({
         "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"levels_percent":[0,30,50,70]},
-        "liquid":{"enabled":liquid_always,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":if liquid_always{liquid_level}else{0},"speed_percent":if liquid_always{if liquid_level==2{100}else{30}}else{0},"amplitude":if liquid_always{if liquid_level==2{200}else{60}}else{0},"levels_percent":[30,100]},
+        "liquid":{"enabled":liquid_always||liquid_thermal,"active":liquid_always||liquid_kernel_state>0,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":effective_liquid_level,"speed_percent":liquid_speed,"amplitude":liquid_amplitude,"kernel_state":liquid_kernel_state,"kernel_max_state":2,"levels_percent":[30,100]},
         "factory_curve":factory,"custom_curve":custom,"curve":curve
     })
 }
@@ -841,22 +1071,33 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let board = ubus("system", "board", json!({})).await;
     let info = ubus("system", "info", json!({})).await;
     let net = ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
+    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
+    let active_subid = match (common.as_ref(), sim.as_ref()) {
+        (Ok(common), Ok(sim)) => topflow_active_subid(common, sim),
+        _ => None,
+    };
     let traffic = ubus(
         "zwrt_data",
         "get_wwandst",
-        json!({"source_module":"deviceui","cid":1,"type":1}),
+        add_subid(
+            json!({"source_module":"deviceui","cid":1,"type":1}),
+            active_subid,
+        ),
     )
     .await;
     let accounting = ubus(
         "zwrt_data",
         "get_wwandst",
-        json!({"source_module":"web","cid":1,"type":4}),
+        add_subid(
+            json!({"source_module":"web","cid":1,"type":4}),
+            active_subid,
+        ),
     )
     .await;
     let limit = ubus(
         "zwrt_data",
         "get_wwandst_monthlimit",
-        json!({"source_module":"web","cid":1}),
+        add_subid(json!({"source_module":"web","cid":1}), active_subid),
     )
     .await;
     let clear_day = ubus(
@@ -865,7 +1106,6 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         json!({"source_module":"web","cid":1}),
     )
     .await;
-    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
     let lan_clients = ubus(
         "zwrt_router.api",
@@ -900,13 +1140,35 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     )
     .await;
     let lan_if = ubus("network.interface.lan", "status", json!({})).await;
-    let wan4_if = ubus("network.interface.zte_wan", "status", json!({})).await;
-    let wan6_if = ubus("network.interface.zte_wan6", "status", json!({})).await;
+    let wan4_if = ubus(
+        if active_subid.is_some() {
+            "network.interface.zte_mwan2"
+        } else {
+            "network.interface.zte_wan"
+        },
+        "status",
+        json!({}),
+    )
+    .await;
+    let wan6_if = ubus(
+        if active_subid.is_some() {
+            "network.interface.zte_mwan2_6"
+        } else {
+            "network.interface.zte_wan6"
+        },
+        "status",
+        json!({}),
+    )
+    .await;
     let lan_config = ubus("zwrt_router.api", "router_get_lan_info", json!({})).await;
     let cellular = ubus(
         "zwrt_data",
         "get_wwaniface",
-        json!({"source_module":"web","cid":1,"connect_status":""}),
+        if active_subid.is_some() {
+            add_subid(json!({"source_module":"web","cid":1}), active_subid)
+        } else {
+            json!({"source_module":"web","cid":1,"connect_status":""})
+        },
     )
     .await;
     let common = object(common);
@@ -991,6 +1253,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ("nrca", "nrca"),
         ("lteca", "lteca"),
         ("ltecasig", "ltecasig"),
+        ("lte_band_lock", "lte_band_lock"),
+        ("gw_band_lock", "gw_band_lock"),
+        ("nr5g_sa_band_lock", "nr5g_sa_band_lock"),
+        ("nr5g_nsa_band_lock", "nr5g_nsa_band_lock"),
+        ("nr5g_nrdc_band_lock", "nr5g_nrdc_band_lock"),
+        ("lock_lte_cell", "lock_lte_cell"),
+        ("lock_nr_cell", "lock_nr_cell"),
         ("net_select", "net_select"),
         ("sa_bands", "nr5g_sa_band_lock"),
         ("nsa_bands", "nr5g_nsa_band_lock"),
@@ -1015,6 +1284,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ("lte_pci", "lte_pci"),
         ("lte_cell_id", "cell_id"),
         ("lte_channel", "wan_active_channel"),
+        ("lte_action_channel", "wan_active_channel"),
         ("nr_pci", "nr5g_pci"),
         ("nr_cell_id", "nr5g_cell_id"),
         ("nr_channel", "nr5g_action_channel"),
@@ -1045,6 +1315,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "month_tx_bytes",
         "total_rx_bytes",
         "total_tx_bytes",
+        "month_time",
     ] {
         tout.insert(key.into(), json!(integer(&accounting, key)));
     }
@@ -1400,7 +1671,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         let mwan_running = std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
-            .is_some_and(|v| v != 0);
+            .is_some_and(|v| v != 0)
+            || proc_find_command("mwan3track").is_some()
+            || proc_cmdline_contains("mwan_monitor.sh");
+        let custom_icg_pid = proc_find_command("icg-client");
         let mwan_status = object(ubus("mwan3", "status", json!({})).await);
         let mut paths = Vec::new();
         let interfaces = mwan_status
@@ -1492,7 +1766,32 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or_default();
         let enabled = mode == "SMULTIWAN";
-        fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"paths":paths,"path_count":path_count,"online_path_count":online_path_count,"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
+        if let Some(pid) = custom_icg_pid {
+            let status_path = std::env::var("ZWRT_DATAD_ICG_STATUS_PATH")
+                .unwrap_or_else(|_| "/tmp/icg-v3-status.json".into());
+            let status = fs::read(status_path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+                .unwrap_or_else(|| json!({}));
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            fields.insert(
+                "aggregation".into(),
+                custom_aggregation(
+                    &status,
+                    &ipv4_interfaces().await,
+                    pid,
+                    now,
+                    enabled,
+                    &mode,
+                    mwan_running,
+                ),
+            );
+        } else {
+            fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"paths":paths,"path_count":path_count,"online_path_count":online_path_count,"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
+        }
         fields.insert(
             "multiwan".into(),
             topflow_multiwan(&uci_sets, &mode, mwan_running),
@@ -1549,6 +1848,9 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
     )
     .await
     .map_err(|e| e.to_string())?;
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
     serde_json::from_slice(&raw).map_err(|e| format!("invalid ubus JSON: {e}"))
 }
 pub async fn ubus_list(verbose: bool) -> Result<Value, String> {
@@ -1598,5 +1900,59 @@ mod tests {
         assert_eq!(lan, 0);
         assert_eq!(items.as_array().unwrap().len(), 1);
         assert_eq!(items[0]["mac"], "aa:bb:cc:dd:ee:ff");
+    }
+    #[test]
+    fn topflow_uses_current_sim_slot_as_subid() {
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"model_name":"MU5252"}),
+                &json!({"current_sim_slot":3})
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"hardware_version":"MU5252_HW1.0"}),
+                &json!({"current_sim_slot":0})
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            topflow_active_subid(
+                &json!({"model_name":"MU5250"}),
+                &json!({"current_sim_slot":1})
+            ),
+            None
+        );
+    }
+    #[test]
+    fn custom_icg_groups_fresh_quic_lanes_by_physical_path() {
+        let status = json!({"schema":1,"timestamp":100,"pid":42,"lanes":[
+            {"local_ip":"10.0.0.2","server_ip":"203.0.113.1","server_port":19004,"online":true,"rx_bps":10,"tx_bps":20,"rtt_us":2000,"sent_packets":100,"lost_packets":1,"uptime_seconds":30},
+            {"local_ip":"10.0.0.2","server_ip":"203.0.113.1","server_port":19004,"online":true,"rx_bps":30,"tx_bps":40,"rtt_us":4000,"sent_packets":100,"lost_packets":1,"uptime_seconds":20},
+            {"local_ip":"10.0.0.3","server_ip":"203.0.113.1","server_port":19004,"online":false}
+        ]});
+        let interfaces = BTreeMap::from([
+            ("10.0.0.2".into(), "rmnet_data0".into()),
+            ("10.0.0.3".into(), "V3E1net0".into()),
+        ]);
+        let value = custom_aggregation(&status, &interfaces, 42, 103, true, "SMULTIWAN", true);
+        assert_eq!(value["state"], "online");
+        assert_eq!(value["quic_tunnel_count"], 2);
+        assert_eq!(value["path_count"], 2);
+        assert_eq!(value["online_path_count"], 1);
+        assert_eq!(value["paths"][0]["label"], "X75");
+        assert_eq!(value["paths"][0]["latency_ms"], 3.0);
+        assert_eq!(value["paths"][0]["uptime_seconds"], 30.0);
+    }
+    #[test]
+    fn custom_icg_rejects_stale_or_wrong_pid_telemetry() {
+        let status = json!({"schema":1,"timestamp":90,"pid":7,"lanes":[{"local_ip":"10.0.0.2","online":true}]});
+        let value =
+            custom_aggregation(&status, &BTreeMap::new(), 42, 100, true, "SMULTIWAN", false);
+        assert_eq!(value["telemetry_fresh"], false);
+        assert_eq!(value["state"], "waiting");
+        assert_eq!(value["quic_tunnel_count"], 0);
+        assert_eq!(value["paths"], json!([]));
     }
 }

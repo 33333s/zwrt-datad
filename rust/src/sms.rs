@@ -23,7 +23,7 @@ fn valid(number: &str, message: &str, sms_time: &str) -> bool {
             .all(|(index, byte)| byte.is_ascii_digit() || (index == 0 && byte == b'+'))
         && !message.is_empty()
         && message.len() <= 4096
-        && message.len() % 2 == 0
+        && message.len() & 1 == 0
         && message.bytes().all(|byte| byte.is_ascii_hexdigit())
         && !sms_time.is_empty()
         && sms_time.len() <= 64
@@ -98,7 +98,7 @@ fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
 
 async fn decrypt(value: &str) -> Result<Option<String>, String> {
     if value.len() < 40
-        || value.len() % 2 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.len() & 1 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Ok(None);
     }

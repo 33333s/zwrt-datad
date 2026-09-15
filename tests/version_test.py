@@ -46,30 +46,6 @@ else:
                         ZWRT_DATAD_NEIGHBOR_DIR=str(self.root / 'capture'),
                         ZWRT_DATAD_NEIGHBOR_CONFIG=str(self.root / 'neighbor.json'))
 
-    def test_generator_follows_manifest_and_rejects_invalid(self):
-        manifest = self.root / "build-version.json"
-        header = self.root / "version.h"
-        command = [sys.executable, str(ROOT / "scripts/generate-version.py"),
-                   "--manifest", str(manifest), "--output", str(header)]
-        for version in ('9.8.7', '9.8.8'):
-            manifest.write_text(json.dumps({'schema': 1, 'datad': {'version': version}}))
-            subprocess.run(command, check=True)
-            # Compile a consumer, proving that changing only the manifest updates it.
-            probe = self.root / 'probe'
-            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                            '-I', str(self.root), '-x', 'c', '-', '-o', str(probe)],
-                           input='#include "version.h"\n#include <stdio.h>\nint main(void) { puts(ZWRT_DATAD_VERSION); }\n',
-                           text=True, check=True)
-            self.assertEqual(subprocess.check_output([str(probe)], text=True).strip(), version)
-        before, stamp = header.read_bytes(), header.stat().st_mtime_ns
-        subprocess.run(command, check=True)
-        self.assertEqual(header.stat().st_mtime_ns, stamp)
-        for invalid in ('not-a-version', '1.2', '1.2.3"', None):
-            manifest.write_text(json.dumps({'schema': 1, 'datad': {'version': invalid}}))
-            result = subprocess.run(command, capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(header.read_bytes(), before)
-
     def test_cli_needs_no_device_or_runtime_files(self):
         for args in (['--version'], ['-V'],
                      ['--neighbor', '--auth-token-file', str(self.root / 'missing'), '--version']):

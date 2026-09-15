@@ -133,9 +133,6 @@ DATAD_SERVICE_EOF
 cat > "$WORK/version.json" <<'DATAD_MANIFEST_EOF'
 @@MANIFEST@@
 DATAD_MANIFEST_EOF
-cat > "$WORK/OPENSSL-LICENSE.txt" <<'DATAD_LICENSE_EOF'
-@@LICENSE@@
-DATAD_LICENSE_EOF
 cat > "$WORK/rc.awk" <<'DATAD_RC_AWK_EOF'
 @@RC_AWK@@
 DATAD_RC_AWK_EOF
@@ -184,7 +181,7 @@ chmod 755 "$WORK/zwrt-datad"
 FILES_CHANGED=0
 BINARY_CHANGED=0
 SERVICE_CHANGED=0
-for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt; do
+for name in zwrt-datad service.sh version.json; do
     if ! cmp -s "$WORK/$name" "$DIR/$name"; then
         FILES_CHANGED=1
         [ "$name" != zwrt-datad ] || BINARY_CHANGED=1
@@ -196,17 +193,18 @@ PIDS=$(running_pids)
 [ -z "$PIDS" ] || WAS_RUNNING=1
 CLOUD_PIDS=$(legacy_cloud_pids)
 [ -z "$CLOUD_PIDS" ] || WAS_CLOUD_RUNNING=1
-LEGACY_CLOUD=0
-[ -z "$CLOUD_PIDS" ] || LEGACY_CLOUD=1
+LEGACY_RESIDUE=0
+[ -z "$CLOUD_PIDS" ] || LEGACY_RESIDUE=1
 for legacy_cloud_file in zwrt-datad-cloud cloud-service.sh cloud.pid cloud.sock cloud.lock; do
-    [ ! -e "$DIR/$legacy_cloud_file" ] || LEGACY_CLOUD=1
+    [ ! -e "$DIR/$legacy_cloud_file" ] || LEGACY_RESIDUE=1
 done
+[ ! -e "$DIR/OPENSSL-LICENSE.txt" ] || LEGACY_RESIDUE=1
 NEED_START=1
 if [ "$BINARY_CHANGED" = 0 ] && [ "$SERVICE_CHANGED" = 0 ] && [ "$(printf '%s\n' "$PIDS" | awk 'NF{n++} END{print n+0}')" = 1 ] && health 9460 && health 9461; then
     actual=$(readlink "/proc/$PIDS/exe" 2>/dev/null || true)
     [ "$actual" != "$BIN" ] || NEED_START=0
 fi
-if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-links" ] && [ "$NEED_START" = 0 ] && [ "$LEGACY_CLOUD" = 0 ]; then
+if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-links" ] && [ "$NEED_START" = 0 ] && [ "$LEGACY_RESIDUE" = 0 ]; then
     SUCCESS=1
     say "v$VERSION 已安装；安装文件和自启一致，无需重写或重启服务"
     exit 0
@@ -230,7 +228,7 @@ for pid in $PIDS; do
         done
     fi
 done
-if [ "$LEGACY_CLOUD" = 1 ]; then stop_legacy_cloud; fi
+if [ "$LEGACY_RESIDUE" = 1 ]; then stop_legacy_cloud; fi
 if [ "$NEED_START" = 1 ]; then
     IFS= read -r original_service < "$BACKUP/original-service"
     if [ -f "$original_service" ]; then sh "$original_service" stop 9>&-; fi
@@ -248,7 +246,7 @@ if [ "$NEED_START" = 1 ]; then
     stop_smoke
 fi
 
-for name in zwrt-datad service.sh version.json OPENSSL-LICENSE.txt; do
+for name in zwrt-datad service.sh version.json; do
     if ! cmp -s "$WORK/$name" "$DIR/$name"; then
         cp "$WORK/$name" "$DIR/$name.new.$$"
         case "$name" in zwrt-datad|service.sh) chmod 755 "$DIR/$name.new.$$" ;; *) chmod 644 "$DIR/$name.new.$$" ;; esac
@@ -279,8 +277,11 @@ while IFS= read -r link; do
     cp -P "$link" "$BACKUP/legacy-links/${link##*/}"
     rm "$link"
 done < "$WORK/legacy-links"
-rm -f "$DIR/zwrt-datad-cloud" "$DIR/cloud-service.sh" "$DIR/cloud.pid" "$DIR/cloud.sock" "$DIR/cloud.lock"
+rm -f "$DIR/zwrt-datad-cloud" "$DIR/cloud-service.sh" "$DIR/cloud.pid" "$DIR/cloud.sock" "$DIR/cloud.lock" "$DIR/OPENSSL-LICENSE.txt"
 SUCCESS=1
+rm -rf "$BACKUP"
+[ ! -e "$BACKUP" ] || fail "安装成功，但临时回滚备份清理失败：$BACKUP"
+BACKUP=
 say "安装完成：v$VERSION，$BIN"
 say "自启：sh /data/zwrt-datad/service.sh start"
-say "备份：$BACKUP"
+say "临时回滚备份已删除"

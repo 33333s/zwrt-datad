@@ -94,10 +94,12 @@ fn integer(params: &Value, name: &str, required: bool) -> Result<Option<i64>, St
     }
 }
 fn boolean(params: &Value, name: &str) -> Result<bool, String> {
-    object(params)
-        .get(name)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{name} must be boolean"))
+    match object(params).get(name) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Number(value)) if value.as_i64() == Some(0) => Ok(false),
+        Some(Value::Number(value)) if value.as_i64() == Some(1) => Ok(true),
+        _ => Err(format!("{name} must be boolean or 0/1")),
+    }
 }
 fn mapped(params: &Value, specs: &[(&str, &str, bool, bool)]) -> Result<Value, String> {
     let mut args = Map::new();
@@ -489,21 +491,56 @@ async fn band(params: &Value, lte: bool, nsa: bool) -> Outcome {
     }
 }
 async fn unlock_all() -> Outcome {
-    if let Err(e) = state::ubus(
+    let lte = state::ubus(
         "zte_nwinfo_api",
         "nwinfo_lock_lte_cell",
         json!({"lock_lte_pci":"0","lock_lte_earfcn":"0"}),
     )
-    .await
-    {
-        return Outcome::Failed(e);
-    }
-    call(
+    .await;
+    let nr = state::ubus(
         "zte_nwinfo_api",
         "nwinfo_lock_nr_cell",
         json!({"lock_nr_pci":"0","lock_nr_earfcn":"0","lock_nr_cell_band":"0"}),
     )
-    .await
+    .await;
+    if lte.is_ok() && nr.is_ok() {
+        return Outcome::Ok(json!({"verified":false,"lte_call_ok":true,"nr_call_ok":true}));
+    }
+    let readback = state::ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
+    if let Ok(readback) = readback
+        && cell_lock_clear(&readback, "lock_lte_cell")
+        && cell_lock_clear(&readback, "lock_nr_cell")
+    {
+        return Outcome::Ok(json!({
+            "verified":true,
+            "lte_call_ok":lte.is_ok(),
+            "nr_call_ok":nr.is_ok()
+        }));
+    }
+    let errors = [lte.err(), nr.err()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    Outcome::Failed(if errors.is_empty() {
+        "cell unlock readback did not confirm an unlocked state".into()
+    } else {
+        errors
+    })
+}
+fn cell_lock_clear(value: &Value, key: &str) -> bool {
+    let lock = value
+        .get(key)
+        .map(|value| match value {
+            Value::String(value) => value.clone(),
+            Value::Number(value) => value.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    lock.trim().is_empty()
+        || lock
+            .split(',')
+            .all(|part| part.trim().is_empty() || part.trim() == "0")
 }
 async fn sim_slot(params: &Value) -> Outcome {
     let slot = match integer(params, "slot", true) {
@@ -1907,5 +1944,21 @@ mod tests {
         for bad in ["1 3", "n78", "1;reboot"] {
             assert!(!bad.bytes().all(|b| b.is_ascii_digit() || b == b','));
         }
+    }
+    #[test]
+    fn unlocked_cell_readback_accepts_absent_empty_and_zero_values() {
+        assert!(cell_lock_clear(&json!({}), "lock_lte_cell"));
+        assert!(cell_lock_clear(
+            &json!({"lock_lte_cell":"0,0"}),
+            "lock_lte_cell"
+        ));
+        assert!(cell_lock_clear(
+            &json!({"lock_nr_cell":"0,0,0"}),
+            "lock_nr_cell"
+        ));
+        assert!(!cell_lock_clear(
+            &json!({"lock_lte_cell":"57,3725"}),
+            "lock_lte_cell"
+        ));
     }
 }
