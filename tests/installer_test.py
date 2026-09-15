@@ -82,6 +82,10 @@ class BootEntries(unittest.TestCase):
             self.assertNotIn("@@LICENSE@@", body)
             self.assertNotIn("DATAD_LICENSE_EOF", body)
             self.assertNotIn("@@", body)
+            self.assertNotIn('say "备份：$BACKUP"', body)
+            self.assertIn('rm -rf "$BACKUP"', body)
+            self.assertLess(body.index("SUCCESS=1"), body.index('rm -rf "$BACKUP"'))
+            self.assertLess(body.index('rm -rf "$BACKUP"'), body.index('say "安装完成：'))
             self.assertEqual(subprocess.run(["sh", "-n", str(output)]).returncode, 0)
 
 

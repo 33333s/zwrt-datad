@@ -279,6 +279,9 @@ while IFS= read -r link; do
 done < "$WORK/legacy-links"
 rm -f "$DIR/zwrt-datad-cloud" "$DIR/cloud-service.sh" "$DIR/cloud.pid" "$DIR/cloud.sock" "$DIR/cloud.lock" "$DIR/OPENSSL-LICENSE.txt"
 SUCCESS=1
+rm -rf "$BACKUP"
+[ ! -e "$BACKUP" ] || fail "安装成功，但临时回滚备份清理失败：$BACKUP"
+BACKUP=
 say "安装完成：v$VERSION，$BIN"
 say "自启：sh /data/zwrt-datad/service.sh start"
-say "备份：$BACKUP"
+say "临时回滚备份已删除"
