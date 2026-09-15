@@ -9,6 +9,8 @@ SMS_PID=
 cleanup() {
     [ -z "$PID" ] || kill "$PID" 2>/dev/null || true
     [ -z "$SMS_PID" ] || kill "$SMS_PID" 2>/dev/null || true
+    [ -z "$PID" ] || wait "$PID" 2>/dev/null || true
+    [ -z "$SMS_PID" ] || wait "$SMS_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
