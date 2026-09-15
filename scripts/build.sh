@@ -43,9 +43,33 @@ file "$ASSET" | grep -q 'ARM aarch64.*statically linked.*stripped' || {
 }
 sha256sum "$ASSET"
 
+VERSION="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
+COMMIT="$(git rev-parse HEAD)"
+ASSET_SHA256="$(sha256sum "$ASSET" | awk '{print $1}')"
+mkdir -p build
+python3 - "$VERSION" "$COMMIT" "$ASSET" "$ASSET_SHA256" >build/rust-release-provenance.json <<'PY'
+import json
+import sys
+
+version, commit, asset, sha256 = sys.argv[1:]
+json.dump(
+    {
+        "implementation": "rust",
+        "version": version,
+        "commit": commit,
+        "asset": asset,
+        "sha256": sha256,
+    },
+    sys.stdout,
+    indent=2,
+    sort_keys=True,
+)
+sys.stdout.write("\n")
+PY
+
 QEMU="${QEMU_AARCH64:-$(command -v qemu-aarch64 2>/dev/null || true)}"
 if [ -n "$QEMU" ]; then
-  expected="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
+  expected="$VERSION"
   actual="$($QEMU "$ASSET" --version)"
   [ "$actual" = "zwrt-datad $expected" ] || {
     echo "embedded version mismatch: $actual" >&2
