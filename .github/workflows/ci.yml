@@ -56,7 +56,7 @@ jobs:
       - name: Test custom QUIC aggregation
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude \
-            tests/custom_aggregation_test.c src/password_auth.c src/cloud_proxy.c src/json.c \
+            tests/custom_aggregation_test.c src/password_auth.c src/cloud_proxy.c src/json.c src/webshell.c \
             src/device_exec.c src/system_ext.c src/web_crypto.c src/control.c src/wifi_control.c src/neighbor_manager.c src/neighbor/*.c -lm -ldl -o /tmp/custom-aggregation-test
           /tmp/custom-aggregation-test
       - name: Test wireless policy and interface mapping
