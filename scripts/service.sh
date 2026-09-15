@@ -68,6 +68,37 @@ stop_legacy_cloud() {
     rm -f "$SERVICE_DIR/cloud.pid" "$SERVICE_DIR/cloud.sock" "$SERVICE_DIR/cloud.lock"
 }
 
+ensure_auth_token() {
+    if [ -e "$TOKEN_FILE" ] || [ -L "$TOKEN_FILE" ]; then
+        if [ ! -f "$TOKEN_FILE" ] || [ -L "$TOKEN_FILE" ] || [ ! -s "$TOKEN_FILE" ]; then
+            echo "zwrt-datad 启动失败：$TOKEN_FILE 必须是非空普通文件" >&2
+            return 1
+        fi
+        chmod 600 "$TOKEN_FILE" 2>/dev/null || return 1
+        return 0
+    fi
+
+    token_dir="${TOKEN_FILE%/*}"
+    [ "$token_dir" != "$TOKEN_FILE" ] || token_dir=.
+    mkdir -p "$token_dir" || return 1
+    token_tmp="$TOKEN_FILE.new.$$"
+    umask 077
+    (set -C; : > "$token_tmp") 2>/dev/null || {
+        echo "zwrt-datad 启动失败：无法安全创建 Token 临时文件" >&2
+        return 1
+    }
+    generated_token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    case "$generated_token" in
+        *[!0-9a-f]*|'') rm -f "$token_tmp"; return 1 ;;
+    esac
+    if [ "${#generated_token}" -ne 64 ] ||
+        ! printf '%s\n' "$generated_token" > "$token_tmp"; then
+        rm -f "$token_tmp"
+        return 1
+    fi
+    chmod 600 "$token_tmp" && mv -f "$token_tmp" "$TOKEN_FILE"
+}
+
 start() {
     active_pid="$(running_pid)"
     if [ -n "$active_pid" ]; then
@@ -88,15 +119,10 @@ start() {
     mkdir -p "$SERVICE_DIR" || return 1
     cd "$SERVICE_DIR" || return 1
     stop_legacy_cloud
-    if [ -s "$TOKEN_FILE" ]; then
-        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
-            --lan-bind 0.0.0.0 --lan-port 9461 --auth-token-file "$TOKEN_FILE" \
-            >> "$LOG_FILE" 2>&1 </dev/null &
-    else
-        nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
-            --lan-bind 0.0.0.0 --lan-port 9461 \
-            >> "$LOG_FILE" 2>&1 </dev/null &
-    fi
+    ensure_auth_token || return 1
+    nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
+        --lan-bind 0.0.0.0 --lan-port 9461 --auth-token-file "$TOKEN_FILE" \
+        >> "$LOG_FILE" 2>&1 </dev/null &
     launched_pid=$!
     sleep 1
     if process_matches "$launched_pid"; then

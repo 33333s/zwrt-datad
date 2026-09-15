@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.49",
+    "version": "0.9.50",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增仅限回环、强制鉴权的 WebSocket PTY WebShell 接口"
+    "notes": "为 WebShell 首次启动安全生成设备本地鉴权 Token"
   }
 }
