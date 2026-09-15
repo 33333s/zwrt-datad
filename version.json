@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.9.51",
+    "version": "0.10.0",
     "asset": "zwrt-datad-aarch64",
-    "notes": "Rust 版集成回环鉴权 WebShell，并限制会话、帧和缓冲区内存"
+    "notes": "Rust 实现成为 main 唯一发布版本，C/Go 实现归档到 c 分支"
   }
 }

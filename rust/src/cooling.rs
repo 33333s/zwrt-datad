@@ -8,6 +8,7 @@ use std::{
 
 const DEFAULT_CURVE: [(i64, i64); 5] = [(40, 0), (45, 0), (50, 76), (60, 128), (70, 255)];
 static HARD_OVERRIDE: AtomicBool = AtomicBool::new(false);
+static COOLING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Clone)]
 struct Config {
     fan_always: bool,
@@ -294,6 +295,7 @@ fn failed(e: String) -> (bool, String) {
     (false, e)
 }
 pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
+    let _guard = COOLING_LOCK.lock().await;
     let mut c = load().await;
     match action {
         "cooling.fan.set_enabled" => {
@@ -421,6 +423,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
 }
 
 pub async fn tick() {
+    let _guard = COOLING_LOCK.lock().await;
     let path = env("ZWRT_DATAD_COOLING_CONFIG", "/data/zwrt-datad/cooling.conf");
     if tokio::fs::metadata(path).await.is_err() {
         return;

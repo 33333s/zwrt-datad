@@ -9,6 +9,8 @@ SMS_PID=
 cleanup() {
     [ -z "$PID" ] || kill "$PID" 2>/dev/null || true
     [ -z "$SMS_PID" ] || kill "$SMS_PID" 2>/dev/null || true
+    [ -z "$PID" ] || wait "$PID" 2>/dev/null || true
+    [ -z "$SMS_PID" ] || wait "$SMS_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -112,6 +114,16 @@ process_gone() {
         sleep 0.02
     done
 }
+wait_file_value() {
+    path=$1
+    expected=$2
+    attempt=0
+    while [ "$(cat "$path" 2>/dev/null || true)" != "$expected" ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 100 ] || return 1
+        sleep 0.01
+    done
+}
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
     python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
@@ -178,22 +190,22 @@ extra_failure=$(curl -sS -o "$TMP/extra-failure.json" -w '%{http_code}' -H 'cont
 rm -rf "$ZWRT_DATAD_NET_CLASS_DIR/wlan4"
 post '{"action":"wifi.interface.delete","params":{"section":"datad_ssid_1"}}' >/dev/null
 post '{"action":"cooling.fan.set_curve","params":{"points":[{"temperature":40,"pwm":0},{"temperature":45,"pwm":0},{"temperature":50,"pwm":76},{"temperature":60,"pwm":128},{"temperature":70,"pwm":255}]}}' >/dev/null
-[ "$(cat "$ZWRT_DATAD_FAN_PWM_PATH")" = 30 ]
+wait_file_value "$ZWRT_DATAD_FAN_PWM_PATH" 30
 post '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' >/dev/null
-[ "$(cat "$ZWRT_DATAD_FAN_PWM_PATH")" = 128 ]
+wait_file_value "$ZWRT_DATAD_FAN_PWM_PATH" 128
 post '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' >/dev/null
-[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/mode")" = enabled ]
-[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp")" = 53000 ]
+wait_file_value "$ZWRT_DATAD_COOLING_ZONE_PATH/mode" enabled
+wait_file_value "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp" 53000
 post '{"action":"cooling.liquid.set_mode","params":{"mode":"high"}}' >/dev/null
-[ "$(cat "$ZWRT_DATAD_LIQUID_DRIVE_PATH")" = '1023 200 200' ]
+wait_file_value "$ZWRT_DATAD_LIQUID_DRIVE_PATH" '1023 200 200'
 post '{"action":"cooling.liquid.set_enabled","params":{"enabled":false}}' >/dev/null
-[ "$(cat "$ZWRT_DATAD_LIQUID_DRIVE_PATH")" = '0 0 0' ]
+wait_file_value "$ZWRT_DATAD_LIQUID_DRIVE_PATH" '0 0 0'
 rm -f "$ZWRT_DATAD_FAN_PWM_PATH"
 cooling_status=$(curl -sS -o "$TMP/cooling-bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"cooling.fan.set_enabled","params":{"enabled":true}}' \
     "http://127.0.0.1:$PORT/control")
 [ "$cooling_status" = 502 ]
-[ "$(cat "$ZWRT_DATAD_COOLING_ZONE_PATH/mode")" = enabled ]
+wait_file_value "$ZWRT_DATAD_COOLING_ZONE_PATH/mode" enabled
 
 status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"band.set_lte","params":{"bands":"1;reboot"}}' \

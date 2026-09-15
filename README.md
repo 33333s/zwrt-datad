@@ -8,7 +8,7 @@
 
 `zwrt-datad` 运行在设备本机，统一读取 `ubus`、`uci`、`sysfs` 和必要的设备日志，把不同机型的底层接口整理成稳定的 JSON 状态，并通过 HTTP 与 SSE 提供给 UFI、WebUI、脚本或其他本机服务。
 
-项目使用机型模板隔离固件差异。上层应用不需要为每台设备重复轮询厂商接口，也不需要自行解析日志。datad 只负责设备数据、设备控制和自身更新，不包含前端页面、插件系统或 UFI 业务。
+项目使用 Rust 实现，并通过机型模板隔离固件差异。上层应用不需要为每台设备重复轮询厂商接口，也不需要自行解析日志。datad 只负责设备数据、设备控制和自身更新，不包含前端页面、插件系统或 UFI 业务。旧 C/Go 实现保留在 `c` 分支，不再用于新版本发布。
 
 ## 主要功能
 
@@ -21,7 +21,7 @@
 - 可选邻小区采集，具有独立 worker、容量限制、过期处理和进程隔离
 - 可选 NMS 云端连接与远程服务入口
 - 内置 datad 自更新，使用 Ed25519 签名和 SHA-256 校验更新清单与二进制
-- 单进程、静态 ARM64 发布，默认每秒生成一次状态快照
+- 单进程 Rust、静态 ARM64 发布，默认每秒生成一次状态快照
 
 ## 当前已适配设备
 
@@ -100,4 +100,4 @@ curl -N http://127.0.0.1:9460/events
 
 ## 许可与贡献者
 
-项目使用 [MIT License](LICENSE)。静态发布中包含的 OpenSSL 许可见 [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
+项目使用 [MIT License](LICENSE)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。

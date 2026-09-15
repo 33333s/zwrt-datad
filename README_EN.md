@@ -8,7 +8,7 @@ A unified data and control service for ZTE ARM64 5G routers.
 
 `zwrt-datad` runs locally on the router. It reads `ubus`, `uci`, `sysfs`, and selected device logs, normalizes model-specific interfaces into a stable JSON state, and exposes that state to UFI, WebUI clients, scripts, and other local services over HTTP and SSE.
 
-Device templates isolate firmware differences so consumers do not need to poll vendor APIs or parse logs independently. datad is limited to device data, device control, and its own signed updates; it does not include a frontend, plugin system, or UFI application logic.
+The project is implemented in Rust. Device templates isolate firmware differences so consumers do not need to poll vendor APIs or parse logs independently. datad is limited to device data, device control, and its own signed updates; it does not include a frontend, plugin system, or UFI application logic. The previous C/Go implementation is retained on the `c` branch and is no longer used for new releases.
 
 ## Features
 
@@ -21,7 +21,7 @@ Device templates isolate firmware differences so consumers do not need to poll v
 - Includes optional isolated neighbor-cell collection with resource and expiry limits
 - Includes optional NMS cloud connectivity and remote service entry points
 - Verifies datad self-updates with Ed25519 signatures and SHA-256 hashes
-- Ships as a single statically linked ARM64 process with a one-second default sampling interval
+- Ships as a single statically linked Rust ARM64 process with a one-second default sampling interval
 
 ## Supported devices
 
@@ -100,4 +100,4 @@ Port 9460 is the loopback API. The LAN API on port 9461 requires a Bearer Token 
 
 ## License and contributors
 
-Licensed under the [MIT License](LICENSE). OpenSSL licensing for static releases is available in [`OPENSSL-LICENSE.txt`](OPENSSL-LICENSE.txt). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for project credits.
+Licensed under the [MIT License](LICENSE). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for project credits.
