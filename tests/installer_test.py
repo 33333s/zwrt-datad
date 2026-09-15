@@ -78,6 +78,8 @@ class BootEntries(unittest.TestCase):
             subprocess.run(["python3", str(ROOT / "scripts/render-installer.py"), str(binary), str(output)], check=True, capture_output=True)
             body = output.read_text()
             self.assertIn((ROOT / "scripts/service.sh").read_text().rstrip(), body)
+            self.assertIn('od -An -N32 -tx1 /dev/urandom', body)
+            self.assertIn('chmod 600 "$token_tmp" && mv -f "$token_tmp" "$TOKEN_FILE"', body)
             self.assertIn((ROOT / "version.json").read_text().rstrip(), body)
             self.assertIn((ROOT / "OPENSSL-LICENSE.txt").read_text().rstrip(), body)
             self.assertNotIn("@@", body)

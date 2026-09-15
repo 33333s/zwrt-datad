@@ -42,6 +42,8 @@ jobs:
         run: python3 tests/version_test.py ./zwrt-datad-test
       - name: Test loopback WebShell protocol and security boundaries
         run: python3 tests/webshell_test.py ./zwrt-datad-test
+      - name: Test service token generation and fail-closed behavior
+        run: sh tests/service_token_test.sh ./zwrt-datad-test
       - name: Test neighbor parsing, lifecycle and direct supply
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude tests/neighbor_stream_test.c src/neighbor/parser.c -lm -o /tmp/neighbor-stream-test

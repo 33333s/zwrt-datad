@@ -35,6 +35,9 @@ Authorization: Bearer <token>
 正式 `service.sh` 使用 `--webshell` 启用回环 WebShell。该接口不会在 9461 LAN
 监听开放，并且不会继承本机 9460 的免鉴权特例；没有有效 Token 时不能创建
 Shell。UFI 若提供网页终端，应由自身后端代理，不得向浏览器泄露 datad Token。
+旧设备首次使用新版 `service.sh` 启动且尚无 `auth.token` 时，脚本会从
+`/dev/urandom` 生成 32 字节随机值并以 `0600` 原子保存；已有非空普通文件会保留，
+空文件、符号链接或非普通文件会导致启动失败，不会静默降级为免鉴权 WebShell。
 
 不要把长期、无轮转的输出重定向到 `/tmp/*.log`。在常见 OpenWrt 设备中，`/tmp` 位于 tmpfs；如果某个扩展构建或诊断后端输出高频调试信息，日志文件会直接占用 RAM，表现为“可用内存持续下降”，并不等同于进程 RSS 泄漏。
 
