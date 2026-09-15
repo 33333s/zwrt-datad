@@ -24,6 +24,9 @@ X-Auth-Token: <token>
 
 原生 `EventSource` 无法设置请求头时，也可以使用 `?access_token=<token>`。
 
+`/webshell` 是例外：它只接受 `Authorization: Bearer` 或 `X-Auth-Token`
+请求头，不接受 URL 查询参数中的 Token。
+
 ## Routes
 
 ### `POST /auth/login`
@@ -174,6 +177,34 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 ### `GET /healthz`
 
 始终返回 `ok`。该接口只代表 HTTP 进程正在监听，不代表每个设备子模块都可用。
+
+### `GET /webshell/status`
+
+返回 WebShell 是否启用、当前会话数、会话上限和协议版本。该接口和
+`/webshell` 均只允许从 `127.0.0.1:9460` 访问，即使回环访问也必须携带
+有效 Token；LAN 监听 `9461` 固定返回 `403`。
+
+```json
+{"enabled":true,"active_sessions":0,"max_sessions":4,"protocol":"websocket-binary-v1"}
+```
+
+### `GET /webshell`
+
+升级为 WebSocket 后创建独立 PTY，并启动固定的系统交互 Shell。服务端不接受
+可执行文件、命令行或环境变量参数。
+
+- 客户端二进制帧：原样写入 PTY。
+- 服务端二进制帧：PTY 输出。
+- 客户端文本帧：只接受紧凑格式的终端尺寸消息：
+  `{"type":"resize","cols":120,"rows":40}`。
+- 建连后的首个服务端文本帧：
+  `{"type":"ready","cols":80,"rows":24}`。
+- 最多 4 个并发会话，单帧最多 16384 字节，空闲 15 分钟自动断开。
+- 客户端帧必须按 RFC 6455 掩码；不支持分片和 WebSocket 扩展。
+- 连接关闭、协议错误或 datad 退出时，PTY 和 Shell 进程一并清理。
+
+浏览器原生 `WebSocket` 不能自行设置 Authorization 请求头，因此 UFI 不应把
+datad Token 放进 URL；应由 UFI 后端在设备内连接该回环接口并代理已认证会话。
 
 ## Status Codes
 
