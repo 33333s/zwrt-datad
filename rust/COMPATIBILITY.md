@@ -1,6 +1,7 @@
 # Compatibility tracker
 
-The Rust branch is never installed over the production binary until every required row is green on all supported devices.
+Rust is the production implementation on `main`. The previous C/Go production
+line is retained on the `c` branch and is not used for new releases.
 
 | Area | Rust status | Production gate |
 |---|---|---|
@@ -16,4 +17,5 @@ The Rust branch is never installed over the production binary until every requir
 | cloud config and runtime | validation, password redaction, atomic 0600 persistence, LAN isolation, MQTT/TLS QoS 1 reporting, hot reconfiguration and allow-listed WSS-to-localhost tunnels implemented; real local TLS MQTT/WSS roundtrips and MC7523 ARM64 `/tmp` config/status/0600 persistence smoke pass | production-platform interoperability |
 | signed OTA | pure Rust config/status/check/update, custom-first source ordering with stale-source fallback, Ed25519 manifest verification, installer SHA-256, >10% battery and idle safety gates, retry state and result reconciliation implemented; MC7523 `/tmp` skipped stale signed netdisk 0.9.40 and verified signed GitHub 0.9.44 | never invoke install on a test device; final production-only upgrade/rollback acceptance remains |
 
-No Rust code may call the legacy datad binary or link the legacy C/Go objects. During migration, device execution is read-only on a separate port unless a control adapter has its own fixture and rollback tests.
+No Rust code may call the legacy datad binary or link the archived C/Go objects.
+New releases are built exclusively from `rust/Cargo.toml` on `main`.

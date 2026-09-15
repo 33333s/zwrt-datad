@@ -1,47 +1,58 @@
 #!/bin/bash
-# Build zwrt-datad with the local Bootlin aarch64 musl toolchain.
-# Usage: wsl -- bash -lc 'bash /mnt/d/.../zwrt-datad/scripts/build.sh'
-set -e
+# Build the production Rust datad with the Bootlin aarch64 musl toolchain.
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TC="$HOME/aarch64--musl--stable-2025.08-1/bin"
+TC="${DATAD_MUSL_TOOLCHAIN_DIR:-$HOME/aarch64--musl--stable-2025.08-1/bin}"
+TARGET=aarch64-unknown-linux-musl
+RUST_TOOLCHAIN="${DATAD_RUST_TOOLCHAIN:-1.89.0}"
+RUSTUP="${RUSTUP:-$HOME/.cargo/bin/rustup}"
+CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 CC="$TC/aarch64-linux-gcc"
+AR="$TC/aarch64-linux-ar"
+STRIP="$TC/aarch64-linux-strip"
+
 cd "$ROOT"
 ASSET="$(sed -n 's/^[[:space:]]*"asset":[[:space:]]*"\([^"]*\)".*/\1/p' version.json)"
 
-[ -x "$CC" ] || { echo "toolchain missing: $CC"; exit 1; }
-[ -n "$ASSET" ] || { echo "invalid asset name in version.json"; exit 1; }
+[ -x "$RUSTUP" ] || { echo "rustup missing: $RUSTUP" >&2; exit 1; }
+[ -x "$CARGO" ] || { echo "cargo missing: $CARGO" >&2; exit 1; }
+[ -x "$CC" ] || { echo "toolchain missing: $CC" >&2; exit 1; }
+[ -x "$AR" ] || { echo "toolchain missing: $AR" >&2; exit 1; }
+[ -x "$STRIP" ] || { echo "toolchain missing: $STRIP" >&2; exit 1; }
+[ "$ASSET" = zwrt-datad-aarch64 ] || { echo "invalid asset name in version.json" >&2; exit 1; }
 
-python3 scripts/generate-version.py
+if ! "$RUSTUP" toolchain list | grep -Eq "^${RUST_TOOLCHAIN}(-|[[:space:]])"; then
+  "$RUSTUP" toolchain install "$RUST_TOOLCHAIN" --profile minimal
+fi
+"$RUSTUP" target add --toolchain "$RUST_TOOLCHAIN" "$TARGET"
 
-CFLAGS="-std=c11 -Os -ffunction-sections -fdata-sections \
-  -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Iinclude"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$CC"
+export CC_aarch64_unknown_linux_musl="$CC"
+export AR_aarch64_unknown_linux_musl="$AR"
 
-CRYPTO_PREFIX="$(bash scripts/build-static-crypto.sh)"
-DATAD_BUILD="$ROOT/build/datad-embedded-aarch64"
-rm -rf "$DATAD_BUILD"
-mkdir -p "$DATAD_BUILD"
-for source in src/*.c src/neighbor/*.c; do
-  object="$DATAD_BUILD/${source//\//_}.o"
-  $CC $CFLAGS -DWEB_CRYPTO_STATIC -DCLOUD_EMBEDDED -DDATAD_EMBEDDED \
-    -I"$CRYPTO_PREFIX/include" -c "$source" -o "$object"
-done
-"$TC/aarch64-linux-ar" rcs "$DATAD_BUILD/libdatad.a" "$DATAD_BUILD"/*.o
-(
-  cd cloud
-  CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="$CC" \
-  CGO_CFLAGS="-I$ROOT/include" \
-  CGO_LDFLAGS="$DATAD_BUILD/libdatad.a $CRYPTO_PREFIX/lib/libcrypto.a -lm -ldl -pthread" \
-  go build -tags datad_embedded,netgo,osusergo -trimpath \
-    -ldflags="-s -w -X main.version=$(python3 -c 'import json; print(json.load(open("../version.json"))["datad"]["version"])') -linkmode external -extldflags -static" \
-    -o "$ROOT/zwrt-datad" .
-)
-echo ">> link OK"
-"$TC/aarch64-linux-size" zwrt-datad
-"$TC/aarch64-linux-strip" -o "$ASSET" zwrt-datad
-cp "$ASSET" zwrt-datad.stripped
-ls -lh zwrt-datad "$ASSET" zwrt-datad.stripped
+"$CARGO" "+$RUST_TOOLCHAIN" build \
+  --manifest-path rust/Cargo.toml \
+  --locked --release --target "$TARGET"
+"$STRIP" -o "$ASSET" "rust/target/$TARGET/release/zwrt-datad"
+
+file "$ASSET" | grep -q 'ARM aarch64.*statically linked.*stripped' || {
+  echo "release asset is not a static stripped aarch64 binary" >&2
+  exit 1
+}
 sha256sum "$ASSET"
+
+QEMU="${QEMU_AARCH64:-$(command -v qemu-aarch64 2>/dev/null || true)}"
+if [ -n "$QEMU" ]; then
+  expected="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
+  actual="$($QEMU "$ASSET" --version)"
+  [ "$actual" = "zwrt-datad $expected" ] || {
+    echo "embedded version mismatch: $actual" >&2
+    exit 1
+  }
+fi
+
 python3 scripts/render-installer.py "$ASSET" build/install-datad.sh
 sh -n build/install-datad.sh
 if [ -n "${DATAD_OTA_SIGNING_KEY_FILE:-}" ]; then
