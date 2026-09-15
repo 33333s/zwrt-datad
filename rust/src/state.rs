@@ -547,12 +547,16 @@ fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool
     json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
 }
 fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
-    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH").unwrap_or_default();
+    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH")
+        .unwrap_or_else(|_| "/sys/class/thermal/thermal_zone0".into());
     let pwm_path = std::env::var("ZWRT_DATAD_FAN_PWM_PATH")
         .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/pwm1".into());
-    let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH").unwrap_or_default();
-    let liquid_thermal_path =
-        std::env::var("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH").unwrap_or_default();
+    let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH")
+        .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/device/thermal_enable".into());
+    let liquid_thermal_path = std::env::var("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH")
+        .unwrap_or_else(|_| "/sys/class/leds/aw_vibrator/thermal_enable".into());
+    let liquid_state_path = std::env::var("ZWRT_DATAD_LIQUID_COOLING_STATE_PATH")
+        .unwrap_or_else(|_| "/sys/class/thermal/cooling_device6/cur_state".into());
     let config_path = std::env::var("ZWRT_DATAD_COOLING_CONFIG")
         .unwrap_or_else(|_| "/data/zwrt-datad/cooling.conf".into());
     let config: BTreeMap<String, i64> = fs::read_to_string(config_path)
@@ -588,6 +592,7 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
     let liquid_thermal = fs::read_to_string(liquid_thermal_path)
         .unwrap_or_default()
         .contains("thermal_enable:1");
+    let liquid_kernel_state = read_i64(liquid_state_path).clamp(0, 2);
     let mut factory = Vec::new();
     for (index, fallback_pwm) in [76, 128, 179].into_iter().enumerate() {
         let temperature = read_i64(format!("{zone}/trip_point_{index}_temp"));
@@ -616,9 +621,24 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         custom.clone()
     };
     let liquid_level = config.get("liquid_level").copied().unwrap_or(1).clamp(1, 2);
+    let effective_liquid_level = if liquid_always {
+        liquid_level
+    } else {
+        liquid_kernel_state
+    };
+    let liquid_speed = match effective_liquid_level {
+        1 => 30,
+        2 => 100,
+        _ => 0,
+    };
+    let liquid_amplitude = match effective_liquid_level {
+        1 => 60,
+        2 => 200,
+        _ => 0,
+    };
     json!({
         "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"levels_percent":[0,30,50,70]},
-        "liquid":{"enabled":liquid_always,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":if liquid_always{liquid_level}else{0},"speed_percent":if liquid_always{if liquid_level==2{100}else{30}}else{0},"amplitude":if liquid_always{if liquid_level==2{200}else{60}}else{0},"levels_percent":[30,100]},
+        "liquid":{"enabled":liquid_always||liquid_thermal,"active":liquid_always||liquid_kernel_state>0,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":effective_liquid_level,"speed_percent":liquid_speed,"amplitude":liquid_amplitude,"kernel_state":liquid_kernel_state,"kernel_max_state":2,"levels_percent":[30,100]},
         "factory_curve":factory,"custom_curve":custom,"curve":curve
     })
 }
