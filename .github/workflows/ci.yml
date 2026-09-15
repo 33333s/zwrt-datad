@@ -107,6 +107,6 @@ jobs:
       - run: python3 ../tests/version_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_embedded_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
-      - run: sh -x ../tests/rust_control_integration.sh
+      - run: ../tests/rust_control_integration.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
