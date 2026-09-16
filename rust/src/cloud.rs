@@ -336,6 +336,10 @@ async fn session(
         config.report_interval_seconds,
     )));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Presence must remain faster than NMS's 30-second offline deadline,
+    // independently of the user-selected telemetry reporting interval.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             changed = config_rx.changed() => {
@@ -359,6 +363,7 @@ async fn session(
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
                     ticker.reset();
+                    heartbeat.reset();
                     set_status(&status, "connected", "");
                     let snapshot = state_rx.borrow().clone();
                     if let Some(app) = &app
@@ -389,6 +394,12 @@ async fn session(
                 }
                 Ok(_) => {},
                 Err(_) => { bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed; }
+            },
+            _ = heartbeat.tick(), if connected => {
+                if publish(&client, format!("{}/status", root(config)), json!({"online":true})).await.is_err() {
+                    bridge.shutdown(); updates.detach_all();
+                    return SessionEnd::Failed;
+                }
             },
             _ = ticker.tick(), if connected => {
                 if let Some(app) = &app
@@ -1034,7 +1045,7 @@ mod tests {
             vendor: "ZTE".into(),
             model: "MU5252".into(),
             identity: "fixture-device".into(),
-            report_interval_seconds: 30,
+            report_interval_seconds: 3600,
             ..Default::default()
         };
         let mut fields = serde_json::Map::new();
@@ -1079,6 +1090,21 @@ mod tests {
                 found.insert("system");
             }
         }
+        // Long telemetry intervals must still emit an independent presence heartbeat.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let report = reports_rx.recv().await.unwrap();
+                assert!(
+                    report.get("model").is_none(),
+                    "unexpected full telemetry report"
+                );
+                if report["online"] == true {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         config_tx.send(Some(Config::default())).unwrap();
         let offline = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

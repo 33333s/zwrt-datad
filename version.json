@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.6",
+    "version": "0.10.7",
     "asset": "zwrt-datad-aarch64",
-    "notes": "完善 NMS datad OTA 重连恢复、安装结果校验及网络地址上报"
+    "notes": "云端在线心跳独立于数据上报周期，避免 NMS 误判离线及远程会话中断"
   }
 }
