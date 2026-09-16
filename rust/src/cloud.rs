@@ -234,7 +234,7 @@ async fn supervisor(
     app: Option<crate::server::App>,
 ) {
     loop {
-        let config = config_rx.borrow().clone();
+        let config = config_rx.borrow_and_update().clone();
         let Some(config) = config else {
             if config_rx.changed().await.is_err() {
                 return;
@@ -1002,6 +1002,76 @@ mod tests {
         let mut payload = vec![0u8; size];
         reader.read_exact(&mut payload).await.unwrap();
         (header, payload)
+    }
+
+    #[tokio::test]
+    async fn supervisor_consumes_configuration_changes_before_starting_a_session() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (online_tx, online_rx) = oneshot::channel();
+        let broker = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut online_tx = Some(online_tx);
+            loop {
+                let (header, payload) = mqtt_packet(&mut stream).await;
+                match header >> 4 {
+                    1 => stream.write_all(&[0x20, 2, 0, 0]).await.unwrap(),
+                    8 => stream
+                        .write_all(&[0x90, 3, payload[0], payload[1], 1])
+                        .await
+                        .unwrap(),
+                    3 => {
+                        let length = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                        let mut offset = length + 2;
+                        if (header >> 1) & 3 == 1 {
+                            stream
+                                .write_all(&[0x40, 2, payload[offset], payload[offset + 1]])
+                                .await
+                                .unwrap();
+                            offset += 2;
+                        }
+                        if let Ok(value) = serde_json::from_slice::<Value>(&payload[offset..])
+                            && value["online"] == true
+                            && let Some(sender) = online_tx.take()
+                        {
+                            let _ = sender.send(());
+                        }
+                    }
+                    12 => stream.write_all(&[0xd0, 0]).await.unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        let (config_tx, config_rx) = watch::channel(Some(Config::default()));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: Default::default(),
+        });
+        let status = Arc::new(Mutex::new(Status::default()));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status.clone(), None));
+        tokio::task::yield_now().await;
+        config_tx
+            .send(Some(Config {
+                enabled: true,
+                broker: format!("ssl://{address}"),
+                ca_pem,
+                username: "fixture".into(),
+                password: "secret".into(),
+                identity: "fixture-device".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), online_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(status.lock().unwrap().state, "connected");
+        task.abort();
+        broker.abort();
     }
 
     #[tokio::test]
