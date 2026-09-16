@@ -909,6 +909,7 @@ async fn control(
         return control_ok(action, json!({"sample_interval_ms":milliseconds}));
     }
     if action == "qos.reload" {
+        crate::qos::invalidate();
         let refresh = app.clone();
         tokio::spawn(async move { refresh.refresh_snapshot().await });
         return control_ok(action, json!({"queued":true}));
