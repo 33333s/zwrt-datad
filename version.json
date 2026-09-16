@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.5",
+    "version": "0.10.6",
     "asset": "zwrt-datad-aarch64",
-    "notes": "增加 NMS 签名 datad 自更新指令、版本绑定与重启后哈希确认"
+    "notes": "完善 NMS datad OTA 重连恢复、安装结果校验及网络地址上报"
   }
 }

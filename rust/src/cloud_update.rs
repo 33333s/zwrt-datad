@@ -98,10 +98,10 @@ impl App {
                 let _ = write_record(&path, &result);
             } else if let Ok(marker) =
                 fs::read_to_string(self.inner._data_dir.join("ota-install-result"))
-                && marker.trim() == "failed"
+                && matches!(marker.trim(), "failed" | "success")
             {
                 result["status"] = json!("failed");
-                result["error"] = json!({"code":"installer_failed"});
+                result["error"] = json!({"code":if marker.trim()=="success" {"installed_version_mismatch"} else {"installer_failed"}});
                 let _ = write_record(&path, &result);
             }
         }

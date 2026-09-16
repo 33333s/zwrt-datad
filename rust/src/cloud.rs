@@ -339,7 +339,7 @@ async fn session(
     loop {
         tokio::select! {
             changed = config_rx.changed() => {
-                bridge.shutdown();
+                bridge.shutdown(); updates.detach_all();
                 if connected {
                     let _ = publish_and_flush(
                         &client,
@@ -366,7 +366,7 @@ async fn session(
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
                     if report(&client, config, &snapshot, &status).await.is_err() {
-                        bridge.shutdown();
+                        bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
                 }
@@ -388,7 +388,7 @@ async fn session(
                             }
                 }
                 Ok(_) => {},
-                Err(_) => { bridge.shutdown(); return SessionEnd::Failed; }
+                Err(_) => { bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed; }
             },
             _ = ticker.tick(), if connected => {
                 if let Some(app) = &app
@@ -397,7 +397,7 @@ async fn session(
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
                 if report(&client, config, &snapshot, &status).await.is_err() {
-                    bridge.shutdown();
+                    bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
             }
@@ -458,6 +458,23 @@ async fn report(
         client,
         format!("{}/telemetry/system", root(config)),
         system_telemetry(&state),
+    )
+    .await?;
+    let addresses = |family: &str| -> Vec<Value> {
+        state
+            .pointer(&format!("/net/interfaces/{family}/{family}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("address").and_then(Value::as_str))
+            .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
+            .map(|address| json!(address))
+            .collect()
+    };
+    publish(
+        client,
+        format!("{}/telemetry/network", root(config)),
+        json!({"upstream":{"ipv4":addresses("ipv4"),"ipv6":addresses("ipv6")}}),
     )
     .await?;
     let mut guard = status.lock().unwrap();
