@@ -1540,14 +1540,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":imsi.clone(),"msisdn":msisdn.clone(),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
     if template == "MU5252" {
         let active_subid = integer(&sim, "current_sim_slot").clamp(1, 6);
-        let x75_traffic = object(
-            ubus(
-                "zwrt_data",
-                "get_wwandst",
-                json!({"source_module":"deviceui","cid":1,"type":1,"subid":active_subid}),
-            )
-            .await,
-        );
+        // The top-level realtime traffic call already uses active_subid on
+        // TopFlow. Reuse it for the integrated X75 instead of asking the
+        // expensive vendor data daemon for the same payload twice per sample.
+        let x75_traffic = traffic.clone();
         let v3t = object(ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", json!({})).await);
         let msim = object(ubus("zte_nwinfo_api", "nwinfo_get_msim_netinfo", json!({})).await);
         let mut modems = Vec::new();
@@ -1557,8 +1553,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         } else {
             string(&raw_net, "lte_bandwidth")
         };
-        let x75_qos =
-            crate::qos::read_for_plmn(integer(&raw_net, "rmcc"), integer(&raw_net, "rmnc"));
+        let x75_qos = qos.clone();
         modems.push(json!({
             "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
             "ifname":"rmnet_data0","wan_interface":"zte_mwan2",

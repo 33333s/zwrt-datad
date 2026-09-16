@@ -1928,6 +1928,7 @@ async fn qos_clear() -> Outcome {
             Err(e) => return Outcome::Failed(format!("failed to clear {path}: {e}")),
         }
     }
+    crate::qos::invalidate();
     Outcome::Ok(json!({"cleared":true,"files":cleared}))
 }
 
