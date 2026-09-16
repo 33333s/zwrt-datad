@@ -39,7 +39,9 @@ test "$(curl -s -o /dev/null -w '%{http_code}' \
     http://127.0.0.1:9460/webshell/status)" = 401
 test "$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $datad_test_token" \
-    http://127.0.0.1:9461/webshell/status)" = 403
+    http://127.0.0.1:9461/webshell/status)" = 200
+test "$(curl -s -o /dev/null -w '%{http_code}' \
+    http://127.0.0.1:9461/webshell/status)" = 401
 curl -fsS -H "Authorization: Bearer $datad_test_token" \
     http://127.0.0.1:9460/webshell/status | grep -q '"enabled":true'
 echo "listener policy verified"
@@ -54,4 +56,3 @@ fi
 test ! -e "$TEST_DIR/should-not-be-created"
 
 echo "service token security OK"
-

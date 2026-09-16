@@ -24,16 +24,17 @@ X-Auth-Token: <token>
 
 原生 `EventSource` 无法设置请求头时，也可以使用 `?access_token=<token>`。
 
-`/webshell` 是例外：它只接受 `Authorization: Bearer` 或 `X-Auth-Token`
-请求头，不接受 URL 查询参数中的 Token。
+`/webshell` 是例外：它不接受 URL 查询参数中的 Token。普通 HTTP 客户端可使用
+`Authorization: Bearer` 或 `X-Auth-Token` 请求头；浏览器原生 WebSocket
+无法设置这两个请求头时，使用下面说明的 WebSocket 子协议传递 Token。
 
 ## Routes
 
 ### `GET /webshell/status`
 
 返回 WebShell 是否启用、当前会话数、会话上限和协议版本。该接口和
-`/webshell` 均只允许从 `127.0.0.1:9460` 访问，即使回环访问也必须携带
-有效 Token；LAN 监听 `9461` 固定返回 `403`。
+`/webshell` 在 `9460` 与 `9461` 上都必须携带有效 Token；未提供或 Token
+错误时返回 `401`。`9461` 仍受 LAN 来源过滤约束。
 
 ```json
 {"enabled":true,"active_sessions":0,"max_sessions":4,"protocol":"websocket-binary-v1"}
@@ -46,8 +47,19 @@ X-Auth-Token: <token>
 返回 PTY 输出；文本帧只接受 `{"type":"resize","cols":120,"rows":40}`。
 最多 4 个并发会话，聚合消息最多 16384 字节，空闲 15 分钟自动断开。
 
-浏览器原生 `WebSocket` 不能自行设置 Authorization 请求头，因此 UFI 应由后端
-在设备内连接该回环接口并代理已认证会话，不得把 datad Token 放进 URL。
+浏览器原生 `WebSocket` 不能自行设置 Authorization 请求头。浏览器直连时应先
+通过 `/auth/login` 或 `/auth/exchange` 获取临时 Token，再同时声明固定协议和
+鉴权协议：
+
+```js
+const socket = new WebSocket("ws://<device-lan-ip>:9461/webshell", [
+  "datad-webshell-v1",
+  `datad-auth.${accessToken}`,
+]);
+```
+
+服务端只协商并回显固定的 `datad-webshell-v1`，不会回显 Token。不得把 datad
+Token 放进 URL；`?access_token=` 对 WebShell 始终返回 `401`。
 
 ### `POST /auth/login`
 

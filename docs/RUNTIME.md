@@ -32,9 +32,11 @@ Authorization: Bearer <token>
 
 也兼容仅供本机服务间调用的 `X-Auth-Token` 请求头。不要把 Token 写入前端静态文件。
 
-正式 `service.sh` 使用 `--webshell` 启用回环 WebShell。该接口不会在 9461 LAN
-监听开放，并且回环访问也必须携带有效 Token。首次启动会从 `/dev/urandom`
-生成 32 字节随机 Token，以 `0600` 原子保存；异常 Token 文件会令启动失败。
+正式 `service.sh` 使用 `--webshell` 启用 WebShell。9460 和 9461 上的 WebShell
+都必须携带有效 Token；9461 同时受 LAN 来源过滤约束。浏览器 WebSocket 使用
+`datad-webshell-v1` 和 `datad-auth.<token>` 两个子协议完成鉴权，查询参数 Token
+始终拒绝。首次启动会从 `/dev/urandom` 生成 32 字节随机 Token，以 `0600`
+原子保存；异常 Token 文件会令启动失败。
 
 不要把长期、无轮转的输出重定向到 `/tmp/*.log`。在常见 OpenWrt 设备中，`/tmp` 位于 tmpfs；如果某个扩展构建或诊断后端输出高频调试信息，日志文件会直接占用 RAM，表现为“可用内存持续下降”，并不等同于进程 RSS 泄漏。
 
