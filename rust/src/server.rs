@@ -11,7 +11,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::rejection::JsonRejection,
-    extract::{ConnectInfo, Extension, Request, WebSocketUpgrade},
+    extract::{ConnectInfo, Request, WebSocketUpgrade},
     extract::{Query, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
     convert::Infallible,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc,
@@ -55,11 +55,6 @@ struct Inner {
     ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
-}
-
-#[derive(Clone, Copy)]
-struct ListenerPolicy {
-    lan_only: bool,
 }
 
 struct DeviceSession {
@@ -212,11 +207,11 @@ impl App {
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
+        if open_auth_routes {
+            router = router.layer(middleware::from_fn(lan_source_filter));
+        }
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
-            .layer(Extension(ListenerPolicy {
-                lan_only: open_auth_routes,
-            }))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
         let result = axum::serve(
@@ -231,7 +226,62 @@ impl App {
     }
 }
 
-async fn webshell_auth(app: &App, headers: &HeaderMap) -> bool {
+fn lan_source_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_lan_source_allowed(ip),
+        IpAddr::V6(ip) => {
+            ip.to_ipv4_mapped().is_some_and(ipv4_lan_source_allowed)
+                || ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn ipv4_lan_source_allowed(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+}
+
+async fn lan_source_filter(request: Request, next: Next) -> Response {
+    let allowed = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| lan_source_allowed(peer.ip()));
+    if allowed {
+        next.run(request).await
+    } else {
+        webshell_error(
+            StatusCode::FORBIDDEN,
+            "source_not_allowed",
+            "LAN listener only accepts private network sources",
+        )
+    }
+}
+
+const WEBSHELL_PROTOCOL: &str = "datad-webshell-v1";
+const WEBSHELL_AUTH_PROTOCOL_PREFIX: &str = "datad-auth.";
+
+fn webshell_protocol_token(headers: &HeaderMap) -> Option<&str> {
+    let protocols = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    let mut supports_webshell = false;
+    let mut token = None;
+    for protocol in protocols.split(',').map(str::trim) {
+        if protocol == WEBSHELL_PROTOCOL {
+            supports_webshell = true;
+        } else if let Some(value) = protocol.strip_prefix(WEBSHELL_AUTH_PROTOCOL_PREFIX)
+            && !value.is_empty()
+        {
+            token = Some(value);
+        }
+    }
+    supports_webshell.then_some(token).flatten()
+}
+
+async fn webshell_auth(app: &App, headers: &HeaderMap, allow_protocol: bool) -> bool {
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -239,7 +289,10 @@ async fn webshell_auth(app: &App, headers: &HeaderMap) -> bool {
     let legacy = headers
         .get("x-auth-token")
         .and_then(|value| value.to_str().ok());
-    let Some(presented) = bearer.or(legacy) else {
+    let protocol = allow_protocol
+        .then(|| webshell_protocol_token(headers))
+        .flatten();
+    let Some(presented) = bearer.or(legacy).or(protocol) else {
         return false;
     };
     static_token_valid(app.inner.token.as_deref(), Some(presented))
@@ -254,20 +307,8 @@ fn webshell_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-async fn webshell_status(
-    State(app): State<App>,
-    Extension(policy): Extension<ListenerPolicy>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    if policy.lan_only || !peer.ip().is_loopback() {
-        return webshell_error(
-            StatusCode::FORBIDDEN,
-            "loopback_only",
-            "WebShell is loopback only",
-        );
-    }
-    if !webshell_auth(&app, &headers).await {
+async fn webshell_status(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
         return webshell_error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -282,19 +323,10 @@ async fn webshell_status(
 
 async fn webshell_upgrade(
     State(app): State<App>,
-    Extension(policy): Extension<ListenerPolicy>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if policy.lan_only || !peer.ip().is_loopback() {
-        return webshell_error(
-            StatusCode::FORBIDDEN,
-            "loopback_only",
-            "WebShell is loopback only",
-        );
-    }
-    if !webshell_auth(&app, &headers).await {
+    if !webshell_auth(&app, &headers, true).await {
         return webshell_error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -319,7 +351,8 @@ async fn webshell_upgrade(
         );
     };
     let shell = app.inner.webshell.clone();
-    ws.read_buffer_size(crate::webshell::MAX_MESSAGE_SIZE)
+    ws.protocols([WEBSHELL_PROTOCOL])
+        .read_buffer_size(crate::webshell::MAX_MESSAGE_SIZE)
         .write_buffer_size(8 * 1024)
         .max_write_buffer_size(64 * 1024)
         .max_message_size(crate::webshell::MAX_MESSAGE_SIZE)
@@ -344,7 +377,10 @@ fn valid_websocket_key(headers: &HeaderMap) -> bool {
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/" | "/healthz" | "/auth/login" | "/auth/exchange") {
+    if matches!(
+        path,
+        "/" | "/healthz" | "/auth/login" | "/auth/exchange" | "/webshell" | "/webshell/status"
+    ) {
         return next.run(request).await;
     }
     let headers = request.headers();
@@ -1085,5 +1121,35 @@ mod tests {
         assert!(!static_token_valid(None, Some("anything")));
         assert!(static_token_valid(Some("secret"), Some("secret")));
         assert!(!static_token_valid(Some("secret"), Some("wrong")));
+    }
+
+    #[test]
+    fn lan_listener_rejects_public_sources() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "169.254.1.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:192.168.0.1",
+        ] {
+            assert!(lan_source_allowed(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(!lan_source_allowed(ip.parse().unwrap()), "{ip}");
+        }
     }
 }

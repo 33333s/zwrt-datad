@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.3",
+    "version": "0.10.4",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复频段能力目录与当前锁频状态混用，恢复原厂默认完整频段能力并新增结构化 band_capabilities"
+    "notes": "WebShell 开放到需强制鉴权的 9461 LAN 监听，并增加不暴露 URL Token 的浏览器 WebSocket 子协议鉴权"
   }
 }

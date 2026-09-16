@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protocol and lifecycle regression tests for the loopback-only WebShell."""
+"""Protocol, authentication, and lifecycle regression tests for WebShell."""
 
 import base64
 import hashlib
@@ -37,7 +37,7 @@ def http_status(port, path, token=None):
         return error
 
 
-def websocket(port, token=TOKEN, key=None, path="/webshell"):
+def websocket(port, token=TOKEN, key=None, path="/webshell", protocols=None):
     key = key or base64.b64encode(os.urandom(16)).decode()
     sock = socket.create_connection(("127.0.0.1", port), timeout=3)
     lines = [
@@ -50,6 +50,8 @@ def websocket(port, token=TOKEN, key=None, path="/webshell"):
     ]
     if token is not None:
         lines.append(f"Authorization: Bearer {token}")
+    if protocols:
+        lines.append("Sec-WebSocket-Protocol: " + ", ".join(protocols))
     sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
     response = b""
     while b"\r\n\r\n" not in response:
@@ -194,13 +196,48 @@ def main():
                     "protocol": "websocket-binary-v1",
                 }
             with http_status(lan_port, "/webshell/status", TOKEN) as response:
-                assert response.status == 403
+                assert json.load(response)["enabled"] is True
+            with http_status(lan_port, "/webshell/status?access_token=" + TOKEN) as response:
+                assert response.status == 401
 
             unauth, header, _, _ = websocket(local_port, token=None)
             assert header.startswith(b"HTTP/1.1 401"), header
             unauth.close()
-            lan, header, _, _ = websocket(lan_port)
-            assert header.startswith(b"HTTP/1.1 403"), header
+            lan_unauth, header, _, _ = websocket(lan_port, token=None)
+            assert header.startswith(b"HTTP/1.1 401"), header
+            lan_unauth.close()
+            lan_bad, header, _, _ = websocket(lan_port, token="wrong-token")
+            assert header.startswith(b"HTTP/1.1 401"), header
+            lan_bad.close()
+            lan_query, header, _, _ = websocket(
+                lan_port, token=None, path="/webshell?access_token=" + TOKEN
+            )
+            assert header.startswith(b"HTTP/1.1 401"), header
+            lan_query.close()
+            lan_protocol_bad, header, _, _ = websocket(
+                lan_port,
+                token=None,
+                protocols=["datad-webshell-v1", "datad-auth.wrong-token"],
+            )
+            assert header.startswith(b"HTTP/1.1 401"), header
+            lan_protocol_bad.close()
+            lan_protocol_incomplete, header, _, _ = websocket(
+                lan_port,
+                token=None,
+                protocols=["datad-auth." + TOKEN],
+            )
+            assert header.startswith(b"HTTP/1.1 401"), header
+            lan_protocol_incomplete.close()
+            lan, header, pending, _ = websocket(
+                lan_port,
+                token=None,
+                protocols=["datad-webshell-v1", "datad-auth." + TOKEN],
+            )
+            assert header.startswith(b"HTTP/1.1 101"), header
+            assert b"sec-websocket-protocol: datad-webshell-v1" in header.lower(), header
+            assert TOKEN.encode() not in header, header
+            opcode, ready, pending = recv_frame(lan, pending)
+            assert opcode == 1 and json.loads(ready)["type"] == "ready"
             lan.close()
             invalid, header, _, _ = websocket(local_port, key="invalid")
             assert header.startswith(b"HTTP/1.1 400"), header
