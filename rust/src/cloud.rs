@@ -234,7 +234,7 @@ async fn supervisor(
     app: Option<crate::server::App>,
 ) {
     loop {
-        let config = config_rx.borrow().clone();
+        let config = config_rx.borrow_and_update().clone();
         let Some(config) = config else {
             if config_rx.changed().await.is_err() {
                 return;
@@ -336,6 +336,10 @@ async fn session(
         config.report_interval_seconds,
     )));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Presence must remain faster than NMS's 30-second offline deadline,
+    // independently of the user-selected telemetry reporting interval.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             changed = config_rx.changed() => {
@@ -359,6 +363,7 @@ async fn session(
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
                     ticker.reset();
+                    heartbeat.reset();
                     set_status(&status, "connected", "");
                     let snapshot = state_rx.borrow().clone();
                     if let Some(app) = &app
@@ -389,6 +394,12 @@ async fn session(
                 }
                 Ok(_) => {},
                 Err(_) => { bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed; }
+            },
+            _ = heartbeat.tick(), if connected => {
+                if publish(&client, format!("{}/status", root(config)), json!({"online":true})).await.is_err() {
+                    bridge.shutdown(); updates.detach_all();
+                    return SessionEnd::Failed;
+                }
             },
             _ = ticker.tick(), if connected => {
                 if let Some(app) = &app
@@ -693,7 +704,14 @@ async fn bridge_pipe(
     };
     let websocket = tokio::select! {
         value = connect_async_tls_with_config(request, None, false, Some(connector)) => {
-            match value { Ok((socket, _)) => socket, Err(_) => return false }
+            match value {
+                Ok((socket, _)) => socket,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    // Expired/revoked sessions must release their slot, not retry for 12 hours.
+                    return matches!(response.status().as_u16(), 401 | 403 | 404 | 410);
+                }
+                Err(_) => return false,
+            }
         },
         _ = shutdown.changed() => return true,
     };
@@ -987,6 +1005,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_consumes_configuration_changes_before_starting_a_session() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (online_tx, online_rx) = oneshot::channel();
+        let broker = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut online_tx = Some(online_tx);
+            loop {
+                let (header, payload) = mqtt_packet(&mut stream).await;
+                match header >> 4 {
+                    1 => stream.write_all(&[0x20, 2, 0, 0]).await.unwrap(),
+                    8 => stream
+                        .write_all(&[0x90, 3, payload[0], payload[1], 1])
+                        .await
+                        .unwrap(),
+                    3 => {
+                        let length = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                        let mut offset = length + 2;
+                        if (header >> 1) & 3 == 1 {
+                            stream
+                                .write_all(&[0x40, 2, payload[offset], payload[offset + 1]])
+                                .await
+                                .unwrap();
+                            offset += 2;
+                        }
+                        if let Ok(value) = serde_json::from_slice::<Value>(&payload[offset..])
+                            && value["online"] == true
+                            && let Some(sender) = online_tx.take()
+                        {
+                            let _ = sender.send(());
+                        }
+                    }
+                    12 => stream.write_all(&[0xd0, 0]).await.unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        let (config_tx, config_rx) = watch::channel(Some(Config::default()));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: Default::default(),
+        });
+        let status = Arc::new(Mutex::new(Status::default()));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status.clone(), None));
+        tokio::task::yield_now().await;
+        config_tx
+            .send(Some(Config {
+                enabled: true,
+                broker: format!("ssl://{address}"),
+                ca_pem,
+                username: "fixture".into(),
+                password: "secret".into(),
+                identity: "fixture-device".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), online_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(status.lock().unwrap().state, "connected");
+        task.abort();
+        broker.abort();
+    }
+
+    #[tokio::test]
     async fn mqtt_tls_reports_selected_state_and_reconfigures() {
         let (acceptor, ca_pem) = tls_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1034,7 +1122,7 @@ mod tests {
             vendor: "ZTE".into(),
             model: "MU5252".into(),
             identity: "fixture-device".into(),
-            report_interval_seconds: 30,
+            report_interval_seconds: 3600,
             ..Default::default()
         };
         let mut fields = serde_json::Map::new();
@@ -1079,6 +1167,21 @@ mod tests {
                 found.insert("system");
             }
         }
+        // Long telemetry intervals must still emit an independent presence heartbeat.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let report = reports_rx.recv().await.unwrap();
+                assert!(
+                    report.get("model").is_none(),
+                    "unexpected full telemetry report"
+                );
+                if report["online"] == true {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         config_tx.send(Some(Config::default())).unwrap();
         let offline = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1099,6 +1202,44 @@ mod tests {
             SessionEnd::Reconfigure
         ));
         broker.abort();
+    }
+
+    #[tokio::test]
+    async fn closed_remote_sessions_stop_but_gateway_failures_retry() {
+        for code in [401, 403, 404, 410, 502] {
+            let (acceptor, ca_pem) = tls_fixture();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(tcp).await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(format!("HTTP/1.1 {code} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let config = Config {
+                ca_pem,
+                ..Default::default()
+            };
+            let command = RemoteCommand {
+                protocol_version: 1,
+                request_id: "closed-session".into(),
+                action: "remote.open".into(),
+                remote_url: format!("wss://{address}/api/remote/device/closed-session"),
+                token: "a".repeat(64),
+                target_service: "router_web".into(),
+                target_port: 2333,
+                target_ports: vec![],
+                ttl_seconds: 30,
+            };
+            let (_tx, rx) = watch::channel(false);
+            let stop =
+                tokio::time::timeout(Duration::from_secs(5), bridge_pipe(&config, &command, rx))
+                    .await
+                    .unwrap();
+            assert_eq!(stop, code != 502, "HTTP {code}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
