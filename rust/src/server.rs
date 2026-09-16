@@ -40,19 +40,19 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 #[derive(Clone)]
 pub struct App {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
-struct Inner {
+pub(crate) struct Inner {
     snapshot: RwLock<Snapshot>,
     tx: watch::Sender<Snapshot>,
     interval_ms: AtomicU64,
-    _data_dir: PathBuf,
+    pub(crate) _data_dir: PathBuf,
     token: Option<String>,
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
     sse_slots: Arc<Semaphore>,
     cloud: RwLock<Cloud>,
-    ota: Mutex<Ota>,
+    pub(crate) ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
 }
@@ -95,7 +95,11 @@ impl App {
                 webshell: WebShell::new(webshell_enabled),
             }),
         };
-        app.inner.cloud.read().await.start(app.inner.tx.subscribe());
+        app.inner
+            .cloud
+            .read()
+            .await
+            .start(app.inner.tx.subscribe(), app.clone());
         app.spawn_sampler();
         app.spawn_ota();
         Ok(app)
