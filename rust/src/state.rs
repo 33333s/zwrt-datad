@@ -106,6 +106,67 @@ fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
         .map(String::as_str)
         .unwrap_or_default()
 }
+fn supported_band_list(value: &str) -> Option<Vec<u32>> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut bands = Vec::new();
+    for item in value.split(',') {
+        if item.is_empty() || !item.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let band = item.parse::<u32>().ok()?;
+        if !(1..=1024).contains(&band) || bands.contains(&band) {
+            return None;
+        }
+        bands.push(band);
+    }
+    Some(bands)
+}
+fn band_capabilities(sets: &[BTreeMap<String, String>]) -> (String, String, String, Value) {
+    let lte = uci_get(
+        sets,
+        "zwrt_zte_nwinfo.default_band_lock.default_lte_ext_band_lock",
+    );
+    let nr_sa = uci_get(
+        sets,
+        "zwrt_zte_nwinfo.default_band_lock.default_nr5g_sa_band_lock",
+    );
+    let nr_nsa = uci_get(
+        sets,
+        "zwrt_zte_nwinfo.default_band_lock.default_nr5g_nsa_band_lock",
+    );
+    match (
+        supported_band_list(lte),
+        supported_band_list(nr_sa),
+        supported_band_list(nr_nsa),
+    ) {
+        (Some(lte_bands), Some(nr_sa_bands), Some(nr_nsa_bands)) => (
+            lte.into(),
+            nr_sa.into(),
+            nr_nsa.into(),
+            json!({
+                "source":"device_default_band_lock",
+                "complete":true,
+                "lte":lte_bands,
+                "nr_sa":nr_sa_bands,
+                "nr_nsa":nr_nsa_bands
+            }),
+        ),
+        _ => (
+            String::new(),
+            String::new(),
+            String::new(),
+            json!({
+                "source":"unavailable",
+                "complete":false,
+                "lte":[],
+                "nr_sa":[],
+                "nr_nsa":[]
+            }),
+        ),
+    }
+}
 fn normalize_profile(v: &str) -> String {
     let mut out = String::new();
     let mut sep = true;
@@ -1211,6 +1272,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "zwrt_tr069",
         "zwrt_router",
         "zte_nwinfo",
+        "zwrt_zte_nwinfo",
         "wireless",
         "mwan3",
     ];
@@ -1264,12 +1326,15 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ("sa_bands", "nr5g_sa_band_lock"),
         ("nsa_bands", "nr5g_nsa_band_lock"),
         ("lte_bands", "lte_band"),
-        ("lte_supported_bands", "lte_band"),
-        ("nr_sa_supported_bands", "nr5g_sa_band_lock"),
-        ("nr_nsa_supported_bands", "nr5g_nsa_band_lock"),
     ] {
         net.insert(to.into(), json!(string(&raw_net, from)));
     }
+    let (lte_supported, nr_sa_supported, nr_nsa_supported, capabilities) =
+        band_capabilities(&uci_sets);
+    net.insert("lte_supported_bands".into(), json!(lte_supported));
+    net.insert("nr_sa_supported_bands".into(), json!(nr_sa_supported));
+    net.insert("nr_nsa_supported_bands".into(), json!(nr_nsa_supported));
+    net.insert("band_capabilities".into(), capabilities);
     for (to, from) in [
         ("bars", "signalbar"),
         ("nr_rsrp", "nr5g_rsrp"),
@@ -1878,6 +1943,52 @@ mod tests {
     fn profile() {
         assert_eq!(normalize_profile("MC7523 HW1.0"), "mc7523_hw1_0");
         assert_eq!(normalize_profile("MU5250"), "mu5250")
+    }
+    #[test]
+    fn supported_band_catalog_is_strict_and_separate_from_current_locks() {
+        let sets = vec![BTreeMap::from([
+            (
+                "zwrt_zte_nwinfo.default_band_lock.default_lte_ext_band_lock".into(),
+                "1,3,66".into(),
+            ),
+            (
+                "zwrt_zte_nwinfo.default_band_lock.default_nr5g_sa_band_lock".into(),
+                "1,78".into(),
+            ),
+            (
+                "zwrt_zte_nwinfo.default_band_lock.default_nr5g_nsa_band_lock".into(),
+                "1,28,78".into(),
+            ),
+        ])];
+        let (lte, nr_sa, nr_nsa, capabilities) = band_capabilities(&sets);
+        assert_eq!(lte, "1,3,66");
+        assert_eq!(nr_sa, "1,78");
+        assert_eq!(nr_nsa, "1,28,78");
+        assert_eq!(capabilities["complete"], true);
+        assert_eq!(capabilities["lte"], json!([1, 3, 66]));
+    }
+    #[test]
+    fn incomplete_or_invalid_supported_band_catalog_is_unavailable() {
+        for invalid in ["", "1,1", "1, 3", "0,3", "1025"] {
+            let sets = vec![BTreeMap::from([
+                (
+                    "zwrt_zte_nwinfo.default_band_lock.default_lte_ext_band_lock".into(),
+                    invalid.into(),
+                ),
+                (
+                    "zwrt_zte_nwinfo.default_band_lock.default_nr5g_sa_band_lock".into(),
+                    "1,78".into(),
+                ),
+                (
+                    "zwrt_zte_nwinfo.default_band_lock.default_nr5g_nsa_band_lock".into(),
+                    "1,78".into(),
+                ),
+            ])];
+            let (lte, nr_sa, nr_nsa, capabilities) = band_capabilities(&sets);
+            assert!(lte.is_empty() && nr_sa.is_empty() && nr_nsa.is_empty());
+            assert_eq!(capabilities["complete"], false);
+            assert_eq!(capabilities["source"], "unavailable");
+        }
     }
     #[test]
     fn iface() {
