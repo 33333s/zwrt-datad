@@ -704,7 +704,14 @@ async fn bridge_pipe(
     };
     let websocket = tokio::select! {
         value = connect_async_tls_with_config(request, None, false, Some(connector)) => {
-            match value { Ok((socket, _)) => socket, Err(_) => return false }
+            match value {
+                Ok((socket, _)) => socket,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    // Expired/revoked sessions must release their slot, not retry for 12 hours.
+                    return matches!(response.status().as_u16(), 401 | 403 | 404 | 410);
+                }
+                Err(_) => return false,
+            }
         },
         _ = shutdown.changed() => return true,
     };
@@ -1125,6 +1132,44 @@ mod tests {
             SessionEnd::Reconfigure
         ));
         broker.abort();
+    }
+
+    #[tokio::test]
+    async fn closed_remote_sessions_stop_but_gateway_failures_retry() {
+        for code in [401, 403, 404, 410, 502] {
+            let (acceptor, ca_pem) = tls_fixture();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(tcp).await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(format!("HTTP/1.1 {code} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let config = Config {
+                ca_pem,
+                ..Default::default()
+            };
+            let command = RemoteCommand {
+                protocol_version: 1,
+                request_id: "closed-session".into(),
+                action: "remote.open".into(),
+                remote_url: format!("wss://{address}/api/remote/device/closed-session"),
+                token: "a".repeat(64),
+                target_service: "router_web".into(),
+                target_port: 2333,
+                target_ports: vec![],
+                ttl_seconds: 30,
+            };
+            let (_tx, rx) = watch::channel(false);
+            let stop =
+                tokio::time::timeout(Duration::from_secs(5), bridge_pipe(&config, &command, rx))
+                    .await
+                    .unwrap();
+            assert_eq!(stop, code != 502, "HTTP {code}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

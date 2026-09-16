@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.7",
+    "version": "0.10.8",
     "asset": "zwrt-datad-aarch64",
-    "notes": "云端在线心跳独立于数据上报周期，避免 NMS 误判离线及远程会话中断"
+    "notes": "独立云端心跳及失效远程会话回收，修复连接中断和会话数量耗尽"
   }
 }
