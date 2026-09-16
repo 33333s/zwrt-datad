@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.4",
+    "version": "0.10.6",
     "asset": "zwrt-datad-aarch64",
-    "notes": "WebShell 开放到需强制鉴权的 9461 LAN 监听，并增加不暴露 URL Token 的浏览器 WebSocket 子协议鉴权"
+    "notes": "完善 NMS datad OTA 重连恢复、安装结果校验及网络地址上报"
   }
 }

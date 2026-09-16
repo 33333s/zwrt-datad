@@ -193,10 +193,10 @@ impl Cloud {
         }
     }
 
-    pub fn start(&self, state: watch::Receiver<Snapshot>) {
+    pub fn start(&self, state: watch::Receiver<Snapshot>, app: crate::server::App) {
         let config = self.tx.subscribe();
         let status = self.status.clone();
-        tokio::spawn(async move { supervisor(config, state, status).await });
+        tokio::spawn(async move { supervisor(config, state, status, Some(app)).await });
     }
 
     pub fn public_config(&self) -> Value {
@@ -231,6 +231,7 @@ async fn supervisor(
     mut config_rx: watch::Receiver<Option<Config>>,
     state_rx: watch::Receiver<Snapshot>,
     status: Arc<Mutex<Status>>,
+    app: Option<crate::server::App>,
 ) {
     loop {
         let config = config_rx.borrow().clone();
@@ -250,7 +251,15 @@ async fn supervisor(
         let mut delay = Duration::from_secs(1);
         loop {
             set_status(&status, "connecting", "");
-            match session(&config, state_rx.clone(), config_rx.clone(), status.clone()).await {
+            match session(
+                &config,
+                state_rx.clone(),
+                config_rx.clone(),
+                status.clone(),
+                app.clone(),
+            )
+            .await
+            {
                 SessionEnd::Reconfigure => break,
                 SessionEnd::Stopped => return,
                 SessionEnd::Failed => {
@@ -284,6 +293,7 @@ async fn session(
     mut state_rx: watch::Receiver<Snapshot>,
     mut config_rx: watch::Receiver<Option<Config>>,
     status: Arc<Mutex<Status>>,
+    app: Option<crate::server::App>,
 ) -> SessionEnd {
     let Ok(url) = Url::parse(&config.broker.replacen("ssl://", "mqtts://", 1)) else {
         return SessionEnd::Failed;
@@ -320,6 +330,7 @@ async fn session(
         return SessionEnd::Failed;
     }
     let bridge = BridgeManager::new(config.clone());
+    let mut updates = JoinSet::new();
     let mut connected = false;
     let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(
         config.report_interval_seconds,
@@ -328,7 +339,7 @@ async fn session(
     loop {
         tokio::select! {
             changed = config_rx.changed() => {
-                bridge.shutdown();
+                bridge.shutdown(); updates.detach_all();
                 if connected {
                     let _ = publish_and_flush(
                         &client,
@@ -339,31 +350,54 @@ async fn session(
                 }
                 return if changed.is_ok() { SessionEnd::Reconfigure } else { SessionEnd::Stopped };
             }
+            result = updates.join_next(), if !updates.is_empty() => {
+                if let Some(Ok(result)) = result {
+                    let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                }
+            },
             event = eventloop.poll() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
                     ticker.reset();
                     set_status(&status, "connected", "");
                     let snapshot = state_rx.borrow().clone();
+                    if let Some(app) = &app
+                        && let Some(result) = app.cloud_update_result().await {
+                            let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                    }
                     if report(&client, config, &snapshot, &status).await.is_err() {
-                        bridge.shutdown();
+                        bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
                 }
                 Ok(Event::Incoming(Incoming::Publish(message))) if connected => {
-                    if !message.retain && message.payload.len() <= 8192
-                        && let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload)
+                    if message.topic != format!("{}/command/request", root(config)) || message.retain || message.payload.len() > 8192 { continue; }
+                    if let Ok(command) = serde_json::from_slice::<crate::cloud_update::Command>(&message.payload) {
+                        if let Some(app) = &app {
+                            let app = app.clone();
+                            let config = config.clone();
+                            if updates.is_empty() {
+                                updates.spawn(async move { app.cloud_update(command, config).await });
+                            }
+                        }
+                        continue;
+                    }
+                    if let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload)
                             && let Some(result) = bridge.receive(command).await {
                                 let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                             }
                 }
                 Ok(_) => {},
-                Err(_) => { bridge.shutdown(); return SessionEnd::Failed; }
+                Err(_) => { bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed; }
             },
             _ = ticker.tick(), if connected => {
+                if let Some(app) = &app
+                    && let Some(result) = app.cloud_update_result().await {
+                        let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                }
                 let snapshot = state_rx.borrow_and_update().clone();
                 if report(&client, config, &snapshot, &status).await.is_err() {
-                    bridge.shutdown();
+                    bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
             }
@@ -412,7 +446,7 @@ async fn report(
         "vendor":config.vendor,"model":config.model,"device_id":config.identity,
         "id_type":config.identity_type,"platform":config.platform,
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
-        "capabilities":[],"remote_services":config.services,"remote_enabled":config.remote_enabled
+        "capabilities":["datad.update","datad.remote"],"remote_services":config.services,"remote_enabled":config.remote_enabled
     })).await?;
     publish(
         client,
@@ -424,6 +458,23 @@ async fn report(
         client,
         format!("{}/telemetry/system", root(config)),
         system_telemetry(&state),
+    )
+    .await?;
+    let addresses = |family: &str| -> Vec<Value> {
+        state
+            .pointer(&format!("/net/interfaces/{family}/{family}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("address").and_then(Value::as_str))
+            .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
+            .map(|address| json!(address))
+            .collect()
+    };
+    publish(
+        client,
+        format!("{}/telemetry/network", root(config)),
+        json!({"upstream":{"ipv4":addresses("ipv4"),"ipv6":addresses("ipv6")}}),
     )
     .await?;
     let mut guard = status.lock().unwrap();
@@ -1003,7 +1054,7 @@ mod tests {
         let status = Arc::new(Mutex::new(Status::default()));
         let session_task = tokio::spawn({
             let status = status.clone();
-            async move { session(&config, state_rx, config_rx, status).await }
+            async move { session(&config, state_rx, config_rx, status, None).await }
         });
         let mut found = HashSet::new();
         while found.len() < 3 {
