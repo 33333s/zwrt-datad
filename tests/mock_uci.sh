@@ -68,6 +68,15 @@ if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; 
     exit 0
 fi
 
+if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zwrt_zte_nwinfo" ]; then
+    printf '%s\n' \
+        "zwrt_zte_nwinfo.default_band_lock=default_band_lock" \
+        "zwrt_zte_nwinfo.default_band_lock.default_lte_ext_band_lock='${MOCK_SUPPORTED_LTE_BANDS:-1,2,3,7,8,20,28,38,40,41,66}'" \
+        "zwrt_zte_nwinfo.default_band_lock.default_nr5g_sa_band_lock='${MOCK_SUPPORTED_NR_SA_BANDS:-1,3,28,41,77,78,79}'" \
+        "zwrt_zte_nwinfo.default_band_lock.default_nr5g_nsa_band_lock='${MOCK_SUPPORTED_NR_NSA_BANDS:-1,3,28,41,77,78,79}'"
+    exit 0
+fi
+
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ]; then
     case "${3:-}" in
         zwrt_zte_mdm)

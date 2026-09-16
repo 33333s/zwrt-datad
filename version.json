@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.2",
+    "version": "0.10.3",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 QCI/AMBR 轮转日志读取并缓存解析结果，减少 TopFlow 重复采集"
+    "notes": "修复频段能力目录与当前锁频状态混用，恢复原厂默认完整频段能力并新增结构化 band_capabilities"
   }
 }
