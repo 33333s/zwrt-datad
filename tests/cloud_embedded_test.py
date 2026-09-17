@@ -57,8 +57,11 @@ def main():
             assert code == 200 and config["password_configured"] is False, config
             saved = config["config"]
             saved["password"] = "fixture-secret"
+            saved["broker"] = "wss://nms.example.com/mqtt"
             code, configured = request(base + "/cloud/config", "POST", saved)
             assert code == 200 and configured["password_configured"] is True, configured
+            assert configured["config"]["broker"] == saved["broker"]
+            assert "fixture-secret" not in json.dumps(configured)
             config_file = Path(folder) / "cloud.json"
             assert config_file.exists() and config_file.stat().st_mode & 0o777 == 0o600
             assert not (Path(folder) / "cloud.sock").exists()

@@ -1406,6 +1406,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "249896ab27ed630590971738264baa8f722f18965d2e387c706c40a3c2a572cc"
 dependencies = [
  "async-tungstenite",
+ "futures-io",
+ "futures-util",
+ "http",
  "rustls-native-certs",
  "rustls-pki-types",
  "rustls-webpki",
@@ -1424,7 +1427,9 @@ dependencies = [
  "bytes",
  "fixedbitset",
  "flume",
+ "futures-io",
  "futures-util",
+ "http",
  "log",
  "mqttbytes-core-next",
  "rumqttc-core-next",
