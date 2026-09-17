@@ -17,7 +17,7 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rsa = "0.9"
 rand = "0.8"
-rumqttc = { package = "rumqttc-v4-next", version = "0.34", default-features = false, features = ["use-rustls-ring"] }
+rumqttc = { package = "rumqttc-v4-next", version = "0.34", default-features = false, features = ["use-rustls-ring", "websocket"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

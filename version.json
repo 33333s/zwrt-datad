@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.9",
+    "version": "0.10.10",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复云端开关保存后重连循环、在线心跳及失效远程会话回收"
+    "notes": "新增 MQTT over WSS，支持经 HTTPS 443 和 Cloudflare Tunnel 连接 NMS"
   }
 }

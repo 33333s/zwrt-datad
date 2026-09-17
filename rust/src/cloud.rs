@@ -2,7 +2,8 @@ use crate::model::Snapshot;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use rumqttc::{
-    AsyncClient, Event, Incoming, LastWill, MqttOptions, Outgoing, PublishOptions, QoS, Transport,
+    AsyncClient, Event, Incoming, LastWill, MqttOptions, Outgoing, PublishOptions, QoS,
+    TlsConfiguration, Transport,
 };
 use rustls::{
     ClientConfig, RootCertStore,
@@ -288,6 +289,57 @@ enum SessionEnd {
     Failed,
 }
 
+const MQTT_ADDRESS_ERROR: &str = "MQTT 地址格式为 ssl://主机:端口 或 wss://主机[:端口]/mqtt";
+
+fn mqtt_url(address: &str) -> Result<Url, String> {
+    if address.trim() != address || address.chars().any(char::is_control) {
+        return Err(MQTT_ADDRESS_ERROR.into());
+    }
+    let url = Url::parse(address).map_err(|_| MQTT_ADDRESS_ERROR)?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port() == Some(0)
+    {
+        return Err(MQTT_ADDRESS_ERROR.into());
+    }
+    match url.scheme() {
+        "ssl" if url.port().is_some() && matches!(url.path(), "" | "/") => Ok(url),
+        "wss" => Ok(url),
+        _ => Err(MQTT_ADDRESS_ERROR.into()),
+    }
+}
+
+fn mqtt_options(config: &Config, client_id: &str) -> Result<MqttOptions, String> {
+    let url = mqtt_url(&config.broker)?;
+    if url.scheme() == "wss" {
+        // Preserve the endpoint path and verify the broker hostname with the
+        // same embedded trust roots / optional CA used by remote WSS sessions.
+        return MqttOptions::websocket_with_tls_config(
+            client_id,
+            url.as_str(),
+            TlsConfiguration::Rustls(websocket_tls(config)?),
+        )
+        .map_err(|_| MQTT_ADDRESS_ERROR.into());
+    }
+    let mut options = MqttOptions::new(
+        client_id,
+        (
+            url.host_str().ok_or(MQTT_ADDRESS_ERROR)?,
+            url.port().ok_or(MQTT_ADDRESS_ERROR)?,
+        ),
+    );
+    let transport = if config.ca_pem.is_empty() {
+        Transport::try_tls_with_default_config().map_err(|_| "无法加载 MQTT TLS 根证书")?
+    } else {
+        Transport::tls(config.ca_pem.as_bytes().to_vec(), None, None)
+    };
+    options.set_transport(transport);
+    Ok(options)
+}
+
 async fn session(
     config: &Config,
     mut state_rx: watch::Receiver<Snapshot>,
@@ -295,15 +347,11 @@ async fn session(
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
 ) -> SessionEnd {
-    let Ok(url) = Url::parse(&config.broker.replacen("ssl://", "mqtts://", 1)) else {
-        return SessionEnd::Failed;
-    };
-    let (Some(host), Some(port)) = (url.host_str(), url.port()) else {
-        return SessionEnd::Failed;
-    };
     let id_hash = Sha256::digest(root(config).as_bytes());
     let client_id = format!("datad-{}", hex(&id_hash[..12]));
-    let mut options = MqttOptions::new(client_id, (host, port));
+    let Ok(mut options) = mqtt_options(config, &client_id) else {
+        return SessionEnd::Failed;
+    };
     options.set_credentials(config.username.clone(), config.password.clone());
     options.set_keep_alive(30);
     options.set_clean_session(true);
@@ -313,11 +361,6 @@ async fn session(
         QoS::AtLeastOnce,
         false,
     ));
-    options.set_transport(if config.ca_pem.is_empty() {
-        Transport::tls_with_default_config()
-    } else {
-        Transport::tls(config.ca_pem.as_bytes().to_vec(), None, None)
-    });
     let (client, mut eventloop) = AsyncClient::builder(options).capacity(32).build();
     if client
         .subscribe(
@@ -807,19 +850,7 @@ fn validate(config: &Config) -> Result<(), String> {
         }
     }
     if !config.broker.is_empty() {
-        let url = Url::parse(&config.broker.replacen("ssl://", "mqtts://", 1))
-            .map_err(|_| "MQTT 地址格式为 ssl://主机:端口")?;
-        if !config.broker.starts_with("ssl://")
-            || url.host_str().is_none()
-            || url.port().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || (!matches!(url.path(), "" | "/"))
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err("MQTT 地址格式为 ssl://主机:端口".into());
-        }
+        mqtt_url(&config.broker)?;
     }
     if !config.platform_url.is_empty() {
         let url = Url::parse(&config.platform_url).map_err(|_| "NMS 地址必须是 HTTPS 站点地址")?;
@@ -915,6 +946,238 @@ mod tests {
     };
     use tokio_rustls::TlsAcceptor;
     use tokio_tungstenite::accept_hdr_async;
+
+    #[test]
+    fn mqtt_addresses_require_encryption_and_keep_wss_paths() {
+        init_crypto();
+        for address in [
+            "ssl://broker.example:8883",
+            "wss://broker.example/mqtt",
+            "wss://broker.example:8443/custom/mqtt",
+            "wss://[::1]:8443/mqtt",
+        ] {
+            let config = Config {
+                broker: address.into(),
+                ..Default::default()
+            };
+            validate(&config).unwrap();
+            let options = mqtt_options(&config, "fixture").unwrap();
+            if address.starts_with("wss://") {
+                assert!(matches!(options.transport(), Transport::Wss(_)));
+                assert_eq!(
+                    options.broker().websocket_url(),
+                    Some(mqtt_url(address).unwrap().as_str())
+                );
+            } else {
+                assert!(matches!(options.transport(), Transport::Tls(_)));
+            }
+        }
+        for address in [
+            "ws://broker.example/mqtt",
+            "mqtt://broker.example:1883",
+            "https://broker.example/mqtt",
+            "ssl://broker.example",
+            "ssl://broker.example:8883/mqtt",
+            "wss://user:secret@broker.example/mqtt",
+            "wss://broker.example/mqtt?token=secret",
+            "wss://broker.example/mqtt#fragment",
+            "wss://broker.example:0/mqtt",
+            "wss://broker.example:65536/mqtt",
+            "wss://broker.example\n/mqtt",
+            " wss://broker.example/mqtt",
+        ] {
+            assert!(mqtt_url(address).is_err(), "accepted {address}");
+        }
+        assert_eq!(
+            mqtt_url("wss://broker.example/mqtt")
+                .unwrap()
+                .port_or_known_default(),
+            Some(443)
+        );
+    }
+
+    // WebSocket messages need not align with MQTT packets. The fixture broker
+    // buffers complete MQTT packets independently from the client's framing.
+    fn take_mqtt_packet(bytes: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+        let mut size = 0usize;
+        let mut multiplier = 1usize;
+        for offset in 1..=4 {
+            let value = *bytes.get(offset)?;
+            size += usize::from(value & 127) * multiplier;
+            if value & 128 == 0 {
+                let end = offset + 1 + size;
+                if bytes.len() < end {
+                    return None;
+                }
+                let header = bytes[0];
+                let payload = bytes[offset + 1..end].to_vec();
+                bytes.drain(..end);
+                return Some((header, payload));
+            }
+            multiplier *= 128;
+        }
+        panic!("invalid fixture MQTT remaining length");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite callback requires its HTTP error response type.
+    async fn mqtt_wss_authenticates_reports_and_reconnects() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reports_tx, mut reports_rx) = mpsc::channel(32);
+        let broker = tokio::spawn(async move {
+            for connection in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let stream = acceptor.accept(tcp).await.unwrap();
+                let mut ws = accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(request.uri().path(), "/custom/mqtt");
+                    assert_eq!(request.headers()["sec-websocket-protocol"], "mqtt");
+                    assert!(!request.headers().contains_key("authorization"));
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static("mqtt"));
+                    Ok(response)
+                }).await.unwrap();
+                let mut pending = Vec::new();
+                let mut got_system = false;
+                let mut got_device = false;
+                let mut got_online = false;
+                'messages: while let Some(Ok(message)) = ws.next().await {
+                    if let Message::Binary(data) = message {
+                        pending.extend_from_slice(&data);
+                    }
+                    while let Some((header, payload)) = take_mqtt_packet(&mut pending) {
+                        let response = match header >> 4 {
+                            1 => {
+                                assert!(payload.windows(12).any(|w| w == b"fixture-user"));
+                                assert!(payload.windows(16).any(|w| w == b"fixture-password"));
+                                vec![0x20, 2, 0, 0]
+                            }
+                            8 => vec![0x90, 3, payload[0], payload[1], 1],
+                            3 => {
+                                let topic_len =
+                                    usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                                let mut offset = topic_len + 2;
+                                let ack = if (header >> 1) & 3 == 1 {
+                                    let ack = vec![0x40, 2, payload[offset], payload[offset + 1]];
+                                    offset += 2;
+                                    ack
+                                } else {
+                                    vec![]
+                                };
+                                if let Ok(value) =
+                                    serde_json::from_slice::<Value>(&payload[offset..])
+                                {
+                                    assert!(!value.to_string().contains("do-not-upload"));
+                                    got_online |= value["online"] == true;
+                                    got_device |= value["model"] == "WSS-fixture";
+                                    got_system |= value.get("boot_id").is_some();
+                                    reports_tx.send((connection, value)).await.unwrap();
+                                }
+                                ack
+                            }
+                            12 => vec![0xd0, 0],
+                            _ => vec![],
+                        };
+                        if !response.is_empty() {
+                            ws.send(Message::Binary(response.into())).await.unwrap();
+                        }
+                        if got_online && got_device && got_system {
+                            ws.close(None).await.unwrap();
+                            break 'messages;
+                        }
+                    }
+                }
+            }
+        });
+        let config = Config {
+            enabled: true,
+            broker: format!("wss://{address}/custom/mqtt"),
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+            ca_pem,
+            model: "WSS-fixture".into(),
+            identity: "fixture-device".into(),
+            ..Default::default()
+        };
+        let (_config_tx, config_rx) = watch::channel(Some(config));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: serde_json::Map::from_iter([("password".into(), json!("do-not-upload"))]),
+        });
+        let status = Arc::new(Mutex::new(Status::default()));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut connections = HashSet::new();
+            while connections.len() < 2 {
+                let (connection, value) = reports_rx.recv().await.unwrap();
+                if value["online"] == true {
+                    connections.insert(connection);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        broker.abort();
+    }
+
+    #[tokio::test]
+    async fn mqtt_wss_rejects_untrusted_certificates_and_hostname_mismatch() {
+        init_crypto();
+        for trust_wrong_hostname in [false, true] {
+            let names = if trust_wrong_hostname {
+                vec!["wrong.example".into()]
+            } else {
+                vec!["127.0.0.1".into()]
+            };
+            let certified = generate_simple_self_signed(names).unwrap();
+            let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            let server = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certified.cert.der().clone()], key)
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(server));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                assert!(acceptor.accept(tcp).await.is_err());
+            });
+            let config = Config {
+                broker: format!("wss://{address}/mqtt"),
+                ca_pem: if trust_wrong_hostname {
+                    certified.cert.pem()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            };
+            let (_state_tx, state_rx) = watch::channel(Snapshot {
+                ts: now(),
+                datad: Default::default(),
+                fields: Default::default(),
+            });
+            let (_config_tx, config_rx) = watch::channel(Some(config.clone()));
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session(
+                    &config,
+                    state_rx,
+                    config_rx,
+                    Arc::new(Mutex::new(Status::default())),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, SessionEnd::Failed));
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[test]
     fn defaults_validate() {
