@@ -245,6 +245,20 @@ mod tests {
             }).await.unwrap();
             let first = decode(ws.next().await.unwrap().unwrap()).unwrap();
             assert!(matches!(first,ShellMessage::Text(value) if value.contains("ready")));
+            ws.send(Message::Ping(b"idle-probe".to_vec().into()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(message) = ws.next().await {
+                    if matches!(message.unwrap(), Message::Pong(data) if data == b"idle-probe"[..])
+                    {
+                        return;
+                    }
+                }
+                panic!("idle terminal did not answer ping");
+            })
+            .await
+            .unwrap();
             input(&mut ws, b"printf '\\137PID:%s\\n' \"$$\"\n").await;
             let output = until(&mut ws, "_PID:").await;
             let pid: i32 = output
