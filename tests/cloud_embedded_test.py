@@ -56,11 +56,14 @@ def main():
             code, config = request(base + "/cloud/config")
             assert code == 200 and config["password_configured"] is False, config
             saved = config["config"]
+            assert saved["remote_webshell_enabled"] is False
+            saved["remote_webshell_enabled"] = True
             saved["password"] = "fixture-secret"
             saved["broker"] = "wss://nms.example.com/mqtt"
             code, configured = request(base + "/cloud/config", "POST", saved)
             assert code == 200 and configured["password_configured"] is True, configured
             assert configured["config"]["broker"] == saved["broker"]
+            assert configured["config"]["remote_webshell_enabled"] is True
             assert "fixture-secret" not in json.dumps(configured)
             config_file = Path(folder) / "cloud.json"
             assert config_file.exists() and config_file.stat().st_mode & 0o777 == 0o600

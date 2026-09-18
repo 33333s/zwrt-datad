@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.10",
+    "version": "0.10.11",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MQTT over WSS，支持经 HTTPS 443 和 Cloudflare Tunnel 连接 NMS"
+    "notes": "新增独立授权的 NMS 云端 WebShell 与会话关闭回收"
   }
 }

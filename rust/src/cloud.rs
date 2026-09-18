@@ -65,6 +65,7 @@ pub struct Config {
     pub platform: String,
     pub report_interval_seconds: u16,
     pub remote_enabled: bool,
+    pub remote_webshell_enabled: bool,
     pub services: Vec<Service>,
 }
 
@@ -84,6 +85,7 @@ impl Default for Config {
             platform: "qualcomm".into(),
             report_interval_seconds: 30,
             remote_enabled: false,
+            remote_webshell_enabled: false,
             services: vec![
                 Service {
                     name: "设备后台".into(),
@@ -372,7 +374,10 @@ async fn session(
     {
         return SessionEnd::Failed;
     }
-    let bridge = BridgeManager::new(config.clone());
+    let bridge = BridgeManager::new(config.clone(), app.clone());
+    let webshell_available = app
+        .as_ref()
+        .is_some_and(|app| app.cloud_webshell_available());
     let mut updates = JoinSet::new();
     let mut connected = false;
     let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(
@@ -413,7 +418,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &snapshot, &status).await.is_err() {
+                    if report(&client, config, &snapshot, &status, webshell_available).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -450,7 +455,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &snapshot, &status).await.is_err() {
+                if report(&client, config, &snapshot, &status, webshell_available).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -489,8 +494,13 @@ async fn report(
     config: &Config,
     snapshot: &Snapshot,
     status: &Arc<Mutex<Status>>,
+    webshell_available: bool,
 ) -> Result<(), String> {
     let state = serde_json::to_value(snapshot).unwrap_or(Value::Null);
+    let mut capabilities = vec!["datad.update", "datad.remote"];
+    if webshell_available {
+        capabilities.push("datad.webshell");
+    }
     let firmware = state
         .get("system")
         .and_then(|value| value.get("sw_version").or_else(|| value.get("fw")))
@@ -500,7 +510,8 @@ async fn report(
         "vendor":config.vendor,"model":config.model,"device_id":config.identity,
         "id_type":config.identity_type,"platform":config.platform,
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
-        "capabilities":["datad.update","datad.remote"],"remote_services":config.services,"remote_enabled":config.remote_enabled
+        "capabilities":capabilities,"remote_services":config.services,"remote_enabled":config.remote_enabled,
+        "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     })).await?;
     publish(
         client,
@@ -611,22 +622,24 @@ struct BridgeState {
 #[derive(Clone)]
 struct BridgeManager {
     config: Config,
+    app: Option<crate::server::App>,
     state: Arc<AsyncMutex<BridgeState>>,
     shutdown: watch::Sender<bool>,
 }
 
 impl BridgeManager {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, app: Option<crate::server::App>) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             config,
+            app,
             state: Arc::new(AsyncMutex::new(BridgeState::default())),
             shutdown,
         }
     }
 
     fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     async fn receive(&self, command: RemoteCommand) -> Option<Value> {
@@ -642,17 +655,48 @@ impl BridgeManager {
         if state.active.len() >= 4 || state.seen.len() >= 128 {
             return Some(reject("session_limit".into()));
         }
+        let shell_permit = if command.target_service == "webshell" {
+            let Some(app) = &self.app else {
+                return Some(reject("webshell_disabled".into()));
+            };
+            match app.cloud_webshell_slot() {
+                Ok(permit) => Some(permit),
+                Err(error) => return Some(reject(error.into())),
+            }
+        } else {
+            None
+        };
         state.active.insert(command.request_id.clone());
         state
             .seen
             .insert(command.request_id.clone(), now() + 12 * 3600);
         drop(state);
         let manager = self.clone();
-        tokio::spawn(async move { manager.run_bridge(command).await });
+        tokio::spawn(async move { manager.run_bridge(command, shell_permit).await });
         None
     }
 
-    async fn run_bridge(&self, command: RemoteCommand) {
+    async fn run_bridge(
+        &self,
+        command: RemoteCommand,
+        shell_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        if let Some(permit) = shell_permit {
+            if let Some(app) = &self.app {
+                crate::cloud_shell::run(
+                    app.cloud_webshell(),
+                    &self.config,
+                    &command.remote_url,
+                    &command.token,
+                    Duration::from_secs(command.ttl_seconds),
+                    self.shutdown.subscribe(),
+                    permit,
+                )
+                .await;
+            }
+            self.state.lock().await.active.remove(&command.request_id);
+            return;
+        }
         let mut workers = JoinSet::new();
         for _ in 0..4 {
             let config = self.config.clone();
@@ -713,6 +757,19 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
     {
         return Err("multiple_ports_unsupported".into());
     }
+    if command.target_service == "webshell" {
+        if !config.remote_webshell_enabled {
+            return Err("webshell_disabled".into());
+        }
+        if command.target_port != 0
+            || !command.target_ports.is_empty()
+            || command.ttl_seconds > 1800
+            || !command.token.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("invalid_webshell_request".into());
+        }
+        return Ok(());
+    }
     let allowed = config.services.iter().any(|service| {
         service.port == command.target_port
             && ((command.target_service == "terminal" && service.kind == "terminal")
@@ -730,6 +787,9 @@ async fn bridge_pipe(
     command: &RemoteCommand,
     mut shutdown: watch::Receiver<bool>,
 ) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
     let Ok(mut request) = command.remote_url.clone().into_client_request() else {
         return true;
     };
@@ -794,7 +854,7 @@ async fn bridge_pipe(
     }
 }
 
-fn websocket_tls(config: &Config) -> Result<Arc<ClientConfig>, String> {
+pub(crate) fn websocket_tls(config: &Config) -> Result<Arc<ClientConfig>, String> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if !config.ca_pem.is_empty() {
@@ -1234,6 +1294,64 @@ mod tests {
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
             "multiple_ports_unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_webshell_requires_opt_in_and_local_engine() {
+        assert!(!Config::default().remote_webshell_enabled);
+        assert!(
+            !serde_json::from_str::<Config>("{}")
+                .unwrap()
+                .remote_webshell_enabled
+        );
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            ..Default::default()
+        };
+        let mut command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "native-session".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://nms.example.com/api/remote/device/native-session".into(),
+            token: "a".repeat(64),
+            target_service: "webshell".into(),
+            target_port: 0,
+            target_ports: vec![],
+            ttl_seconds: 1800,
+        };
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "webshell_disabled"
+        );
+        config.remote_webshell_enabled = true;
+        validate_remote(&config, &command).unwrap();
+        command.target_port = 22;
+        assert!(validate_remote(&config, &command).is_err());
+        command.target_port = 0;
+        command.target_ports = vec![0];
+        assert!(validate_remote(&config, &command).is_err());
+        command.target_ports.clear();
+        command.ttl_seconds = 1801;
+        assert!(validate_remote(&config, &command).is_err());
+        command.ttl_seconds = 1800;
+        command.token = "!".repeat(64);
+        assert!(validate_remote(&config, &command).is_err());
+        command.token = "a".repeat(64);
+        command.remote_url = "wss://other.example.com/api/remote/device/native-session".into();
+        assert!(validate_remote(&config, &command).is_err());
+        command.remote_url = "wss://nms.example.com/api/remote/device/native-session".into();
+        let manager = BridgeManager::new(config, None);
+        assert_eq!(
+            manager.receive(command).await.unwrap()["error"]["code"],
+            "webshell_disabled"
+        );
+        manager.shutdown();
+        assert!(
+            *manager.shutdown.subscribe().borrow(),
+            "shutdown lost before subscription"
         );
     }
 
