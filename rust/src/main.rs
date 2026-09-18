@@ -1,5 +1,6 @@
 mod auth;
 mod cloud;
+mod cloud_shell;
 mod cloud_update;
 mod command;
 mod control;

@@ -1,5 +1,5 @@
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -61,10 +61,24 @@ impl WebShell {
     }
 
     pub async fn serve(self, socket: WebSocket, permit: OwnedSemaphorePermit) {
+        self.serve_with_cancel(socket, permit, std::future::pending())
+            .await;
+    }
+
+    pub(crate) async fn serve_with_cancel<S, E, F>(
+        self,
+        socket: S,
+        permit: OwnedSemaphorePermit,
+        stop: F,
+    ) where
+        S: Stream<Item = Result<Message, E>> + Sink<Message, Error = E> + Unpin + Send + 'static,
+        E: Send + 'static,
+        F: std::future::Future<Output = ()> + Send,
+    {
         let _permit = permit;
         let _active = ActiveGuard::new(self.active.clone());
         if let Ok(mut process) = PtyProcess::spawn() {
-            run_session(socket, &mut process).await;
+            run_session(socket, &mut process, stop).await;
             process.terminate().await;
         }
     }
@@ -89,6 +103,7 @@ struct PtyProcess {
     master: AsyncFd<File>,
     child: Child,
     pid: i32,
+    terminated: bool,
 }
 
 impl PtyProcess {
@@ -152,6 +167,7 @@ impl PtyProcess {
             master: AsyncFd::new(master)?,
             child,
             pid,
+            terminated: false,
         })
     }
 
@@ -176,21 +192,36 @@ impl PtyProcess {
         }
     }
 
-    async fn terminate(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            if self.pid > 0 {
+    fn kill_groups(&self) {
+        // Job control gives a foreground command its own process group.
+        let foreground = unsafe { libc::tcgetpgrp(self.master.get_ref().as_raw_fd()) };
+        for group in [foreground, self.pid] {
+            if group > 0 && group != unsafe { libc::getpgrp() } {
                 unsafe {
-                    libc::kill(-self.pid, libc::SIGHUP);
-                    libc::kill(-self.pid, libc::SIGKILL);
+                    libc::kill(-group, libc::SIGHUP);
+                    libc::kill(-group, libc::SIGKILL);
                 }
             }
-            if tokio::time::timeout(Duration::from_secs(1), self.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = self.child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_millis(100), self.child.wait()).await;
-            }
+        }
+    }
+
+    async fn terminate(&mut self) {
+        self.kill_groups();
+        if tokio::time::timeout(Duration::from_secs(1), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_millis(100), self.child.wait()).await;
+        }
+        self.terminated = true;
+    }
+}
+
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        if !self.terminated {
+            self.kill_groups();
         }
     }
 }
@@ -237,22 +268,34 @@ fn parse_resize(text: &str) -> Option<(u16, u16)> {
     .then_some((resize.cols, resize.rows))
 }
 
-async fn run_session(socket: WebSocket, process: &mut PtyProcess) {
+async fn run_session<S, E, F>(socket: S, process: &mut PtyProcess, stop: F)
+where
+    S: Stream<Item = Result<Message, E>> + Sink<Message, Error = E> + Unpin + Send + 'static,
+    E: Send + 'static,
+    F: std::future::Future<Output = ()> + Send,
+{
+    tokio::pin!(stop);
     let (mut sender, mut receiver) = socket.split();
-    if sender
-        .send(Message::Text(
-            r#"{"type":"ready","cols":80,"rows":24}"#.into(),
-        ))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send(Message::Text(
+                r#"{"type":"ready","cols":80,"rows":24}"#.into(),
+            ))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
     let _ = process.resize(80, 24);
     let (output_tx, mut output_rx) = mpsc::channel::<Message>(1);
     let mut writer = tokio::spawn(async move {
         while let Some(message) = output_rx.recv().await {
-            if sender.send(message).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(2), sender.send(message)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -263,6 +306,7 @@ async fn run_session(socket: WebSocket, process: &mut PtyProcess) {
     loop {
         tokio::select! {
             _ = &mut idle => break,
+            _ = &mut stop => break,
             _ = &mut writer => break,
             status = process.child.wait() => {
                 let _ = status;
@@ -271,7 +315,7 @@ async fn run_session(socket: WebSocket, process: &mut PtyProcess) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(data))) if !data.is_empty() => {
-                        if write_master(&process.master, &data).await.is_err() { break; }
+                        if !matches!(tokio::time::timeout(Duration::from_secs(2), write_master(&process.master, &data)).await, Ok(Ok(()))) { break; }
                         idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                     }
                     Some(Ok(Message::Binary(_))) => {}

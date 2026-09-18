@@ -63,6 +63,25 @@ struct DeviceSession {
 }
 
 impl App {
+    pub(crate) fn cloud_webshell_available(&self) -> bool {
+        self.inner.webshell.enabled()
+    }
+
+    pub(crate) fn cloud_webshell_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+        if !self.cloud_webshell_available() {
+            return Err("webshell_disabled");
+        }
+        self.inner
+            .webshell
+            .try_acquire()
+            .ok_or("webshell_session_limit")
+    }
+
+    pub(crate) fn cloud_webshell(&self) -> WebShell {
+        self.inner.webshell.clone()
+    }
     pub async fn new(
         data_dir: PathBuf,
         interval: Duration,
