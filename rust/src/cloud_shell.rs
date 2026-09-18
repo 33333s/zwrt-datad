@@ -10,7 +10,9 @@ use std::{io, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
-    tungstenite::{Error, Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        Error, Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
+    },
 };
 
 const PROTOCOL: &str = "nms-webshell-v1";
@@ -96,7 +98,14 @@ pub(crate) async fn run(
     let Ok(tls) = websocket_tls(config) else {
         return;
     };
-    let connect = connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls)));
+    // Bound allocation before decoding records, including fragmented messages.
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE + 5))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE + 5))
+        .write_buffer_size(0)
+        .max_write_buffer_size(2 * MAX_MESSAGE_SIZE);
+    let connect =
+        connect_async_tls_with_config(request, Some(limits), false, Some(Connector::Rustls(tls)));
     let (socket, response) = tokio::select! {
         result = tokio::time::timeout(ttl.min(Duration::from_secs(10)), connect) => {
             match result { Ok(Ok(value)) => value, _ => return }
@@ -190,7 +199,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for ending in ["disconnect", "disable", "ttl"] {
+        for ending in ["disconnect", "disable", "ttl", "oversize"] {
             let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
             let config = Config {
                 ca_pem: certificate.cert.pem(),
@@ -287,6 +296,11 @@ mod tests {
                 }
                 "disable" => {
                     shutdown.send_replace(true);
+                }
+                "oversize" => {
+                    ws.send(Message::Binary(vec![0; MAX_MESSAGE_SIZE + 6].into()))
+                        .await
+                        .unwrap();
                 }
                 _ => {}
             }
