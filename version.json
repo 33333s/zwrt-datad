@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.11",
+    "version": "0.10.12",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增独立授权的 NMS 云端 WebShell 与会话关闭回收"
+    "notes": "新增明确授权的备用远程地址，支持 NMS 免费与会员双线路"
   }
 }

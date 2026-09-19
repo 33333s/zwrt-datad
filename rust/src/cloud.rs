@@ -53,6 +53,7 @@ pub struct Config {
     pub enabled: bool,
     pub broker: String,
     pub platform_url: String,
+    pub remote_origins: Vec<String>,
     pub username: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub password: String,
@@ -75,6 +76,7 @@ impl Default for Config {
             enabled: false,
             broker: String::new(),
             platform_url: String::new(),
+            remote_origins: Vec::new(),
             username: String::new(),
             password: String::new(),
             ca_pem: String::new(),
@@ -497,7 +499,7 @@ async fn report(
     webshell_available: bool,
 ) -> Result<(), String> {
     let state = serde_json::to_value(snapshot).unwrap_or(Value::Null);
-    let mut capabilities = vec!["datad.update", "datad.remote"];
+    let mut capabilities = vec!["datad.update", "datad.remote", "datad.remote_origins"];
     if webshell_available {
         capabilities.push("datad.webshell");
     }
@@ -511,6 +513,7 @@ async fn report(
         "id_type":config.identity_type,"platform":config.platform,
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
         "capabilities":capabilities,"remote_services":config.services,"remote_enabled":config.remote_enabled,
+        "remote_origins":reported_remote_origins(config),
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     })).await?;
     publish(
@@ -736,11 +739,29 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
     {
         return Err("invalid_request".into());
     }
+    if command.remote_url.len() > 2048
+        || command
+            .remote_url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("invalid_remote_url".into());
+    }
     let remote = Url::parse(&command.remote_url).map_err(|_| "invalid_remote_url")?;
-    let base = Url::parse(&config.platform_url).map_err(|_| "invalid_remote_url")?;
+    let base = https_origin(&config.platform_url).map_err(|_| "invalid_remote_url")?;
+    let approved = std::iter::once(base)
+        .chain(
+            config
+                .remote_origins
+                .iter()
+                .filter_map(|raw| https_origin(raw).ok()),
+        )
+        .any(|origin| {
+            remote.host_str() == origin.host_str()
+                && remote.port_or_known_default() == origin.port_or_known_default()
+        });
     if remote.scheme() != "wss"
-        || remote.host_str() != base.host_str()
-        || remote.port_or_known_default() != base.port_or_known_default()
+        || !approved
         || !remote.username().is_empty()
         || remote.password().is_some()
         || remote.query().is_some()
@@ -891,6 +912,44 @@ fn topic(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_. -".contains(&byte))
 }
 
+fn https_origin(raw: &str) -> Result<Url, String> {
+    let invalid = || "NMS 地址必须是 HTTPS 站点地址".to_owned();
+    if raw.len() > 512
+        || raw
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(raw).map_err(|_| invalid())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.host_str().is_some_and(|host| host.contains('*'))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port() == Some(0)
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+fn reported_remote_origins(config: &Config) -> Vec<String> {
+    let mut result = Vec::new();
+    for raw in std::iter::once(&config.platform_url).chain(&config.remote_origins) {
+        if let Ok(origin) = https_origin(raw) {
+            let value = origin.origin().ascii_serialization();
+            if !result.contains(&value) {
+                result.push(value);
+            }
+        }
+    }
+    result
+}
+
 fn validate(config: &Config) -> Result<(), String> {
     if !(10..=3600).contains(&config.report_interval_seconds) {
         return Err("上报间隔必须为 10–3600 秒".into());
@@ -912,17 +971,20 @@ fn validate(config: &Config) -> Result<(), String> {
     if !config.broker.is_empty() {
         mqtt_url(&config.broker)?;
     }
+    if config.remote_origins.len() > 4 {
+        return Err("最多配置 4 个备用远程地址".into());
+    }
+    let mut origins = HashSet::new();
     if !config.platform_url.is_empty() {
-        let url = Url::parse(&config.platform_url).map_err(|_| "NMS 地址必须是 HTTPS 站点地址")?;
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || !matches!(url.path(), "" | "/")
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err("NMS 地址必须是 HTTPS 站点地址".into());
+        origins.insert(
+            https_origin(&config.platform_url)?
+                .origin()
+                .ascii_serialization(),
+        );
+    }
+    for raw in &config.remote_origins {
+        if !origins.insert(https_origin(raw)?.origin().ascii_serialization()) {
+            return Err("远程地址不能重复".into());
         }
     }
     if !config.ca_pem.is_empty() {
@@ -1295,6 +1357,104 @@ mod tests {
             validate_remote(&config, &command).unwrap_err(),
             "multiple_ports_unsupported"
         );
+    }
+
+    #[test]
+    fn alternate_remote_origins_require_explicit_https_hosts_and_ports() {
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            ..Default::default()
+        };
+        let mut command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "route-fixture".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://relay.example.com:16001/api/remote/device/route-fixture".into(),
+            token: "a".repeat(64),
+            target_service: "router_web".into(),
+            target_port: 80,
+            target_ports: vec![],
+            ttl_seconds: 900,
+        };
+        assert!(validate_remote(&config, &command).is_err());
+        config.remote_origins = vec!["https://relay.example.com:16001".into()];
+        validate_remote(&config, &command).unwrap();
+        command.remote_url = "wss://nms.example.com/api/remote/device/route-fixture".into();
+        validate_remote(&config, &command).unwrap();
+        for address in [
+            "wss://relay.example.com/api/remote/device/route-fixture",
+            "wss://relay.example.com:16002/api/remote/device/route-fixture",
+            "wss://relay.example.com.evil.test:16001/api/remote/device/route-fixture",
+            "ws://relay.example.com:16001/api/remote/device/route-fixture",
+            "wss://user:secret@relay.example.com:16001/api/remote/device/route-fixture",
+            "wss://relay.example.com:16001/api/remote/device/other-session",
+            "wss://relay.example.com:16001/api/remote/device/route-fixture?token=x",
+            "wss://relay.example.com:16001/api/remote/device/route-fixture#x",
+            " wss://relay.example.com:16001/api/remote/device/route-fixture",
+        ] {
+            command.remote_url = address.into();
+            assert!(
+                validate_remote(&config, &command).is_err(),
+                "accepted {address}"
+            );
+        }
+        assert_eq!(
+            reported_remote_origins(&config),
+            vec!["https://nms.example.com", "https://relay.example.com:16001"]
+        );
+        config.remote_origins.clear();
+        assert_eq!(
+            reported_remote_origins(&config),
+            vec!["https://nms.example.com"]
+        );
+        assert!(
+            serde_json::from_str::<Config>("{}")
+                .unwrap()
+                .remote_origins
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn origin_configuration_is_bounded_and_does_not_contain_credentials() {
+        for raw in [
+            "http://relay.example.com",
+            "https://*.example.com",
+            "https://user:secret@relay.example.com",
+            "https://relay.example.com/path",
+            "https://relay.example.com?",
+            "https://relay.example.com#",
+            "https://relay.example.com:0",
+            "https://relay.example.com:65536",
+            "https://relay.example.com\n",
+            " https://relay.example.com",
+        ] {
+            let config = Config {
+                remote_origins: vec![raw.into()],
+                ..Default::default()
+            };
+            assert!(validate(&config).is_err(), "accepted {raw}");
+        }
+        let config = Config {
+            platform_url: "https://nms.example.com".into(),
+            remote_origins: vec!["https://NMS.example.com:443/".into()],
+            ..Default::default()
+        };
+        assert!(validate(&config).is_err());
+        let config = Config {
+            remote_origins: (1..=5)
+                .map(|i| format!("https://relay{i}.example.com"))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate(&config).is_err());
+        let config = Config {
+            remote_origins: vec!["https://[::1]:9443".into()],
+            ..Default::default()
+        };
+        validate(&config).unwrap();
     }
 
     #[tokio::test]
