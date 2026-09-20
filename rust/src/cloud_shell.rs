@@ -332,11 +332,22 @@ mod tests {
                 !std::path::Path::new(&format!("/proc/{pid}")).exists(),
                 "shell leader not reaped"
             );
-            let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
-            assert!(
-                stat.is_empty() || stat.split(") ").nth(1).is_some_and(|v| v.starts_with('Z')),
-                "foreground command survived {ending}"
-            );
+            // The foreground group is not our direct child. SIGKILL delivery
+            // is asynchronous even after the shell leader has been reaped.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let stat =
+                        std::fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
+                    if stat.is_empty()
+                        || stat.split(") ").nth(1).is_some_and(|v| v.starts_with('Z'))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("foreground command survived {ending}"));
         }
     }
 }
