@@ -622,8 +622,8 @@ fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool
     json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
 }
 fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
-    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH")
-        .unwrap_or_else(|_| "/sys/class/thermal/thermal_zone0".into());
+    let zone = crate::cooling::zone_path();
+    let zone_value = |name: &str| zone.as_ref().map(|p| read_i64(p.join(name))).unwrap_or(-1);
     let pwm_path = std::env::var("ZWRT_DATAD_FAN_PWM_PATH")
         .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/pwm1".into());
     let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH")
@@ -655,12 +655,12 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         .unwrap_or(liquid_uci)
         != 0;
     let fan_mode = config.get("fan_mode").copied().unwrap_or_default();
-    let zone_enabled = fs::read_to_string(format!("{zone}/mode"))
-        .unwrap_or_default()
-        .trim()
-        == "enabled";
+    let zone_enabled = zone
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p.join("mode")).ok())
+        .is_some_and(|v| v.trim() == "enabled");
     let pwm = read_i64(pwm_path);
-    let temp = read_i64(format!("{zone}/temp"));
+    let temp = zone_value("temp");
     let fan_thermal = fs::read_to_string(fan_thermal_path)
         .unwrap_or_default()
         .contains("thermal_enable:1");
@@ -670,8 +670,8 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
     let liquid_kernel_state = read_i64(liquid_state_path).clamp(0, 2);
     let mut factory = Vec::new();
     for (index, fallback_pwm) in [76, 128, 179].into_iter().enumerate() {
-        let temperature = read_i64(format!("{zone}/trip_point_{index}_temp"));
-        let hysteresis = read_i64(format!("{zone}/trip_point_{index}_hyst"));
+        let temperature = zone_value(&format!("trip_point_{index}_temp"));
+        let hysteresis = zone_value(&format!("trip_point_{index}_hyst"));
         factory.push(json!({"level":index+1,"temperature_celsius":temperature/1000,"hysteresis_celsius":hysteresis/1000,"pwm":fallback_pwm,"speed_percent":((fallback_pwm*100+127)/255)}));
     }
     let custom_count = config
@@ -712,7 +712,7 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         _ => 0,
     };
     json!({
-        "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"levels_percent":[0,30,50,70]},
+        "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"policy":crate::cooling::fan_policy_status(),"temperature_source":zone,"levels_percent":[0,30,50,70]},
         "liquid":{"enabled":liquid_always||liquid_thermal,"active":liquid_always||liquid_kernel_state>0,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":effective_liquid_level,"speed_percent":liquid_speed,"amplitude":liquid_amplitude,"kernel_state":liquid_kernel_state,"kernel_max_state":2,"levels_percent":[30,100]},
         "factory_curve":factory,"custom_curve":custom,"curve":curve
     })

@@ -1119,6 +1119,7 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+    crate::cooling::shutdown().await;
 }
 
 #[cfg(test)]

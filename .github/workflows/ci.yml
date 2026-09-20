@@ -32,5 +32,6 @@ jobs:
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
       - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
       - run: ../tests/rust_control_integration.sh
+      - run: python3 ../tests/rust_cooling_test.py target/debug/zwrt-datad
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
