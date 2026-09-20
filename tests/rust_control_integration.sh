@@ -96,8 +96,17 @@ while ! curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null; do
 done
 
 post() {
-    curl -fsS -H 'content-type: application/json' --data-binary "$1" \
-        "http://127.0.0.1:$PORT/control"
+    post_http_code=$(curl -sS -o "$TMP/last-control.json" -w '%{http_code}' \
+        -H 'content-type: application/json' --data-binary "$1" \
+        "http://127.0.0.1:$PORT/control")
+    case "$post_http_code" in
+        2??) cat "$TMP/last-control.json" ;;
+        *)
+            printf 'control fixture failed (HTTP %s):\n' "$post_http_code" >&2
+            cat "$TMP/last-control.json" >&2
+            return 1
+            ;;
+    esac
 }
 file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"

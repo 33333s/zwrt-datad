@@ -99,6 +99,27 @@ ensure_auth_token() {
     chmod 600 "$token_tmp" && mv -f "$token_tmp" "$TOKEN_FILE"
 }
 
+discover_cooling_paths() {
+    if [ -z "${ZWRT_DATAD_COOLING_ZONE_PATH:-}" ]; then
+        for type_file in /sys/class/thermal/thermal_zone*/type; do
+            [ -f "$type_file" ] || continue
+            [ "$(cat "$type_file" 2>/dev/null)" = "sys-therm-4" ] || continue
+            ZWRT_DATAD_COOLING_ZONE_PATH="${type_file%/type}"
+            export ZWRT_DATAD_COOLING_ZONE_PATH
+            break
+        done
+    fi
+    if [ -z "${ZWRT_DATAD_FAN_COOLING_STATE_PATH:-}" ]; then
+        for type_file in /sys/class/thermal/cooling_device*/type; do
+            [ -f "$type_file" ] || continue
+            [ "$(cat "$type_file" 2>/dev/null)" = "pwm-fan" ] || continue
+            ZWRT_DATAD_FAN_COOLING_STATE_PATH="${type_file%/type}/cur_state"
+            export ZWRT_DATAD_FAN_COOLING_STATE_PATH
+            break
+        done
+    fi
+}
+
 start() {
     active_pid="$(running_pid)"
     if [ -n "$active_pid" ]; then
@@ -120,6 +141,7 @@ start() {
     cd "$SERVICE_DIR" || return 1
     stop_legacy_cloud
     ensure_auth_token || return 1
+    discover_cooling_paths
     nohup "$BIN" -i 1000 -b 127.0.0.1 -p 9460 --webshell \
         --lan-bind 0.0.0.0 --lan-port 9461 --auth-token-file "$TOKEN_FILE" \
         >> "$LOG_FILE" 2>&1 </dev/null &

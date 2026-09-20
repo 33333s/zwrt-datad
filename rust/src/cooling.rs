@@ -2,13 +2,24 @@ use crate::state;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const DEFAULT_CURVE: [(i64, i64); 5] = [(40, 0), (45, 0), (50, 76), (60, 128), (70, 255)];
 static HARD_OVERRIDE: AtomicBool = AtomicBool::new(false);
+static STOPPING: AtomicBool = AtomicBool::new(false);
 static COOLING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[derive(Clone, Default)]
+struct FanPolicyStatus {
+    attempted: bool,
+    applied: bool,
+    error: String,
+}
+static FAN_POLICY_STATUS: OnceLock<Mutex<FanPolicyStatus>> = OnceLock::new();
 #[derive(Clone)]
 struct Config {
     fan_always: bool,
@@ -152,14 +163,78 @@ async fn write(path: PathBuf, value: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 use tokio::io::AsyncWriteExt;
-fn zone() -> PathBuf {
+fn discover_typed(root: &Path, prefix: &str, wanted: &str) -> Option<PathBuf> {
+    let mut entries = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.into_iter().find(|path| {
+        std::fs::read_to_string(path.join("type"))
+            .ok()
+            .is_some_and(|value| value.trim() == wanted)
+    })
+}
+pub(crate) fn zone_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH")
+        && !path.is_empty()
+    {
+        return Some(path.into());
+    }
+    let root = env("ZWRT_DATAD_THERMAL_ROOT", "/sys/class/thermal");
+    discover_typed(&root, "thermal_zone", "sys-therm-4")
+}
+fn fan_cooling_state_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ZWRT_DATAD_FAN_COOLING_STATE_PATH")
+        && !path.is_empty()
+    {
+        return Some(path.into());
+    }
+    let root = env("ZWRT_DATAD_THERMAL_ROOT", "/sys/class/thermal");
+    discover_typed(&root, "cooling_device", "pwm-fan").map(|path| path.join("cur_state"))
+}
+fn pwm_path() -> PathBuf {
+    env("ZWRT_DATAD_FAN_PWM_PATH", "/sys/class/hwmon/hwmon0/pwm1")
+}
+fn thermal_enable_path() -> PathBuf {
     env(
-        "ZWRT_DATAD_COOLING_ZONE_PATH",
-        "/sys/class/thermal/thermal_zone0",
+        "ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH",
+        "/sys/class/hwmon/hwmon0/device/thermal_enable",
     )
 }
+fn low_speed_path() -> PathBuf {
+    std::env::var("ZWRT_DATAD_FAN_LOW_SPEED_MODE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| pwm_path().with_file_name("device").join("low_speed_mode"))
+}
+fn record_fan_policy(result: &Result<(), String>) {
+    let mut status = FAN_POLICY_STATUS
+        .get_or_init(|| Mutex::new(FanPolicyStatus::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.attempted = true;
+    status.applied = result.is_ok();
+    status.error = result.as_ref().err().cloned().unwrap_or_default();
+}
+pub(crate) fn fan_policy_status() -> Value {
+    let status = FAN_POLICY_STATUS
+        .get_or_init(|| Mutex::new(FanPolicyStatus::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    json!({"attempted":status.attempted,"applied":status.applied,"error":status.error})
+}
 async fn temperature() -> i64 {
-    tokio::fs::read_to_string(zone().join("temp"))
+    let Some(zone) = zone_path() else {
+        return -1;
+    };
+    tokio::fs::read_to_string(zone.join("temp"))
         .await
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -167,34 +242,44 @@ async fn temperature() -> i64 {
         .unwrap_or(-1)
 }
 async fn prepare_fan() -> Result<(), String> {
-    write(
-        env(
-            "ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH",
-            "/sys/class/hwmon/hwmon0/device/thermal_enable",
-        ),
-        "1",
-    )
-    .await?;
-    write(zone().join("mode"), "disabled").await?;
-    write(
-        env(
-            "ZWRT_DATAD_FAN_COOLING_STATE_PATH",
-            "/sys/class/thermal/cooling_device0/cur_state",
-        ),
-        "0",
-    )
-    .await
+    // Resolve both devices before disabling any thermal controller. In
+    // particular cooling_device0 may be a CPU hotplug controller, not a fan.
+    let zone = zone_path().ok_or("fan thermal zone not found")?;
+    let state = fan_cooling_state_path().ok_or("pwm-fan cooling device not found")?;
+    write(thermal_enable_path(), "1").await?;
+    write(zone.join("mode"), "disabled").await?;
+    write(state, "0").await?;
+    let low_speed = low_speed_path();
+    if tokio::fs::try_exists(&low_speed)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        // OEM quiet mode otherwise clamps all requests (including 255) to 76.
+        write(low_speed, "0").await?;
+    }
+    Ok(())
+}
+async fn restore_kernel_fan() -> Result<(), String> {
+    let zone = zone_path().ok_or("fan thermal zone not found")?;
+    // Attempt both writes even if the driver enable write fails.
+    let thermal = write(thermal_enable_path(), "1").await;
+    let mode = write(zone.join("mode"), "enabled").await;
+    thermal.and(mode)
 }
 async fn fan_pwm(pwm: i64) -> Result<(), String> {
     prepare_fan().await?;
-    if let Err(e) = write(
-        env("ZWRT_DATAD_FAN_PWM_PATH", "/sys/class/hwmon/hwmon0/pwm1"),
-        &pwm.clamp(0, 255).to_string(),
-    )
-    .await
-    {
-        let _ = write(zone().join("mode"), "enabled").await;
-        return Err(e);
+    let requested = pwm.clamp(0, 255);
+    write(pwm_path(), &requested.to_string()).await?;
+    let actual = tokio::fs::read_to_string(pwm_path())
+        .await
+        .map_err(|e| e.to_string())?
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| e.to_string())?;
+    if actual != requested {
+        return Err(format!(
+            "fan PWM readback mismatch: requested {requested}, got {actual}"
+        ));
     }
     Ok(())
 }
@@ -229,27 +314,21 @@ async fn apply_fan(c: &Config) -> Result<(), String> {
         return fan_pwm(128).await;
     }
     if c.fan_mode == 1 {
-        write(
-            env(
-                "ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH",
-                "/sys/class/hwmon/hwmon0/device/thermal_enable",
-            ),
-            "1",
-        )
-        .await?;
+        let zone = zone_path().ok_or("fan thermal zone not found")?;
+        write(thermal_enable_path(), "1").await?;
         for i in 0..3 {
             write(
-                zone().join(format!("trip_point_{i}_temp")),
+                zone.join(format!("trip_point_{i}_temp")),
                 &(c.temps[i] * 1000).to_string(),
             )
             .await?;
             write(
-                zone().join(format!("trip_point_{i}_hyst")),
+                zone.join(format!("trip_point_{i}_hyst")),
                 &(c.hyst[i] * 1000).to_string(),
             )
             .await?;
         }
-        let result = write(zone().join("mode"), "enabled").await;
+        let result = write(zone.join("mode"), "enabled").await;
         if result.is_ok() {
             HARD_OVERRIDE.store(false, Ordering::Relaxed);
         }
@@ -260,6 +339,17 @@ async fn apply_fan(c: &Config) -> Result<(), String> {
     if result.is_ok() {
         HARD_OVERRIDE.store(false, Ordering::Relaxed);
     }
+    result
+}
+async fn apply_fan_recorded(c: &Config) -> Result<(), String> {
+    let result = match apply_fan(c).await {
+        Ok(()) => Ok(()),
+        Err(error) => match restore_kernel_fan().await {
+            Ok(()) => Err(format!("{error}; kernel thermal control restored")),
+            Err(recovery) => Err(format!("{error}; kernel recovery failed: {recovery}")),
+        },
+    };
+    record_fan_policy(&result);
     result
 }
 async fn apply_liquid(c: &Config) -> Result<(), String> {
@@ -296,6 +386,9 @@ fn failed(e: String) -> (bool, String) {
 }
 pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
     let _guard = COOLING_LOCK.lock().await;
+    if STOPPING.load(Ordering::Relaxed) {
+        return Err(failed("cooling controller is shutting down".into()));
+    }
     let mut c = load().await;
     match action {
         "cooling.fan.set_enabled" => {
@@ -305,7 +398,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
                 .ok_or_else(|| invalid("enabled must be boolean"))?;
             c.fan_always = e;
             c.fan_mode = if e { c.fan_mode } else { 2 };
-            apply_fan(&c).await.map_err(failed)?;
+            apply_fan_recorded(&c).await.map_err(failed)?;
             vendor("zwrt_deviceui.Device.fan_switch_status", e)
                 .await
                 .map_err(failed)?;
@@ -329,7 +422,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
                 "always_on" => c.fan_always = true,
                 _ => return Err(invalid("mode must be automatic, custom, or always_on")),
             }
-            apply_fan(&c).await.map_err(failed)?;
+            apply_fan_recorded(&c).await.map_err(failed)?;
             vendor("zwrt_deviceui.Device.fan_switch_status", c.fan_always)
                 .await
                 .map_err(failed)?;
@@ -367,7 +460,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
             c.curve = curve.clone();
             c.fan_mode = 2;
             c.fan_always = false;
-            apply_fan(&c).await.map_err(failed)?;
+            apply_fan_recorded(&c).await.map_err(failed)?;
             vendor("zwrt_deviceui.Device.fan_switch_status", false)
                 .await
                 .map_err(failed)?;
@@ -424,6 +517,9 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
 
 pub async fn tick() {
     let _guard = COOLING_LOCK.lock().await;
+    if STOPPING.load(Ordering::Relaxed) {
+        return;
+    }
     let path = env("ZWRT_DATAD_COOLING_CONFIG", "/data/zwrt-datad/cooling.conf");
     if tokio::fs::metadata(path).await.is_err() {
         return;
@@ -432,5 +528,71 @@ pub async fn tick() {
     if config.liquid_always {
         let _ = apply_liquid(&config).await;
     }
-    let _ = apply_fan(&config).await;
+    let _ = apply_fan_recorded(&config).await;
+}
+
+pub async fn shutdown() {
+    let _guard = COOLING_LOCK.lock().await;
+    if STOPPING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let config = env("ZWRT_DATAD_COOLING_CONFIG", "/data/zwrt-datad/cooling.conf");
+    if tokio::fs::try_exists(config).await.unwrap_or(false)
+        && let Err(error) = restore_kernel_fan().await
+    {
+        eprintln!("cooling shutdown: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_fan_zone_and_pwm_cooling_device_by_type() {
+        let root = std::env::temp_dir().join(format!(
+            "datad-cooling-discovery-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let zone0 = root.join("thermal_zone0");
+        let zone32 = root.join("thermal_zone32");
+        let cooling0 = root.join("cooling_device0");
+        let cooling7 = root.join("cooling_device7");
+        for path in [&zone0, &zone32, &cooling0, &cooling7] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(zone0.join("type"), "sdr0_pa\n").unwrap();
+        std::fs::write(zone32.join("type"), "sys-therm-4\n").unwrap();
+        std::fs::write(cooling0.join("type"), "cpu-hotplug1\n").unwrap();
+        std::fs::write(cooling7.join("type"), "pwm-fan\n").unwrap();
+        assert_eq!(
+            discover_typed(&root, "thermal_zone", "sys-therm-4"),
+            Some(zone32)
+        );
+        assert_eq!(
+            discover_typed(&root, "cooling_device", "pwm-fan"),
+            Some(cooling7)
+        );
+        assert_eq!(discover_typed(&root, "thermal_zone", "missing-type"), None);
+        assert_eq!(
+            discover_typed(&root, "cooling_device", "missing-type"),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn curve_preserves_interpolation_and_overheat_guard() {
+        let c = Config {
+            curve: vec![(40, 0), (47, 41), (58, 74), (65, 120), (73, 128), (80, 255)],
+            ..Config::default()
+        };
+        assert_eq!(curve_pwm(&c, -273), None);
+        assert_eq!(curve_pwm(&c, 0), None);
+        assert_eq!(curve_pwm(&c, 39), Some(0));
+        assert_eq!(curve_pwm(&c, 64), Some(113));
+        assert_eq!(curve_pwm(&c, 65), Some(120));
+        assert_eq!(curve_pwm(&c, 80), Some(255));
+    }
 }

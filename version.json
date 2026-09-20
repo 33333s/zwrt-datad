@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.12",
+    "version": "0.10.13",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增明确授权的备用远程地址，支持 NMS 免费与会员双线路"
+    "notes": "修复风扇温控节点发现、低速截断与故障恢复"
   }
 }
