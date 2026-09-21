@@ -73,6 +73,22 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 `wifi.configure.key` 是设备 WiFi 明文密码，只能在本机受 Token 保护的接口中传输，不应写入日志。
 
+`wifi.status` 的 `main_2g/main_5g` 均返回原始字符串配置：
+`ssid/key/encryption/disabled/hidden/isolate/pmf/maxassoc`。不要把缺失字段直接当成
+关闭状态再提交；`hidden=1` 表示隐藏 SSID，而不是开启广播。
+
+`wifi.dual_band_status` 从原厂 `zwrt_wlan.wlan_uci_get_section` 的 `zte_mbb.lbd`
+读取双频合一。返回 `supported/enabled` 布尔值，并保留
+`WiFiDualBandSupported/WiFiDualBandEnabled/BandSteeringSwitch` 字符串兼容字段。
+读取失败或未知状态返回错误，不伪装成关闭。`wifi.set_dual_band` 只写
+`zwrt_wlan.set` 的 `zte_mbb.lbd` 并检查读回，返回 `changed/verified`；不修改网络隔离。
+客户端应调用这个控制动作，不要用 `router_set_wifi_isolate` 代替。
+通用 ubus 透传保持原厂语义，不会替客户端改写错误的方法调用。
+
+`wifi.configure` 检查原厂 reload 的业务结果和提交后的字段读回；原厂拒绝或
+读回不一致返回错误。`verified=true` 只表示配置已核对，不表示 AP 广播已恢复；
+原厂异步无线重载可能还需要数十秒。失败时配置可能已经提交，应重新读取确认。
+
 `wireless.config` 的国家码作用于整台无线芯片，因此写入任一频段时会同步
 `wireless.wifi0.country` 与 `wireless.wifi1.country`。信道 `0` 或 `auto` 表示自动。
 国家码变更后，datad 会先让厂商 `zwrt_wlan.reload` 应用监管域，再读取

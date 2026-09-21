@@ -785,22 +785,8 @@ async fn control(
         };
     }
     if action == "wifi.dual_band_status" {
-        return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
-            Ok(value) => {
-                let enabled = value
-                    .get("wifimain24_wifimain5_enable")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default()
-                    != 0;
-                control_ok(
-                    action,
-                    json!({
-                        "WiFiDualBandSupported":"1",
-                        "WiFiDualBandEnabled":if enabled { "1" } else { "0" },
-                        "BandSteeringSwitch":if enabled { "1" } else { "0" }
-                    }),
-                )
-            }
+        return match crate::wifi::dual_band_status().await {
+            Ok(value) => control_ok(action, value),
             Err(error) => control_failed(action, error),
         };
     }
@@ -808,7 +794,16 @@ async fn control(
         let mut result = serde_json::Map::new();
         for section in ["main_2g", "main_5g"] {
             let mut item = serde_json::Map::new();
-            for field in ["ssid", "key", "encryption", "disabled"] {
+            for field in [
+                "ssid",
+                "key",
+                "encryption",
+                "disabled",
+                "hidden",
+                "isolate",
+                "pmf",
+                "maxassoc",
+            ] {
                 item.insert(
                     field.into(),
                     json!(state::uci_read(&format!("wireless.{section}.{field}")).await),

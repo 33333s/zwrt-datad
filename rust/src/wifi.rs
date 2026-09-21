@@ -42,6 +42,86 @@ fn runtime_dir() -> String {
     std::env::var("ZWRT_DATAD_WIFI_RUNTIME_DIR").unwrap_or_else(|_| "/data/zwrt-datad/wifi".into())
 }
 
+// Band steering is a WLAN setting. The similarly named router isolation flag
+// controls traffic between bands and must never be used for this operation.
+async fn dual_band_enabled() -> Result<bool, String> {
+    let value = state::ubus(
+        "zwrt_wlan",
+        "wlan_uci_get_section",
+        json!({"section":"zte_mbb"}),
+    )
+    .await?;
+    match value.get("lbd") {
+        Some(Value::String(value)) if value == "0" => Ok(false),
+        Some(Value::String(value)) if value == "1" => Ok(true),
+        Some(Value::Number(value)) if value.as_i64() == Some(0) => Ok(false),
+        Some(Value::Number(value)) if value.as_i64() == Some(1) => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err("band steering state unavailable (zte_mbb.lbd)".into()),
+    }
+}
+
+fn dual_band_response(enabled: bool) -> Value {
+    json!({
+        "supported":true,"enabled":enabled,
+        "WiFiDualBandSupported":"1",
+        "WiFiDualBandEnabled":if enabled { "1" } else { "0" },
+        "BandSteeringSwitch":if enabled { "1" } else { "0" }
+    })
+}
+
+pub async fn dual_band_status() -> Result<Value, String> {
+    Ok(dual_band_response(dual_band_enabled().await?))
+}
+
+pub async fn set_dual_band(enabled: bool) -> Result<Value, String> {
+    let changed = dual_band_enabled().await? != enabled;
+    if changed {
+        let response = state::ubus(
+            "zwrt_wlan",
+            "set",
+            json!({"zte_mbb":{"lbd":if enabled { "1" } else { "0" }}}),
+        )
+        .await?;
+        check_write_response(&response)?;
+        let mut verified = false;
+        for attempt in 0..5 {
+            if attempt != 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if dual_band_enabled().await == Ok(enabled) {
+                verified = true;
+                break;
+            }
+        }
+        if !verified {
+            return Err("band steering readback did not confirm the requested state".into());
+        }
+    }
+    let mut result = dual_band_response(enabled);
+    result["changed"] = json!(changed);
+    result["verified"] = json!(true);
+    Ok(result)
+}
+
+pub(crate) fn check_write_response(response: &Value) -> Result<(), String> {
+    let ok = response.is_object()
+        && response.get("error").is_none_or(|error| error.is_null())
+        && match response.get("result") {
+            None => true,
+            Some(Value::Number(value)) => value.as_i64() == Some(0),
+            Some(Value::String(value)) => matches!(value.as_str(), "0" | "success" | "ok"),
+            Some(Value::Bool(value)) => *value,
+            _ => false,
+        };
+    if ok {
+        Ok(())
+    } else {
+        // Do not echo the firmware response: it may contain Wi-Fi credentials.
+        Err("firmware rejected the Wi-Fi request".into())
+    }
+}
+
 pub async fn advanced_status() -> Result<Value, String> {
     let model = state::uci_read("zwrt_common_info.common_config.model_name").await;
     if model != "MU5252" {
@@ -460,6 +540,31 @@ fn parse_regulatory_limit(input: &str, frequency: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_write_results_reject_business_failures_without_echoing_secrets() {
+        for value in [
+            json!({}),
+            json!({"result":0}),
+            json!({"result":"0"}),
+            json!({"result":"success"}),
+            json!({"result":"ok"}),
+            json!({"result":true}),
+        ] {
+            assert!(check_write_response(&value).is_ok());
+        }
+        for value in [
+            json!(null),
+            json!([]),
+            json!({"result":1}),
+            json!({"result":false}),
+            json!({"result":"failure","key":"secret"}),
+            json!({"error":"secret"}),
+        ] {
+            let error = check_write_response(&value).unwrap_err();
+            assert!(!error.contains("secret"));
+        }
+    }
 
     #[test]
     fn parses_iw_and_regulatory_limit() {

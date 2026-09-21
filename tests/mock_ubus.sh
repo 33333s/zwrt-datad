@@ -38,6 +38,26 @@ if [ -n "${ZWRT_DATAD_FD_DUMP:-}" ] && [ -d "/proc/$$/fd" ]; then
 fi
 
 case "$service:$method" in
+    zwrt_wlan:wlan_uci_get_section)
+        case "$args" in
+            *zte_mbb*)
+                lbd=0
+                if [ -f "${MOCK_UCI_STATE_DIR:-}/wireless.zte_mbb.lbd" ]; then
+                    lbd=$(cat "$MOCK_UCI_STATE_DIR/wireless.zte_mbb.lbd")
+                fi
+                printf '{"lbd":"%s"}\n' "$lbd"
+                ;;
+            *) printf '{}\n' ;;
+        esac
+        ;;
+    zwrt_wlan:set)
+        case "$args" in
+            *'"lbd"'*)
+                python3 -c 'import json,pathlib,sys; d=json.loads(sys.argv[1]); assert set(d)=={"zte_mbb"}; assert set(d["zte_mbb"])=={"lbd"}; p=pathlib.Path(sys.argv[2]); p.mkdir(parents=True,exist_ok=True); (p/"wireless.zte_mbb.lbd").write_text(d["zte_mbb"]["lbd"])' "$args" "$MOCK_UCI_STATE_DIR"
+                ;;
+        esac
+        printf '{"result":"success"}\n'
+        ;;
     iwinfo:countrylist)
         printf '%s\n' '{"results":[{"code":"00","country":"World","iso3166":"00","active":false},{"code":"CN","country":"China","iso3166":"CN","active":true},{"code":"HK","country":"Hong Kong","iso3166":"HK","active":false}]}'
         ;;
