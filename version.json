@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.13",
+    "version": "0.10.14",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复风扇温控节点发现、低速截断与故障恢复"
+    "notes": "修复 Wi-Fi 配置漏读、双频合一接口及保存结果校验"
   }
 }

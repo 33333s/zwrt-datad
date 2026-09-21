@@ -566,22 +566,10 @@ async fn wifi_dual_band(params: &Value) -> Outcome {
         Ok(v) => v,
         Err(e) => return Outcome::Invalid(e),
     };
-    let mut current =
-        match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
-            Ok(Value::Object(v)) => v,
-            Ok(_) => return Outcome::Failed("invalid router_get_wifi_isolate response".into()),
-            Err(e) => return Outcome::Failed(e),
-        };
-    current.insert(
-        "wifimain24_wifimain5_enable".into(),
-        json!(i32::from(enabled)),
-    );
-    call(
-        "zwrt_router.api",
-        "router_set_wifi_isolate",
-        Value::Object(current),
-    )
-    .await
+    match crate::wifi::set_dual_band(enabled).await {
+        Ok(value) => Outcome::Ok(value),
+        Err(error) => Outcome::Failed(error),
+    }
 }
 async fn direct_supply(params: &Value) -> Outcome {
     let wanted = match boolean(params, "enabled") {
@@ -786,31 +774,44 @@ async fn wifi_configure(params: &Value) -> Outcome {
         }
     }
     let mut changed = false;
-    for (field, value) in updates {
-        if field == "key" && value.is_empty() {
+    for (field, value) in &updates {
+        if *field == "key" && value.is_empty() {
             continue;
         }
         let path = format!("wireless.{section}.{field}");
-        if state::uci_read(&path).await == value {
+        if state::uci_read(&path).await == *value {
             continue;
         }
-        if let Err(e) = state::uci_write("set", &path, Some(&value)).await {
+        if let Err(e) = state::uci_write("set", &path, Some(value)).await {
             return revert_wireless(e).await;
         }
         changed = true;
     }
     if !changed {
-        return Outcome::Ok(json!({"section":section,"changed":false}));
+        return Outcome::Ok(json!({"section":section,"changed":false,"verified":true}));
     }
     if let Err(e) = state::uci_write("commit", "wireless", None).await {
         return revert_wireless(e).await;
     }
-    if let Err(e) = state::ubus("zwrt_wlan", "reload", json!({})).await {
+    let reload = state::ubus("zwrt_wlan", "reload", json!({}))
+        .await
+        .and_then(|value| crate::wifi::check_write_response(&value));
+    if let Err(e) = reload {
         return Outcome::Failed(format!(
             "wifi configuration committed but reload failed: {e}"
         ));
     }
-    Outcome::Ok(json!({"section":section,"changed":true}))
+    for (field, value) in &updates {
+        if *field == "key" && value.is_empty() {
+            continue;
+        }
+        if state::uci_read(&format!("wireless.{section}.{field}")).await != *value {
+            return Outcome::Failed(format!(
+                "wifi configuration readback did not confirm {field}"
+            ));
+        }
+    }
+    Outcome::Ok(json!({"section":section,"changed":true,"verified":true}))
 }
 
 async fn client_access(params: &Value, block: bool) -> Outcome {
