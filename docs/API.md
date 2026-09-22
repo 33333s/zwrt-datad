@@ -30,6 +30,20 @@ X-Auth-Token: <token>
 
 ## Routes
 
+### `GET /usb/status`
+
+只读返回当前采样的 USB 链路信息，与 `/state.usb` 和 `/events` 的 `usb` 相同。
+`9461` 需要有效 Token，权限规则与 `/state` 一致。无请求参数，不切换 USB 模式、不重新枚举设备。
+
+```sh
+curl -s http://127.0.0.1:9460/usb/status
+```
+
+- `controllers[]`：本机作为 USB 外设连接电脑等主机时的 UDC 状态；当前协商速率为 `speed_mbps`，单位 **Mbps**，不是 MB/s 或实际吞吐。
+- `devices[]`：本机 USB 主机侧已枚举的子设备；包含内部 USB 基带，不能将它们的速率当成对外 Type-C 线缆速率。根 Hub 和接口节点不计作连接。
+- 未连接或无法确认速率时为 `null`，不能用 `maximum_speed` 代替。仅有 `super-speed-plus` 标签时不推断具体 10/20 Gbps。
+- 完整字段与缺失值规则见 [STATE_SCHEMA.md](STATE_SCHEMA.md#usb-协商速率)。
+
 ### `GET /webshell/status`
 
 返回 WebShell 是否启用、当前会话数、会话上限和协议版本。该接口和

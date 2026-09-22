@@ -1,5 +1,36 @@
 # zwrt-datad state schema
 
+## USB 协商速率
+
+顶层 `usb` 同步出现在 `/state`、`/events`，也可由 `GET /usb/status` 单独获取：
+
+```json
+{
+  "source": "sysfs",
+  "gadget_available": true,
+  "host_available": true,
+  "controllers": [{
+    "name": "controller0", "state": "configured", "connected": true,
+    "speed": "high-speed", "speed_mbps": 480.0,
+    "maximum_speed": "super-speed-plus"
+  }],
+  "devices": [{
+    "name": "1-1", "speed": "high-speed", "speed_mbps": 480.0,
+    "rx_lanes": 1, "tx_lanes": 1
+  }],
+  "truncated": false
+}
+```
+
+- `gadget_available`/`host_available` 表示相应 sysfs 目录可枚举，不代表已连接。
+- `controllers` 来自 `/sys/class/udc`。`state` 规范化为小写连字符，`not attached` 为 `not-attached`；此时 `connected=false`，速率字段为 `null`，即使内核残留旧速率也不显示为当前速率。状态不可读且无已知速率时 `connected=null`。
+- `speed` 是内核速率等级；`speed_mbps` 是名义协商链路速率，不是应用传输吞吐。Low/Full/High/SuperSpeed 分别对应 1.5/12/480/5000 Mbps；泛化的 SuperSpeedPlus 等级不包含足够的通道速率信息，保留等级但 `speed_mbps=null`。`maximum_speed` 仅表示最大能力，绝不用来填充当前速率。
+- `devices` 来自 `/sys/bus/usb/devices` 的真实设备节点（如 `1-1`、`1-2.3`）；从 `speed` 数值直接读取 Mbps，`rx_lanes`/`tx_lanes` 不可读时为 `null`。跳过 `usbN` 根 Hub 与带冒号的接口节点，不采集 USB 序列号。
+- 两类列表互不替代；内部 USB 基带速率不是路由器对外 USB 口速率。最多读取每目录 256 个条目，返回 16 个控制器/64 个设备；超限 `truncated=true`。缺失/非法属性为 `null`，缺失目录返回对应 `available=false` 与空数组。
+- 只读取少量 sysfs 属性，不调用 ADB，不修改 USB 角色、功能、模式或连接；HTTP 端点复用采样快照，不另外轮询。
+
+参考：[Linux UDC ABI](https://github.com/torvalds/linux/blob/v5.15/Documentation/ABI/stable/sysfs-class-udc)、[USB host sysfs 实现](https://github.com/torvalds/linux/blob/v5.15/drivers/usb/core/sysfs.c)。
+
 服务通过 HTTP / SSE 暴露统一状态快照：
 
 ```text
