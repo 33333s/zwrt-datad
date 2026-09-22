@@ -152,15 +152,18 @@ async fn save(c: &Config) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 async fn write(path: PathBuf, value: &str) -> Result<(), String> {
-    tokio::fs::OpenOptions::new()
+    let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(&path)
         .await
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .write_all(value.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(value.as_bytes())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Tokio files offload writes to the blocking pool. Complete that write
+    // before releasing the cooling lock or verifying the driver readback.
+    file.flush().await.map_err(|e| e.to_string())
 }
 use tokio::io::AsyncWriteExt;
 fn discover_typed(root: &Path, prefix: &str, wanted: &str) -> Option<PathBuf> {
@@ -547,6 +550,34 @@ pub async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn driver_write_is_complete_before_immediate_readback() {
+        let path = std::env::temp_dir().join(format!(
+            "datad-cooling-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "0").unwrap();
+        let mut mismatch = None;
+        for value in 1..=128 {
+            let expected = value.to_string();
+            write(path.clone(), &expected).await.unwrap();
+            let actual = std::fs::read_to_string(&path).unwrap();
+            if actual != expected {
+                mismatch = Some((expected, actual));
+                break;
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            mismatch, None,
+            "write returned before driver data was ready"
+        );
+    }
 
     #[test]
     fn discovers_fan_zone_and_pwm_cooling_device_by_type() {
