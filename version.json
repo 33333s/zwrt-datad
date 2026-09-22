@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.14",
+    "version": "0.10.15",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 Wi-Fi 配置漏读、双频合一接口及保存结果校验"
+    "notes": "修复短信单行公钥兼容、解密会话恢复及完整列表读取"
   }
 }
