@@ -1186,20 +1186,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let battery = ubus("zwrt_bsp.battery", "list", json!({})).await;
     let charger = ubus("zwrt_bsp.charger", "list", json!({})).await;
     let nfc = ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
-    let _ = crate::sms::prepare().await;
-    let sms_capacity = ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
-    let sms_nv = ubus(
-        "zwrt_wms",
-        "zte_libwms_get_sms_data",
-        json!({"page":0,"data_per_page":8,"mem_store":1,"tags":10,"order_by":"order by id desc"}),
-    )
-    .await;
-    let sms_sim = ubus(
-        "zwrt_wms",
-        "zte_libwms_get_sms_data",
-        json!({"page":0,"data_per_page":8,"mem_store":0,"tags":10,"order_by":"order by id desc"}),
-    )
-    .await;
+    let sms = crate::sms::snapshot().await;
     let lan_if = ubus("network.interface.lan", "status", json!({})).await;
     let wan4_if = ubus(
         if active_subid.is_some() {
@@ -1252,10 +1239,6 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let charger = object(charger);
     let nfc_ok = nfc.is_ok();
     let nfc = object(nfc);
-    let sms_ok = sms_capacity.is_ok();
-    let sms_capacity = object(sms_capacity);
-    let sms_nv = object(sms_nv);
-    let sms_sim = object(sms_sim);
     let lan_if = object(lan_if);
     let wan4_if = object(wan4_if);
     let wan6_if = object(wan6_if);
@@ -1437,9 +1420,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     {
         fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
     }
-    if sms_ok {
-        let list = crate::sms::normalize_lists(&[sms_nv.clone(), sms_sim.clone()]).await;
-        fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
+    if let Some(sms) = sms {
+        fields.insert("sms".into(), sms);
     }
     fields.insert("traffic".into(), Value::Object(tout));
     let qos = crate::qos::read_for_plmn(integer(&raw_net, "rmcc"), integer(&raw_net, "rmnc"));

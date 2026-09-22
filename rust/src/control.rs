@@ -381,24 +381,32 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "sms.delete" => {
-            mapped_call(
+            let outcome = mapped_call(
                 params,
                 "zwrt_wms",
                 "zwrt_wms_delete_sms",
                 &[("ids", "id", true, false)],
                 false,
             )
-            .await
+            .await;
+            if matches!(&outcome, Outcome::Ok(_)) {
+                crate::sms::invalidate();
+            }
+            outcome
         }
         "sms.mark_read" => {
-            mapped_call(
+            let outcome = mapped_call(
                 params,
                 "zwrt_wms",
                 "zwrt_wms_modify_tag",
                 &[("ids", "id", true, false), ("tag", "tag", false, true)],
                 false,
             )
-            .await
+            .await;
+            if matches!(&outcome, Outcome::Ok(_)) {
+                crate::sms::invalidate();
+            }
+            outcome
         }
         "sms.send_raw" => match crate::sms::send(params).await {
             Ok(value) => Outcome::Ok(value),

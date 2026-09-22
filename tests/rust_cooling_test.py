@@ -115,7 +115,8 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
             assert (zone / "mode").read_text() == "enabled"
             assert (hotplug / "cur_state").read_text() == "2"
             (fan / "type").write_text("pwm-fan")
-            assert control()[0] == 200
+            code, result = control()
+            assert code == 200, result
 
             # An unavailable driver write also restores kernel control.
             (base / "pwm").unlink()

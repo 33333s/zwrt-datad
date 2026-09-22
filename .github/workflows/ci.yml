@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo build --locked
+      - run: python3 -m pip install 'cryptography>=43,<49'
+      - run: python3 ../tests/rust_sms_test.py target/debug/zwrt-datad
       - run: python3 ../tests/installer_test.py
       - run: python3 ../tests/rust_webshell_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_webshell_memory_test.py target/debug/zwrt-datad

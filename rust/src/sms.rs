@@ -8,11 +8,58 @@ use rand::{RngCore, rngs::OsRng};
 use reqwest::redirect::Policy;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey};
 use serde_json::{Value, json};
-use std::{sync::LazyLock, time::Duration};
+use std::{
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
 static SESSION_KEY: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
+// Serialize our own reads and sends; the vendor session can also be replaced
+// by its web UI, so reads must still recover from authentication failures.
+static SMS_IO: Mutex<()> = Mutex::const_new(());
+static CACHE: LazyLock<Mutex<ReadCache>> = LazyLock::new(|| Mutex::new(ReadCache::default()));
+static REVISION: AtomicU64 = AtomicU64::new(0);
+const PAGE_SIZE: usize = 64;
+const MAX_PAGES: usize = 4;
+const MAX_MESSAGES: usize = PAGE_SIZE * MAX_PAGES * 2;
+
+#[derive(Default)]
+struct ReadCache {
+    checked: Option<Instant>,
+    refreshed: Option<Instant>,
+    revision: u64,
+    capacity: Option<Value>,
+    list: Vec<Value>,
+    error: Option<String>,
+    truncated: bool,
+}
+
+impl ReadCache {
+    fn value(&self) -> Option<Value> {
+        let capacity = self.capacity.as_ref()?;
+        let number = |name| {
+            capacity
+                .get(name)
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0)
+        };
+        let mut value = json!({"unread":number("sms_dev_unread_num") + number("sms_sim_unread_num"),
+            "list":self.list,"stale":self.error.is_some(),"truncated":self.truncated});
+        if let Some(error) = &self.error {
+            value["error"] = json!(error);
+        }
+        Some(value)
+    }
+}
+
+pub fn invalidate() {
+    REVISION.fetch_add(1, Ordering::Relaxed);
+}
 
 fn valid(number: &str, message: &str, sms_time: &str) -> bool {
     !number.is_empty()
@@ -33,9 +80,39 @@ fn valid(number: &str, message: &str, sms_time: &str) -> bool {
 }
 
 fn public_key(pem: &str) -> Result<RsaPublicKey, String> {
-    RsaPublicKey::from_public_key_pem(pem)
-        .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
-        .map_err(|_| "invalid vendor RSA public key".into())
+    // Some firmware removes every PEM newline, including after the header.
+    // Decode the bounded, whitespace-normalized body without weakening DER
+    // validation or confusing PKCS#1 and SubjectPublicKeyInfo containers.
+    if pem.len() <= 16_384 {
+        for label in ["PUBLIC KEY", "RSA PUBLIC KEY"] {
+            let begin = format!("-----BEGIN {label}-----");
+            let end = format!("-----END {label}-----");
+            if let Some(body) = pem
+                .trim()
+                .strip_prefix(&begin)
+                .and_then(|s| s.strip_suffix(&end))
+            {
+                let body: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                if let Ok(der) = STANDARD.decode(body) {
+                    let parsed = if label == "PUBLIC KEY" {
+                        RsaPublicKey::from_public_key_der(&der).map_err(|_| ())
+                    } else {
+                        RsaPublicKey::from_pkcs1_der(&der).map_err(|_| ())
+                    };
+                    if let Ok(key) = parsed {
+                        return Ok(key);
+                    }
+                }
+            }
+        }
+    }
+    Err("invalid vendor RSA public key".into())
+}
+
+async fn reset_crypto_session() {
+    if let Some(mut key) = SESSION_KEY.lock().await.take() {
+        key.zeroize();
+    }
 }
 
 async fn ensure_crypto_session() -> Result<[u8; 32], String> {
@@ -60,22 +137,135 @@ async fn ensure_crypto_session() -> Result<[u8; 32], String> {
         .encrypt(&mut OsRng, Pkcs1v15Encrypt, hex.as_bytes())
         .map_err(|_| "vendor RSA key registration failed")?;
     hex.zeroize();
-    if let Err(error) = state::ubus(
+    let registration = state::ubus(
         "zwrt_web",
         "web_http_enstr_set",
         json!({"web_enstr":STANDARD.encode(wrapped)}),
     )
-    .await
-    {
+    .await;
+    if let Err(error) = registration {
         key.zeroize();
         return Err(error);
+    }
+    if registration
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("result"))
+        .is_some_and(|v| {
+            !matches!(v.as_str(), Some("success" | "0"))
+                && v.as_i64() != Some(0)
+                && v.as_bool() != Some(true)
+        })
+    {
+        key.zeroize();
+        return Err("vendor RSA key registration rejected".into());
     }
     *guard = Some(key);
     Ok(key)
 }
 
-pub async fn prepare() -> bool {
-    ensure_crypto_session().await.is_ok()
+async fn read_pages() -> Result<(Vec<Value>, bool), String> {
+    let mut replies = Vec::new();
+    let mut truncated = false;
+    for store in [1, 0] {
+        let mut seen = std::collections::HashSet::new();
+        for page in 0..MAX_PAGES {
+            let reply = state::ubus("zwrt_wms", "zte_libwms_get_sms_data", json!({
+                "page":page,"data_per_page":PAGE_SIZE,"mem_store":store,"tags":10,"order_by":"order by id desc"
+            })).await?;
+            let rows = reply
+                .get("list")
+                .or_else(|| reply.get("messages"))
+                .and_then(Value::as_array)
+                .ok_or("invalid vendor SMS list")?;
+            let count = rows.len();
+            if count > PAGE_SIZE {
+                return Err("vendor SMS page exceeds limit".into());
+            }
+            let mut new_ids = 0;
+            for row in rows {
+                let id = message_id(row).ok_or("invalid vendor SMS id")?;
+                new_ids += usize::from(seen.insert(id));
+            }
+            replies.push(reply);
+            if count < PAGE_SIZE {
+                break;
+            }
+            if new_ids == 0 || page + 1 == MAX_PAGES {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    Ok((replies, truncated))
+}
+
+async fn load_messages() -> Result<(Vec<Value>, bool), String> {
+    // Unencrypted models remain readable even when the web crypto service is
+    // unavailable. An encrypted response, however, must authenticate.
+    let mut key = ensure_crypto_session().await.ok();
+    let (replies, truncated) = read_pages().await?;
+    let result = normalize_lists(&replies, key.as_ref());
+    key.zeroize();
+    match result {
+        Ok(list) => Ok((list, truncated)),
+        Err(_) => {
+            reset_crypto_session().await;
+            let mut key = ensure_crypto_session().await?;
+            // Re-read ciphertext after registering the replacement key. Never
+            // retry a send here: retransmission could duplicate real SMS.
+            let result = read_pages().await;
+            let result = result.and_then(|(replies, truncated)| {
+                normalize_lists(&replies, Some(&key)).map(|list| (list, truncated))
+            });
+            key.zeroize();
+            if result.is_err() {
+                reset_crypto_session().await;
+            }
+            result
+        }
+    }
+}
+
+pub async fn snapshot() -> Option<Value> {
+    let mut cache = CACHE.lock().await;
+    let revision = REVISION.load(Ordering::Relaxed);
+    if cache.revision == revision
+        && cache
+            .checked
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+    {
+        return cache.value();
+    }
+    cache.checked = Some(Instant::now());
+    let capacity = match state::ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await {
+        Ok(value) => value,
+        Err(_) => {
+            cache.error = Some("vendor SMS capacity unavailable".into());
+            return cache.value();
+        }
+    };
+    let refresh = cache.revision != revision
+        || cache.capacity.as_ref() != Some(&capacity)
+        || cache.error.is_some()
+        || cache
+            .refreshed
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+    cache.capacity = Some(capacity);
+    cache.revision = revision;
+    if refresh {
+        let _io = SMS_IO.lock().await;
+        match load_messages().await {
+            Ok((list, truncated)) => {
+                cache.list = list;
+                cache.truncated = truncated;
+                cache.error = None;
+                cache.refreshed = Some(Instant::now());
+            }
+            Err(error) => cache.error = Some(error),
+        }
+    }
+    cache.value()
 }
 
 fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
@@ -96,7 +286,7 @@ fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
     Ok(STANDARD.encode(envelope))
 }
 
-async fn decrypt(value: &str) -> Result<Option<String>, String> {
+fn decrypt(value: &str, key: Option<&[u8; 32]>) -> Result<Option<String>, String> {
     if value.len() < 40
         || value.len() & 1 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -108,8 +298,8 @@ async fn decrypt(value: &str) -> Result<Option<String>, String> {
     if raw.len() <= 28 {
         return Ok(None);
     }
-    let key = (*SESSION_KEY.lock().await).ok_or("vendor SMS crypto session unavailable")?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key")?;
+    let key = key.ok_or("vendor SMS crypto session unavailable")?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid AES key")?;
     let mut input = raw[28..].to_vec();
     input.extend_from_slice(&raw[12..28]);
     cipher
@@ -146,7 +336,12 @@ fn sms_date(value: &str) -> String {
     String::new()
 }
 
-pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
+fn message_id(item: &Value) -> Option<i64> {
+    let value = item.get("id")?;
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn normalize_lists(replies: &[Value], key: Option<&[u8; 32]>) -> Result<Vec<Value>, String> {
     let mut output = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let items: Vec<Value> = replies
@@ -161,16 +356,10 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
         })
         .collect();
     for item in items {
-        if output.len() >= 32 {
+        if output.len() >= MAX_MESSAGES {
             break;
         }
-        let Some(id) = item.get("id").and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_str()?.parse::<i64>().ok())
-        }) else {
-            continue;
-        };
+        let id = message_id(&item).ok_or("invalid vendor SMS id")?;
         if !ids.insert(id) {
             continue;
         }
@@ -184,12 +373,8 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
             .or_else(|| item.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let Ok(number) = decrypt(number_raw).await else {
-            continue;
-        };
-        let Ok(text) = decrypt(text_raw).await else {
-            continue;
-        };
+        let number = decrypt(number_raw, key)?;
+        let text = decrypt(text_raw, key)?;
         let number = number.map_or_else(|| number_raw.to_owned(), |value| utf16be_hex(&value));
         let text = utf16be_hex(text.as_deref().unwrap_or(text_raw));
         let unread = item.get("tag").and_then(|value| {
@@ -205,7 +390,7 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
             "text":text
         }));
     }
-    output
+    Ok(output)
 }
 
 async fn send_external(
@@ -304,6 +489,8 @@ async fn select_slot(slot: i64) -> Result<(), String> {
 }
 
 async fn send_host(number: &str, message: &str, sms_time: &str) -> Result<Value, String> {
+    let _io = SMS_IO.lock().await;
+    reset_crypto_session().await;
     let mut key = ensure_crypto_session().await?;
     let encrypted_number = encrypt(&key, number)?;
     let encrypted_message = encrypt(&key, message)?;
@@ -354,6 +541,7 @@ pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
         }
         _ => return Err((true, "invalid SMS sender".into())),
     };
+    invalidate();
     result.map_err(|error| (false, error))
 }
 
@@ -383,13 +571,13 @@ mod tests {
         assert_eq!(plain, b"6D4B8BD5");
     }
 
-    #[tokio::test]
-    async fn normalizes_plain_sms_and_deduplicates() {
+    #[test]
+    fn normalizes_plain_sms_and_deduplicates() {
         let replies = [
             json!({"messages":[{"id":"7","num":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","text":"6D4B8BD5"}]}),
             json!({"list":[{"id":7,"number":"duplicate","content":"0041"}]}),
         ];
-        let list = normalize_lists(&replies).await;
+        let list = normalize_lists(&replies, None).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["num"], "10086");
         assert_eq!(list[0]["text"], "测试");
@@ -397,18 +585,72 @@ mod tests {
         assert_eq!(list[0]["unread"], 1);
     }
 
-    #[tokio::test]
-    async fn authenticates_and_normalizes_encrypted_sms() {
+    #[test]
+    fn authenticates_and_normalizes_encrypted_sms() {
         let key = [9_u8; 32];
-        *SESSION_KEY.lock().await = Some(key);
         let number = encrypt(&key, "00310030003000380036").unwrap();
         let text = encrypt(&key, "6D4B8BD5").unwrap();
-        let list = normalize_lists(&[json!({"list":[{
+        let replies = [json!({"list":[{
             "id":8,"num":number,"date":"26,08,27,04,00,00,+,0","tag":0,"text":text
-        }]})])
-        .await;
-        *SESSION_KEY.lock().await = None;
+        }]})];
+        assert!(normalize_lists(&replies, None).is_err());
+        assert!(normalize_lists(&replies, Some(&[8_u8; 32])).is_err());
+        let list = normalize_lists(&replies, Some(&key)).unwrap();
         assert_eq!(list[0]["num"], "10086");
         assert_eq!(list[0]["text"], "测试");
+    }
+
+    #[test]
+    fn accepts_flat_and_wrapped_public_keys_but_rejects_junk() {
+        use rsa::{
+            BigUint,
+            pkcs1::EncodeRsaPublicKey,
+            pkcs8::{EncodePublicKey, LineEnding},
+        };
+        let key = RsaPublicKey::new(
+            (BigUint::from(1_u8) << 2047) + BigUint::from(5_u8),
+            BigUint::from(65537_u32),
+        )
+        .unwrap();
+        for pem in [
+            key.to_public_key_pem(LineEnding::LF).unwrap(),
+            key.to_pkcs1_pem(LineEnding::LF).unwrap(),
+        ] {
+            assert_eq!(public_key(&pem).unwrap(), key);
+            assert_eq!(public_key(&pem.replace('\n', "")).unwrap(), key);
+            assert_eq!(public_key(&pem.replace('\n', "\r\n")).unwrap(), key);
+            assert!(public_key(&format!("{pem}junk")).is_err());
+            assert!(public_key(&pem.replacen("-----END", "-----BROKEN", 1)).is_err());
+        }
+        assert!(public_key("-----BEGIN PUBLIC KEY-----!!!-----END PUBLIC KEY-----").is_err());
+        assert!(public_key(&"A".repeat(16_385)).is_err());
+    }
+
+    #[test]
+    fn preserves_more_than_eight_or_thirty_two_messages() {
+        let rows: Vec<_> = (0..100)
+            .map(|id| json!({"id":id,"number":"10086","content":"0041"}))
+            .collect();
+        assert_eq!(
+            normalize_lists(&[json!({"messages":rows})], None)
+                .unwrap()
+                .len(),
+            100
+        );
+    }
+
+    #[test]
+    fn read_failure_keeps_last_good_list_and_reports_stale() {
+        let cache = ReadCache {
+            capacity: Some(json!({"sms_dev_unread_num":"1"})),
+            list: vec![json!({"id":1,"text":"cached"})],
+            error: Some("SMS envelope authentication failed".into()),
+            ..Default::default()
+        };
+        let value = cache.value().unwrap();
+        assert_eq!(value["list"].as_array().unwrap().len(), 1);
+        assert_eq!(value["stale"], true);
+        assert_eq!(value["unread"], 1);
+        assert!(value["error"].is_string());
     }
 }
