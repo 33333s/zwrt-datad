@@ -15,6 +15,7 @@ mod qtrace_mask;
 mod server;
 mod sms;
 mod state;
+mod usb;
 mod webshell;
 mod wifi;
 
@@ -37,6 +38,9 @@ fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()
 struct Args {
     #[arg(long)]
     once: bool,
+    /// Print USB sysfs link status without starting services or changing device state.
+    #[arg(long)]
+    usb_status: bool,
     #[arg(long)]
     neighbor: bool,
     #[arg(long)]
@@ -77,6 +81,10 @@ async fn main() -> Result<()> {
         }
     }
     let args = Args::parse();
+    if args.usb_status {
+        println!("{}", serde_json::to_string(&usb::snapshot())?);
+        return Ok(());
+    }
     let interval = Duration::from_millis(args.interval.clamp(500, 5000));
     let _ = (
         &args.neighbor,

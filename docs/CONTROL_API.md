@@ -126,6 +126,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `sleep.set` | `seconds` |
 | `nfc.set` | `enabled`, `flag?` |
 
+`usb.status` 保留原有 `result.typec`、`result.usb` 厂商字段，新增 `result.link`，内容等同于 `GET /usb/status` 与 `/state.usb`。仅查询握手速率推荐直接使用只读 `GET /usb/status`，不依赖厂商 UBus 查询成功。
+
 ## Traffic And QoS
 
 | action | params |

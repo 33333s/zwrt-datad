@@ -1865,6 +1865,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     };
     fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":cpu_usage,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
     fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
+    fields.insert("usb".into(), crate::usb::snapshot());
     fields.insert("runtime".into(), runtime);
     Snapshot {
         ts: SystemTime::now()

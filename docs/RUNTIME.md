@@ -44,6 +44,8 @@ Authorization: Bearer <token>
 
 ## 运行检查
 
+`zwrt-datad --usb-status` 只读输出 USB 协商速率 JSON，然后退出；不初始化云连接、状态采样、风扇控制或配置文件，可在正式服务运行时用于核对。HTTP 接口为 `GET /usb/status`，状态/SSE 顶层字段为 `usb`。测试可通过 `ZWRT_DATAD_USB_UDC_ROOT` 与 `ZWRT_DATAD_USB_HOST_ROOT` 指定隔离 sysfs 目录；这些路径不能由 HTTP 请求设置。
+
 ```sh
 curl -fsS http://127.0.0.1:9460/healthz
 curl -fsS -H "Authorization: Bearer $(cat /data/zwrt-datad/auth.token)" \

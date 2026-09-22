@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.15",
+    "version": "0.10.16",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复短信单行公钥兼容、解密会话恢复及完整列表读取"
+    "notes": "新增 USB 实际协商速率、控制器连接状态及 HTTP/SSE 只读接口"
   }
 }

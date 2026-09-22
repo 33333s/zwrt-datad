@@ -200,6 +200,7 @@ impl App {
             .route("/healthz", get(health))
             .route("/version", get(version))
             .route("/state", get(snapshot))
+            .route("/usb/status", get(usb_status))
             .route("/events", get(events))
             .route("/capabilities", get(capabilities))
             .route("/ubus", get(ubus_list))
@@ -580,6 +581,16 @@ async fn version() -> Json<DatadVersion> {
 async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
     Json(app.snapshot().await)
 }
+async fn usb_status(State(app): State<App>) -> Json<Value> {
+    Json(
+        app.snapshot()
+            .await
+            .fields
+            .get("usb")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+}
 fn capability_controls() -> Vec<&'static str> {
     let mut controls = vec![
         "device.login_info",
@@ -868,7 +879,10 @@ async fn control(
         let typec = state::ubus("zwrt_bsp.typec", "list", json!({})).await;
         let usb = state::ubus("zwrt_bsp.usb", "list", json!({})).await;
         return match (typec, usb) {
-            (Ok(typec), Ok(usb)) => control_ok(action, json!({"typec":typec,"usb":usb})),
+            (Ok(typec), Ok(usb)) => control_ok(
+                action,
+                json!({"typec":typec,"usb":usb,"link":app.snapshot().await.fields.get("usb")}),
+            ),
             (Err(error), _) | (_, Err(error)) => control_failed(action, error),
         };
     }
