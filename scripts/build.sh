@@ -32,9 +32,20 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$CC"
 export CC_aarch64_unknown_linux_musl="$CC"
 export AR_aarch64_unknown_linux_musl="$AR"
 
+# Keep the main daemon static. Only this one-shot Rust process loads the
+# existing firmware Keymaster library; no vendor library is redistributed.
+mkdir -p build
+CARGO_TARGET_DIR="$ROOT/build/keymaster-target" \
+  RUSTFLAGS="-C target-feature=-crt-static -C link-self-contained=no" \
+  "$CARGO" "+$RUST_TOOLCHAIN" build --manifest-path rust/Cargo.toml \
+  --locked --release --target "$TARGET" --features keymaster-worker --bin keymaster-worker
+cp build/keymaster-target/$TARGET/release/keymaster-worker build/keymaster-worker
+file build/keymaster-worker | grep -q 'ARM aarch64.*dynamically linked.*stripped'
+export DATAD_KEYMASTER_WORKER="$ROOT/build/keymaster-worker"
+
 "$CARGO" "+$RUST_TOOLCHAIN" build \
   --manifest-path rust/Cargo.toml \
-  --locked --release --target "$TARGET"
+  --locked --release --target "$TARGET" --bin zwrt-datad
 "$STRIP" -o "$ASSET" "rust/target/$TARGET/release/zwrt-datad"
 
 file "$ASSET" | grep -q 'ARM aarch64.*statically linked.*stripped' || {

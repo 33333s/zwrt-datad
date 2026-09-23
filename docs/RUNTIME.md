@@ -44,6 +44,14 @@ Authorization: Bearer <token>
 
 ## 运行检查
 
+### 设备签名身份
+
+身份不会在启动时自动创建，也不会自动上传或登记到任何服务器。`POST /identity/init` 首次显式创建；私有目录为 `$ZWRT_DATAD_DIR/identity`（0700），其中 `key.json`（0600）保存硬件绑定的加密 key blob 与公钥。它不是原始私钥文件，不能复制到其他设备使用。OTA 应保留整个 identity 目录；损坏、外机 blob 或硬件不可用只报错，不自动换钥匙。删除该目录或恢复出厂可能丢失原身份，再初始化产生新公钥，必须由后台受控换绑。
+
+主程序仍为静态 Rust；`scripts/build.sh` 通过同一 `rust/Cargo.toml` 构建并内嵌一个短生命周期 Rust worker，它只动态加载设备已有的 `/usr/lib/libKeyMaster.so.0.0.0`。不分发、不替换原厂库，不调用 attestation keybox provision、清空全部密钥、设备ID或熔丝接口。worker 缓存在私有目录，单次运行结束即回收原厂库的进程资源；硬件接口不可用时不退回软件密钥。首次来源仍未远程证明，见 [API.md](API.md)。
+
+本机管理员可运行 `zwrt-datad --identity init`、`--identity public-key`，或通过 stdin 提交相同请求 JSON 给 `--identity sign`。这些诊断命令不启动采样/云连接/散热控制；`init` 会在指定 `--data-dir` 内持久化密钥，其他两项不会初始化身份。普通读取 USB 的 `--usb-status` 不会触碰身份。`keymaster-worker` Cargo feature 和 debug-only 的 `ZWRT_DATAD_IDENTITY_TEST_WORKER` 仅用于构建/回归，正式 main build 不启用测试替身。
+
 `zwrt-datad --usb-status` 只读输出 USB 协商速率 JSON，然后退出；不初始化云连接、状态采样、风扇控制或配置文件，可在正式服务运行时用于核对。HTTP 接口为 `GET /usb/status`，状态/SSE 顶层字段为 `usb`。测试可通过 `ZWRT_DATAD_USB_UDC_ROOT` 与 `ZWRT_DATAD_USB_HOST_ROOT` 指定隔离 sysfs 目录；这些路径不能由 HTTP 请求设置。
 
 ```sh

@@ -6,6 +6,7 @@ mod command;
 mod control;
 mod cooling;
 mod extra_wifi;
+mod identity;
 mod model;
 mod neighbor;
 mod neighbor_manager;
@@ -41,6 +42,9 @@ struct Args {
     /// Print USB sysfs link status without starting services or changing device state.
     #[arg(long)]
     usb_status: bool,
+    /// Manage the local hardware identity without starting other services.
+    #[arg(long, value_parser = ["init", "public-key", "sign"])]
+    identity: Option<String>,
     #[arg(long)]
     neighbor: bool,
     #[arg(long)]
@@ -83,6 +87,37 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if args.usb_status {
         println!("{}", serde_json::to_string(&usb::snapshot())?);
+        return Ok(());
+    }
+    if let Some(operation) = &args.identity {
+        if operation == "init" {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&args.data_dir)?;
+        }
+        let identity = identity::Identity::new(&args.data_dir);
+        let result = match operation.as_str() {
+            "init" => identity.initialize().await,
+            "public-key" => identity.public_key().await,
+            "sign" => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::io::stdin().take(2049).read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() <= 2048, "identity request too large");
+                let request: identity::SignRequest = serde_json::from_slice(&bytes)?;
+                identity.sign(request).await
+            }
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(value) => println!("{}", serde_json::to_string(&value)?),
+            Err(error) => {
+                eprintln!("{}: {}", error.code, error.message);
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
     let interval = Duration::from_millis(args.interval.clamp(500, 5000));

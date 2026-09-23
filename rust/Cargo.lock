@@ -2432,6 +2432,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "reqwest",
+ "ring",
  "rsa",
  "rumqttc-v4-next",
  "rustls",

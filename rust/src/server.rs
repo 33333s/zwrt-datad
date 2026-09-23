@@ -47,6 +47,7 @@ pub(crate) struct Inner {
     tx: watch::Sender<Snapshot>,
     interval_ms: AtomicU64,
     pub(crate) _data_dir: PathBuf,
+    identity: crate::identity::Identity,
     token: Option<String>,
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
@@ -106,6 +107,7 @@ impl App {
                 cloud: RwLock::new(Cloud::load(&data_dir)),
                 ota: Mutex::new(Ota::load(&data_dir).map_err(anyhow::Error::msg)?),
                 neighbor: Mutex::new(neighbor),
+                identity: crate::identity::Identity::new(&data_dir),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -201,6 +203,15 @@ impl App {
             .route("/version", get(version))
             .route("/state", get(snapshot))
             .route("/usb/status", get(usb_status))
+            .route("/identity/public-key", get(identity_public_key))
+            .route(
+                "/identity/init",
+                post(identity_init).layer(RequestBodyLimitLayer::new(2048)),
+            )
+            .route(
+                "/identity/sign",
+                post(identity_sign).layer(RequestBodyLimitLayer::new(2048)),
+            )
             .route("/events", get(events))
             .route("/capabilities", get(capabilities))
             .route("/ubus", get(ubus_list))
@@ -329,6 +340,74 @@ fn webshell_error(status: StatusCode, code: &str, message: &str) -> Response {
         Json(json!({"ok":false,"error":{"code":code,"message":message}})),
     )
         .into_response()
+}
+
+fn identity_result(result: Result<Value, crate::identity::Error>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => webshell_error(
+            StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            error.code,
+            error.message,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityInit {}
+
+async fn identity_public_key(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return webshell_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication required",
+        );
+    }
+    identity_result(app.inner.identity.public_key().await)
+}
+async fn identity_init(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Result<Json<IdentityInit>, JsonRejection>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return webshell_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication required",
+        );
+    }
+    if body.is_err() {
+        return webshell_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_identity_request",
+            "expected an empty JSON object",
+        );
+    }
+    identity_result(app.inner.identity.initialize().await)
+}
+async fn identity_sign(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Result<Json<crate::identity::SignRequest>, JsonRejection>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return webshell_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication required",
+        );
+    }
+    match body {
+        Ok(Json(request)) => identity_result(app.inner.identity.sign(request).await),
+        Err(_) => webshell_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_identity_request",
+            "expected purpose and challenge JSON fields",
+        ),
+    }
 }
 
 async fn webshell_status(State(app): State<App>, headers: HeaderMap) -> Response {
