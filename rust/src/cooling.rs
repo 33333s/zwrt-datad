@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -13,6 +13,11 @@ const DEFAULT_CURVE: [(i64, i64); 5] = [(40, 0), (45, 0), (50, 76), (60, 128), (
 static HARD_OVERRIDE: AtomicBool = AtomicBool::new(false);
 static STOPPING: AtomicBool = AtomicBool::new(false);
 static COOLING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CONTROL_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub fn control_revision() -> u64 {
+    CONTROL_REVISION.load(Ordering::Acquire)
+}
 #[derive(Clone, Default)]
 struct FanPolicyStatus {
     attempted: bool,
@@ -392,6 +397,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
     if STOPPING.load(Ordering::Relaxed) {
         return Err(failed("cooling controller is shutting down".into()));
     }
+    CONTROL_REVISION.fetch_add(1, Ordering::AcqRel);
     let mut c = load().await;
     match action {
         "cooling.fan.set_enabled" => {
@@ -461,15 +467,19 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
                 curve.push((t, pwm));
             }
             c.curve = curve.clone();
-            c.fan_mode = 2;
-            c.fan_always = false;
+            // Saving points must not silently cancel an enabled constant mode.
+            // Turning always-on off (or explicitly selecting custom) activates
+            // the saved curve. This also makes delayed UI saves harmless.
+            if !c.fan_always {
+                c.fan_mode = 2;
+            }
             apply_fan_recorded(&c).await.map_err(failed)?;
-            vendor("zwrt_deviceui.Device.fan_switch_status", false)
+            vendor("zwrt_deviceui.Device.fan_switch_status", c.fan_always)
                 .await
                 .map_err(failed)?;
             save(&c).await.map_err(failed)?;
             Ok(
-                json!({"enabled":false,"always_on":false,"mode":"custom","points":curve.into_iter().map(|(temperature,pwm)|json!({"temperature":temperature,"pwm":pwm})).collect::<Vec<_>>()}),
+                json!({"enabled":c.fan_always,"always_on":c.fan_always,"mode":if c.fan_always{"always_on"}else{"custom"},"points":curve.into_iter().map(|(temperature,pwm)|json!({"temperature":temperature,"pwm":pwm})).collect::<Vec<_>>()}),
             )
         }
         "cooling.liquid.set_enabled" => {
@@ -478,12 +488,17 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
                 .and_then(Value::as_bool)
                 .ok_or_else(|| invalid("enabled must be boolean"))?;
             c.liquid_always = e;
+            if e {
+                c.liquid_level = 2;
+            }
             apply_liquid(&c).await.map_err(failed)?;
             vendor("zwrt_deviceui.Device.liquid_cooling_switch_status", e)
                 .await
                 .map_err(failed)?;
             save(&c).await.map_err(failed)?;
-            Ok(json!({"enabled":e,"always_on":e}))
+            Ok(
+                json!({"enabled":e,"always_on":e,"mode":if e{"high"}else{"automatic"},"level":if e{2}else{0},"amplitude":if e{200}else{0}}),
+            )
         }
         "cooling.liquid.set_mode" => {
             let mode = p
@@ -516,6 +531,48 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
         }
         _ => Err(invalid("unsupported cooling action")),
     }
+}
+
+/// Use native switches already sampled by state collection, without letting
+/// an older sample overwrite a newer API operation.
+pub async fn sync_vendor_switches(
+    revision: u64,
+    fan: Option<bool>,
+    liquid: Option<bool>,
+) -> Result<(), String> {
+    let _guard = COOLING_LOCK.lock().await;
+    if STOPPING.load(Ordering::Relaxed) || revision != control_revision() {
+        return Ok(());
+    }
+    let path = env("ZWRT_DATAD_COOLING_CONFIG", "/data/zwrt-datad/cooling.conf");
+    if !tokio::fs::try_exists(path)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
+    let mut config = load().await;
+    let fan_changed = fan.is_some_and(|value| value != config.fan_always);
+    let liquid_changed = liquid.is_some_and(|value| value != config.liquid_always);
+    if !fan_changed && !liquid_changed {
+        return Ok(());
+    }
+    CONTROL_REVISION.fetch_add(1, Ordering::AcqRel);
+    if fan_changed {
+        config.fan_always = fan.unwrap();
+        if !config.fan_always {
+            config.fan_mode = 2;
+        }
+        apply_fan_recorded(&config).await?;
+    }
+    if liquid_changed {
+        config.liquid_always = liquid.unwrap();
+        if config.liquid_always {
+            config.liquid_level = 2;
+        }
+        apply_liquid(&config).await?;
+    }
+    save(&config).await
 }
 
 pub async fn tick() {

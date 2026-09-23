@@ -1838,15 +1838,30 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             "multiwan".into(),
             topflow_multiwan(&uci_sets, &mode, mwan_running),
         );
+        let revision = crate::cooling::control_revision();
         let fan_enabled = uci_read("zwrt_deviceui.Device.fan_switch_status")
             .await
-            .parse()
-            .unwrap_or_default();
+            .parse::<i64>()
+            .ok()
+            .filter(|v| matches!(v, 0 | 1));
         let liquid_enabled = uci_read("zwrt_deviceui.Device.liquid_cooling_switch_status")
             .await
-            .parse()
-            .unwrap_or_default();
-        fields.insert("cooling".into(), cooling_state(fan_enabled, liquid_enabled));
+            .parse::<i64>()
+            .ok()
+            .filter(|v| matches!(v, 0 | 1));
+        let error = crate::cooling::sync_vendor_switches(
+            revision,
+            fan_enabled.map(|v| v == 1),
+            liquid_enabled.map(|v| v == 1),
+        )
+        .await
+        .err();
+        let mut cooling = cooling_state(
+            fan_enabled.unwrap_or_default(),
+            liquid_enabled.unwrap_or_default(),
+        );
+        cooling["vendor_sync_error"] = json!(error);
+        fields.insert("cooling".into(), cooling);
     } else {
         fields.insert("modems".into(), json!([]));
     }
