@@ -148,6 +148,13 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
             replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "0")
             wait_for(lambda: (base / "liquid-thermal").read_text() == "1", "native liquid off did not restore thermal")
             wait_for(lambda: request("/state")[1]["cooling"]["vendor_sync_error"] is None, "native sync error")
+            (base / "liquid-drive").unlink()
+            (base / "liquid-drive").mkdir()
+            code, result = request("/control", {"action":"cooling.liquid.set_enabled", "params":{"enabled":True}})
+            assert code == 502 and "liquid thermal control restored" in result["error"]["message"]
+            assert (base / "liquid-thermal").read_text() == "1"
+            (base / "liquid-drive").rmdir()
+            (base / "liquid-drive").write_text("0 0 0")
             saved_curve = (base / "cooling.conf").read_text()
 
             # A missing/invalid sensor must restore the actual fan zone, not

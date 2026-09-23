@@ -370,16 +370,25 @@ async fn apply_liquid(c: &Config) -> Result<(), String> {
         "/sys/class/leds/aw_vibrator/atsin0",
     );
     if c.liquid_always {
-        write(thermal, "0").await?;
-        write(
+        write(thermal.clone(), "0").await?;
+        let result = write(
             drive,
             &format!("1023 {} 200", if c.liquid_level >= 2 { 200 } else { 60 }),
         )
-        .await?;
-        Ok(())
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => match write(thermal, "1").await {
+                Ok(()) => Err(format!("{error}; liquid thermal control restored")),
+                Err(recovery) => Err(format!(
+                    "{error}; liquid thermal recovery failed: {recovery}"
+                )),
+            },
+        }
     } else {
-        write(drive, "0 0 0").await?;
-        write(thermal, "1").await
+        let stop = write(drive, "0 0 0").await;
+        let restore = write(thermal, "1").await;
+        stop.and(restore)
     }
 }
 async fn vendor(path: &str, value: bool) -> Result<(), String> {
