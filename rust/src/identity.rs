@@ -25,7 +25,7 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-const WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keymaster-worker"));
+static WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keymaster-worker"));
 const MAX_RECORD: usize = 32 * 1024;
 const MAX_BLOB: usize = 8192;
 const MAX_OUTPUT: usize = MAX_BLOB + 512;

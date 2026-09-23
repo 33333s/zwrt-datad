@@ -86,6 +86,9 @@ with tempfile.TemporaryDirectory(prefix='datad-identity-test-') as directory:
         setup(mode='unavailable')
         assert request('/identity/init',{})[0]==503
         assert not (data/'identity/key.json').exists(), 'software fallback created a key'
+        setup(mode='bad_signature')
+        assert request('/identity/init',{})[0]==409
+        assert not (data/'identity/key.json').exists(), 'unverified key was persisted'
         setup(mode='ok')
         code,public=request('/identity/init',{})
         assert code==200 and public['created'] and public['backend']=='test-only' and public['attested'] is False, public
@@ -96,6 +99,9 @@ with tempfile.TemporaryDirectory(prefix='datad-identity-test-') as directory:
         code,repeat=request('/identity/init',{}); assert code==200 and not repeat['created'] and repeat['key_id']==public['key_id']
         assert record.read_bytes()==original
         code,read=request('/identity/public-key'); assert code==200 and read['key_id']==public['key_id']
+        # The earlier valid-shape sign attempt before initialization also
+        # consumes the 250ms rate window, particularly on fast CI runners.
+        time.sleep(.3)
         expected=proof(); code,signed=request('/identity/sign',expected); assert code==200,signed; verify(signed,expected,public)
         stop(); start()
         assert request('/identity/public-key')[1]['key_id']==public['key_id'], 'restart changed identity'
@@ -119,6 +125,9 @@ with tempfile.TemporaryDirectory(prefix='datad-identity-test-') as directory:
         marker.write_text('0'*64)
         assert request('/identity/public-key')[0]==409
         marker.write_text(marker_text)
+        marker.unlink()
+        assert request('/identity/init',{})[1]['created'] is False
+        assert marker.read_text()==marker_text and record.read_bytes()==original
         record.write_text('broken')
         assert request('/identity/init',{})[0]==500 and record.read_text()=='broken', 'corrupt key overwritten'
         record.write_bytes(original)
