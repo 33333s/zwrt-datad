@@ -3,6 +3,19 @@ name = "zwrt-datad"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+default-run = "zwrt-datad"
+
+[features]
+keymaster-worker = []
+
+[[bin]]
+name = "zwrt-datad"
+path = "src/main.rs"
+
+[[bin]]
+name = "keymaster-worker"
+path = "keymaster_worker.rs"
+required-features = ["keymaster-worker"]
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +30,7 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rsa = "0.9"
 rand = "0.8"
+ring = "0.17"
 rumqttc = { package = "rumqttc-v4-next", version = "0.34", default-features = false, features = ["use-rustls-ring", "websocket"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }

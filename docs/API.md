@@ -30,6 +30,62 @@ X-Auth-Token: <token>
 
 ## Routes
 
+### 设备身份公钥与挑战签名
+
+三项接口在 **9460 和 9461 均必须鉴权**，仅接受 `Authorization: Bearer` 或 `X-Auth-Token` 请求头；不接受 URL 中的 Token。
+
+| 接口 | 请求 | 用途 |
+|---|---|---|
+| `POST /identity/init` | `{}` | 显式创建身份；已有可用密钥时幂等返回，不覆盖或换钥匙 |
+| `GET /identity/public-key` | 无 | 读取已初始化的公钥；不会自动生成密钥 |
+| `POST /identity/sign` | `{"purpose":"enroll","challenge":"<base64url nonce>"}` | 对固定域分离消息签名 |
+
+初始化和公钥响应包含 `key_id`（SPKI DER 的 SHA-256 小写 hex）、`key_id_scheme=sha256-spki`、`algorithm=ECDSA-P256-SHA256`、`public_key_pem`、`public_key_spki`（标准 Base64 编码的 DER 公钥，不是证书）、`backend=qcom-keymaster`、`attested=false`。初始化额外返回 `created`，重复初始化为 `false`。不返回密钥 blob 或私钥。
+
+该身份使用设备原厂 Keymaster 生成的 P-256 签名密钥，不提供软件私钥回退。`key_id` 标识的是这份密钥，**不是不可变的硬件序列号**。本接口不提供厂商证明链；`backend` 只是程序自报的实现信息，服务器不能把它当作远程可信证明。首次登记由运营方的账户授权、支付审核及风控决定。
+
+`purpose` 仅允许 `enroll`、`authenticate`；`challenge` 必须是服务端产生的32字节随机数，采用无填充的 Base64URL（43字符）。请求 JSON 上限2048字节，未知字段会被拒绝。单进程最多一个身份操作，签名最短间隔250ms，原厂 worker 超时8秒；忙或超频返回429。
+
+签名响应包含 `key_id`、`purpose`、`challenge`、`signature`（标准 Base64）、`signature_format=asn1-der`、`signed_message`（标准 Base64）及 `attested=false`。实际签名内容按下式拼接原始字节，使用 ECDSA-P256/SHA-256：
+
+```text
+UTF8("zwrt-datad-identity-v1") || 0x00 ||
+ASCII(purpose) || 0x00 || ASCII(key_id) || 0x00 || nonce_32_bytes
+```
+
+服务器必须自己用预期公钥、预期 purpose 和已发出的 nonce 重建消息，不能直接信任客户端的 `signed_message`。nonce 应绑定账户/许可证、登记公钥、用途和相应请求，设置短有效期并在验证成功时原子消费，拒绝重放。登记完成后固定公钥；换绑必须受控，不能凭相同 SN/IMEI 自动换钥匙，也不应签完一次就发可无限复制的长期通用授权令牌。恶意 root 仍可能注册软件密钥或使用真机代签，后台风控只能降低这些风险，不能把此接口当作远程 attestation。
+
+常见错误：未初始化为409 `identity_not_initialized`；损坏或不安全的存储为500 `identity_storage_error`；无可用硬件接口为503 `identity_backend_unavailable`；外机/不可用密钥为409 `identity_key_unusable`。这些失败不会自动重建身份。
+
+示例（Token 由调用方安全注入）：
+
+```sh
+curl -s -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{}' http://127.0.0.1:9460/identity/init
+curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:9460/identity/public-key
+```
+
+服务端验签示意（`expected_challenge` 必须来自服务端保存的尚未消费的挑战记录）：
+
+```python
+import base64, hashlib
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+
+key = serialization.load_pem_public_key(registered_pem.encode())
+assert isinstance(key, ec.EllipticCurvePublicKey) and isinstance(key.curve, ec.SECP256R1)
+spki = key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+kid = hashlib.sha256(spki).hexdigest()
+assert reply['key_id'] == registered_key_id == kid
+assert reply['purpose'] == expected_purpose
+assert reply['challenge'] == expected_challenge
+nonce = base64.urlsafe_b64decode(expected_challenge + '=')
+assert len(nonce) == 32
+message = b'zwrt-datad-identity-v1\0' + expected_purpose.encode('ascii') + b'\0' + kid.encode('ascii') + b'\0' + nonce
+key.verify(base64.b64decode(reply['signature'], validate=True), message, ec.ECDSA(hashes.SHA256()))
+# 还必须检查并原子消费服务端 nonce 的账户绑定、用途和有效期。
+```
+
 ### `GET /usb/status`
 
 只读返回当前采样的 USB 链路信息，与 `/state.usb` 和 `/events` 的 `usb` 相同。
