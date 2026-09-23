@@ -43,6 +43,7 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
         (hotplug / "type", "cpu-hotplug1"), (hotplug / "cur_state", "2"),
         (base / "pwm", "76"), (base / "fan-thermal", "thermal_enable:1"),
         (base / "low-speed", "low_speed_mode:1, low_speed_max:76"),
+        (base / "liquid-thermal", "thermal_enable:1"), (base / "liquid-drive", "0 0 0"),
         (base / "qos", ""), (base / "qos.0", ""), (base / "leases", ""),
     ):
         path.write_text(value)
@@ -61,6 +62,8 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
         "ZWRT_DATAD_PROC_ROOT": str(base / "proc"), "ZWRT_DATAD_FAN_PWM_PATH": str(base / "pwm"),
         "ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH": str(base / "fan-thermal"),
         "ZWRT_DATAD_FAN_LOW_SPEED_MODE_PATH": str(base / "low-speed"),
+        "ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH": str(base / "liquid-thermal"),
+        "ZWRT_DATAD_LIQUID_DRIVE_PATH": str(base / "liquid-drive"),
         "ZWRT_DATAD_QOS_LOG": str(base / "qos"), "ZWRT_DATAD_QOS_LOG_ROTATED": str(base / "qos.0"),
         "ZWRT_DATAD_DHCP_LEASES_PATH": str(base / "leases"),
     })
@@ -85,6 +88,16 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
     def state():
         return request("/state")[1]["cooling"]["fan"]
 
+    def action(name, params):
+        code, body = request("/control", {"action": name, "params": params})
+        assert code == 200, body
+        return body["result"]
+
+    def replace(path, value):
+        temp = path.with_suffix(".next")
+        temp.write_text(value)
+        temp.replace(path)
+
     with (base / "server.log").open("w+") as log:
         process = subprocess.Popen([str(BINARY), "-b", "127.0.0.1", "-p", str(port), "--data-dir", str(base / "data")], env=env, stdout=log, stderr=log)
         try:
@@ -97,6 +110,51 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
             assert (base / "low-speed").read_text() == "0"
             assert (hotplug / "cur_state").read_text() == "2"
             assert (cpu / "mode").read_text() == "enabled"
+
+            action("cooling.fan.set_enabled", {"enabled": True})
+            wait_for(lambda: state()["mode"] == "always_on" and state()["pwm"] == 128, "fan constant mode missing")
+            for temperature in (40000, 55000, 73000):
+                replace(zone / "temp", str(temperature))
+                wait_for(lambda: state()["temperature_celsius"] == temperature // 1000, "temperature not refreshed")
+                assert state()["pwm"] == 128, "always-on incorrectly followed custom curve"
+            result = action("cooling.fan.set_curve", {"points": points})
+            assert result["always_on"] and result["mode"] == "always_on"
+            wait_for(lambda: state()["mode"] == "always_on" and state()["pwm"] == 128, "curve save disabled always-on")
+            replace(zone / "temp", "81000")
+            wait_for(lambda: state()["pwm"] == 255, "overheat override was lost")
+            replace(zone / "temp", "64000")
+            wait_for(lambda: state()["pwm"] == 128, "constant mode did not resume after cooling")
+            action("cooling.fan.set_enabled", {"enabled": False})
+            wait_for(lambda: state()["mode"] == "custom" and state()["pwm"] == 113, "saved curve did not resume")
+
+            # Native UI/UCI switch changes must not fight the saved datad mode.
+            replace(base / "uci" / "zwrt_deviceui.Device.fan_switch_status", "1")
+            wait_for(lambda: state()["mode"] == "always_on" and state()["pwm"] == 128, "native always-on not synchronized")
+            stamp = (base / "cooling.conf").stat().st_mtime_ns
+            time.sleep(1.5)
+            assert (base / "cooling.conf").stat().st_mtime_ns == stamp, "unchanged native switches caused flash writes"
+            replace(base / "uci" / "zwrt_deviceui.Device.fan_switch_status", "0")
+            wait_for(lambda: state()["mode"] == "custom" and state()["pwm"] == 113, "native off did not restore curve")
+
+            action("cooling.liquid.set_mode", {"mode": "low"})
+            assert (base / "liquid-drive").read_text() == "1023 60 200"
+            result = action("cooling.liquid.set_enabled", {"enabled": True})
+            assert result["mode"] == "high" and result["amplitude"] == 200
+            assert (base / "liquid-drive").read_text() == "1023 200 200"
+            action("cooling.liquid.set_enabled", {"enabled": False})
+            assert (base / "liquid-drive").read_text() == "0 0 0"
+            replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "1")
+            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 200 200", "native liquid on not high")
+            replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "0")
+            wait_for(lambda: (base / "liquid-thermal").read_text() == "1", "native liquid off did not restore thermal")
+            wait_for(lambda: request("/state")[1]["cooling"]["vendor_sync_error"] is None, "native sync error")
+            (base / "liquid-drive").unlink()
+            (base / "liquid-drive").mkdir()
+            code, result = request("/control", {"action":"cooling.liquid.set_enabled", "params":{"enabled":True}})
+            assert code == 502 and "liquid thermal control restored" in result["error"]["message"]
+            assert (base / "liquid-thermal").read_text() == "1"
+            (base / "liquid-drive").rmdir()
+            (base / "liquid-drive").write_text("0 0 0")
             saved_curve = (base / "cooling.conf").read_text()
 
             # A missing/invalid sensor must restore the actual fan zone, not

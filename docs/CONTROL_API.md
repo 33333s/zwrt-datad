@@ -152,6 +152,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 ## MU5252 Aggregation And Cooling
 
+已配置 datad 散热后，采样同步原厂常开开关的变化：风扇开启为128、关闭恢复自定义曲线，液冷开启为最高档、关闭交还 thermal。`cooling.vendor_sync_error` 报告同步失败。旧采样不会覆盖较新的 datad 控制请求；复用已有字段读取，不增加轮询。80°C 过热保护保持不变。
+
 以下动作只应在 `/state` 实际输出 `aggregation` / `cooling` 的 MU5252 模板上显示：
 
 | action | params | 说明 |
@@ -163,8 +165,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `multiwan.rule.set` | `section,use_policy,sticky,logging` | 修改已存在 rule 使用的策略、会话保持与日志开关 |
 | `cooling.fan.set_enabled` | `enabled` | 兼容 action 名；`true` 切到常开，`false` 切到自定义曲线 |
 | `cooling.fan.set_mode` | `mode` | `automatic` 使用原厂内核三档曲线，`custom` 使用保存的 2–8 点线性曲线，`always_on` 固定 PWM 128 |
-| `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 保存并启用 datad 自定义曲线，同时退出常开；2–8 点，温度严格递增、PWM 不递减 |
-| `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；实际控制“液冷常开”。`true` 固定厂商参数 `1023 60 200`，`false` 解除强制并交还 thermal 控制 |
+| `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 保存曲线；常开已开启时不退出常开，关闭后使用保存的曲线，否则立即启用曲线。2–8 点，温度严格递增、PWM 不递减 |
+| `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；`true` 固定原厂最高档 `1023 200 200`（幅值200），即使此前选过低档也切到高档；`false` 交还 thermal 控制 |
 | `cooling.liquid.set_mode` | `mode` | MU5252 液冷模式：`automatic` 交还内核 thermal；`low` 使用原厂低档幅度 60；`high` 使用原厂高档幅度 200。两档均保持频率 200，不伪造连续百分比 |
 
 风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。状态中的 `always_on` 表示常开，`enabled` 仅作为同值兼容别名。`automatic` 会重新启用 `sys-therm-4` 并使用设备树的 44/48/53℃、30/50/70% 三档曲线；`custom` 会禁用该 thermal zone、清零 `pwm-fan` 的锁存 state，并每秒按保存曲线线性插值写 PWM；`always_on` 采用同一用户态控制路径持续写 PWM 128。三种模式都保持风扇 `thermal_enable=1`，且 80℃ 始终强制 PWM 255。`factory_curve` 与 `custom_curve` 分别返回原厂和自定义曲线；`curve` 保留为旧消费者兼容字段。液冷自动模式恢复其 `thermal_enable`，低/高档使用原厂固定硬件参数。datad 正常退出时会把风扇 thermal 控制交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
