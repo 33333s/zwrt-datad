@@ -116,6 +116,7 @@ unsafe extern "C" {
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn alarm(seconds: u32) -> u32;
+    fn setrlimit(resource: c_int, limits: *const [u64; 2]) -> c_int;
 }
 
 struct Keymaster {
@@ -278,6 +279,9 @@ fn input() -> Result<(u8, Vec<u8>, Vec<u8>), i32> {
 }
 
 fn main() {
+    if unsafe { setrlimit(4, &[0, 0]) } != 0 {
+        std::process::exit(1);
+    }
     // Preserve the private protocol pipe, then discard native-library stdout
     // and stderr. No blob or user data is ever formatted into diagnostic logs.
     let fd = unsafe { dup(1) };

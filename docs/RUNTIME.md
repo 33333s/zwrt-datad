@@ -46,7 +46,7 @@ Authorization: Bearer <token>
 
 ### 设备签名身份
 
-身份不会在启动时自动创建，也不会自动上传或登记到任何服务器。`POST /identity/init` 首次显式创建；私有目录为 `$ZWRT_DATAD_DIR/identity`（0700），其中 `key.json`（0600）保存硬件绑定的加密 key blob 与公钥。它不是原始私钥文件，不能复制到其他设备使用。OTA 应保留整个 identity 目录；损坏、外机 blob 或硬件不可用只报错，不自动换钥匙。删除该目录或恢复出厂可能丢失原身份，再初始化产生新公钥，必须由后台受控换绑。
+身份不会在启动时自动创建，也不会自动上传或登记到任何服务器。`POST /identity/init` 首次显式创建；私有目录为 `$ZWRT_DATAD_DIR/identity`（0700），其中 `key.json`（0600）保存硬件绑定的加密 key blob 与公钥，`initialized-key-id` 保存本机初始化完成后的公钥指纹。它不是原始私钥文件，不能复制到其他设备使用。OTA 应保留整个 identity 目录；损坏、外机 blob、已初始化但密钥文件丢失或硬件不可用只报错，不自动换钥匙。初始化被中断而密钥文件完整时，可以在验证同一公钥后补齐标记，不重新生成。删除整个目录或恢复出厂可能丢失原身份，再初始化产生新公钥，必须由后台受控换绑。
 
 主程序仍为静态 Rust；`scripts/build.sh` 通过同一 `rust/Cargo.toml` 构建并内嵌一个短生命周期 Rust worker，它只动态加载设备已有的 `/usr/lib/libKeyMaster.so.0.0.0`。不分发、不替换原厂库，不调用 attestation keybox provision、清空全部密钥、设备ID或熔丝接口。worker 缓存在私有目录，单次运行结束即回收原厂库的进程资源；硬件接口不可用时不退回软件密钥。首次来源仍未远程证明，见 [API.md](API.md)。
 

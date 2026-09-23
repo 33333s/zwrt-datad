@@ -80,6 +80,7 @@ with tempfile.TemporaryDirectory(prefix='datad-identity-test-') as directory:
             assert request(path,body,False)[0]==401
         assert request('/identity/public-key?access_token=fixture-identity-token',auth=False)[0]==401
         assert request('/identity/public-key')[0]==409
+        assert request('/identity/sign',proof())[1]['error']['code']=='identity_not_initialized'
         assert not (data/'identity').exists(), 'GET created an identity'
         assert request('/identity/init',{'force':True})[0]==400
         setup(mode='unavailable')
@@ -110,12 +111,23 @@ with tempfile.TemporaryDirectory(prefix='datad-identity-test-') as directory:
         assert request('/identity/public-key')[0]==409 and request('/identity/init',{})[0]==409
         assert record.read_bytes()==original, 'foreign key was regenerated'
         setup(device='fixture-A')
+        missing=root/'missing-key'; record.rename(missing)
+        assert request('/identity/init',{})[1]['error']['code']=='identity_key_unusable'
+        assert not record.exists(), 'missing initialized key was regenerated'
+        missing.rename(record)
+        marker=data/'identity/initialized-key-id'; marker_text=marker.read_text()
+        marker.write_text('0'*64)
+        assert request('/identity/public-key')[0]==409
+        marker.write_text(marker_text)
         record.write_text('broken')
         assert request('/identity/init',{})[0]==500 and record.read_text()=='broken', 'corrupt key overwritten'
         record.write_bytes(original)
         record.chmod(0o644)
         assert request('/identity/public-key')[0]==500
         record.chmod(0o600)
+        data.chmod(0o777)
+        assert request('/identity/public-key')[0]==500
+        data.chmod(0o700)
         alias=root/'alias'; os.link(record,alias)
         assert request('/identity/public-key')[0]==500
         alias.unlink()

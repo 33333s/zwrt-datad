@@ -23,7 +23,7 @@ use tokio::{
     process::Command,
     sync::{Mutex, Semaphore},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keymaster-worker"));
 const MAX_RECORD: usize = 32 * 1024;
@@ -42,6 +42,13 @@ pub struct Error {
     pub status: u16,
 }
 impl Error {
+    fn uninitialized() -> Self {
+        Self {
+            code: "identity_not_initialized",
+            message: "explicit initialization is required",
+            status: 409,
+        }
+    }
     fn storage() -> Self {
         Self {
             code: "identity_storage_error",
@@ -178,10 +185,10 @@ impl Identity {
         {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error {
-                    code: "identity_not_initialized",
-                    message: "explicit initialization is required",
-                    status: 409,
+                return Err(if self.has_marker() {
+                    Error::key()
+                } else {
+                    Error::uninitialized()
                 });
             }
             Err(_) => return Err(Error::storage()),
@@ -198,10 +205,50 @@ impl Identity {
         if length > MAX_RECORD || record.schema != 1 {
             return Err(Error::storage());
         }
-        decode_record(&record)?;
+        let (mut blob, _) = decode_record(&record)?;
+        blob.zeroize();
         Ok(record)
     }
+    fn existing_directory(&self) -> Result<(), Error> {
+        if fs::symlink_metadata(&self.directory)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(Error::uninitialized());
+        }
+        self.directory(false)
+    }
+    fn has_marker(&self) -> bool {
+        fs::symlink_metadata(self.directory.join("initialized-key-id")).is_ok()
+    }
+    fn ensure_marker(&self, public: &[u8]) -> Result<(), Error> {
+        let expected = fingerprint(public);
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.directory.join("initialized-key-id"))
+        {
+            Ok(file) => {
+                secure(&file)?;
+                let mut actual = String::new();
+                file.take(65)
+                    .read_to_string(&mut actual)
+                    .map_err(|_| Error::storage())?;
+                if actual != expected {
+                    return Err(Error::key());
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.has_marker() => {
+                self.publish_new("initialized-key-id", expected.as_bytes())
+            }
+            Err(_) => Err(Error::storage()),
+        }
+    }
     fn save_new(&self, record: &Record) -> Result<(), Error> {
+        let bytes = Zeroizing::new(serde_json::to_vec(record).map_err(|_| Error::storage())?);
+        self.publish_new("key.json", &bytes)
+    }
+    fn publish_new(&self, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let temp = self
             .directory
             .join(format!(".key-new-{:016x}", rand::random::<u64>()));
@@ -213,12 +260,10 @@ impl Identity {
             .open(&temp)
             .map_err(|_| Error::storage())?;
         let result = (|| {
-            let mut bytes = serde_json::to_vec(record).map_err(|_| Error::storage())?;
-            let result = file.write_all(&bytes).and_then(|_| file.sync_all());
-            bytes.zeroize();
+            let result = file.write_all(bytes).and_then(|_| file.sync_all());
             result.map_err(|_| Error::storage())?;
             // Atomic publication with NO replacement of an existing identity.
-            fs::hard_link(&temp, self.directory.join("key.json")).map_err(|_| Error::storage())?;
+            fs::hard_link(&temp, self.directory.join(name)).map_err(|_| Error::storage())?;
             Ok(())
         })();
         let removed = fs::remove_file(&temp);
@@ -285,7 +330,7 @@ impl Identity {
             return Err(Error::input());
         }
         let worker = self.worker()?;
-        let mut input = vec![op];
+        let mut input = Zeroizing::new(vec![op]);
         input.extend_from_slice(&(blob.len() as u32).to_be_bytes());
         input.extend_from_slice(&(message.len() as u32).to_be_bytes());
         input.extend_from_slice(blob);
@@ -312,7 +357,7 @@ impl Identity {
                 .await
                 .map_err(|_| Error::backend())?;
             drop(stdin);
-            let mut output = Vec::new();
+            let mut output = Zeroizing::new(Vec::new());
             stdout
                 .take(MAX_OUTPUT as u64 + 1)
                 .read_to_end(&mut output)
@@ -342,7 +387,13 @@ impl Identity {
         let record = self.load()?;
         let (mut blob, public) = decode_record(&record)?;
         match self.invoke(2, &blob, &[]).await {
-            Ok((empty, actual)) if empty.is_empty() && actual == public => Ok((blob, public)),
+            Ok((empty, actual)) if empty.is_empty() && actual == public => {
+                if let Err(error) = self.ensure_marker(&public) {
+                    blob.zeroize();
+                    return Err(error);
+                }
+                Ok((blob, public))
+            }
             Ok(_) => {
                 blob.zeroize();
                 Err(Error::key())
@@ -369,7 +420,7 @@ impl Identity {
                 value["created"] = json!(false);
                 return Ok(value);
             }
-            Err(error) if error.code == "identity_not_initialized" => (),
+            Err(error) if error.code == "identity_not_initialized" && !self.has_marker() => (),
             Err(error) => return Err(error),
         }
         let (mut blob, public) = self.invoke(1, &[], &[]).await?;
@@ -394,6 +445,7 @@ impl Identity {
             return Err(Error::key());
         }
         self.save_new(&record)?;
+        self.ensure_marker(&public)?;
         let mut value = public_json(&public);
         value["created"] = json!(true);
         Ok(value)
@@ -404,14 +456,7 @@ impl Identity {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::busy())?;
-        if !self.directory.exists() {
-            return Err(Error {
-                code: "identity_not_initialized",
-                message: "explicit initialization is required",
-                status: 409,
-            });
-        }
-        self.directory(false)?;
+        self.existing_directory()?;
         let _lock = self.lock()?;
         let (mut blob, public) = self.checked_record().await?;
         blob.zeroize();
@@ -434,7 +479,7 @@ impl Identity {
         }
         *last = Some(Instant::now());
         drop(last);
-        self.directory(false)?;
+        self.existing_directory()?;
         let _lock = self.lock()?;
         let (mut blob, public) = self.checked_record().await?;
         let key_id = fingerprint(&public);
