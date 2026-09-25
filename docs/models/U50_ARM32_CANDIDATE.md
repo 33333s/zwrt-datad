@@ -1,18 +1,29 @@
 # U50 Pro / U50S ARM32 candidate
 
-This branch adds an isolated, read-only candidate runtime for original-firmware U50 devices. It is **not** a production template. `device.api_template_supported` remains `0` until both devices are checked against live readbacks.
+This branch contains a read-only original-firmware adapter. It is **not** a production template: `device.api_template_supported` remains `0` until actual U50 Pro and U50S runtime responses are verified.
 
-Firmware evidence: U50 Pro `u50prox62_full.bin` (SHA-256 `501b78f6f4b685a2caed6d5bae4b7193cb468bfb8dfdd3d26b7bf20225665148`) and U50S `BD_ZTE2SIMU50SV1.0.0B02` packages contain 32-bit ARM EABI5 root filesystems, `cfg`, `zte_topsw_*`, and GoAhead. The U50 Pro rootfs identifies as `sdxlemur-qti-distro-nogplv3-debug`; U50S identifies as `sdxprairie-mdm`. Neither inspected rootfs contains ZWRT `ubus`/`uci` tools. Their `zte_topsw_goahead` binaries differ, so a shared string name is only a lead, not a verified response contract. The raw firmware files and private partitions are not part of this repository.
+## Static firmware evidence
 
-The candidate reads only `/goform/goform_get_cmd_process` over loopback HTTP. The request uses a fixed allowlist: `model_name`, `wa_inner_version`, `network_type`, `network_provider_fullname`, `wan_active_band`, `battery_value`, and `signalbar`. It publishes device identity and a small set of clearly named network fields. Battery and signal values remain under `u50_unverified` because their units and semantics are not established. It never reads SIM identifiers, keys, or passwords. An HTML login response or unexpected JSON fails the probe instead of producing a healthy blank state.
+The U50 Pro `u50prox62_full.bin` (SHA-256 `501b78f6f4b685a2caed6d5bae4b7193cb468bfb8dfdd3d26b7bf20225665148`) and U50S `BD_ZTE2SIMU50SV1.0.0B02` packages contain ARM 32-bit EABI5 root filesystems. U50 Pro identifies as `sdxlemur-qti-distro-nogplv3-debug`; U50S identifies as `sdxprairie-mdm`. Both contain `/usr/bin/cfg`, `zte_topsw_*`, and GoAhead, and neither inspected rootfs contains ZWRT `ubus`/`uci` tools. Their core binaries differ. Raw firmware and private partitions are not in this repository.
 
-Example for an isolated device test, after checking the actual model and local GoAhead access:
+Both firmwares' original shell scripts call `cfg get` for the same read-only keys used by this adapter:
+
+| Firmware source | Candidate output |
+|---|---|
+| `cfg get model_name` | `device.model_name` |
+| `cfg get integrate_version` | `system.sw_version` |
+| `cfg get lan_ipaddr` | `dhcp.ip` after IP validation |
+| `cfg get lan_netmask`, `wan_ipaddr`, `wan_gateway`, `ppp_status` | `u50_cfg` raw configuration/status fields; IPs validated, PPP code not interpreted |
+
+Both GoAhead binaries contain the same read keys `model_name`, `wa_inner_version`, `network_type`, `network_provider_fullname`, `network_provider`, `battery_value`, `battery_temp`, `battery_status`, `signalbar`, and `simcard_status`. GoAhead is an **optional** supplement. If local HTTP requires login or returns an unexpected body, `cfg` identity and configuration remain available and `u50_sources.goform` reads `unavailable`. Network type/operator are mapped only when returned. Battery, signal and SIM status stay under `u50_unverified` because binary strings alone do not establish units or values. SIM identifiers, passwords and keys are not requested.
+
+## Isolated use
 
 ```sh
 ./build/zwrt-datad-armv7-candidate --u50-model u50pro --once
 ./build/zwrt-datad-armv7-candidate --u50-model u50s --bind 127.0.0.1 --port 19460
 ```
 
-The candidate server exposes `/healthz`, `/version`, `/state`, and `/capabilities` on loopback only. It does not expose `/control`, `/ubus`, `/ota`, cloud, or WebShell. Build it with `scripts/build-arm32-candidate.sh`; the output is an experimental ARMv7 musl binary and does not change `version.json` or the ARM64 release asset.
+The ARM32 binary requires `--u50-model`; it cannot accidentally start the ZWRT collector. The candidate server binds only loopback and exposes `/healthz`, `/version`, `/state`, and `/capabilities`. It does not expose `/control`, `/ubus`, `/ota`, cloud, or WebShell. Build with `scripts/build-arm32-candidate.sh`; this produces an experimental ARMv7 musl binary without changing the ARM64 release asset or `version.json`.
 
-Before formal support: verify the runtime `model_name`, GoAhead authentication, response types and units, sampling costs, Wi-Fi layout, battery presence, and behavior on both real models. Then map verified fields to the stable state contract, implement and independently validate only the required controls, and add model-specific fixtures. Do not set `api_template_supported=1` based on firmware strings alone.
+Static analysis cannot establish the real device's `cfg` values, GoAhead authentication/response types, network and battery units, sampling costs, or safe control semantics. Verify on each real model before expanding the stable state contract or marking the template supported. No installation or service replacement is part of this branch.
