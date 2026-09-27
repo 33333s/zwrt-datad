@@ -45,6 +45,8 @@ case "$1:$2" in
   get:wan_ipaddr) printf '%s\\n' '10.0.0.2' ;;
   get:wan_gateway) printf '%s\\n' '10.0.0.1' ;;
   get:ppp_status) printf '%s\\n' 'connected' ;;
+  get:network_type) printf '%s\\n' 'LTE' ;;
+  get:network_provider_fullname) printf '%s\\n' 'TestCfg' ;;
   *) exit 1 ;;
 esac
 ''')
@@ -91,7 +93,8 @@ esac
         partial = json.loads(fallback.stdout)
         assert partial["u50_sources"]["goform"] == "unavailable"
         assert partial["device"]["model_name"] == "U50Pro"
-        assert "net" not in partial
+        assert partial["net"]["type"] == "LTE"
+        assert partial["net"]["operator"] == "TestCfg"
         u50s_env = {**env, "MOCK_U50_MODEL": "U50S"}
         u50s = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--once"], env=u50s_env, capture_output=True, text=True, timeout=15, check=True)
         assert json.loads(u50s.stdout)["device"]["api_template"] == "U50S"

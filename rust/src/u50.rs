@@ -27,6 +27,8 @@ const CFG_KEYS: &[&str] = &[
     "wan_ipaddr",
     "wan_gateway",
     "ppp_status",
+    "network_type",
+    "network_provider_fullname",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,8 +165,16 @@ fn from_sources(
     {
         fields.insert("dhcp".into(), json!({"ip":ip}));
     }
+    let mut net = Map::new();
+    for (source, target) in [
+        ("network_type", "type"),
+        ("network_provider_fullname", "operator"),
+    ] {
+        if let Some(value) = cfg.get(source) {
+            net.insert(target.into(), json!(value));
+        }
+    }
     if let Some(raw) = goform {
-        let mut net = Map::new();
         for (source, target) in [
             ("network_type", "type"),
             ("network_provider_fullname", "operator"),
@@ -177,9 +187,6 @@ fn from_sources(
             && let Some(value) = string_field(raw, "network_provider")
         {
             net.insert("operator".into(), json!(value));
-        }
-        if !net.is_empty() {
-            fields.insert("net".into(), Value::Object(net));
         }
         let mut candidate = Map::new();
         for key in [
@@ -196,6 +203,9 @@ fn from_sources(
         if !candidate.is_empty() {
             fields.insert("u50_unverified".into(), Value::Object(candidate));
         }
+    }
+    if !net.is_empty() {
+        fields.insert("net".into(), Value::Object(net));
     }
     fields.insert(
         "u50_sources".into(),
@@ -333,11 +343,13 @@ mod tests {
             ("model_name".into(), "U50Pro".into()),
             ("integrate_version".into(), "B02".into()),
             ("lan_ipaddr".into(), "192.168.0.1".into()),
+            ("network_type".into(), "LTE".into()),
         ]);
         let value = from_sources(Model::U50Pro, &cfg, None).unwrap();
         assert_eq!(value.fields["device"]["api_template_supported"], 0);
         assert_eq!(value.fields["system"]["sw_version"], "B02");
         assert_eq!(value.fields["dhcp"]["ip"], "192.168.0.1");
+        assert_eq!(value.fields["net"]["type"], "LTE");
         assert_eq!(value.fields["u50_sources"]["goform"], "unavailable");
     }
     #[test]
