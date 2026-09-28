@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.21",
+    "version": "0.10.22",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增可选 NMS 面板控制通道 v2，保留旧版只读状态流并要求独立开关"
+    "notes": "NMS 面板按需提供筛选后的设备标识与 WAN 地址，不传递原始 UCI 或接口配置"
   }
 }
