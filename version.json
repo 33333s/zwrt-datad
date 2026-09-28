@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.23",
+    "version": "0.10.24",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：补全读写映射并同步主线 NMS 只读面板状态流"
+    "notes": "ARM32 U50 候选版：同步主线免费/会员 NMS 默认线路，保留只读面板"
   }
 }

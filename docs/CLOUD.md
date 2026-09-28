@@ -1,6 +1,6 @@
 # NMS 云端管理
 
-默认关闭。云端 TLS/MQTT/WebSocket 运行时由 Rust datad 进程直接提供，共享同一二进制和 PID。`scripts/build.sh` 只从 `rust/Cargo.toml` 构建最终 ARM64 musl 静态二进制；设备不再安装或启动 `zwrt-datad-cloud`、`cloud-service.sh` 或 `cloud.sock`。
+默认关闭。首次没有 `cloud.json` 时，NMS 地址预填 `https://nms.ericsfj.com`，MQTT 地址预填 `wss://nms.ericsfj.com/mqtt`；用户名、密码和设备标识仍需独立填写，datad 不会自行启用或连接。已有配置文件中的自定义地址、凭据、开关及后台列表保持原值，不在加载时重写。云端 TLS/MQTT/WebSocket 运行时由 Rust datad 进程直接提供，共享同一二进制和 PID。`scripts/build.sh` 只从 `rust/Cargo.toml` 构建最终 ARM64 musl 静态二进制；设备不再安装或启动 `zwrt-datad-cloud`、`cloud-service.sh` 或 `cloud.sock`。
 
 UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。请求由 datad 进程内直接处理。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。
 
@@ -36,6 +36,8 @@ WSS 必须协商 `nms-webshell-v1`。设备使用 `Authorization: Bearer <sessio
 ## 备用远程入口（0.10.12）
 
 `remote_origins` 是可选的 HTTPS 站点地址列表，默认空，最多 4 个。主 `platform_url` 始终保留。示例：`platform_url: "https://nms.example.com"`、`remote_origins: ["https://relay.example.com:16001"]`。仅接受明确的主机及端口，禁止通配符、用户信息、路径、查询参数、片段、空白和重复地址；不提供跳过 TLS 校验选项。
+
+当 `platform_url` 与 `broker` 都使用上面的内置免费地址时，datad 还把 `https://a.ericsfj.com:16001` 加入**运行时有效的备用远程来源**，即使旧 `cloud.json` 的 `remote_origins` 仍为空。该地址只用于已启用远程访问且经 NMS 会话票据授权的 WebSocket，不改变 MQTT/心跳入口，也不表示会员资格。NMS 遥测报告包含这个有效来源；`GET /cloud/config` 和 UFI 自定义表单保持用户保存的 `remote_origins` 原值。只要主 NMS 或 MQTT 地址改为自定义值，隐式会员来源即不再加入；用户显式配置的备用来源仍照常生效。
 
 `remote.open` 可连接主地址或已配置备用地址对应的 WSS，其他主机、端口和会话路径仍被拒绝。遥测声明 `datad.remote_origins` 并上报规范化后的全部允许地址。空列表保持旧版只允许主平台的行为。保存配置会关闭旧会话并重新上报；原有本地认证、WebShell 开关、资源上限和签名更新规则保持不变。
 
