@@ -39,6 +39,10 @@ pub fn init_crypto() {
     });
 }
 
+const DEFAULT_PLATFORM_URL: &str = "https://nms.ericsfj.com";
+const DEFAULT_BROKER: &str = "wss://nms.ericsfj.com/mqtt";
+const DEFAULT_MEMBER_ORIGIN: &str = "https://a.ericsfj.com:16001";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
@@ -74,8 +78,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            broker: String::new(),
-            platform_url: String::new(),
+            broker: DEFAULT_BROKER.into(),
+            platform_url: DEFAULT_PLATFORM_URL.into(),
             remote_origins: Vec::new(),
             username: String::new(),
             password: String::new(),
@@ -770,18 +774,11 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
         return Err("invalid_remote_url".into());
     }
     let remote = Url::parse(&command.remote_url).map_err(|_| "invalid_remote_url")?;
-    let base = https_origin(&config.platform_url).map_err(|_| "invalid_remote_url")?;
-    let approved = std::iter::once(base)
-        .chain(
-            config
-                .remote_origins
-                .iter()
-                .filter_map(|raw| https_origin(raw).ok()),
-        )
-        .any(|origin| {
-            remote.host_str() == origin.host_str()
-                && remote.port_or_known_default() == origin.port_or_known_default()
-        });
+    https_origin(&config.platform_url).map_err(|_| "invalid_remote_url")?;
+    let approved = effective_remote_origins(config).iter().any(|origin| {
+        remote.host_str() == origin.host_str()
+            && remote.port_or_known_default() == origin.port_or_known_default()
+    });
     if remote.scheme() != "wss"
         || !approved
         || !remote.username().is_empty()
@@ -969,17 +966,36 @@ fn https_origin(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn reported_remote_origins(config: &Config) -> Vec<String> {
-    let mut result = Vec::new();
-    for raw in std::iter::once(&config.platform_url).chain(&config.remote_origins) {
-        if let Ok(origin) = https_origin(raw) {
-            let value = origin.origin().ascii_serialization();
-            if !result.contains(&value) {
-                result.push(value);
-            }
+fn uses_builtin_network(config: &Config) -> bool {
+    config.broker == DEFAULT_BROKER
+        && https_origin(&config.platform_url)
+            .ok()
+            .is_some_and(|origin| origin.origin().ascii_serialization() == DEFAULT_PLATFORM_URL)
+}
+
+fn effective_remote_origins(config: &Config) -> Vec<Url> {
+    let mut result: Vec<Url> = Vec::new();
+    let built_in = std::iter::once(DEFAULT_MEMBER_ORIGIN).filter(|_| uses_builtin_network(config));
+    for raw in std::iter::once(config.platform_url.as_str())
+        .chain(config.remote_origins.iter().map(String::as_str))
+        .chain(built_in)
+    {
+        if let Ok(origin) = https_origin(raw)
+            && !result
+                .iter()
+                .any(|existing| existing.origin() == origin.origin())
+        {
+            result.push(origin);
         }
     }
     result
+}
+
+fn reported_remote_origins(config: &Config) -> Vec<String> {
+    effective_remote_origins(config)
+        .iter()
+        .map(|origin| origin.origin().ascii_serialization())
+        .collect()
 }
 
 fn validate(config: &Config) -> Result<(), String> {
@@ -1336,6 +1352,96 @@ mod tests {
     #[test]
     fn defaults_validate() {
         validate(&Config::default()).unwrap()
+    }
+
+    #[test]
+    fn built_in_routes_remain_disabled_until_credentials_and_remote_access_are_enabled() {
+        let mut config = Config::default();
+        assert_eq!(config.platform_url, DEFAULT_PLATFORM_URL);
+        assert_eq!(config.broker, DEFAULT_BROKER);
+        assert!(!config.enabled && !config.remote_enabled);
+        assert!(config.username.is_empty() && config.password.is_empty());
+        assert!(config.remote_origins.is_empty());
+        assert_eq!(
+            reported_remote_origins(&config),
+            vec![DEFAULT_PLATFORM_URL, DEFAULT_MEMBER_ORIGIN]
+        );
+
+        let command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "member-default".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://a.ericsfj.com:16001/api/remote/device/member-default".into(),
+            token: "a".repeat(64),
+            target_service: "router_web".into(),
+            target_port: 80,
+            target_ports: vec![],
+            ttl_seconds: 900,
+        };
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "remote_disabled"
+        );
+        config.enabled = true;
+        config.remote_enabled = true;
+        validate_remote(&config, &command).unwrap();
+
+        config.broker = "wss://custom.example/mqtt".into();
+        assert!(validate_remote(&config, &command).is_err());
+        assert_eq!(reported_remote_origins(&config), vec![DEFAULT_PLATFORM_URL]);
+        config.remote_origins = vec![DEFAULT_MEMBER_ORIGIN.into()];
+        validate_remote(&config, &command).unwrap();
+        config.remote_origins.clear();
+        config.broker = DEFAULT_BROKER.into();
+        config.platform_url = "https://custom.example".into();
+        assert!(validate_remote(&config, &command).is_err());
+        assert_eq!(
+            reported_remote_origins(&config),
+            vec!["https://custom.example"]
+        );
+    }
+
+    #[test]
+    fn existing_custom_cloud_config_is_not_replaced_by_built_in_defaults() {
+        let config: Config = serde_json::from_str(
+            r#"{"enabled":false,"platform_url":"https://custom.example","broker":"wss://custom.example/mqtt","remote_origins":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.platform_url, "https://custom.example");
+        assert_eq!(config.broker, "wss://custom.example/mqtt");
+        assert!(config.remote_origins.is_empty());
+        assert_eq!(
+            reported_remote_origins(&config),
+            vec!["https://custom.example"]
+        );
+        validate(&config).unwrap();
+    }
+
+    #[test]
+    fn cloud_load_prefills_new_device_but_preserves_saved_custom_file_and_ui_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-cloud-defaults-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let fresh = Cloud::load(&dir);
+        let fresh_view = fresh.public_config();
+        assert_eq!(fresh_view["config"]["platform_url"], DEFAULT_PLATFORM_URL);
+        assert_eq!(fresh_view["config"]["broker"], DEFAULT_BROKER);
+        assert_eq!(fresh_view["config"]["enabled"], false);
+        assert_eq!(fresh_view["password_configured"], false);
+        assert!(!dir.join("cloud.json").exists());
+
+        let saved = br#"{"enabled":false,"platform_url":"https://custom.example","broker":"wss://custom.example/mqtt","remote_origins":[]}"#;
+        fs::write(dir.join("cloud.json"), saved).unwrap();
+        let existing = Cloud::load(&dir);
+        let view = existing.public_config();
+        assert_eq!(view["config"]["platform_url"], "https://custom.example");
+        assert_eq!(view["config"]["broker"], "wss://custom.example/mqtt");
+        assert_eq!(view["config"]["remote_origins"], json!([]));
+        assert_eq!(fs::read(dir.join("cloud.json")).unwrap(), saved);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

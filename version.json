@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.19",
+    "version": "0.10.20",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 NMS 按需远程面板只读状态流，不开放设备本地 UFI 或 datad 管理端口"
+    "notes": "默认预填免费 NMS/MQTT 地址，并在默认线路下内置会员远程来源；保留已有自定义云端配置"
   }
 }
