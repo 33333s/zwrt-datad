@@ -102,6 +102,14 @@ fn boolean(params: &Value, name: &str) -> Result<bool, String> {
         _ => Err(format!("{name} must be boolean or 0/1")),
     }
 }
+fn response_integer(value: &Value, name: &str) -> Option<i64> {
+    match value.get(name) {
+        Some(Value::Number(value)) => value.as_i64(),
+        Some(Value::String(value)) => value.parse().ok(),
+        Some(Value::Bool(value)) => Some(i64::from(*value)),
+        _ => None,
+    }
+}
 fn mapped(params: &Value, specs: &[(&str, &str, bool, bool)]) -> Result<Value, String> {
     let mut args = Map::new();
     for (input, output, required, is_int) in specs {
@@ -664,23 +672,56 @@ async fn direct_supply(params: &Value) -> Outcome {
     )
 }
 async fn nfc(params: &Value) -> Outcome {
-    let args = match mapped(
-        params,
-        &[
-            ("enabled", "switch", true, true),
-            ("flag", "flag", false, true),
-        ],
-    ) {
-        Ok(v) => v,
-        Err(e) => return Outcome::Invalid(e),
+    let enabled = match boolean(params, "enabled") {
+        Ok(value) => value,
+        Err(error) => return Outcome::Invalid(error),
     };
-    match state::ubus("zwrt_nfc", "zwrt_nfc_wifi_set", args).await {
-        Ok(value) => {
-            let _ = state::ubus("zwrt_nfc", "zwrt_nfc_wifi_change", json!({})).await;
-            Outcome::Ok(value)
-        }
-        Err(e) => Outcome::Failed(e),
+    let requested_flag = match integer(params, "flag", false) {
+        Ok(value) => value,
+        Err(error) => return Outcome::Invalid(error),
+    };
+    if requested_flag.is_some_and(|flag| !(1..=6).contains(&flag)) {
+        return Outcome::Invalid("flag must be between 1 and 6".into());
     }
+    let before = match state::ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await {
+        Ok(value) => value,
+        Err(error) => return Outcome::Failed(error),
+    };
+    let previous_switch = response_integer(&before, "switch").unwrap_or_default();
+    let previous_flag = response_integer(&before, "flag");
+    let current_flag = previous_flag
+        .filter(|flag| (1..=6).contains(flag))
+        .unwrap_or(2);
+    let flag = requested_flag.unwrap_or(current_flag);
+    let wanted = i64::from(enabled);
+    let changed = previous_switch != wanted || previous_flag != Some(flag);
+    if changed
+        && let Err(error) = state::ubus(
+            "zwrt_nfc",
+            "zwrt_nfc_wifi_set",
+            json!({"switch":wanted,"flag":flag}),
+        )
+        .await
+    {
+        return Outcome::Failed(error);
+    }
+    for _ in 0..5 {
+        if let Ok(value) = state::ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await
+            && response_integer(&value, "switch") == Some(wanted)
+            && response_integer(&value, "flag") == Some(flag)
+        {
+            return Outcome::Ok(json!({
+                "supported":true,
+                "enabled":enabled,
+                "switch":wanted,
+                "flag":flag,
+                "changed":changed,
+                "verified":true
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Outcome::Failed("NFC readback did not confirm the requested state".into())
 }
 async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
     let mut effective = params.clone();

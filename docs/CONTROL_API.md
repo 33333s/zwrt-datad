@@ -128,7 +128,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `usb.set` | `mode/port_switch/network_protocol` |
 | `sleep.status` | 无 |
 | `sleep.set` | `seconds` |
-| `nfc.set` | `enabled`, `flag?` |
+| `nfc.set` | `enabled`（布尔或 0/1），`flag?`（1–6；省略时保留原厂当前 NFC Wi-Fi 目标，无法读取时回退 2） |
 
 `usb.status` 保留原有 `result.typec`、`result.usb` 厂商字段，新增 `result.link`，内容等同于 `GET /usb/status` 与 `/state.usb`。仅查询握手速率推荐直接使用只读 `GET /usb/status`，不依赖厂商 UBus 查询成功。
 

@@ -325,6 +325,8 @@ impl Cloud {
         config.password = input.password;
         config.enabled = true;
         config.remote_enabled = true;
+        config.remote_panel_control_enabled = false;
+        config.remote_webshell_enabled = false;
         self.update(Update {
             config,
             clear_password: false,
@@ -703,21 +705,10 @@ async fn report(
         system_telemetry(&state),
     )
     .await?;
-    let addresses = |family: &str| -> Vec<Value> {
-        state
-            .pointer(&format!("/net/interfaces/{family}/{family}"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.get("address").and_then(Value::as_str))
-            .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
-            .map(|address| json!(address))
-            .collect()
-    };
     publish(
         client,
         format!("{}/telemetry/network", root(config)),
-        json!({"upstream":{"ipv4":addresses("ipv4"),"ipv6":addresses("ipv6")}}),
+        json!({"upstream":{"ipv4":upstream_addresses(&state,"wan4","ipv4"),"ipv6":upstream_addresses(&state,"wan6","ipv6")},"cell":serving_cell(&state)}),
     )
     .await?;
     let mut guard = status.lock().unwrap();
@@ -744,6 +735,63 @@ fn envelope(mut payload: Value) -> Value {
         object.insert("timestamp".into(), json!(now()));
     }
     payload
+}
+
+/// WAN addresses from `/state.interfaces.wan4|wan6.<family>` (ubus
+/// `network.interface.*` `ipv4-address`/`ipv6-address` entries). Only valid
+/// addresses of the requested family are reported, capped like the panel view.
+fn upstream_addresses(state: &Value, interface: &str, family: &str) -> Vec<Value> {
+    state
+        .pointer(&format!("/interfaces/{interface}/{family}"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let address: std::net::IpAddr = entry.get("address")?.as_str()?.parse().ok()?;
+            (address.is_ipv4() == (family == "ipv4")).then(|| json!(address.to_string()))
+        })
+        .take(4)
+        .collect()
+}
+
+/// Serving-cell identity for NMS cell-based positioning. Zero-valued OEM
+/// fields are omitted instead of being sent as a misleading location. A modem
+/// can retain a prior cell value after a RAT switch, so consumers must also
+/// inspect the reported RAT and timestamp. MNC is the exception: 0 is a real
+/// network code (for example 460-00), so it follows a known MCC.
+fn serving_cell(state: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(rat) = state
+        .pointer("/net/type")
+        .and_then(Value::as_str)
+        .filter(|rat| !rat.is_empty())
+    {
+        out.insert("rat".into(), json!(rat));
+    }
+    let net_i64 = |key: &str| {
+        state
+            .pointer(&format!("/net/{key}"))
+            .and_then(Value::as_i64)
+    };
+    if let Some(mcc) = net_i64("mcc").filter(|mcc| *mcc > 0) {
+        out.insert("mcc".into(), json!(mcc));
+        if let Some(mnc) = net_i64("mnc").filter(|mnc| *mnc >= 0) {
+            out.insert("mnc".into(), json!(mnc));
+        }
+    }
+    for key in [
+        "lte_tac",
+        "lte_cell_id",
+        "lte_pci",
+        "nr_tac",
+        "nr_cell_id",
+        "nr_pci",
+    ] {
+        if let Some(value) = net_i64(key).filter(|value| *value > 0) {
+            out.insert(key.into(), json!(value));
+        }
+    }
+    Value::Object(out)
 }
 
 fn system_telemetry(state: &Value) -> Value {
@@ -1370,6 +1418,8 @@ mod tests {
         let mut cloud = Cloud::load(&dir);
         cloud.config.broker = "wss://legacy.example/mqtt".into();
         cloud.config.platform_url = "https://legacy.example".into();
+        cloud.config.remote_panel_control_enabled = true;
+        cloud.config.remote_webshell_enabled = true;
         let public = cloud
             .quick_connect(
                 QuickConnect {
@@ -1388,6 +1438,7 @@ mod tests {
         );
         assert_eq!(public["config"]["remote_enabled"], true);
         assert_eq!(public["config"]["remote_panel_control_enabled"], false);
+        assert_eq!(public["config"]["remote_webshell_enabled"], false);
         assert_eq!(public["password_configured"], true);
         assert!(!public.to_string().contains("sample-secret"));
         assert!(
@@ -1922,6 +1973,42 @@ mod tests {
         assert_eq!(value["cpu"]["usage_percent"].as_f64(), Some(23.0));
         assert_eq!(value["memory"]["usage_percent"].as_f64(), Some(42.0));
         assert_eq!(value["temperature"]["cpu_celsius"].as_f64(), Some(51.0));
+    }
+
+    #[test]
+    fn network_telemetry_reads_wan_addresses_from_state_interfaces() {
+        let state = json!({
+            "interfaces":{
+                "wan4":{"ipv4":[{"address":"10.20.30.40","mask":8},{"address":"not-an-ip"},{"address":"2001:db8::1"}]},
+                "wan6":{"ipv6":[{"address":"2001:db8::7","mask":64},{"address":"10.0.0.1"}]},
+                "lan":{"ipv4":[{"address":"192.168.0.1","mask":24}]}
+            },
+            "net":{"interfaces":{"ipv4":{"ipv4":[{"address":"203.0.113.9"}]}}}
+        });
+        assert_eq!(
+            upstream_addresses(&state, "wan4", "ipv4"),
+            vec![json!("10.20.30.40")]
+        );
+        assert_eq!(
+            upstream_addresses(&state, "wan6", "ipv6"),
+            vec![json!("2001:db8::7")]
+        );
+        assert!(upstream_addresses(&json!({}), "wan4", "ipv4").is_empty());
+    }
+
+    #[test]
+    fn network_telemetry_reports_only_known_serving_cell_identity() {
+        let value = serving_cell(&json!({
+            "net":{"type":"ENDC","mcc":460,"mnc":0,"lte_tac":40302,"lte_cell_id":23621663,
+                "lte_pci":123,"nr_tac":0,"nr_cell_id":0,"nr_pci":321,"imsi":"do-not-upload"}
+        }));
+        assert_eq!(
+            value,
+            json!({"rat":"ENDC","mcc":460,"mnc":0,"lte_tac":40302,"lte_cell_id":23621663,"lte_pci":123,"nr_pci":321})
+        );
+        assert_eq!(serving_cell(&json!({})), json!({}));
+        // Without a registered PLMN an MNC of 0 is only the collector default.
+        assert_eq!(serving_cell(&json!({"net":{"mcc":0,"mnc":0}})), json!({}));
     }
 
     #[test]
