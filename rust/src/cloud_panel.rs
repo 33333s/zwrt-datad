@@ -10,7 +10,7 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 use tokio::sync::watch;
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
@@ -49,6 +49,43 @@ const EXPOSED_BLOCKS: &[&str] = &[
     "sample_interval_ms",
 ];
 
+fn reviewed_device_info(source: &Value) -> Value {
+    let mut out = Map::new();
+    for key in [
+        "iccid",
+        "imei",
+        "imsi",
+        "msisdn",
+        "mac_address",
+        "modem_msn",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_str)
+            && !value.is_empty()
+            && value.len() <= 128
+            && !value.chars().any(char::is_control)
+        {
+            out.insert(key.into(), json!(value));
+        }
+    }
+    Value::Object(out)
+}
+
+fn reviewed_interface_addresses(source: &Value, interface: &str, family: &str) -> Vec<Value> {
+    source
+        .get(interface)
+        .and_then(|value| value.get(family))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let address: IpAddr = entry.get("address")?.as_str()?.parse().ok()?;
+            (address.is_ipv4() == (family == "ipv4"))
+                .then(|| json!({"address":address.to_string()}))
+        })
+        .take(4)
+        .collect()
+}
+
 fn panel_snapshot(snapshot: &Snapshot) -> Value {
     let mut view = Map::new();
     view.insert("ts".into(), json!(snapshot.ts));
@@ -57,6 +94,18 @@ fn panel_snapshot(snapshot: &Snapshot) -> Value {
         if let Some(value) = snapshot.fields.get(*name) {
             view.insert((*name).to_owned(), value.clone());
         }
+    }
+    if let Some(source) = snapshot.fields.get("uci_device_info") {
+        view.insert("uci_device_info".into(), reviewed_device_info(source));
+    }
+    if let Some(source) = snapshot.fields.get("interfaces") {
+        view.insert(
+            "interfaces".into(),
+            json!({
+                "wan4":{"ipv4":reviewed_interface_addresses(source,"wan4","ipv4")},
+                "wan6":{"ipv6":reviewed_interface_addresses(source,"wan6","ipv6")}
+            }),
+        );
     }
     Value::Object(view)
 }
@@ -482,7 +531,16 @@ mod tests {
         fields.insert("future_secret".into(), json!({"token":"must-not-leak"}));
         fields.insert(
             "interfaces".into(),
-            json!({"cellular":{"password":"must-not-leak"}}),
+            json!({"wan4":{"ipv4":[{"address":"198.51.100.7","token":"must-not-leak"}]},
+                "wan6":{"ipv6":[{"address":"2001:db8::7"},{"address":"not-an-ip"}]},
+                "cellular":{"password":"must-not-leak"}}),
+        );
+        fields.insert(
+            "uci_device_info".into(),
+            json!({
+                "mac_address":"aa:bb:cc:dd:ee:ff", "modem_msn":"fixture-msn",
+                "password":"must-not-leak", "oversized":"x".repeat(200)
+            }),
         );
         let snapshot = Snapshot {
             ts: 7,
@@ -496,7 +554,35 @@ mod tests {
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["snapshot"]["net"]["type"], "SA");
         assert!(parsed["snapshot"].get("future_secret").is_none());
-        assert!(parsed["snapshot"].get("interfaces").is_none());
+        assert_eq!(
+            parsed["snapshot"]["uci_device_info"]["mac_address"],
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
+            parsed["snapshot"]["uci_device_info"]["modem_msn"],
+            "fixture-msn"
+        );
+        assert!(
+            parsed["snapshot"]["uci_device_info"]
+                .get("password")
+                .is_none()
+        );
+        assert_eq!(
+            parsed["snapshot"]["interfaces"]["wan4"]["ipv4"][0]["address"],
+            "198.51.100.7"
+        );
+        assert_eq!(
+            parsed["snapshot"]["interfaces"]["wan6"]["ipv6"][0]["address"],
+            "2001:db8::7"
+        );
+        assert_eq!(
+            parsed["snapshot"]["interfaces"]["wan6"]["ipv6"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!raw.contains("must-not-leak"));
         assert_eq!(parsed["protocol_version"], 1);
     }
 
