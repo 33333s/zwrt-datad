@@ -17,6 +17,8 @@ mod server;
 mod sms;
 mod state;
 mod u50;
+mod u50_oem;
+mod u50_oem_ids;
 mod usb;
 mod webshell;
 mod wifi;
@@ -43,6 +45,9 @@ struct Args {
     /// Explicit read-only candidate for original-firmware U50 devices.
     #[arg(long, value_parser = ["u50pro", "u50s"])]
     u50_model: Option<String>,
+    /// Enable authenticated OEM write compatibility on the loopback U50S server.
+    #[arg(long)]
+    u50_enable_writes: bool,
     #[arg(long, default_value = "http://127.0.0.1/goform/goform_get_cmd_process")]
     u50_goform_url: String,
     /// Print USB sysfs link status without starting services or changing device state.
@@ -91,6 +96,10 @@ async fn main() -> Result<()> {
         }
     }
     let args = Args::parse();
+    anyhow::ensure!(
+        args.u50_model.is_some() || !args.u50_enable_writes,
+        "--u50-enable-writes requires --u50-model u50s"
+    );
     #[cfg(target_arch = "arm")]
     anyhow::ensure!(
         args.u50_model.is_some(),
@@ -108,6 +117,7 @@ async fn main() -> Result<()> {
             bind,
             args.once,
             Duration::from_millis(args.interval.clamp(500, 5000)),
+            args.u50_enable_writes,
         )
         .await;
     }

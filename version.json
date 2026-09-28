@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.19",
+    "version": "0.10.20",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：原厂 cfg 网络状态回退"
+    "notes": "ARM32 U50S 候选版：扩展状态与受控原厂接口桥"
   }
 }
