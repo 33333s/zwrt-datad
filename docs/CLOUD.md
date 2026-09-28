@@ -59,6 +59,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 只有已授权的 `datad_panel` / `datad_panel_control` 按需会话接收 `traffic_history:[{date,bytes}]`；常规 MQTT 遥测、本地 `/state` 与 SSE 不含历史文件内容。该数组只含日期和上下行总字节，不含原始 UCI、IP、SIM 标识或每秒速率。NMS 再对日期、顺序、长度和字节范围校验，浏览器只在打开原版“流量历史”弹窗时按日期筛选显示。
 
+从 0.10.27 起，`reboot_schedule` 状态块只随本地 `/state`/SSE 与已授权的按需面板会话发送，不进入常规 MQTT。`schedule.reboot.set` 在 v2 面板要求 `confirmed=true`，每日时间按设备本地时钟和时区解释；datad 将当天的触发日期以 0600 文件持久化后才调用已有 `device.reboot`，同一天至多触发一次。默认关闭；检测到原厂周/间隔日计划重启已启用时，拒绝启用 datad 的每日计划，避免两套计划重复重启。无效配置或设备时间不可用时不触发。
+
 云端连接且 `remote_enabled` 开启时，datad 报告 `datad.panel` 能力。NMS 可用现有 `remote.open` 命令建立 `target_service: "datad_panel"`、`target_port: 0` 的独立 WSS 会话，最长一小时，不占用 9460/9461 TCP 管理端口，也不需要设备本地 UFI 进程。设备必须验证配置的平台/备用 HTTPS 来源、TLS 主机名、一次性会话票据和 `nms-datad-panel-v1` WebSocket 子协议。
 
 连接后设备先发送 `ready`，再以最多每秒一次的 `state` 文本帧发送当前 datad 快照。只允许本模块显式列出的状态块；每帧至多 192 KiB，不上传 datad Bearer Token、云配置或未来新增的未知块。状态只在远程面板会话期间传输，不加入常规 MQTT 遥测或设备历史记录。会话到期、远程开关关闭、配置变化或 WSS 中断即停止。此协议第一阶段只读，设备拒绝浏览器/平台发来的数据帧；后续控制需另行逐项授权和审计。
@@ -83,4 +85,4 @@ APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 
 
 原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。
 
-V2 的状态帧带 `protocol_version:2`，仍只含显式允许的快照块。来自 NMS 的文本控制帧只接受结构化的 `type/control`、32 位十六进制 request_id、已列入 datad 控制动作白名单的 action、JSON 对象 params 和 confirmed 布尔值，最大 8 KiB；每会话最多 128 个不同 request_id，按顺序执行，每个动作最多 20 秒。重启、关机、断网、锁频锁小区、SIM/Wi-Fi/LAN/DNS/供电/休眠/聚合变更、流量计数及限制、客户端解禁、QoS 日志清理、短信发送删除等动作要求 confirmed=true。结果只包含成功布尔值或有限错误码，不回传原厂响应或可能含密钥的原始内容。NMS 必须在每个动作前验证当前设备 Owner/管理员权限、CSRF 与会话有效性，记录不含秘密参数的审计；设备本身不会从浏览器直接接收控制帧。
+V2 的状态帧带 `protocol_version:2`，仍只含显式允许的快照块。来自 NMS 的文本控制帧只接受结构化的 `type/control`、32 位十六进制 request_id、已列入 datad 控制动作白名单的 action、JSON 对象 params 和 confirmed 布尔值，最大 8 KiB；每会话最多 128 个不同 request_id，按顺序执行，每个动作最多 20 秒。重启、每日定时重启、关机、断网、锁频锁小区、SIM/Wi-Fi/LAN/DNS/供电/休眠/聚合变更、流量计数及限制、客户端解禁、QoS 日志清理、短信发送删除等动作要求 confirmed=true。结果只包含成功布尔值或有限错误码，不回传原厂响应或可能含密钥的原始内容。NMS 必须在每个动作前验证当前设备 Owner/管理员权限、CSRF 与会话有效性，记录不含秘密参数的审计；设备本身不会从浏览器直接接收控制帧。

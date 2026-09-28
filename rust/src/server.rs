@@ -4,6 +4,7 @@ use crate::{
     model::{DatadVersion, Snapshot, UbusCall},
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
+    reboot_schedule::{self, Schedule},
     state,
     traffic_history::{History, Usage},
     webshell::WebShell,
@@ -59,6 +60,7 @@ pub(crate) struct Inner {
     webshell: WebShell,
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
+    schedule: Arc<Mutex<Schedule>>,
 }
 
 struct DeviceSession {
@@ -73,6 +75,10 @@ impl App {
 
     pub(crate) fn cloud_panel_history(&self) -> watch::Receiver<Vec<Usage>> {
         self.inner.history_tx.subscribe()
+    }
+
+    pub(crate) fn cloud_panel_schedule(&self) -> Arc<Mutex<Schedule>> {
+        self.inner.schedule.clone()
     }
 
     pub(crate) fn cloud_webshell_available(&self) -> bool {
@@ -109,6 +115,14 @@ impl App {
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
             .await;
         initial.fields.insert("neighbor".into(), neighbor.status());
+        let mut schedule = Schedule::load(&data_dir);
+        schedule.set_environment(
+            reboot_schedule::local_clock(),
+            reboot_schedule::oem_conflict().await,
+        );
+        initial
+            .fields
+            .insert("reboot_schedule".into(), schedule.status());
         let mut history = History::load(&data_dir);
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
@@ -130,6 +144,7 @@ impl App {
                 webshell: WebShell::new(webshell_enabled),
                 history: Mutex::new(history),
                 history_tx,
+                schedule: Arc::new(Mutex::new(schedule)),
             }),
         };
         app.inner
@@ -153,6 +168,28 @@ impl App {
                 ))
                 .await;
                 app.refresh_snapshot().await;
+            }
+        });
+    }
+    pub fn spawn_reboot_schedule(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(10));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let clock = reboot_schedule::local_clock();
+                let conflict = reboot_schedule::oem_conflict().await;
+                let due = app.inner.schedule.lock().await.observe(clock, conflict);
+                if due
+                    && !matches!(
+                        crate::control::execute("device.reboot", &json!({})).await,
+                        crate::control::Outcome::Ok(_)
+                    )
+                {
+                    app.inner.schedule.lock().await.reboot_failed();
+                }
             }
         });
     }
@@ -191,6 +228,10 @@ impl App {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        next.fields.insert(
+            "reboot_schedule".into(),
+            self.inner.schedule.lock().await.status(),
+        );
         let mut history = self.inner.history.lock().await;
         if history.record(&next) {
             self.inner.history_tx.send_replace(history.days());
@@ -822,6 +863,31 @@ async fn control(
         };
         return match app.inner.neighbor.lock().await.set_enabled(enabled).await {Ok(value)=>(StatusCode::OK,Json(json!({"ok":true,"action":action,"result":value}))).into_response(),Err(error)=>(StatusCode::BAD_GATEWAY,Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}}))).into_response()};
     }
+    if action == "schedule.reboot.set" {
+        let params = body.get("params").and_then(Value::as_object);
+        if params.is_none_or(|params| params.len() != 2) {
+            return invalid_parameter(action, "enabled and time are the only accepted fields");
+        }
+        let enabled = params
+            .and_then(|params| params.get("enabled"))
+            .and_then(Value::as_bool);
+        let time = params
+            .and_then(|params| params.get("time"))
+            .and_then(Value::as_str);
+        let (Some(enabled), Some(time)) = (enabled, time) else {
+            return invalid_parameter(action, "enabled must be boolean and time must be HH:MM");
+        };
+        let conflict = reboot_schedule::oem_conflict().await;
+        let result = app.inner.schedule.lock().await.set(enabled, time, conflict);
+        return match result {
+            Ok(value) => {
+                let refresh = app.clone();
+                tokio::spawn(async move { refresh.refresh_snapshot().await });
+                control_ok(action, value)
+            }
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1263,8 +1329,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 79);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 79);
+        assert_eq!(controls.len(), 80);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 80);
     }
 
     #[test]

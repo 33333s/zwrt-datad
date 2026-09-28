@@ -5,6 +5,7 @@ use crate::{
     control::{self, Outcome},
     cooling,
     model::Snapshot,
+    reboot_schedule::{self, Schedule},
     state,
     traffic_history::Usage,
     wifi,
@@ -12,8 +13,8 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::{collections::HashSet, net::IpAddr, time::Duration};
-use tokio::sync::watch;
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, watch};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
     tungstenite::{
@@ -26,6 +27,7 @@ pub(crate) const CONTROL_PROTOCOL: &str = "nms-datad-panel-v2";
 pub(crate) struct PanelFeeds {
     pub state: watch::Receiver<Snapshot>,
     pub history: watch::Receiver<Vec<Usage>>,
+    pub schedule: Option<Arc<Mutex<Schedule>>>,
 }
 const MAX_STATE_BYTES: usize = 192 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024;
@@ -51,6 +53,7 @@ const EXPOSED_BLOCKS: &[&str] = &[
     "usb",
     "runtime",
     "qos",
+    "reboot_schedule",
     "clients",
     "sample_interval_ms",
 ];
@@ -350,6 +353,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "client.block"
             | "client.unblock"
             | "qos.clear"
+            | "schedule.reboot.set"
     )
 }
 
@@ -376,7 +380,10 @@ fn valid_remote_band_list(action: &str, params: &Value) -> bool {
         })
 }
 
-async fn control_result(request: ControlRequest) -> Message {
+async fn control_result(
+    request: ControlRequest,
+    schedule: Option<&Arc<Mutex<Schedule>>>,
+) -> Message {
     let code =
         if request.action == "usb.set" || !control::ACTIONS.contains(&request.action.as_str()) {
             Some("unsupported_action")
@@ -384,6 +391,27 @@ async fn control_result(request: ControlRequest) -> Message {
             Some("confirmation_required")
         } else if !valid_remote_band_list(&request.action, &request.params) {
             Some("invalid_parameter")
+        } else if request.action == "schedule.reboot.set" {
+            let params = request
+                .params
+                .as_object()
+                .filter(|params| params.len() == 2);
+            let enabled = params
+                .and_then(|params| params.get("enabled"))
+                .and_then(Value::as_bool);
+            let time = params
+                .and_then(|params| params.get("time"))
+                .and_then(Value::as_str);
+            match (schedule, enabled, time) {
+                (Some(schedule), Some(enabled), Some(time)) => {
+                    let conflict = reboot_schedule::oem_conflict().await;
+                    match schedule.lock().await.set(enabled, time, conflict) {
+                        Ok(_) => None,
+                        Err(_) => Some("invalid_parameter"),
+                    }
+                }
+                _ => Some("invalid_parameter"),
+            }
         } else {
             match tokio::time::timeout(
                 Duration::from_secs(20),
@@ -417,6 +445,7 @@ pub(crate) async fn run(
     let PanelFeeds {
         state: state_rx,
         history: mut history_rx,
+        schedule,
     } = feeds;
     if *shutdown.borrow() || ttl.is_zero() {
         return;
@@ -547,7 +576,7 @@ pub(crate) async fn run(
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
-                    if socket.send(control_result(request).await).await.is_err() { return; }
+                    if socket.send(control_result(request, schedule.as_ref()).await).await.is_err() { return; }
                     if refresh_wifi || refresh_apn || refresh_cooling {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
@@ -572,6 +601,10 @@ mod tests {
     fn only_reviewed_state_blocks_leave_the_device() {
         let mut fields = Map::new();
         fields.insert("net".into(), json!({"type":"SA"}));
+        fields.insert(
+            "reboot_schedule".into(),
+            json!({"supported":true,"enabled":false,"time":"02:03"}),
+        );
         fields.insert("future_secret".into(), json!({"token":"must-not-leak"}));
         fields.insert(
             "interfaces".into(),
@@ -595,6 +628,10 @@ mod tests {
         let Message::Text(raw) = message else {
             panic!("expected a text frame")
         };
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["snapshot"]["reboot_schedule"]["time"],
+            "02:03"
+        );
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["snapshot"]["net"]["type"], "SA");
         assert!(parsed["snapshot"].get("future_secret").is_none());
@@ -732,7 +769,7 @@ mod tests {
             "band.set_nr_sa",
             &json!({"bands":"28,78"})
         ));
-        let Message::Text(reply) = control_result(request).await else {
+        let Message::Text(reply) = control_result(request, None).await else {
             panic!("expected a text result")
         };
         let reply: Value = serde_json::from_str(&reply).unwrap();
@@ -750,7 +787,7 @@ mod tests {
             assert!(parse_control(&invalid).is_none());
         }
         let unsupported = allowed.replace("device.reboot", "ubus.call");
-        let Message::Text(reply) = control_result(parse_control(&unsupported).unwrap()).await
+        let Message::Text(reply) = control_result(parse_control(&unsupported).unwrap(), None).await
         else {
             panic!("expected an unsupported-action result")
         };
@@ -759,7 +796,7 @@ mod tests {
             "unsupported_action"
         );
         let skipped_adb = allowed.replace("device.reboot", "usb.set");
-        let Message::Text(reply) = control_result(parse_control(&skipped_adb).unwrap()).await
+        let Message::Text(reply) = control_result(parse_control(&skipped_adb).unwrap(), None).await
         else {
             panic!("expected USB mode to be excluded from the remote panel")
         };
@@ -767,6 +804,41 @@ mod tests {
             serde_json::from_str::<Value>(&reply).unwrap()["code"],
             "unsupported_action"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_reboot_schedule_requires_confirmation_and_saves_disabled_plan() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-panel-schedule-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let manager = Arc::new(Mutex::new(Schedule::load(&dir)));
+        let raw = json!({"type":"control","protocol_version":2,"request_id":"a".repeat(32),
+            "action":"schedule.reboot.set","params":{"enabled":false,"time":"02:03"},"confirmed":false}).to_string();
+        let rejected = control_result(parse_control(&raw).unwrap(), Some(&manager)).await;
+        let Message::Text(rejected) = rejected else {
+            panic!("expected a text result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected).unwrap()["code"],
+            "confirmation_required"
+        );
+        assert!(!dir.join("reboot-schedule.json").exists());
+        let accepted = control_result(
+            parse_control(&raw.replace("\"confirmed\":false", "\"confirmed\":true")).unwrap(),
+            Some(&manager),
+        )
+        .await;
+        let Message::Text(accepted) = accepted else {
+            panic!("expected a text result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&accepted).unwrap()["ok"],
+            true
+        );
+        assert_eq!(manager.lock().await.status()["time"], "02:03");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -814,6 +886,7 @@ mod tests {
                 PanelFeeds {
                     state: receiver,
                     history: history_receiver,
+                    schedule: None,
                 },
                 false,
                 &config,
@@ -900,6 +973,7 @@ mod tests {
                 PanelFeeds {
                     state: receiver,
                     history: history_receiver,
+                    schedule: None,
                 },
                 true,
                 &config,
