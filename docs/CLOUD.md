@@ -61,6 +61,8 @@ APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 
 
 风扇、液冷的启停、模式及曲线写入可能改变散热行为，云端 v2 均要求显式确认；设备端原有温度上限保护和曲线参数校验保持有效。
 
+散热设备存在时，面板会话按需读取当前风扇/液冷模式与 datad 有效保存的风扇曲线 `cooling_config`；无散热设备不提供该块。NMS 只接收 20–80℃、PWM 0–255、温度递增且 PWM 不下降的 2–8 个控制点。该配置不进入普通 MQTT 遥测。
+
 ## 可选面板控制通道（0.10.21）
 
 原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。

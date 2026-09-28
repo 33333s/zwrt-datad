@@ -115,6 +115,18 @@ async fn load() -> Config {
         .collect();
     c
 }
+fn panel_value(c: &Config) -> Value {
+    json!({
+        "fan_mode":if c.fan_always{"always_on"}else if c.fan_mode==1{"automatic"}else{"custom"},
+        "fan_always_on":c.fan_always,
+        "fan_curve":c.curve.iter().map(|(temperature,pwm)|json!({"temperature":temperature,"pwm":pwm})).collect::<Vec<_>>(),
+        "liquid_mode":if !c.liquid_always{"automatic"}else if c.liquid_level==2{"high"}else{"low"}
+    })
+}
+pub async fn panel_config() -> Option<Value> {
+    zone_path()?;
+    Some(panel_value(&load().await))
+}
 async fn save(c: &Config) -> Result<(), String> {
     let path = env("ZWRT_DATAD_COOLING_CONFIG", "/data/zwrt-datad/cooling.conf");
     if let Some(p) = path.parent() {
@@ -616,6 +628,14 @@ pub async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn panel_config_uses_effective_curve_defaults() {
+        let value = panel_value(&Config::default());
+        assert_eq!(value["fan_mode"], "custom");
+        assert_eq!(value["fan_curve"].as_array().unwrap().len(), 5);
+        assert_eq!(value["fan_curve"][4]["temperature"], 70);
+        assert_eq!(value["fan_curve"][4]["pwm"], 255);
+    }
 
     #[tokio::test]
     async fn driver_write_is_complete_before_immediate_readback() {

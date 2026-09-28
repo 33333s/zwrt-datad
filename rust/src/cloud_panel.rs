@@ -3,6 +3,7 @@
 use crate::{
     cloud::{Config, websocket_tls},
     control::{self, Outcome},
+    cooling,
     model::Snapshot,
     state, wifi,
 };
@@ -65,7 +66,7 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
 }
 
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
-    state_message_with_config(snapshot, version, None, None)
+    state_message_with_config(snapshot, version, None, None, None)
 }
 
 fn state_message_with_config(
@@ -73,6 +74,7 @@ fn state_message_with_config(
     version: u8,
     wifi_config: Option<&Value>,
     apn_config: Option<&Value>,
+    cooling_config: Option<&Value>,
 ) -> Option<Message> {
     let mut view = panel_snapshot(snapshot);
     if let Some(wifi_config) = wifi_config {
@@ -82,6 +84,10 @@ fn state_message_with_config(
     if let Some(apn_config) = apn_config {
         view.as_object_mut()?
             .insert("apn_config".into(), apn_config.clone());
+    }
+    if let Some(cooling_config) = cooling_config {
+        view.as_object_mut()?
+            .insert("cooling_config".into(), cooling_config.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -401,13 +407,16 @@ pub(crate) async fn run(
     }
     // Extra configuration is fetched only while a remote panel is open. It
     // contains reviewed UI fields, never Wi-Fi keys or raw vendor responses.
-    let (wifi_result, apn_result) = tokio::join!(
+    let (wifi_result, apn_result, cooling_result) = tokio::join!(
         tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()),
-        tokio::time::timeout(Duration::from_secs(6), apn_panel_config())
+        tokio::time::timeout(Duration::from_secs(6), apn_panel_config()),
+        tokio::time::timeout(Duration::from_secs(6), cooling::panel_config())
     );
     let mut wifi_config = wifi_result.ok().flatten();
     let mut apn_config = apn_result.ok().flatten();
-    let mut config_pending = wifi_config.is_some() || apn_config.is_some();
+    let mut cooling_config = cooling_result.ok().flatten();
+    let mut config_pending =
+        wifi_config.is_some() || apn_config.is_some() || cooling_config.is_some();
     let mut sample = tokio::time::interval(Duration::from_secs(1));
     sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -422,7 +431,7 @@ pub(crate) async fn run(
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
                 if next != last || config_pending {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref()) else { return; };
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref()) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     config_pending = false;
@@ -442,11 +451,13 @@ pub(crate) async fn run(
                     if used_ids.len() >= MAX_CONTROLS_PER_SESSION || !used_ids.insert(request.request_id.clone()) { return; }
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     let refresh_apn = request.action.starts_with("apn.");
+                    let refresh_cooling = request.action.starts_with("cooling.");
                     if socket.send(control_result(request).await).await.is_err() { return; }
-                    if refresh_wifi || refresh_apn {
+                    if refresh_wifi || refresh_apn || refresh_cooling {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref())
+                        if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref())
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
