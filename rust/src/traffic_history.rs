@@ -9,9 +9,9 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use time::{Date, Month, OffsetDateTime};
 
 const SAMPLE_SECONDS: i64 = 300;
 const MAX_DAYS: usize = 400;
@@ -65,23 +65,43 @@ fn valid_date(value: &str) -> bool {
         return false;
     }
     let (Ok(year), Ok(month), Ok(day)) = (
-        value[0..4].parse(),
+        value[0..4].parse::<u16>(),
         value[5..7].parse::<u8>(),
         value[8..10].parse::<u8>(),
     ) else {
         return false;
     };
-    Month::try_from(month)
-        .ok()
-        .is_some_and(|month| Date::from_calendar_date(year, month, day).is_ok())
+    if year < 2024 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days: [u8; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    (1..=days[usize::from(month - 1)]).contains(&day)
 }
 
-fn local_date() -> String {
-    let date = OffsetDateTime::now_local()
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
-        .date();
-    let (year, month, day) = date.to_calendar_date();
-    format!("{year:04}-{:02}-{day:02}", month as u8)
+fn local_date() -> Option<String> {
+    // A fixed executable and argument follow the router's own local clock and
+    // timezone. Do not silently relabel local traffic as UTC if this fails.
+    let output = Command::new("/bin/date").arg("+%Y-%m-%d").output().ok()?;
+    if !output.status.success() || output.stdout.len() > 32 {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let date = raw.trim();
+    valid_date(date).then(|| date.to_owned())
 }
 
 impl History {
@@ -134,7 +154,16 @@ impl History {
         let Ok(now) = i64::try_from(now.as_secs()) else {
             return false;
         };
-        let changed = self.apply_sample(&local_date(), now, counter);
+        if self.stored.last_sample_at != 0
+            && (now < self.stored.last_sample_at
+                || now - self.stored.last_sample_at < SAMPLE_SECONDS)
+        {
+            return false;
+        }
+        let Some(date) = local_date() else {
+            return false;
+        };
+        let changed = self.apply_sample(&date, now, counter);
         if changed && let Err(error) = self.persist() {
             eprintln!("traffic history save failed: {error}");
         }
@@ -230,6 +259,8 @@ mod tests {
     #[test]
     fn daily_samples_survive_restarts_and_count_counter_resets() {
         assert!(!valid_date("12é-01-01"));
+        assert!(valid_date("2024-02-29"));
+        assert!(!valid_date("2025-02-29"));
         let dir = std::env::temp_dir().join(format!("datad-history-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut history = History::load(&dir);
