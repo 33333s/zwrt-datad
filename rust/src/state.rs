@@ -106,6 +106,21 @@ fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
         .map(String::as_str)
         .unwrap_or_default()
 }
+const LTE_TAC_MAX: i64 = 0xFFFF;
+const NR_TAC_MAX: i64 = 0xFF_FFFF;
+/// Serving-cell tracking area code. The OEM names the LTE/EPS TAC `lac_code`
+/// in `nwinfo_get_netinfo`; NR TAC is only guaranteed in UCI `cell_info`.
+/// Both are decimal. 0 means unknown/not registered on that RAT, and values
+/// outside the 3GPP width are treated as unknown rather than reported.
+fn tracking_area(raw: &Value, live_key: &str, uci_value: &str, max: i64) -> i64 {
+    let live = integer(raw, live_key);
+    let value = if live != 0 {
+        live
+    } else {
+        uci_value.trim().parse::<i64>().unwrap_or_default()
+    };
+    if (1..=max).contains(&value) { value } else { 0 }
+}
 fn blocked_client_macs(sets: &[BTreeMap<String, String>]) -> Vec<String> {
     let mut blocked = BTreeSet::new();
     'sections: for section in ["main_2g", "main_5g", "guest_2g", "guest_5g"] {
@@ -766,6 +781,8 @@ fn topflow_net_fallback(raw: &mut Value, sets: &[BTreeMap<String, String>]) {
         ),
         ("nr5g_pci", "zte_nwinfo.cell_info.nr5g_pci"),
         ("nr5g_cell_id", "zte_nwinfo.cell_info.nr5g_cellid"),
+        ("lac_code", "zte_nwinfo.cell_info.lac_code"),
+        ("nr5g_tac", "zte_nwinfo.cell_info.nr5g_tac"),
         (
             "nr5g_action_channel",
             "zte_nwinfo.cell_info.nr5g_action_channel",
@@ -1206,6 +1223,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let usb = ubus("zwrt_bsp.usb", "list", json!({})).await;
     let battery = ubus("zwrt_bsp.battery", "list", json!({})).await;
     let charger = ubus("zwrt_bsp.charger", "list", json!({})).await;
+    let original_protection = ubus(
+        "zwrt_mc.device.manager",
+        "get_device_info",
+        json!({"deviceInfoList":["hightemp_datalimit_status","bat_mode"]}),
+    )
+    .await;
     let nfc = ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
     let sms = crate::sms::snapshot().await;
     let lan_if = ubus("network.interface.lan", "status", json!({})).await;
@@ -1258,6 +1281,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let battery_ok = battery.is_ok();
     let battery = object(battery);
     let charger = object(charger);
+    let original_protection = object(original_protection);
     let nfc_ok = nfc.is_ok();
     let nfc = object(nfc);
     let lan_if = object(lan_if);
@@ -1369,11 +1393,32 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     ] {
         net.insert(to.into(), json!(integer(&raw_net, from)));
     }
+    let lte_tac = tracking_area(
+        &raw_net,
+        "lac_code",
+        uci_get(&uci_sets, "zte_nwinfo.cell_info.lac_code"),
+        LTE_TAC_MAX,
+    );
+    let nr_tac = tracking_area(
+        &raw_net,
+        "nr5g_tac",
+        uci_get(&uci_sets, "zte_nwinfo.cell_info.nr5g_tac"),
+        NR_TAC_MAX,
+    );
+    net.insert("lte_tac".into(), json!(lte_tac));
+    net.insert("nr_tac".into(), json!(nr_tac));
     net.insert(
         "wan_status".into(),
         json!(string(&router_status, "current_wan_status")),
     );
-    net.insert("HSR".into(), json!(false));
+    let hst_info = uci_get(&uci_sets, "zte_nwinfo.sys_info.hst_info");
+    // HSR is the OEM high-speed-rail mode flag. It does not claim independent
+    // SIB1 or other signaling confirmation.
+    net.insert("HSR".into(), json!(hst_info == "1"));
+    net.insert(
+        "high_speed_rail".into(),
+        json!({"active":hst_info=="1","raw":if hst_info.is_empty(){Value::Null}else{json!(hst_info)}}),
+    );
     let mut tout = Map::new();
     for (to, from) in [
         ("rx_speed", "real_rx_speed"),
@@ -1443,7 +1488,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             .as_object()
             .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
     {
-        fields.insert("battery".into(),json!({"percent":integer(&battery,"battery_capacity"),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer(&battery,"battery_time_to_full"),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now")}));
+        let charge_mode = integer(&original_protection, "bat_mode");
+        fields.insert("battery".into(),json!({"percent":integer(&battery,"battery_capacity"),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer(&battery,"battery_time_to_full"),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now"),"charge_protection":{"active":charge_mode>=2,"mode":charge_mode}}));
     }
     if let Some(mode) = charger
         .get("direct_power_supply_mode")
@@ -1468,11 +1514,21 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             v.contains_key("switch") || v.contains_key("ap") || v.contains_key("wifi_ap")
         })
     {
-        fields.insert("nfc".into(), json!({"switch":integer(&nfc,"switch")}));
+        let nfc_switch = integer(&nfc, "switch");
+        fields.insert(
+            "nfc".into(),
+            json!({"switch":nfc_switch,"enabled":nfc_switch==1,"flag":integer(&nfc,"flag")}),
+        );
     }
+    let high_temp_raw = string(&original_protection, "hightemp_datalimit_status");
+    let high_temp_level = match high_temp_raw.as_str() {
+        "1" => 2,
+        "2" => 3,
+        _ => 0,
+    };
     fields.insert(
         "thermal".into(),
-        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[]}),
+        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[],"protection":{"active":high_temp_level>0,"level":high_temp_level,"speed_limited":high_temp_level==2,"network_restricted":high_temp_level==3,"raw":if high_temp_raw.is_empty(){Value::Null}else{json!(high_temp_raw)}}}),
     );
     fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":interface(&wan4_if),"wan6":interface(&wan6_if),"lan_config":lan_config,"cellular":cellular}));
     const UF: &[(&str, &str)] = &[
@@ -1556,6 +1612,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ),
         ("total_time", "zwrt_data_commit.wwancid1dst.total_time"),
         ("radio_network_type", "zte_nwinfo.sys_info.network_type"),
+        ("high_speed_rail_status", "zte_nwinfo.sys_info.hst_info"),
         ("radio_signalbar", "zte_nwinfo.signal_strength.signalbar"),
         (
             "radio_operator",
@@ -1635,7 +1692,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         modems.push(json!({
             "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
             "ifname":"rmnet_data0","wan_interface":"zte_mwan2",
-            "net":{"type":network_type,"bars":integer(&raw_net,"signalbar"),"roaming":string(&raw_net,"simcard_roam"),"operator":string(&raw_net,"network_provider_fullname"),"band":string(&raw_net,"wan_active_band"),"bandwidth":bandwidth,"nr_rsrp":integer(&raw_net,"nr5g_rsrp"),"nr_rsrq":integer(&raw_net,"nr5g_rsrq"),"nr_snr":string(&raw_net,"nr5g_snr"),"nr_pci":integer(&raw_net,"nr5g_pci"),"nr_cell_id":integer(&raw_net,"nr5g_cell_id"),"nr_channel":integer(&raw_net,"nr5g_action_channel"),"lte_rsrp":integer(&raw_net,"lte_rsrp"),"lte_rsrq":integer(&raw_net,"lte_rsrq"),"lte_pci":integer(&raw_net,"lte_pci"),"cell_id":integer(&raw_net,"cell_id")},
+            "net":{"type":network_type,"bars":integer(&raw_net,"signalbar"),"roaming":string(&raw_net,"simcard_roam"),"operator":string(&raw_net,"network_provider_fullname"),"band":string(&raw_net,"wan_active_band"),"bandwidth":bandwidth,"nr_rsrp":integer(&raw_net,"nr5g_rsrp"),"nr_rsrq":integer(&raw_net,"nr5g_rsrq"),"nr_snr":string(&raw_net,"nr5g_snr"),"nr_pci":integer(&raw_net,"nr5g_pci"),"nr_cell_id":integer(&raw_net,"nr5g_cell_id"),"nr_tac":nr_tac,"nr_channel":integer(&raw_net,"nr5g_action_channel"),"lte_rsrp":integer(&raw_net,"lte_rsrp"),"lte_rsrq":integer(&raw_net,"lte_rsrq"),"lte_pci":integer(&raw_net,"lte_pci"),"cell_id":integer(&raw_net,"cell_id"),"lte_tac":lte_tac},
             "sim":{"state":string(&sim,"sim_states"),"slot":integer(&sim,"current_sim_slot"),"iccid":string(&sim,"sim_iccid"),"imsi":imsi,"msisdn":msisdn,"imei":string(&imei,"imei")},
             "wwan":{"status":string(&cellular,"connect_status"),"ipv4_ifname":string(&cellular,"ipv4_dev_name"),"ipv6_ifname":string(&cellular,"ipv6_dev_name")},
             "interfaces":{"ipv4":interface(&wan4_if),"ipv6":interface(&wan6_if)},
@@ -1968,6 +2025,32 @@ fn validate_name(v: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tracking_area_prefers_live_value_and_rejects_out_of_range() {
+        let live = json!({"lac_code":40302,"nr5g_tac":"0"});
+        assert_eq!(tracking_area(&live, "lac_code", "1", LTE_TAC_MAX), 40302);
+        assert_eq!(
+            tracking_area(&live, "nr5g_tac", "1234567", NR_TAC_MAX),
+            1234567
+        );
+        assert_eq!(
+            tracking_area(&json!({}), "lac_code", " 12 ", LTE_TAC_MAX),
+            12
+        );
+        assert_eq!(tracking_area(&json!({}), "lac_code", "", LTE_TAC_MAX), 0);
+        assert_eq!(
+            tracking_area(&json!({}), "lac_code", "65536", LTE_TAC_MAX),
+            0
+        );
+        assert_eq!(
+            tracking_area(&json!({"lac_code":-1}), "lac_code", "", LTE_TAC_MAX),
+            0
+        );
+        assert_eq!(
+            tracking_area(&json!({}), "nr5g_tac", "16777216", NR_TAC_MAX),
+            0
+        );
+    }
     #[test]
     fn blocked_client_macs_are_bounded_and_validated() {
         let wireless = BTreeMap::from([

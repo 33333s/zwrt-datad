@@ -78,6 +78,8 @@ SSE  /events
     "mnc": 0,
     "nr_pci": 0,
     "nr_cell_id": 0,
+    "nr_tac": 0,
+    "lte_tac": 40302,
     "nr_channel": 0,
     "nr_bw": "100MHz",
     "nrca": "0,273,1,41,504990,100,0,-140.0,-43.0,-23.0,-120.0;",
@@ -128,7 +130,7 @@ SSE  /events
     "unread": 2,
     "list": [ { "id": 53, "num": "10086", "date": "06-15 14:57", "unread": 0, "text": "正文…" } ]
   },
-  "nfc": { "switch": 1 },
+  "nfc": { "switch": 1, "enabled": true, "flag": 2 },
   "interfaces": {
     "lan": { "up": true, "proto": "static", "device": "br-lan", "ipv4": [], "ipv6": [], "dns": [] },
     "wan4": { "up": true, "proto": "dhcp", "device": "rmnet_data0", "ipv4": [], "ipv6": [], "dns": [] },
@@ -319,8 +321,12 @@ SSE  /events
 - `cooling.fan.temperature_source` 为按类型发现的温控 sysfs 路径，未发现时为 `null`；`policy.{attempted,applied,error}` 给出最近策略应用结果。`mode` 仍表示保存的配置，故障时实际内核接管由 `kernel_zone_enabled` 表示。用户态控制解除驱动可选低速限幅并检查 PWM 读回；温度/驱动失败恢复内核温控，不再把静默失败当成自定义曲线已生效。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
+- `net.lte_tac` / `net.nr_tac`：服务小区跟踪区码（十进制）。LTE 取原厂 `nwinfo_get_netinfo.lac_code`（缺失时回退 UCI `zte_nwinfo.cell_info.lac_code`），NR 取 `nr5g_tac`（原厂 netinfo 通常不带，回退 UCI `zte_nwinfo.cell_info.nr5g_tac`）。未注册该制式或超出 3GPP 位宽（LTE 16 位、NR 24 位）时为 `0`；NSA/ENDC 下 NR TAC 通常为 `0`。`modems[id=x75].net` 同步提供这两个字段。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
-- `net.HSR`：高铁专网确认结果。该值只应来自信令确认，不按 ARFCN/EARFCN 直接判定。当前公开版尚未实现 modem SIB1 信令确认链路，因此该字段保持 `false`，直到公开实现具备同等确认能力。
+- `net.HSR` 与 `net.high_speed_rail` 表示中兴原厂后台的高铁模式状态，来自 `zte_nwinfo.sys_info.hst_info`；值为 `1` 时 `HSR/high_speed_rail.active=true`。`high_speed_rail.raw` 保留原厂原值，字段缺失时为 `null`。这不按 ARFCN/EARFCN 推断，也不声称自行解析 SIB1 或完成独立信令确认。
+- `thermal.protection`：中兴原厂高温保护状态，来自 `hightemp_datalimit_status`。原值 `0` 映射为 level 0/未触发，`1` 映射为 level 2/高温限速，`2` 映射为 level 3/超高温限制上网；同时提供 `active`、`speed_limited`、`network_restricted` 与 `raw`。
+- `battery.charge_protection`：中兴原厂安全保护性充电状态，来自 `bat_mode`。`mode >= 2` 时 `active=true`，表示因长时间充电而将电量维持在约 80%；仅在机型具有真实电池状态块时输出。
+- `nfc.switch/enabled/flag`：中兴原厂 NFC Wi-Fi 状态与目标 AP 标记。`nfc.set` 省略 `flag` 时保持当前原厂值，写入后必须读回确认；不再调用原厂页面未使用的 `zwrt_nfc_wifi_change`。
 - WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
 - `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时完整流式扫描两份日志，只缓存 `[DATA]` 解析材料；当前日志追加时增量读取，检测到 rename 轮转、截断或原地重写时完整重扫两份日志。当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；`qos.reload` 会主动失效缓存并重读。

@@ -6,13 +6,17 @@ NMS 创建待接入凭据后，只把一次显示的 MQTT 用户名（`enr_` 前
 
 datad 优先使用 modem MSN 生成与 UFI 相同的稳定 UUID；若没有 MSN，依次使用设备序列号、IMEI，生成后固定保存在 `cloud.json`，后续状态变化不会重算。若取不到可靠标识或型号，保存失败，不注册随机身份。首次连接仅向 `onboard/<用户名>/hello` 发送签名身份报告；NMS 校验凭据、签名、账户和设备占用后返回绑定结果，datad 才订阅正式命令并发送正常遥测。待接入凭据只能绑定首台设备，失效、撤销或已被占用的身份不能继续接入。旧 `dev_` 凭据继续按原流程连接。
 
+0.10.24 起，快速接入即使从曾经关闭的旧高级配置切换，也会明确把远程面板控制和 WebShell 设为关闭；若需要这些能力，设备所有者必须随后在高级配置中单独开启。
+
 默认关闭。首次没有 `cloud.json` 时，NMS 地址预填 `https://nms.ericsfj.com`，MQTT 地址预填 `wss://nms.ericsfj.com/mqtt`；用户名、密码和设备标识仍需独立填写，datad 不会自行启用或连接。已有配置文件中的自定义地址、凭据、开关及后台列表保持原值，不在加载时重写。云端 TLS/MQTT/WebSocket 运行时由 Rust datad 进程直接提供，共享同一二进制和 PID。`scripts/build.sh` 只从 `rust/Cargo.toml` 构建最终 ARM64 musl 静态二进制；设备不再安装或启动 `zwrt-datad-cloud`、`cloud-service.sh` 或 `cloud.sock`。
 
 UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。请求由 datad 进程内直接处理。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。
 
 配置字段：enabled、broker（`ssl://主机:端口` 或 `wss://主机[:端口]/mqtt`，WSS 默认 443）、platform_url（https://主机:端口）、username/password（设备 MQTT 凭据）、ca_pem（可选 CA）、vendor/model/identity_type/identity/platform、report_interval_seconds（10–3600）、remote_enabled、services:[{name,port,kind}]（kind=web/terminal）。默认后台端口 80/2333/8899，最多 8 项，禁止 9460/9461。UFI 传入已有持久 UUID，不能每次启用生成新身份。
 
-发布协议 v1 非 retained 的 telemetry/device、telemetry/system、status（含离线遗嘱），订阅本设备 command/request，只接受 `remote.open` 和已签名的 datad 自更新命令（见 `docs/NMS.md`）。拒绝 retained、重复会话、非平台 WSS、未授权端口和超限会话，只连接 127.0.0.1。保留后台认证，不执行免密 handoff 或额外端口。最多 4 会话，每个 4 流；到期、配置关闭或平台拒绝后退出。不开放云端 ubus 或系统固件 OTA；可选原生终端另需下文的独立授权。
+发布协议 v1 非 retained 的 telemetry/device、telemetry/system、telemetry/network、status（含离线遗嘱），订阅本设备 command/request，只接受 `remote.open` 和已签名的 datad 自更新命令（见 `docs/NMS.md`）。拒绝 retained、重复会话、非平台 WSS、未授权端口和超限会话，只连接 127.0.0.1。保留后台认证，不执行免密 handoff 或额外端口。最多 4 会话，每个 4 流；到期、配置关闭或平台拒绝后退出。不开放云端 ubus 或系统固件 OTA；可选原生终端另需下文的独立授权。
+
+`telemetry/network` 包含 `upstream.ipv4/ipv6` 与服务小区标识 `cell`：`rat`、`mcc`、`mnc`、`lte_tac`、`lte_cell_id`、`lte_pci`、`nr_tac`、`nr_cell_id`、`nr_pci`，供 NMS 做基站定位。数值字段只上报大于 0 的值（`mnc` 在 `mcc` 有效时保留 `0`）；原厂可能在切换制式后短暂保留旧小区值，消费端还须核对 `rat` 与上报时间。不包含 IMSI、ICCID 等 SIM 标识。
 
 端口清单使用 `remote_services` 扩展字段，自定义入口需要 NMS 服务端同时支持。`connected` 只证明 MQTT 连接，不能证明设备准入、绑定或网页访问成功。上报仅包含选定资源字段，不上传完整 `/state`、短信或认证信息。
 

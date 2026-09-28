@@ -38,6 +38,9 @@ Authorization: Bearer <token>
 始终拒绝。首次启动会从 `/dev/urandom` 生成 32 字节随机 Token，以 `0600`
 原子保存；异常 Token 文件会令启动失败。
 
+PTY 子进程优先使用 `/bin/ash -l -i`，固定从 `/` 启动；登录 shell 按 OpenWrt
+标准流程加载 `/etc/profile` 并显示设备自己的 `/etc/banner`。
+
 不要把长期、无轮转的输出重定向到 `/tmp/*.log`。在常见 OpenWrt 设备中，`/tmp` 位于 tmpfs；如果某个扩展构建或诊断后端输出高频调试信息，日志文件会直接占用 RAM，表现为“可用内存持续下降”，并不等同于进程 RSS 泄漏。
 
 若确实需要保留诊断日志，应使用具有容量上限和轮转策略的持久化目录；诊断结束后及时停用高频输出并清理旧文件。

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.23",
+    "version": "0.10.24",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增仅填 MQTT 凭据的设备自报接入与 NMS 首报绑定流程"
+    "notes": "新增服务小区与保护状态上报、NFC读回和WebShell登录环境，并收紧快速接入默认权限"
   }
 }

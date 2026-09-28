@@ -140,7 +140,9 @@ impl PtyProcess {
 
         let mut command = Command::new(shell);
         command
+            .arg("-l")
             .arg("-i")
+            .current_dir("/")
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave))
@@ -236,7 +238,7 @@ fn set_fd_flag(fd: i32, get: i32, set: i32, flag: i32) -> io::Result<()> {
 }
 
 fn select_shell() -> Option<&'static str> {
-    ["/system/bin/sh", "/bin/ash", "/bin/sh"]
+    ["/bin/ash", "/bin/sh", "/system/bin/sh"]
         .into_iter()
         .find(|path| {
             OpenOptions::new()
@@ -419,6 +421,13 @@ mod tests {
         if let Some(shell) = select_shell() {
             assert!(["/system/bin/sh", "/bin/ash", "/bin/sh"].contains(&shell));
             assert!(std::path::Path::new(shell).is_absolute());
+        }
+    }
+
+    #[test]
+    fn openwrt_ash_is_preferred_when_available() {
+        if OpenOptions::new().read(true).open("/bin/ash").is_ok() {
+            assert_eq!(select_shell(), Some("/bin/ash"));
         }
     }
 }
