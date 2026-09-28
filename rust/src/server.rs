@@ -685,7 +685,6 @@ fn capability_controls() -> Vec<&'static str> {
         "wifi.dual_band_status",
         "wifi.txpower.status",
         "wifi.advanced.status",
-        "wireless.config",
         "sleep.status",
         "usb.status",
         "power.direct_supply.status",

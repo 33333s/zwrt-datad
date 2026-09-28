@@ -27,6 +27,7 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_module",
     "wifi.set_chip",
     "wifi.configure",
+    "wireless.config",
     "wifi.txpower.apply",
     "wifi.txpower.set_percent",
     "wifi.txpower.set_limit",
@@ -349,6 +350,19 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "traffic.set_limit" => {
+            let enabled = match integer(params, "enabled", true) {
+                Ok(Some(value @ (0 | 1))) => value,
+                _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
+            };
+            if enabled == 1
+                && (!valid_traffic_bytes(params, "value", false)
+                    || !matches!(integer(params, "type", true), Ok(Some(1..=3))))
+            {
+                return Outcome::Invalid("invalid traffic limit".into());
+            }
+            if !matches!(integer(params, "ratio", false), Ok(None | Some(0..=100))) {
+                return Outcome::Invalid("ratio must be 0 through 100".into());
+            }
             traffic(
                 params,
                 "set_wwandst_monthlimit",
@@ -363,15 +377,28 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "traffic.set_clear_day" => {
+            let day = match integer(params, "day", true) {
+                Ok(Some(value @ 1..=31)) => value,
+                _ => return Outcome::Invalid("day must be 1 through 31".into()),
+            };
+            let enabled = match integer(params, "enabled", false) {
+                Ok(Some(value @ (0 | 1))) => value,
+                Ok(Some(_)) => return Outcome::Invalid("enabled must be 0 or 1".into()),
+                Ok(None) => 1,
+                Err(error) => return Outcome::Invalid(error),
+            };
             traffic(
-                params,
+                &json!({"day":day}),
                 "set_wwandst_clearday",
                 &[("day", "clearday", true, true)],
-                json!({"enable":1}),
+                json!({"enable":enabled}),
             )
             .await
         }
         "traffic.calibrate" => {
+            if !valid_traffic_bytes(params, "value", true) {
+                return Outcome::Invalid("invalid traffic calibration".into());
+            }
             traffic(
                 params,
                 "set_wwandst_calibmonth",
@@ -446,6 +473,11 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
 }
 
 async fn cellular_set(params: &Value) -> Outcome {
+    for field in ["enabled", "roaming"] {
+        if !matches!(integer(params, field, false), Ok(None | Some(0 | 1))) {
+            return Outcome::Invalid(format!("{field} must be 0 or 1"));
+        }
+    }
     let overrides = match mapped(
         params,
         &[
@@ -458,21 +490,15 @@ async fn cellular_set(params: &Value) -> Outcome {
         Ok(_) => return Outcome::Invalid("no cellular fields supplied".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    let mut current = match state::ubus(
-        "zwrt_data",
-        "get_wwaniface",
-        json!({"source_module":"web","cid":1,"connect_status":""}),
-    )
-    .await
-    {
-        Ok(Value::Object(v)) => v,
-        Ok(_) => return Outcome::Failed("invalid get_wwaniface response".into()),
-        Err(e) => return Outcome::Failed(e),
-    };
-    current.extend(overrides);
-    current.insert("source_module".into(), json!("WEBUI"));
-    current.insert("cid".into(), json!(1));
-    call("zwrt_data", "set_wwaniface", Value::Object(current)).await
+    // get_wwaniface is a status response, not a safe write template. In
+    // particular, its enable=0 can coexist with an active data session;
+    // copying that value into set_wwaniface disconnects the modem when the
+    // caller only intended to change roaming. The firmware accepts partial
+    // writes (the existing connect/disconnect actions already use them).
+    let mut args = overrides;
+    args.insert("source_module".into(), json!("WEBUI"));
+    args.insert("cid".into(), json!(1));
+    call("zwrt_data", "set_wwaniface", Value::Object(args)).await
 }
 async fn band(params: &Value, lte: bool, nsa: bool) -> Outcome {
     let bands = match string(params, "bands", false) {
@@ -657,8 +683,26 @@ async fn nfc(params: &Value) -> Outcome {
     }
 }
 async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
+    let mut effective = params.clone();
+    if profile_required {
+        let Some(id) = params.get("profile_id").and_then(Value::as_str) else {
+            return Outcome::Invalid("profile_id is required".into());
+        };
+        let list = match state::ubus("zwrt_apn_object", "getManuApnList", json!({})).await {
+            Ok(value) => value,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let Some(existing) = existing_apn_fields(&list, id) else {
+            return Outcome::Invalid("profile not found".into());
+        };
+        if let Value::Object(ref mut fields) = effective {
+            for (name, value) in existing {
+                fields.entry(name).or_insert(value);
+            }
+        }
+    }
     mapped_call(
-        params,
+        &effective,
         "zwrt_apn_object",
         method,
         &[
@@ -675,6 +719,48 @@ async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
     )
     .await
 }
+fn existing_apn_fields(reply: &Value, id: &str) -> Option<Map<String, Value>> {
+    let profile = reply
+        .get("apnListArray")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("profileId").and_then(Value::as_str) == Some(id))?;
+    let mut fields = Map::new();
+    for name in ["username", "password"] {
+        let value = profile.get(name).and_then(Value::as_str)?;
+        if value.len() > 1024 {
+            return None;
+        }
+        fields.insert(name.into(), json!(value));
+    }
+    for (input, vendor) in [
+        ("auth_mode", "pppAuthMode"),
+        ("pdp_type", "pdpType"),
+        ("roaming_pdp_type", "roamingPdpType"),
+    ] {
+        if let Some(value) = profile
+            .get(vendor)
+            .and_then(Value::as_i64)
+            .filter(|value| (0..=3).contains(value))
+        {
+            fields.insert(input.into(), json!(value));
+        }
+    }
+    Some(fields)
+}
+fn valid_traffic_bytes(params: &Value, name: &str, allow_zero: bool) -> bool {
+    const MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024 * 1024;
+    let Ok(Some(value)) = string(params, name, true) else {
+        return false;
+    };
+    !value.is_empty()
+        && value.len() <= 15
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u64>()
+            .is_ok_and(|amount| (allow_zero || amount > 0) && amount <= MAX_BYTES)
+}
+
 async fn traffic(
     params: &Value,
     method: &str,
@@ -1945,6 +2031,17 @@ async fn qos_clear() -> Outcome {
 mod tests {
     use super::*;
     #[test]
+    fn apn_edit_keeps_existing_credentials_on_device() {
+        let reply = json!({"apnListArray":[{"profileId":"profile-1","username":"device-user","password":"device-secret","pppAuthMode":3,"pdpType":2,"roamingPdpType":1}]});
+        let fields = existing_apn_fields(&reply, "profile-1").unwrap();
+        assert_eq!(fields["username"], "device-user");
+        assert_eq!(fields["password"], "device-secret");
+        assert_eq!(fields["auth_mode"], 3);
+        assert_eq!(fields["pdp_type"], 2);
+        assert_eq!(fields["roaming_pdp_type"], 1);
+        assert!(existing_apn_fields(&reply, "missing").is_none());
+    }
+    #[test]
     fn rejects_non_hex_mac() {
         assert!(!valid_mac("00:11:22:33:44:zz"));
         assert!(valid_mac("00:11:22:33:44:aa"));
@@ -1953,6 +2050,49 @@ mod tests {
     fn band_validation() {
         for bad in ["1 3", "n78", "1;reboot"] {
             assert!(!bad.bytes().all(|b| b.is_ascii_digit() || b == b','));
+        }
+    }
+    #[tokio::test]
+    async fn traffic_controls_reject_unsafe_values_before_ubus() {
+        for params in [
+            json!({"enabled":1,"value":"1;reboot","type":2}),
+            json!({"enabled":1,"value":"0","type":2}),
+            json!({"enabled":1,"value":"1024","type":9}),
+            json!({"enabled":1,"value":"1024","type":2,"ratio":101}),
+            json!({"enabled":2}),
+        ] {
+            assert!(matches!(
+                execute("traffic.set_limit", &params).await,
+                Outcome::Invalid(_)
+            ));
+        }
+        for params in [
+            json!({"day":0}),
+            json!({"day":32}),
+            json!({"day":15,"enabled":2}),
+        ] {
+            assert!(matches!(
+                execute("traffic.set_clear_day", &params).await,
+                Outcome::Invalid(_)
+            ));
+        }
+        assert!(matches!(
+            execute("traffic.calibrate", &json!({"value":"-1"})).await,
+            Outcome::Invalid(_)
+        ));
+        assert!(valid_traffic_bytes(&json!({"value":"0"}), "value", true));
+    }
+    #[tokio::test]
+    async fn cellular_roaming_rejects_values_outside_the_switch() {
+        for params in [
+            json!({"roaming":-1}),
+            json!({"roaming":2}),
+            json!({"roaming":"on"}),
+        ] {
+            assert!(matches!(
+                execute("cellular.set", &params).await,
+                Outcome::Invalid(_)
+            ));
         }
     }
     #[test]

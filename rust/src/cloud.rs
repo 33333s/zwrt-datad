@@ -70,6 +70,7 @@ pub struct Config {
     pub platform: String,
     pub report_interval_seconds: u16,
     pub remote_enabled: bool,
+    pub remote_panel_control_enabled: bool,
     pub remote_webshell_enabled: bool,
     pub services: Vec<Service>,
 }
@@ -91,6 +92,7 @@ impl Default for Config {
             platform: "qualcomm".into(),
             report_interval_seconds: 30,
             remote_enabled: false,
+            remote_panel_control_enabled: false,
             remote_webshell_enabled: false,
             services: vec![
                 Service {
@@ -510,6 +512,9 @@ async fn report(
     }
     if panel_available {
         capabilities.push("datad.panel");
+        if config.remote_enabled && config.remote_panel_control_enabled {
+            capabilities.push("datad.panel.control");
+        }
     }
     let firmware = state
         .get("system")
@@ -522,6 +527,7 @@ async fn report(
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
         "capabilities":capabilities,"remote_services":config.services,"remote_enabled":config.remote_enabled,
         "remote_origins":reported_remote_origins(config),
+        "remote_panel_control_enabled":config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     })).await?;
     publish(
@@ -677,7 +683,11 @@ impl BridgeManager {
         } else {
             None
         };
-        if command.target_service == "datad_panel" && self.app.is_none() {
+        if matches!(
+            command.target_service.as_str(),
+            "datad_panel" | "datad_panel_control"
+        ) && self.app.is_none()
+        {
             return Some(reject("panel_unavailable".into()));
         }
         state.active.insert(command.request_id.clone());
@@ -711,10 +721,14 @@ impl BridgeManager {
             self.state.lock().await.active.remove(&command.request_id);
             return;
         }
-        if command.target_service == "datad_panel" {
+        if matches!(
+            command.target_service.as_str(),
+            "datad_panel" | "datad_panel_control"
+        ) {
             if let Some(app) = &self.app {
                 crate::cloud_panel::run(
                     app.cloud_panel_state(),
+                    command.target_service == "datad_panel_control",
                     &self.config,
                     &command.remote_url,
                     &command.token,
@@ -810,7 +824,13 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
         }
         return Ok(());
     }
-    if command.target_service == "datad_panel" {
+    if matches!(
+        command.target_service.as_str(),
+        "datad_panel" | "datad_panel_control"
+    ) {
+        if command.target_service == "datad_panel_control" && !config.remote_panel_control_enabled {
+            return Err("panel_control_disabled".into());
+        }
         if command.target_port != 0
             || !command.target_ports.is_empty()
             || command.ttl_seconds > 3600
@@ -1532,6 +1552,19 @@ mod tests {
         command.token = "z".repeat(64);
         assert!(validate_remote(&config, &command).is_err());
         command.token = "a".repeat(64);
+        command.target_service = "datad_panel_control".into();
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "panel_control_disabled"
+        );
+        config.remote_panel_control_enabled = true;
+        validate_remote(&config, &command).unwrap();
+        command.target_port = 9460;
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "invalid_panel_request"
+        );
+        command.target_port = 0;
         config.remote_enabled = false;
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),

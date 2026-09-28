@@ -62,6 +62,7 @@ SSE  /events
     "type": "SA",
     "bars": 5,
     "roaming": "Home",
+    "roaming_allowed": 1,
     "operator": "China Mobile",
     "band": "n28",
     "nr_rsrp": -87,
@@ -266,6 +267,9 @@ SSE  /events
   }
 }
 ```
+
+`net.roaming_allowed` 是蜂窝配置的允许漫游开关（0/1；设备未提供时为 `null`），
+与 `net.roaming` 所表示的当前注册网络状态不同。
 
 ## Template Docs
 

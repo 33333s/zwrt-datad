@@ -48,3 +48,23 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 云端连接且 `remote_enabled` 开启时，datad 报告 `datad.panel` 能力。NMS 可用现有 `remote.open` 命令建立 `target_service: "datad_panel"`、`target_port: 0` 的独立 WSS 会话，最长一小时，不占用 9460/9461 TCP 管理端口，也不需要设备本地 UFI 进程。设备必须验证配置的平台/备用 HTTPS 来源、TLS 主机名、一次性会话票据和 `nms-datad-panel-v1` WebSocket 子协议。
 
 连接后设备先发送 `ready`，再以最多每秒一次的 `state` 文本帧发送当前 datad 快照。只允许本模块显式列出的状态块；每帧至多 192 KiB，不上传 datad Bearer Token、云配置或未来新增的未知块。状态只在远程面板会话期间传输，不加入常规 MQTT 遥测或设备历史记录。会话到期、远程开关关闭、配置变化或 WSS 中断即停止。此协议第一阶段只读，设备拒绝浏览器/平台发来的数据帧；后续控制需另行逐项授权和审计。
+
+`clients` 状态包含在线设备列表和经过 MAC 格式校验、去重并限制为 128 条的 `blocked` 黑名单，用于 NMS 托管的原版接入设备弹窗；不会把 Wi-Fi 密钥或原厂管理凭据放入该状态块。
+
+远程面板会话开启后按需读取 `wifi_config`：仅包含双频合一状态、各频段 SSID、加密模式、隐藏/PMF/最大接入、国家、信道与设备允许的选项；不读取或传输已保存的 Wi-Fi 密钥。改动 Wi-Fi 后重新读取这些字段。`wireless.config` 作为 v2 受确认的频段配置动作，仍由 datad 验证国家和信道并执行读回；普通 MQTT 遥测不含该配置。
+
+云端 v2 的 LTE/NR 锁频动作另行拒绝空频段、0、重复或越界频段。设备原版实测空串可能清空允许频段导致断网；NMS 恢复自动模式必须使用设备报告的完整支持频段列表，不发送空串。
+
+APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 ID、名称、APN、鉴权/PDP 类型与启用状态；原厂回包中的 APN 用户名和密码不会上传。修改既有手动 APN 时，前端留空的用户名、密码和其他未改动可选字段由 datad 在设备本地读取并保留。云端 v2 的 APN 模式、添加、修改、启用、删除都要求显式确认。
+
+链路聚合切换及 `multiwan.interface/member/policy/rule.set` 均属于可能改写路由的操作，云端 v2 要求确认；设备仍使用各动作原有的 section 类型和参数范围校验，并在 MULTIWAN 模式下应用 mwan3 配置。
+
+风扇、液冷的启停、模式及曲线写入可能改变散热行为，云端 v2 均要求显式确认；设备端原有温度上限保护和曲线参数校验保持有效。
+
+散热设备存在时，面板会话按需读取当前风扇/液冷模式与 datad 有效保存的风扇曲线 `cooling_config`；无散热设备不提供该块。NMS 只接收 20–80℃、PWM 0–255、温度递增且 PWM 不下降的 2–8 个控制点。该配置不进入普通 MQTT 遥测。
+
+## 可选面板控制通道（0.10.21）
+
+原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。
+
+V2 的状态帧带 `protocol_version:2`，仍只含显式允许的快照块。来自 NMS 的文本控制帧只接受结构化的 `type/control`、32 位十六进制 request_id、已列入 datad 控制动作白名单的 action、JSON 对象 params 和 confirmed 布尔值，最大 8 KiB；每会话最多 128 个不同 request_id，按顺序执行，每个动作最多 20 秒。重启、关机、断网、锁频锁小区、SIM/Wi-Fi/LAN/聚合变更、短信发送删除等危险动作还要求 confirmed=true。结果只包含成功布尔值或有限错误码，不回传原厂响应或可能含密钥的原始内容。NMS 必须在每个动作前验证当前设备 Owner/管理员权限、CSRF 与会话有效性，记录不含秘密参数的审计；设备本身不会从浏览器直接接收控制帧。
