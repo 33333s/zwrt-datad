@@ -44,8 +44,12 @@ class Vendor(BaseHTTPRequestHandler):
             return self.send_json({"loginfo":"ok" if "sid=two" in self.headers.get("Cookie", "") else ""})
         if keys == ["RD"]:
             return self.send_json({"RD": RD})
-        values = {"model_name":"U50S","network_type":"LTE","wa_inner_version":"B02","cr_version":""}
-        return self.send_json({key: values.get(key, "") for key in keys})
+        values = {"model_name":"U50S","network_type":"LTE","wa_inner_version":"B02","cr_version":"","Language":"en"}
+        reply = {key: values.get(key, "") for key in keys}
+        page = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("page", [None])[0]
+        if page is not None:
+            reply["page_seen"] = page
+        return self.send_json(reply)
     def do_POST(self):
         form = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode())
         action = form.get("goformId", [""])[0]
@@ -56,6 +60,10 @@ class Vendor(BaseHTTPRequestHandler):
             if form.get("password", [""])[0] == expected:
                 return self.send_json({"result":"0"}, "sid=two; Path=/")
             return self.send_json({"result":"3"})
+        if action == "SET_WEB_LANGUAGE":
+            if "sid=two" in self.headers.get("Cookie", "") and "AD" not in form and form.get("Language", [""])[0] == "en":
+                Vendor.writes += 1
+                return self.send_json({"result":"success"})
         if action == "SET_DEVICE_LED":
             expected = digest(digest("B02") + RD)
             if "sid=two" in self.headers.get("Cookie", "") and form.get("AD", [""])[0] == expected and form.get("night_mode_switch", [""])[0] == "0":
@@ -114,12 +122,19 @@ esac
         token = login["token"]
         status, read = request(base + "/oem/read?cmd=network_type", token=token)
         assert status == 200 and read["fields"]["network_type"] == "LTE"
+        status, paged = request(base + "/oem/read?cmd=network_type&page=2", token=token)
+        assert status == 200 and paged["fields"]["page_seen"] == "2"
+        assert request(base + "/oem/read?cmd=network_type&bad%3Bkey=x", token=token)[0] == 400
         assert request(base + "/control", {**action,"goform_id":"NOT_ALLOWED"}, token)[0] == 400
         assert request(base + "/control", {**action,"params":{"AD":"injected"}}, token)[0] == 400
         assert request(base + "/control", {**action,"confirm":False}, token)[0] == 400
         status, result = request(base + "/control", action, token)
         assert status == 200 and result["ok"] and result["verified"] is False
         assert Vendor.writes == 1
+        language_action = {"action":"u50.oem.goform","goform_id":"SET_WEB_LANGUAGE","params":{"Language":"en"},"confirm":True}
+        status, language_result = request(base + "/control", language_action, token)
+        assert status == 200 and language_result["verified"] is True
+        assert Vendor.writes == 2
         assert request(base + "/auth/logout", {}, token)[0] == 200
         assert request(base + "/control", action, token)[0] == 401
         print("U50 OEM challenge and guarded write contract OK")

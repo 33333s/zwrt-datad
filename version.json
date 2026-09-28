@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.20",
+    "version": "0.10.21",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：扩展状态与受控原厂接口桥"
+    "notes": "ARM32 U50S 候选版：扩展遥测与分页原厂读取"
   }
 }

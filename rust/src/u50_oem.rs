@@ -9,6 +9,7 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -138,13 +139,44 @@ impl Bridge {
         Ok((value, cookie))
     }
     async fn get(&self, keys: &str, cookie: &str) -> Result<(Value, String), String> {
+        self.get_with_params(keys, cookie, &BTreeMap::new()).await
+    }
+    async fn get_with_params(
+        &self,
+        keys: &str,
+        cookie: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<(Value, String), String> {
         if keys.len() > 1024 || keys.split(',').count() > 32 || !keys.split(',').all(valid_key) {
             return Err("invalid OEM read keys".into());
         }
+        if params.len() > 16 {
+            return Err("too many OEM read parameters".into());
+        }
+        let mut total = 0usize;
+        for (key, value) in params {
+            if !valid_key(key)
+                || matches!(key.as_str(), "cmd" | "multi_data")
+                || value.len() > 512
+                || value.chars().any(char::is_control)
+            {
+                return Err("invalid OEM read parameter".into());
+            }
+            total += key.len() + value.len();
+            if total > 2048 {
+                return Err("OEM read parameters too large".into());
+            }
+        }
         let mut url = self.inner.get_url.clone();
-        url.query_pairs_mut()
-            .append_pair("cmd", keys)
-            .append_pair("multi_data", "1");
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("cmd", keys)
+                .append_pair("multi_data", "1");
+            for (key, value) in params {
+                query.append_pair(key, value);
+            }
+        }
         let request = self.request(self.inner.client.get(url), cookie);
         let response = request.send().await.map_err(|_| "OEM read failed")?;
         self.response(response).await
@@ -226,9 +258,14 @@ impl Bridge {
         }
         Ok(session.cookie.clone())
     }
-    pub async fn read(&self, token: &str, keys: &str) -> Result<Value, String> {
+    pub async fn read(
+        &self,
+        token: &str,
+        keys: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<Value, String> {
         let cookie = self.authorized_cookie(token).await?;
-        let (value, _) = self.get(keys, &cookie).await?;
+        let (value, _) = self.get_with_params(keys, &cookie, params).await?;
         Ok(json!({"ok":true,"fields":value}))
     }
     pub async fn write(
@@ -248,32 +285,44 @@ impl Bridge {
             return Err("too many OEM parameters".into());
         }
         let cookie = self.authorized_cookie(token).await?;
-        let (versions, _) = self.get("wa_inner_version,cr_version", &cookie).await?;
-        let version = versions
-            .get("wa_inner_version")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let cr = versions
-            .get("cr_version")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if version.is_empty() {
-            return Err("OEM version challenge unavailable".into());
-        }
-        let (rd, _) = self.get("RD", &cookie).await?;
-        let Some(rd) = rd
-            .get("RD")
-            .and_then(Value::as_str)
-            .filter(|v| v.len() == 64)
-        else {
-            return Err("OEM write challenge unavailable".into());
-        };
-        let ad = sha256_hex(&format!("{}{rd}", sha256_hex(&format!("{version}{cr}"))));
         let mut form = vec![
             ("goformId".into(), goform_id.into()),
             ("isTest".into(), "false".into()),
-            ("AD".into(), ad),
         ];
+        // The OEM WebUI explicitly exempts SET_WEB_LANGUAGE from AD. All
+        // other write IDs use a fresh RD challenge tied to firmware versions.
+        if goform_id != "SET_WEB_LANGUAGE" {
+            let (versions, _) = self.get("wa_inner_version,cr_version", &cookie).await?;
+            let version = versions
+                .get("wa_inner_version")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let cr = versions
+                .get("cr_version")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if version.is_empty() {
+                return Err("OEM version challenge unavailable".into());
+            }
+            let (rd, _) = self.get("RD", &cookie).await?;
+            let Some(rd) = rd
+                .get("RD")
+                .and_then(Value::as_str)
+                .filter(|v| v.len() == 64)
+            else {
+                return Err("OEM write challenge unavailable".into());
+            };
+            let ad = sha256_hex(&format!("{}{rd}", sha256_hex(&format!("{version}{cr}"))));
+            form.push(("AD".into(), ad));
+        }
+        if goform_id == "SET_WEB_LANGUAGE" {
+            let Some(language) = params.get("Language").and_then(Value::as_str) else {
+                return Err("missing language".into());
+            };
+            if language.is_empty() || language.len() > 16 || !valid_key(language) {
+                return Err("invalid language".into());
+            }
+        }
         let mut total = 0usize;
         for (key, value) in params {
             if !valid_key(key) || matches!(key.as_str(), "goformId" | "AD" | "isTest") {
@@ -304,7 +353,17 @@ impl Bridge {
         if result.get("result").and_then(Value::as_str) != Some("success") {
             return Err("OEM action rejected".into());
         }
-        Ok(json!({"ok":true,"action":goform_id,"vendor_result":"success","verified":false}))
+        let verified = if goform_id == "SET_WEB_LANGUAGE" {
+            let (readback, _) = self.get("Language", &cookie).await?;
+            let expected = params.get("Language").and_then(Value::as_str).unwrap_or("");
+            if readback.get("Language").and_then(Value::as_str) != Some(expected) {
+                return Err("OEM readback mismatch".into());
+            }
+            true
+        } else {
+            false
+        };
+        Ok(json!({"ok":true,"action":goform_id,"vendor_result":"success","verified":verified}))
     }
     pub async fn logout(&self, token: &str) -> Result<Value, String> {
         let _ = self.authorized_cookie(token).await?;

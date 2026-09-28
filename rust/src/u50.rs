@@ -59,6 +59,20 @@ const CFG_KEYS: &[&str] = &[
     "lte_rsrp",
     "lte_rsrq",
     "lte_snr",
+    "wan_active_band",
+    "wan_active_channel",
+    "wan_lte_ca",
+    "lte_pci",
+    "wifi_chip_temp",
+    "pm_sensor_mdm",
+    "data_volume_limit_switch",
+    "data_volume_limit_size",
+    "data_volume_alert_percent",
+    "wifi_chip1_ssid1_access_sta_num",
+    "wifi_chip2_ssid1_access_sta_num",
+    "wifi_5g_enable",
+    "wifi_lbd_enable",
+    "wan_connect_status",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +287,18 @@ fn from_sources(
     if let Some(value) = cfg.get("ppp_status") {
         net.insert("wan_status".into(), json!(value));
     }
+    if let Some(value) = cfg.get("wan_active_band") {
+        net.insert("band".into(), json!(value));
+    }
+    if let Some(value) = cfg_number(cfg, "wan_active_channel", 0, 1_000_000) {
+        net.insert("lte_channel".into(), json!(value));
+    }
+    if let Some(value) = cfg_number(cfg, "lte_pci", 0, 1007) {
+        net.insert("lte_pci".into(), json!(value));
+    }
+    if let Some(value) = cfg.get("wan_lte_ca") {
+        net.insert("lteca".into(), json!(value));
+    }
     net.insert("HSR".into(), json!(false));
     fields.insert("net".into(), Value::Object(net));
 
@@ -303,18 +329,51 @@ fn from_sources(
             traffic.insert(target.into(), json!(value));
         }
     }
+    if let Some(value) = cfg_number(cfg, "data_volume_limit_switch", 0, 1) {
+        traffic.insert("limit_enabled".into(), json!(value));
+    }
     if !traffic.is_empty() {
         fields.insert("traffic".into(), Value::Object(traffic));
     }
 
+    let mut wlan = Map::new();
     if let Some(value) = cfg
         .get("wifi_onoff_state")
         .filter(|v| *v == "0" || *v == "1")
     {
-        fields.insert("wlan".into(), json!({"enabled":i64::from(value == "1")}));
+        wlan.insert("enabled".into(), json!(i64::from(value == "1")));
+    }
+    for (source, target) in [
+        ("wifi_5g_enable", "five_ghz_enabled"),
+        ("wifi_lbd_enable", "band_steering_enabled"),
+    ] {
+        if let Some(value) = cfg_number(cfg, source, 0, 1) {
+            wlan.insert(target.into(), json!(value));
+        }
+    }
+    if !wlan.is_empty() {
+        fields.insert("wlan".into(), Value::Object(wlan));
     }
     if let Some(value) = cfg_number(cfg, "wifi_access_sta_num", 0, 1024) {
-        fields.insert("clients".into(), json!({"total":value,"wifi":value}));
+        let mut clients = json!({"total":value,"wifi":value});
+        for (source, target) in [
+            ("wifi_chip1_ssid1_access_sta_num", "chip1"),
+            ("wifi_chip2_ssid1_access_sta_num", "chip2"),
+        ] {
+            if let Some(count) = cfg_number(cfg, source, 0, 1024) {
+                clients[target] = json!(count);
+            }
+        }
+        fields.insert("clients".into(), clients);
+    }
+    let mut zones = Vec::new();
+    for (source, name) in [("wifi_chip_temp", "wifi_chip"), ("pm_sensor_mdm", "modem")] {
+        if let Some(value) = cfg_number(cfg, source, -40, 120) {
+            zones.push(json!({"name":name,"celsius":value}));
+        }
+    }
+    if !zones.is_empty() {
+        fields.insert("thermal".into(), json!({"zones":zones}));
     }
     let mut sim = Map::new();
     if let Some(value) = cfg.get("modem_main_state") {
@@ -389,10 +448,6 @@ struct LoginRequest {
     password: String,
 }
 #[derive(Deserialize)]
-struct ReadQuery {
-    cmd: String,
-}
-#[derive(Deserialize)]
 struct ControlRequest {
     action: String,
     goform_id: String,
@@ -428,7 +483,7 @@ async fn oem_login(State(app): State<App>, Json(body): Json<LoginRequest>) -> Re
 async fn oem_read(
     State(app): State<App>,
     headers: HeaderMap,
-    Query(query): Query<ReadQuery>,
+    Query(mut query): Query<BTreeMap<String, String>>,
 ) -> Response {
     let Some(token) = bearer(&headers) else {
         return api_error(StatusCode::UNAUTHORIZED, "Bearer token required");
@@ -436,7 +491,10 @@ async fn oem_read(
     let Some(oem) = app.oem.as_ref() else {
         return api_error(StatusCode::NOT_FOUND, "OEM writes disabled");
     };
-    match oem.read(token, &query.cmd).await {
+    let Some(cmd) = query.remove("cmd") else {
+        return api_error(StatusCode::BAD_REQUEST, "missing cmd");
+    };
+    match oem.read(token, &cmd, &query).await {
         Ok(value) => Json(value).into_response(),
         Err(error) if error.contains("session") || error.contains("login required") => {
             api_error(StatusCode::UNAUTHORIZED, &error)
@@ -661,6 +719,12 @@ mod tests {
             ("wifi_onoff_state".into(), "1".into()),
             ("wifi_access_sta_num".into(), "2".into()),
             ("simcard_active_slot".into(), "1".into()),
+            ("wan_active_band".into(), "B3".into()),
+            ("wan_active_channel".into(), "1650".into()),
+            ("wifi_chip_temp".into(), "43".into()),
+            ("pm_sensor_mdm".into(), "41".into()),
+            ("data_volume_limit_switch".into(), "0".into()),
+            ("wifi_5g_enable".into(), "0".into()),
         ]);
         let value = from_sources(Model::U50Pro, &cfg, None).unwrap();
         assert_eq!(value.fields["device"]["api_template_supported"], 0);
@@ -677,6 +741,11 @@ mod tests {
         assert_eq!(value.fields["wlan"]["enabled"], 1);
         assert_eq!(value.fields["clients"]["total"], 2);
         assert_eq!(value.fields["sim"]["current_slot"], 1);
+        assert_eq!(value.fields["net"]["band"], "B3");
+        assert_eq!(value.fields["net"]["lte_channel"], 1650);
+        assert_eq!(value.fields["traffic"]["limit_enabled"], 0);
+        assert_eq!(value.fields["wlan"]["five_ghz_enabled"], 0);
+        assert_eq!(value.fields["thermal"]["zones"][0]["celsius"], 43);
         assert_eq!(value.fields["u50_sources"]["goform"], "unavailable");
     }
     #[test]
