@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.20",
+    "version": "0.10.21",
     "asset": "zwrt-datad-aarch64",
-    "notes": "默认预填免费 NMS/MQTT 地址，并在默认线路下内置会员远程来源；保留已有自定义云端配置"
+    "notes": "新增可选 NMS 面板控制通道 v2，保留旧版只读状态流并要求独立开关"
   }
 }

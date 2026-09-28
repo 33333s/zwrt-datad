@@ -2,11 +2,13 @@
 //! HTTP port, datad bearer token, or UFI process is exposed to the cloud.
 use crate::{
     cloud::{Config, websocket_tls},
+    control::{self, Outcome},
     model::Snapshot,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use tokio::sync::watch;
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
@@ -16,7 +18,10 @@ use tokio_tungstenite::{
 };
 
 pub(crate) const PROTOCOL: &str = "nms-datad-panel-v1";
+pub(crate) const CONTROL_PROTOCOL: &str = "nms-datad-panel-v2";
 const MAX_STATE_BYTES: usize = 192 * 1024;
+const MAX_CONTROL_BYTES: usize = 8 * 1024;
+const MAX_CONTROLS_PER_SESSION: usize = 128;
 const EXPOSED_BLOCKS: &[&str] = &[
     "net",
     "neighbor",
@@ -55,8 +60,12 @@ fn panel_snapshot(snapshot: &Snapshot) -> Value {
 }
 
 fn state_message(snapshot: &Snapshot) -> Option<Message> {
+    state_message_version(snapshot, 1)
+}
+
+fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
     let raw = serde_json::to_vec(&json!({
-        "type": "state", "protocol_version": 1, "snapshot": panel_snapshot(snapshot)
+        "type": "state", "protocol_version": version, "snapshot": panel_snapshot(snapshot)
     }))
     .ok()?;
     if raw.len() > MAX_STATE_BYTES {
@@ -65,8 +74,91 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
     Some(Message::Text(String::from_utf8(raw).ok()?.into()))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    protocol_version: u8,
+    request_id: String,
+    action: String,
+    params: Value,
+    confirmed: bool,
+}
+
+fn parse_control(raw: &str) -> Option<ControlRequest> {
+    let request: ControlRequest = serde_json::from_str(raw).ok()?;
+    if request.kind != "control"
+        || request.protocol_version != 2
+        || request.request_id.len() != 32
+        || !request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || request.action.is_empty()
+        || request.action.len() > 64
+        || !request.params.is_object()
+    {
+        return None;
+    }
+    Some(request)
+}
+
+fn needs_confirmation(action: &str) -> bool {
+    matches!(
+        action,
+        "device.reboot"
+            | "device.poweroff"
+            | "cellular.disconnect"
+            | "network.set_mode"
+            | "band.set_lte"
+            | "band.set_nr_sa"
+            | "band.set_nr_nsa"
+            | "cell.lock_lte"
+            | "cell.lock_nr"
+            | "cell.unlock_all"
+            | "sim.set_slot"
+            | "wifi.set_module"
+            | "wifi.configure"
+            | "lan.set"
+            | "apn.delete"
+            | "aggregation.set"
+            | "sms.delete"
+            | "sms.send_raw"
+            | "client.kick"
+            | "client.block"
+    )
+}
+
+async fn control_result(request: ControlRequest) -> Message {
+    let code = if !control::ACTIONS.contains(&request.action.as_str()) {
+        Some("unsupported_action")
+    } else if needs_confirmation(&request.action) && !request.confirmed {
+        Some("confirmation_required")
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            control::execute(&request.action, &request.params),
+        )
+        .await
+        {
+            Ok(Outcome::Ok(_)) => None,
+            Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
+            Ok(Outcome::Failed(_)) => Some("device_call_failed"),
+            Ok(Outcome::NotHandled) => Some("unsupported_action"),
+            Err(_) => Some("device_call_timeout"),
+        }
+    };
+    Message::Text(
+        json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code})
+            .to_string()
+            .into(),
+    )
+}
+
 pub(crate) async fn run(
     state_rx: watch::Receiver<Snapshot>,
+    control_mode: bool,
     config: &Config,
     url: &str,
     token: &str,
@@ -76,6 +168,11 @@ pub(crate) async fn run(
     if *shutdown.borrow() || ttl.is_zero() {
         return;
     }
+    let protocol = if control_mode {
+        CONTROL_PROTOCOL
+    } else {
+        PROTOCOL
+    };
     let deadline = tokio::time::Instant::now() + ttl;
     let Ok(mut request) = url.into_client_request() else {
         return;
@@ -89,13 +186,21 @@ pub(crate) async fn run(
         .insert("x-nms-target-port", HeaderValue::from_static("0"));
     request
         .headers_mut()
-        .insert("sec-websocket-protocol", HeaderValue::from_static(PROTOCOL));
+        .insert("sec-websocket-protocol", HeaderValue::from_static(protocol));
     let Ok(tls) = websocket_tls(config) else {
         return;
     };
     let limits = WebSocketConfig::default()
-        .max_message_size(Some(4 * 1024))
-        .max_frame_size(Some(4 * 1024))
+        .max_message_size(Some(if control_mode {
+            MAX_CONTROL_BYTES
+        } else {
+            4 * 1024
+        }))
+        .max_frame_size(Some(if control_mode {
+            MAX_CONTROL_BYTES
+        } else {
+            4 * 1024
+        }))
         .write_buffer_size(0)
         .max_write_buffer_size(2 * MAX_STATE_BYTES);
     let connect =
@@ -110,13 +215,15 @@ pub(crate) async fn run(
         .headers()
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
-        != Some(PROTOCOL)
+        != Some(protocol)
     {
         return;
     }
     if socket
         .send(Message::Text(
-            r#"{"type":"ready","protocol_version":1}"#.into(),
+            json!({"type":"ready","protocol_version":if control_mode {2} else {1}})
+                .to_string()
+                .into(),
         ))
         .await
         .is_err()
@@ -124,7 +231,11 @@ pub(crate) async fn run(
         return;
     }
     let mut last = state_rx.borrow().clone();
-    let Some(first) = state_message(&last) else {
+    let Some(first) = (if control_mode {
+        state_message_version(&last, 2)
+    } else {
+        state_message(&last)
+    }) else {
         return;
     };
     if socket.send(first).await.is_err() {
@@ -136,6 +247,7 @@ pub(crate) async fn run(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     sample.tick().await;
     ping.tick().await;
+    let mut used_ids = HashSet::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return,
@@ -143,7 +255,7 @@ pub(crate) async fn run(
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
                 if next != last {
-                    let Some(message) = state_message(&next) else { return; };
+                    let Some(message) = (if control_mode {state_message_version(&next, 2)} else {state_message(&next)}) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                 }
@@ -157,7 +269,12 @@ pub(crate) async fn run(
                 },
                 Some(Ok(Message::Pong(_))) => {},
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                // This first protocol version is deliberately read-only.
+                Some(Ok(Message::Text(raw))) if control_mode => {
+                    let Some(request) = parse_control(&raw) else { return; };
+                    if used_ids.len() >= MAX_CONTROLS_PER_SESSION || !used_ids.insert(request.request_id.clone()) { return; }
+                    if socket.send(control_result(request).await).await.is_err() { return; }
+                },
+                // V1 remains strictly read-only. V2 refuses binary and unknown frames.
                 Some(Ok(_)) => return,
             }
         }
@@ -207,6 +324,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_frames_require_v2_request_ids_objects_and_confirmation() {
+        let id = "a".repeat(32);
+        let allowed = format!(
+            r#"{{"type":"control","protocol_version":2,"request_id":"{id}","action":"device.reboot","params":{{}},"confirmed":false}}"#
+        );
+        let request = parse_control(&allowed).unwrap();
+        assert!(needs_confirmation(&request.action));
+        let Message::Text(reply) = control_result(request).await else {
+            panic!("expected a text result")
+        };
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["request_id"], id);
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["code"], "confirmation_required");
+
+        for invalid in [
+            allowed.replace("\"protocol_version\":2", "\"protocol_version\":1"),
+            allowed.replace("\"params\":{}", "\"params\":[]"),
+            allowed.replace(&id, "not-a-request-id"),
+            allowed.replace("\"type\":\"control\"", "\"type\":\"state\""),
+            allowed.replace("\"confirmed\":false", "\"confirmed\":false,\"extra\":true"),
+        ] {
+            assert!(parse_control(&invalid).is_none());
+        }
+        let unsupported = allowed.replace("device.reboot", "ubus.call");
+        let Message::Text(reply) = control_result(parse_control(&unsupported).unwrap()).await
+        else {
+            panic!("expected an unsupported-action result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["code"],
+            "unsupported_action"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::result_large_err)] // Tungstenite handshake callback has a large error type.
     async fn authenticated_wss_streams_changed_state_and_rejects_input() {
         use rustls::{ServerConfig, pki_types::PrivateKeyDer};
@@ -245,6 +398,7 @@ mod tests {
         let task = tokio::spawn(async move {
             run(
                 receiver,
+                false,
                 &config,
                 &url,
                 &"a".repeat(64),
@@ -279,6 +433,90 @@ mod tests {
         ws.send(Message::Text(r#"{"type":"control"}"#.into()))
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite handshake callback has a large error type.
+    async fn opted_in_v2_wss_rejects_unknown_actions_and_replayed_requests() {
+        use rustls::{ServerConfig, pki_types::PrivateKeyDer};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::accept_hdr_async;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let config = Config {
+            ca_pem: certificate.cert.pem(),
+            remote_panel_control_enabled: true,
+            ..Default::default()
+        };
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "wss://{}/api/remote/device/control-fixture",
+            listener.local_addr().unwrap()
+        );
+        let (_sender, receiver) = watch::channel(Snapshot {
+            ts: 1,
+            datad: DatadVersion::default(),
+            fields: Map::from_iter([("net".into(), json!({"type":"SA"}))]),
+        });
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run(
+                receiver,
+                true,
+                &config,
+                &url,
+                &"a".repeat(64),
+                Duration::from_secs(5),
+                shutdown,
+            )
+            .await;
+        });
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        let mut ws = accept_hdr_async(tls, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            assert_eq!(request.headers()["sec-websocket-protocol"],CONTROL_PROTOCOL);
+            assert_eq!(request.headers()["x-nms-target-port"],"0");
+            response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(CONTROL_PROTOCOL));
+            Ok(response)
+        }).await.unwrap();
+        let ready: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        let first: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(ready["protocol_version"], 2);
+        assert_eq!(first["protocol_version"], 2);
+        assert_eq!(first["snapshot"]["net"]["type"], "SA");
+
+        let unknown = json!({"type":"control","protocol_version":2,"request_id":"a".repeat(32),"action":"ubus.call","params":{"password":"must-not-leak"},"confirmed":true}).to_string();
+        ws.send(Message::Text(unknown.into())).await.unwrap();
+        let reply = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(!reply.contains("must-not-leak"));
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["code"], "unsupported_action");
+
+        let dangerous = json!({"type":"control","protocol_version":2,"request_id":"b".repeat(32),"action":"device.poweroff","params":{},"confirmed":false}).to_string();
+        ws.send(Message::Text(dangerous.clone().into()))
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(reply["code"], "confirmation_required");
+        ws.send(Message::Text(dangerous.into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
