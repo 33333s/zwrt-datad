@@ -26,7 +26,6 @@ const EXPOSED_BLOCKS: &[&str] = &[
     "traffic",
     "wlan",
     "nfc",
-    "interfaces",
     "sim",
     "modems",
     "aggregation",
@@ -175,6 +174,10 @@ mod tests {
         let mut fields = Map::new();
         fields.insert("net".into(), json!({"type":"SA"}));
         fields.insert("future_secret".into(), json!({"token":"must-not-leak"}));
+        fields.insert(
+            "interfaces".into(),
+            json!({"cellular":{"password":"must-not-leak"}}),
+        );
         let snapshot = Snapshot {
             ts: 7,
             datad: DatadVersion::default(),
@@ -187,6 +190,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["snapshot"]["net"]["type"], "SA");
         assert!(parsed["snapshot"].get("future_secret").is_none());
+        assert!(parsed["snapshot"].get("interfaces").is_none());
         assert_eq!(parsed["protocol_version"], 1);
     }
 
