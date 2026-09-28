@@ -1307,6 +1307,15 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         topflow_net_fallback(&mut raw_net, &uci_sets);
     }
     let mut net = Map::new();
+    net.insert(
+        "roaming_allowed".into(),
+        json!(
+            cellular
+                .get("roam_enable")
+                .and_then(Value::as_i64)
+                .filter(|value| matches!(value, 0 | 1))
+        ),
+    );
     for (to, from) in [
         ("type", "network_type"),
         ("roaming", "simcard_roam"),

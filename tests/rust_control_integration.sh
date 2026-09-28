@@ -136,6 +136,12 @@ wait_file_value() {
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
     python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+post '{"action":"cellular.set","params":{"roaming":1}}' >/dev/null
+python3 - "$MOCK_CALL_LOG" <<'PY'
+import json, sys
+calls = [line.split('\t', 2) for line in open(sys.argv[1]) if '\tset_wwaniface\t' in line]
+assert calls and json.loads(calls[-1][2])["roam_enable"] == 1
+PY
 post '{"action":"band.set_nr_sa","params":{"bands":"78,79"}}' >/dev/null
 post '{"action":"sim.set_slot","params":{"slot":2}}' >/dev/null
 post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
@@ -233,7 +239,7 @@ curl -fsS "http://127.0.0.1:$PORT/capabilities" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
 sleep 1.2
 curl -fsS "http://127.0.0.1:$PORT/state" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}],"blocked":[]}; assert d["dhcp"]["netmask"]=="255.255.255.0" and d["dhcp"]["disabled"] is False and d["dhcp"]["range_start"]=="192.168.0.2" and d["dhcp"]["range_end"]=="192.168.0.253"'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["roaming_allowed"]==0,d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}],"blocked":[]}; assert d["dhcp"]["netmask"]=="255.255.255.0" and d["dhcp"]["disabled"] is False and d["dhcp"]["range_start"]=="192.168.0.2" and d["dhcp"]["range_end"]=="192.168.0.253"'
 unknown_status=$(curl -sS -o "$TMP/unknown.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"fixture.unknown","params":{}}' "http://127.0.0.1:$PORT/control")
 [ "$unknown_status" = 404 ]

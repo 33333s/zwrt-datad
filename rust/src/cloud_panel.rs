@@ -235,6 +235,7 @@ fn needs_confirmation(action: &str) -> bool {
         "device.reboot"
             | "device.poweroff"
             | "cellular.disconnect"
+            | "cellular.set"
             | "network.set_mode"
             | "band.set_lte"
             | "band.set_nr_sa"
@@ -541,6 +542,7 @@ mod tests {
         assert!(needs_confirmation(&request.action));
         assert!(control::ACTIONS.contains(&"wireless.config"));
         assert!(needs_confirmation("wireless.config"));
+        assert!(needs_confirmation("cellular.set"));
         assert!(needs_confirmation("cooling.fan.set_curve"));
         assert!(needs_confirmation("cooling.liquid.set_mode"));
         for invalid in ["", "0", "1,,3", "1,1", "1025", "1;reboot"] {

@@ -473,6 +473,11 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
 }
 
 async fn cellular_set(params: &Value) -> Outcome {
+    for field in ["enabled", "roaming"] {
+        if !matches!(integer(params, field, false), Ok(None | Some(0 | 1))) {
+            return Outcome::Invalid(format!("{field} must be 0 or 1"));
+        }
+    }
     let overrides = match mapped(
         params,
         &[
@@ -2082,6 +2087,19 @@ mod tests {
             Outcome::Invalid(_)
         ));
         assert!(valid_traffic_bytes(&json!({"value":"0"}), "value", true));
+    }
+    #[tokio::test]
+    async fn cellular_roaming_rejects_values_outside_the_switch() {
+        for params in [
+            json!({"roaming":-1}),
+            json!({"roaming":2}),
+            json!({"roaming":"on"}),
+        ] {
+            assert!(matches!(
+                execute("cellular.set", &params).await,
+                Outcome::Invalid(_)
+            ));
+        }
     }
     #[test]
     fn unlocked_cell_readback_accepts_absent_empty_and_zero_values() {
