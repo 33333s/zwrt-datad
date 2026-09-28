@@ -140,7 +140,9 @@ post '{"action":"cellular.set","params":{"roaming":1}}' >/dev/null
 python3 - "$MOCK_CALL_LOG" <<'PY'
 import json, sys
 calls = [line.split('\t', 2) for line in open(sys.argv[1]) if '\tset_wwaniface\t' in line]
-assert calls and json.loads(calls[-1][2])["roam_enable"] == 1
+assert calls
+args = json.loads(calls[-1][2])
+assert args == {"source_module":"WEBUI", "cid":1, "roam_enable":1}, args
 PY
 post '{"action":"band.set_nr_sa","params":{"bands":"78,79"}}' >/dev/null
 post '{"action":"sim.set_slot","params":{"slot":2}}' >/dev/null

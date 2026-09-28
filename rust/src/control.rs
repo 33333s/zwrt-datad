@@ -490,21 +490,15 @@ async fn cellular_set(params: &Value) -> Outcome {
         Ok(_) => return Outcome::Invalid("no cellular fields supplied".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    let mut current = match state::ubus(
-        "zwrt_data",
-        "get_wwaniface",
-        json!({"source_module":"web","cid":1,"connect_status":""}),
-    )
-    .await
-    {
-        Ok(Value::Object(v)) => v,
-        Ok(_) => return Outcome::Failed("invalid get_wwaniface response".into()),
-        Err(e) => return Outcome::Failed(e),
-    };
-    current.extend(overrides);
-    current.insert("source_module".into(), json!("WEBUI"));
-    current.insert("cid".into(), json!(1));
-    call("zwrt_data", "set_wwaniface", Value::Object(current)).await
+    // get_wwaniface is a status response, not a safe write template. In
+    // particular, its enable=0 can coexist with an active data session;
+    // copying that value into set_wwaniface disconnects the modem when the
+    // caller only intended to change roaming. The firmware accepts partial
+    // writes (the existing connect/disconnect actions already use them).
+    let mut args = overrides;
+    args.insert("source_module".into(), json!("WEBUI"));
+    args.insert("cid".into(), json!(1));
+    call("zwrt_data", "set_wwaniface", Value::Object(args)).await
 }
 async fn band(params: &Value, lte: bool, nsa: bool) -> Outcome {
     let bands = match string(params, "bands", false) {

@@ -35,6 +35,10 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `cellular.connect` | 无 |
 | `cellular.disconnect` | 无 |
 | `cellular.set` | `enabled?`, `roaming?`, `connect_mode?` |
+
+`cellular.set` 只提交调用方指定的字段及 `source_module/cid`。`get_wwaniface` 的
+`enable` 是状态响应中的写入参数，可能在已连接时仍为 0；不得将整个读取结果
+作为写入模板，否则仅修改漫游设置也会断开数据连接。
 | `network.set_mode` | `mode` |
 | `band.set_lte` | `bands`，逗号分隔；空串表示自动 |
 | `band.set_nr_sa` | `bands` |
