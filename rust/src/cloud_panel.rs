@@ -204,11 +204,36 @@ fn needs_confirmation(action: &str) -> bool {
     )
 }
 
+fn valid_remote_band_list(action: &str, params: &Value) -> bool {
+    if !matches!(
+        action,
+        "band.set_lte" | "band.set_nr_sa" | "band.set_nr_nsa"
+    ) {
+        return true;
+    }
+    let Some(value) = params.get("bands").and_then(Value::as_str) else {
+        return false;
+    };
+    let parts: Vec<_> = value.split(',').collect();
+    let mut seen = HashSet::new();
+    !parts.is_empty()
+        && parts.len() <= 128
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part
+                    .parse::<u16>()
+                    .is_ok_and(|band| (1..=1024).contains(&band) && seen.insert(band))
+        })
+}
+
 async fn control_result(request: ControlRequest) -> Message {
     let code = if !control::ACTIONS.contains(&request.action.as_str()) {
         Some("unsupported_action")
     } else if needs_confirmation(&request.action) && !request.confirmed {
         Some("confirmation_required")
+    } else if !valid_remote_band_list(&request.action, &request.params) {
+        Some("invalid_parameter")
     } else {
         match tokio::time::timeout(
             Duration::from_secs(20),
@@ -421,6 +446,16 @@ mod tests {
         assert!(needs_confirmation(&request.action));
         assert!(control::ACTIONS.contains(&"wireless.config"));
         assert!(needs_confirmation("wireless.config"));
+        for invalid in ["", "0", "1,,3", "1,1", "1025", "1;reboot"] {
+            assert!(!valid_remote_band_list(
+                "band.set_lte",
+                &json!({"bands":invalid})
+            ));
+        }
+        assert!(valid_remote_band_list(
+            "band.set_nr_sa",
+            &json!({"bands":"28,78"})
+        ));
         let Message::Text(reply) = control_result(request).await else {
             panic!("expected a text result")
         };
