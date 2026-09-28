@@ -5,6 +5,7 @@ use crate::{
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
     state,
+    traffic_history::{History, Usage},
     webshell::WebShell,
 };
 use anyhow::Result;
@@ -56,6 +57,8 @@ pub(crate) struct Inner {
     pub(crate) ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
+    history: Mutex<History>,
+    history_tx: watch::Sender<Vec<Usage>>,
 }
 
 struct DeviceSession {
@@ -66,6 +69,10 @@ struct DeviceSession {
 impl App {
     pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
         self.inner.tx.subscribe()
+    }
+
+    pub(crate) fn cloud_panel_history(&self) -> watch::Receiver<Vec<Usage>> {
+        self.inner.history_tx.subscribe()
     }
 
     pub(crate) fn cloud_webshell_available(&self) -> bool {
@@ -102,6 +109,9 @@ impl App {
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
             .await;
         initial.fields.insert("neighbor".into(), neighbor.status());
+        let mut history = History::load(&data_dir);
+        history.record(&initial);
+        let (history_tx, _) = watch::channel(history.days());
         let (tx, _) = watch::channel(initial.clone());
         let app = Self {
             inner: Arc::new(Inner {
@@ -118,6 +128,8 @@ impl App {
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
                 webshell: WebShell::new(webshell_enabled),
+                history: Mutex::new(history),
+                history_tx,
             }),
         };
         app.inner
@@ -179,6 +191,11 @@ impl App {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        let mut history = self.inner.history.lock().await;
+        if history.record(&next) {
+            self.inner.history_tx.send_replace(history.days());
+        }
+        drop(history);
         let mut neighbor = self.inner.neighbor.lock().await;
         neighbor
             .tick(next.fields.get("net").unwrap_or(&Value::Null))

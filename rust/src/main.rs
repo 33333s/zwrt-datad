@@ -17,6 +17,7 @@ mod qtrace_mask;
 mod server;
 mod sms;
 mod state;
+mod traffic_history;
 mod usb;
 mod webshell;
 mod wifi;

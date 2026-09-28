@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.24",
+    "version": "0.10.25",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增服务小区与保护状态上报、NFC读回和WebShell登录环境，并收紧快速接入默认权限"
+    "notes": "NMS 原版远程面板增加设备本地持久化的每日流量历史，按需传输"
   }
 }

@@ -936,7 +936,10 @@ impl BridgeManager {
         ) {
             if let Some(app) = &self.app {
                 crate::cloud_panel::run(
-                    app.cloud_panel_state(),
+                    crate::cloud_panel::PanelFeeds {
+                        state: app.cloud_panel_state(),
+                        history: app.cloud_panel_history(),
+                    },
                     command.target_service == "datad_panel_control",
                     &self.config,
                     &command.remote_url,
