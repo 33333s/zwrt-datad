@@ -5,7 +5,9 @@ use crate::{
     control::{self, Outcome},
     cooling,
     model::Snapshot,
-    state, wifi,
+    state,
+    traffic_history::Usage,
+    wifi,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -21,6 +23,10 @@ use tokio_tungstenite::{
 
 pub(crate) const PROTOCOL: &str = "nms-datad-panel-v1";
 pub(crate) const CONTROL_PROTOCOL: &str = "nms-datad-panel-v2";
+pub(crate) struct PanelFeeds {
+    pub state: watch::Receiver<Snapshot>,
+    pub history: watch::Receiver<Vec<Usage>>,
+}
 const MAX_STATE_BYTES: usize = 192 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024;
 const MAX_CONTROLS_PER_SESSION: usize = 128;
@@ -110,12 +116,14 @@ fn panel_snapshot(snapshot: &Snapshot) -> Value {
     Value::Object(view)
 }
 
+#[cfg(test)]
 fn state_message(snapshot: &Snapshot) -> Option<Message> {
     state_message_version(snapshot, 1)
 }
 
+#[cfg(test)]
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
-    state_message_with_config(snapshot, version, None, None, None)
+    state_message_with_config(snapshot, version, None, None, None, None)
 }
 
 fn state_message_with_config(
@@ -124,8 +132,13 @@ fn state_message_with_config(
     wifi_config: Option<&Value>,
     apn_config: Option<&Value>,
     cooling_config: Option<&Value>,
+    history: Option<&[Usage]>,
 ) -> Option<Message> {
     let mut view = panel_snapshot(snapshot);
+    if let Some(history) = history {
+        view.as_object_mut()?
+            .insert("traffic_history".into(), json!(history));
+    }
     if let Some(wifi_config) = wifi_config {
         view.as_object_mut()?
             .insert("wifi_config".into(), wifi_config.clone());
@@ -372,7 +385,7 @@ async fn control_result(request: ControlRequest) -> Message {
 }
 
 pub(crate) async fn run(
-    state_rx: watch::Receiver<Snapshot>,
+    feeds: PanelFeeds,
     control_mode: bool,
     config: &Config,
     url: &str,
@@ -380,6 +393,10 @@ pub(crate) async fn run(
     ttl: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let PanelFeeds {
+        state: state_rx,
+        history: mut history_rx,
+    } = feeds;
     if *shutdown.borrow() || ttl.is_zero() {
         return;
     }
@@ -446,11 +463,15 @@ pub(crate) async fn run(
         return;
     }
     let mut last = state_rx.borrow().clone();
-    let Some(first) = (if control_mode {
-        state_message_version(&last, 2)
-    } else {
-        state_message(&last)
-    }) else {
+    let mut history = history_rx.borrow_and_update().clone();
+    let Some(first) = state_message_with_config(
+        &last,
+        if control_mode { 2 } else { 1 },
+        None,
+        None,
+        None,
+        Some(&history),
+    ) else {
         return;
     };
     if socket.send(first).await.is_err() {
@@ -481,10 +502,12 @@ pub(crate) async fn run(
             _ = shutdown.changed() => return,
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
-                if next != last || config_pending {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref()) else { return; };
+                let next_history = history_rx.borrow_and_update().clone();
+                if next != last || config_pending || next_history != history {
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history)) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
+                    history = next_history;
                     config_pending = false;
                 }
             },
@@ -508,7 +531,7 @@ pub(crate) async fn run(
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref())
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history))
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -584,6 +607,34 @@ mod tests {
         );
         assert!(!raw.contains("must-not-leak"));
         assert_eq!(parsed["protocol_version"], 1);
+    }
+
+    #[test]
+    fn daily_history_is_only_in_the_on_demand_panel_frame() {
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::new(),
+        };
+        let history = [Usage {
+            date: "2026-09-29".into(),
+            bytes: 1536,
+        }];
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected a text frame")
+        };
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain["snapshot"].get("traffic_history").is_none());
+        let Message::Text(with_history) =
+            state_message_with_config(&snapshot, 1, None, None, None, Some(&history)).unwrap()
+        else {
+            panic!("expected a text frame")
+        };
+        let with_history: Value = serde_json::from_str(&with_history).unwrap();
+        assert_eq!(
+            with_history["snapshot"]["traffic_history"],
+            json!([{"date":"2026-09-29","bytes":1536}])
+        );
     }
 
     #[test]
@@ -714,10 +765,17 @@ mod tests {
             datad: DatadVersion::default(),
             fields,
         });
+        let (_history_sender, history_receiver) = watch::channel(vec![Usage {
+            date: "2026-09-29".into(),
+            bytes: 1536,
+        }]);
         let (_shutdown_sender, shutdown) = watch::channel(false);
         let task = tokio::spawn(async move {
             run(
-                receiver,
+                PanelFeeds {
+                    state: receiver,
+                    history: history_receiver,
+                },
                 false,
                 &config,
                 &url,
@@ -740,6 +798,9 @@ mod tests {
         assert!(matches!(ready,Message::Text(ref body) if body.contains("\"ready\"")));
         let first = ws.next().await.unwrap().unwrap();
         assert!(matches!(first,Message::Text(ref body) if body.contains("\"LTE\"")));
+        assert!(
+            matches!(first,Message::Text(ref body) if body.contains("\"traffic_history\"") && body.contains("\"bytes\":1536"))
+        );
         sender.send_modify(|snapshot| {
             snapshot.ts = 2;
             snapshot.fields.insert("net".into(), json!({"type":"SA"}));
@@ -793,10 +854,14 @@ mod tests {
             datad: DatadVersion::default(),
             fields: Map::from_iter([("net".into(), json!({"type":"SA"}))]),
         });
+        let (_history_sender, history_receiver) = watch::channel(Vec::<Usage>::new());
         let (_shutdown_sender, shutdown) = watch::channel(false);
         let task = tokio::spawn(async move {
             run(
-                receiver,
+                PanelFeeds {
+                    state: receiver,
+                    history: history_receiver,
+                },
                 true,
                 &config,
                 &url,

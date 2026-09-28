@@ -113,6 +113,16 @@ post() {
 file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
+[ -f "$TMP/data/traffic-history.json" ]
+[ "$(file_mode "$TMP/data/traffic-history.json")" = 600 ]
+python3 - "$TMP/data/traffic-history.json" <<'PY'
+import json, sys
+history = json.load(open(sys.argv[1]))
+assert history["schema"] == 1 and len(history["days"]) == 1
+assert next(iter(history["days"].values()))["bytes"] == 360
+assert "secret" not in json.dumps(history)
+PY
+curl -fsS "http://127.0.0.1:$PORT/state" | python3 -c 'import json,sys; assert "traffic_history" not in json.load(sys.stdin)'
 process_gone() {
     pid=$1
     attempt=0
