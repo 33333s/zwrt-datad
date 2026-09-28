@@ -21,10 +21,11 @@ LD = "a" * 64
 RD = "b" * 64
 
 def digest(value):
-    return hashlib.sha256(value.encode()).hexdigest()
+    return hashlib.sha256(value.encode()).hexdigest().upper()
 
 class Vendor(BaseHTTPRequestHandler):
     writes = 0
+    language_after_cookie = None
     def send_json(self, value, cookie=None):
         data = json.dumps(value).encode()
         self.send_response(200)
@@ -44,7 +45,9 @@ class Vendor(BaseHTTPRequestHandler):
             return self.send_json({"loginfo":"ok" if "sid=two" in self.headers.get("Cookie", "") else ""})
         if keys == ["RD"]:
             return self.send_json({"RD": RD})
-        values = {"model_name":"U50S","network_type":"LTE","wa_inner_version":"B02","cr_version":"","Language":"en"}
+        values = {"model_name":"U50S","network_type":"LTE","wa_inner_version":"B02","cr_version":"","Language":"zh-cn"}
+        if keys == ["Language"] and Vendor.writes >= 2:
+            Vendor.language_after_cookie = self.headers.get("Cookie", "")
         reply = {key: values.get(key, "") for key in keys}
         page = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("page", [None])[0]
         if page is not None:
@@ -61,7 +64,7 @@ class Vendor(BaseHTTPRequestHandler):
                 return self.send_json({"result":"0"}, "sid=two; Path=/")
             return self.send_json({"result":"3"})
         if action == "SET_WEB_LANGUAGE":
-            if "sid=two" in self.headers.get("Cookie", "") and "AD" not in form and form.get("Language", [""])[0] == "en":
+            if not self.headers.get("Cookie", "") and "AD" not in form and form.get("Language", [""])[0] == "zh-cn":
                 Vendor.writes += 1
                 return self.send_json({"result":"success"})
         if action == "SET_DEVICE_LED":
@@ -131,10 +134,11 @@ esac
         status, result = request(base + "/control", action, token)
         assert status == 200 and result["ok"] and result["verified"] is False
         assert Vendor.writes == 1
-        language_action = {"action":"u50.oem.goform","goform_id":"SET_WEB_LANGUAGE","params":{"Language":"en"},"confirm":True}
+        language_action = {"action":"u50.oem.goform","goform_id":"SET_WEB_LANGUAGE","params":{"Language":"zh-cn"},"confirm":True}
         status, language_result = request(base + "/control", language_action, token)
         assert status == 200 and language_result["verified"] is True
         assert Vendor.writes == 2
+        assert Vendor.language_after_cookie == ""
         assert request(base + "/auth/logout", {}, token)[0] == 200
         assert request(base + "/control", action, token)[0] == 401
         print("U50 OEM challenge and guarded write contract OK")

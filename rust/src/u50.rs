@@ -73,6 +73,11 @@ const CFG_KEYS: &[&str] = &[
     "wifi_5g_enable",
     "wifi_lbd_enable",
     "wan_connect_status",
+    "nr5g_action_band",
+    "nr5g_action_channel",
+    "nr5g_pci",
+    "Z5g_rsrp",
+    "Z5g_SINR",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +303,25 @@ fn from_sources(
     }
     if let Some(value) = cfg.get("wan_lte_ca") {
         net.insert("lteca".into(), json!(value));
+    }
+    if let Some(value) = cfg.get("nr5g_action_band") {
+        net.insert("nr_band".into(), json!(value));
+    }
+    if let Some(value) = cfg_number(cfg, "nr5g_action_channel", 0, 1_000_000) {
+        net.insert("nr_channel".into(), json!(value));
+    }
+    if let Some(value) = cfg_number(cfg, "nr5g_pci", 0, 1007) {
+        net.insert("nr_pci".into(), json!(value));
+    }
+    if let Some(value) = cfg_number(cfg, "Z5g_rsrp", -160, -20) {
+        net.insert("nr_rsrp".into(), json!(value));
+    }
+    if let Some(value) = cfg.get("Z5g_SINR")
+        && value
+            .parse::<f64>()
+            .is_ok_and(|n| (-30.0..=60.0).contains(&n))
+    {
+        net.insert("nr_snr".into(), json!(value));
     }
     net.insert("HSR".into(), json!(false));
     fields.insert("net".into(), Value::Object(net));
@@ -725,6 +749,10 @@ mod tests {
             ("pm_sensor_mdm".into(), "41".into()),
             ("data_volume_limit_switch".into(), "0".into()),
             ("wifi_5g_enable".into(), "0".into()),
+            ("nr5g_action_band".into(), "n78".into()),
+            ("nr5g_action_channel".into(), "633984".into()),
+            ("Z5g_rsrp".into(), "-84".into()),
+            ("Z5g_SINR".into(), "2.5".into()),
         ]);
         let value = from_sources(Model::U50Pro, &cfg, None).unwrap();
         assert_eq!(value.fields["device"]["api_template_supported"], 0);
@@ -743,6 +771,11 @@ mod tests {
         assert_eq!(value.fields["sim"]["current_slot"], 1);
         assert_eq!(value.fields["net"]["band"], "B3");
         assert_eq!(value.fields["net"]["lte_channel"], 1650);
+        assert_eq!(value.fields["net"]["nr_band"], "n78");
+        assert_eq!(value.fields["net"]["nr_channel"], 633984);
+        assert_eq!(value.fields["net"]["nr_rsrp"], -84);
+        assert_eq!(value.fields["net"]["nr_snr"], "2.5");
+        assert!(value.fields["net"].get("nr_pci").is_none());
         assert_eq!(value.fields["traffic"]["limit_enabled"], 0);
         assert_eq!(value.fields["wlan"]["five_ghz_enabled"], 0);
         assert_eq!(value.fields["thermal"]["zones"][0]["celsius"], 43);

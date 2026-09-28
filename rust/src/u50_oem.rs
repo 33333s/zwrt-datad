@@ -39,7 +39,7 @@ struct Session {
 }
 
 fn sha256_hex(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    format!("{:x}", Sha256::digest(value.as_bytes())).to_ascii_uppercase()
 }
 fn valid_key(value: &str) -> bool {
     !value.is_empty()
@@ -319,7 +319,16 @@ impl Bridge {
             let Some(language) = params.get("Language").and_then(Value::as_str) else {
                 return Err("missing language".into());
             };
-            if language.is_empty() || language.len() > 16 || !valid_key(language) {
+            if language.len() < 2
+                || language.len() > 16
+                || !language
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic())
+                || !language
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
                 return Err("invalid language".into());
             }
         }
@@ -349,12 +358,25 @@ impl Bridge {
             }
             form.push((key.clone(), value));
         }
-        let (result, _) = self.post(&form, &cookie).await?;
+        let write_cookie = if goform_id == "SET_WEB_LANGUAGE" {
+            ""
+        } else {
+            &cookie
+        };
+        let (result, refreshed_cookie) = self.post(&form, write_cookie).await?;
+        if !refreshed_cookie.is_empty() {
+            let mut guard = self.inner.session.lock().await;
+            if let Some(session) = guard.as_mut()
+                && same_token(&session.token, token)
+            {
+                session.cookie = cookies_from_two(&session.cookie, &refreshed_cookie);
+            }
+        }
         if result.get("result").and_then(Value::as_str) != Some("success") {
             return Err("OEM action rejected".into());
         }
         let verified = if goform_id == "SET_WEB_LANGUAGE" {
-            let (readback, _) = self.get("Language", &cookie).await?;
+            let (readback, _) = self.get("Language", "").await?;
             let expected = params.get("Language").and_then(Value::as_str).unwrap_or("");
             if readback.get("Language").and_then(Value::as_str) != Some(expected) {
                 return Err("OEM readback mismatch".into());
@@ -391,6 +413,10 @@ mod tests {
     use super::*;
     #[test]
     fn token_and_key_validation() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        );
         assert!(valid_key("SET_DEVICE_LED"));
         assert!(!valid_key("a;reboot"));
         assert!(same_token("abc", "abc"));

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.21",
+    "version": "0.10.22",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：扩展遥测与分页原厂读取"
+    "notes": "ARM32 U50S 候选版：补全 NR 信号与原厂登录和语言控制"
   }
 }

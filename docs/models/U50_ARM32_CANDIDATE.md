@@ -37,7 +37,7 @@ The OEM WebUI responds with empty status values when a loopback request sends `H
 
 For the U50S only, `--u50-enable-writes` adds guarded loopback routes. They are absent by default and are not available for U50 Pro:
 
-- `POST /auth/login` with `{ "password": "..." }` uses the current OEM SHA-256 LD challenge, confirms `loginfo=ok`, then returns a random 15-minute Bearer token. The password and OEM session remain in memory only.
+- `POST /auth/login` with `{ "password": "..." }` uses the current OEM uppercase-hex SHA-256 LD challenge, confirms `loginfo=ok`, then returns a random 15-minute Bearer token. The password and OEM session remain in memory only.
 - `GET /oem/read?cmd=key1,key2` requires that token and forwards bounded OEM reads. Up to 16 validated extra query parameters (for example `page` and `data_per_page`) are forwarded for OEM paged resources such as SMS. The raw response is only available to the authenticated caller; it is not copied into the public `/state`.
 - `POST /control` with `{ "action":"u50.oem.goform", "goform_id":"SET_DEVICE_LED", "params":{"night_mode_switch":"0"}, "confirm":true }` requires the token. It accepts only action IDs present in the current U50S WebUI, validates field names/sizes, computes the fresh OEM RD challenge response, and returns `verified:false` until a separate readback proves the effect.
 - `POST /auth/logout` invalidates the datad token. `/capabilities` lists the OEM IDs only when write compatibility is explicitly enabled.
@@ -45,3 +45,5 @@ For the U50S only, `--u50-enable-writes` adds guarded loopback routes. They are 
 These routes provide a bounded compatibility layer for the current OEM action set; they do not imply that every vendor command has been individually verified on hardware. The borrowed device's live deployment remains read-only while owner-admin login and reversible write testing are pending. Firmware upgrade, reboot, network disconnect, SMS transmission, and other consequential commands must not be used as smoke tests.
 
 The next candidate also maps the current firmware's LTE band/channel, Wi-Fi chip/modem thermal zones, traffic-limit switch, five-GHz/band-steering flags, and per-chip client counts when their OEM values are present. `/state` omits absent fields and keeps device identifiers and passwords out of the public snapshot. The OEM action bridge remains optional and reports `verified:false` for generic writes; clients must read back the affected OEM state to establish the result.
+
+The SA signal mapping reads `nr5g_action_band`, `nr5g_action_channel`, `Z5g_rsrp` and `Z5g_SINR` from OEM `cfg`. Numeric fields are range-checked; a nonnumeric NR PCI is omitted rather than emitted as zero. `net.nr_snr` keeps the vendor decimal string because the shared state contract uses a string for this field.
