@@ -37,6 +37,7 @@ export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
 export MOCK_SIM_SLOT_FILE="$TMP/sim-slot"
+export MOCK_NFC_STATE_FILE="$TMP/nfc-state"
 export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
 export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
 export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
@@ -56,6 +57,7 @@ printf '42000\n' >"$ZWRT_DATAD_THERMAL_ROOT/thermal_zone0/temp"
 printf 'fixture-boot-id\n' >"$TMP/boot-id"
 printf '4102444800 00:11:22:33:44:99 192.168.0.99 historical-offline *\n' >"$ZWRT_DATAD_DHCP_LEASES_PATH"
 printf '1\n' >"$MOCK_SIM_SLOT_FILE"
+printf '0 2\n' >"$MOCK_NFC_STATE_FILE"
 export ZWRT_DATAD_BOOT_ID_PATH="$TMP/boot-id"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/web-private.pem" 2>/dev/null
 openssl pkey -in "$TMP/web-private.pem" -pubout -out "$TMP/web-public.pem" 2>/dev/null
@@ -136,12 +138,30 @@ wait_file_value() {
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
     python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+post '{"action":"cellular.set","params":{"roaming":1}}' >/dev/null
+python3 - "$MOCK_CALL_LOG" <<'PY'
+import json, sys
+calls = [line.split('\t', 2) for line in open(sys.argv[1]) if '\tset_wwaniface\t' in line]
+assert calls
+args = json.loads(calls[-1][2])
+assert args == {"source_module":"WEBUI", "cid":1, "roam_enable":1}, args
+PY
 post '{"action":"band.set_nr_sa","params":{"bands":"78,79"}}' >/dev/null
 post '{"action":"sim.set_slot","params":{"slot":2}}' >/dev/null
 post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
 post '{"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}' >/dev/null
 post '{"action":"apn.add","params":{"name":"fixture","apn":"internet","auth_mode":0}}' >/dev/null
 post '{"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}' >/dev/null
+post '{"action":"traffic.set_clear_day","params":{"day":15,"enabled":0}}' >/dev/null
+python3 - "$MOCK_CALL_LOG" <<'PY'
+import json, sys
+calls = [line.split('\t', 2) for line in open(sys.argv[1]) if '\tset_wwandst_clearday\t' in line]
+assert calls and json.loads(calls[-1][2])["enable"] == 0
+assert json.loads(calls[-1][2])["clearday"] == 15
+PY
+post '{"action":"nfc.set","params":{"enabled":true}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True; assert d["result"]=={"supported":True,"enabled":True,"switch":1,"flag":2,"changed":True,"verified":True},d'
+[ "$(cat "$MOCK_NFC_STATE_FILE")" = '1 2' ]
 post '{"action":"sms.send_raw","params":{"sender":"v3e1","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$TMP/sms-http.log" >/dev/null
 post '{"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
@@ -226,7 +246,10 @@ curl -fsS "http://127.0.0.1:$PORT/capabilities" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
 sleep 1.2
 curl -fsS "http://127.0.0.1:$PORT/state" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}]}'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["thermal"]["protection"]=={"active":True,"level":2,"speed_limited":True,"network_restricted":False,"raw":"1"}; assert d["battery"]["charge_protection"]=={"active":True,"mode":2}; assert d["net"]["HSR"] is True; assert d["net"]["high_speed_rail"]=={"active":True,"raw":"1"}; assert d["nfc"]["switch"]==1; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["roaming_allowed"]==0,d["net"]; assert d["net"]["lte_tac"]==40302,d["net"]; assert d["net"]["nr_tac"]==1234567,d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}],"blocked":[]}; assert d["dhcp"]["netmask"]=="255.255.255.0" and d["dhcp"]["disabled"] is False and d["dhcp"]["range_start"]=="192.168.0.2" and d["dhcp"]["range_end"]=="192.168.0.253"'
+event_json=$({ curl -sN --max-time 3 "http://127.0.0.1:$PORT/events" || true; } | sed -n 's/^data: //p' | head -n 1)
+printf '%s' "$event_json" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["thermal"]["protection"]["level"]==2; assert d["battery"]["charge_protection"]["active"] is True; assert d["net"]["high_speed_rail"]["active"] is True'
 unknown_status=$(curl -sS -o "$TMP/unknown.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"fixture.unknown","params":{}}' "http://127.0.0.1:$PORT/control")
 [ "$unknown_status" = 404 ]

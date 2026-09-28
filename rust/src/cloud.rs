@@ -70,6 +70,7 @@ pub struct Config {
     pub platform: String,
     pub report_interval_seconds: u16,
     pub remote_enabled: bool,
+    pub remote_panel_control_enabled: bool,
     pub remote_webshell_enabled: bool,
     pub services: Vec<Service>,
 }
@@ -91,6 +92,7 @@ impl Default for Config {
             platform: "qualcomm".into(),
             report_interval_seconds: 30,
             remote_enabled: false,
+            remote_panel_control_enabled: false,
             remote_webshell_enabled: false,
             services: vec![
                 Service {
@@ -120,6 +122,13 @@ pub struct Update {
     pub config: Config,
     #[serde(default)]
     pub clear_password: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickConnect {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -228,6 +237,7 @@ impl Cloud {
         validated.remote_enabled = false;
         validate(&validated)?;
         config.services.clear();
+        config.remote_panel_control_enabled = false;
         config.remote_webshell_enabled = false;
         let (tx, rx) = watch::channel(Some(config));
         let status = Arc::new(Mutex::new(Status::default()));
@@ -264,6 +274,119 @@ impl Cloud {
         let _ = self.tx.send(Some(self.config.clone()));
         Ok(self.public_config())
     }
+
+    pub fn quick_connect(
+        &mut self,
+        input: QuickConnect,
+        snapshot: &Snapshot,
+    ) -> Result<Value, String> {
+        if self.config.enabled && !self.config.username.is_empty() {
+            return Err("已配置云端连接；如需更换账户，请使用高级配置".into());
+        }
+        if !pending_username(&input.username)
+            || input.password.is_empty()
+            || input.password.len() > 256
+        {
+            return Err("请填写 NMS 签发的 MQTT 用户名和密码".into());
+        }
+        let device = snapshot.fields.get("device").unwrap_or(&Value::Null);
+        let info = snapshot
+            .fields
+            .get("uci_device_info")
+            .unwrap_or(&Value::Null);
+        let model = device
+            .get("api_template")
+            .and_then(Value::as_str)
+            .filter(|value| *value != "legacy_compat" && topic(value))
+            .or_else(|| {
+                device
+                    .get("model_name")
+                    .and_then(Value::as_str)
+                    .filter(|value| topic(value))
+            })
+            .ok_or("设备型号尚未就绪")?;
+        let stable_id = [("modem_msn", info), ("serial_number", info), ("imei", info)]
+            .into_iter()
+            .find_map(|(key, source)| {
+                source
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && topic(value))
+                    .map(|value| (key, value))
+            })
+            .or_else(|| {
+                snapshot
+                    .fields
+                    .get("system")
+                    .and_then(|system| system.get("imei"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| {
+                        (14..=16).contains(&value.len())
+                            && value.bytes().all(|c| c.is_ascii_digit())
+                    })
+                    .map(|value| ("imei", value))
+            })
+            .ok_or("设备稳定标识尚未就绪")?;
+        let mut config = self.config.clone();
+        config.broker = DEFAULT_BROKER.into();
+        config.platform_url = DEFAULT_PLATFORM_URL.into();
+        config.remote_origins.clear();
+        config.ca_pem.clear();
+        config.vendor = device
+            .get("vendor")
+            .and_then(Value::as_str)
+            .filter(|value| topic(value))
+            .unwrap_or("ZTE")
+            .to_owned();
+        config.model = model.to_owned();
+        config.identity_type = "uuid".into();
+        if config.identity.is_empty() {
+            config.identity =
+                deterministic_uuid(&format!("ufi-device:{}:{}", stable_id.0, stable_id.1));
+        }
+        config.platform = if matches!(model, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
+            "qualcomm"
+        } else {
+            "generic"
+        }
+        .into();
+        config.username = input.username;
+        config.password = input.password;
+        config.enabled = true;
+        config.remote_enabled = true;
+        config.remote_panel_control_enabled = false;
+        config.remote_webshell_enabled = false;
+        self.update(Update {
+            config,
+            clear_password: false,
+        })
+    }
+}
+
+fn pending_username(username: &str) -> bool {
+    username.len() == 36
+        && username.starts_with("enr_")
+        && username[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn deterministic_uuid(seed: &str) -> String {
+    let hash = Sha256::digest(seed.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&bytes[..4]),
+        hex(&bytes[4..6]),
+        hex(&bytes[6..8]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..16])
+    )
 }
 
 async fn supervisor(
@@ -388,6 +511,8 @@ async fn session(
     app: Option<crate::server::App>,
     panel_only: bool,
 ) -> SessionEnd {
+    let pending = pending_username(&config.username);
+    let enrollment_root = format!("onboard/{}", config.username);
     let id_hash = Sha256::digest(root(config).as_bytes());
     let client_id = format!("datad-{}", hex(&id_hash[..12]));
     let Ok(mut options) = mqtt_options(config, &client_id) else {
@@ -397,19 +522,24 @@ async fn session(
     options.set_keep_alive(30);
     options.set_clean_session(true);
     options.set_last_will(LastWill::new(
-        format!("{}/status", root(config)),
+        if pending {
+            format!("{enrollment_root}/status")
+        } else {
+            format!("{}/status", root(config))
+        },
         envelope(json!({"online":false})).to_string(),
         QoS::AtLeastOnce,
         false,
     ));
     let (client, mut eventloop) = AsyncClient::builder(options).capacity(32).build();
-    if client
-        .subscribe(
-            format!("{}/command/request", root(config)),
-            QoS::AtLeastOnce,
-        )
-        .await
-        .is_err()
+    if !pending
+        && client
+            .subscribe(
+                format!("{}/command/request", root(config)),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .is_err()
     {
         return SessionEnd::Failed;
     }
@@ -423,6 +553,7 @@ async fn session(
         .is_some_and(|app| app.cloud_webshell_available());
     let mut updates = JoinSet::new();
     let mut connected = false;
+    let mut enrolled = !pending;
     let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(
         config.report_interval_seconds,
     )));
@@ -435,7 +566,7 @@ async fn session(
         tokio::select! {
             changed = config_rx.changed() => {
                 bridge.shutdown(); updates.detach_all();
-                if connected {
+                if connected && enrolled {
                     let _ = publish_and_flush(
                         &client,
                         &mut eventloop,
@@ -453,9 +584,16 @@ async fn session(
             event = eventloop.poll() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
+                    enrolled = !pending;
                     ticker.reset();
                     heartbeat.reset();
-                    set_status(&status, "connected", "");
+                    set_status(&status, if pending {"enrolling"} else {"connected"}, "");
+                    if pending {
+                        if client.subscribe(format!("{enrollment_root}/result"), QoS::AtLeastOnce).await.is_err() {
+                            bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed;
+                        }
+                        continue;
+                    }
                     let snapshot = state_rx.borrow().clone();
                     if let Some(app) = &app
                         && let Some(result) = app.cloud_update_result().await {
@@ -466,7 +604,33 @@ async fn session(
                         return SessionEnd::Failed;
                     }
                 }
+                Ok(Event::Incoming(Incoming::SubAck(_))) if pending && connected && !enrolled => {
+                    if publish(&client, format!("{enrollment_root}/hello"), bootstrap_report(config)).await.is_err() {
+                        bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed;
+                    }
+                }
                 Ok(Event::Incoming(Incoming::Publish(message))) if connected => {
+                    if pending && !enrolled && message.topic == format!("{enrollment_root}/result") && !message.retain && message.payload.len() <= 1024 {
+                        let ack: Value=serde_json::from_slice(&message.payload).unwrap_or(Value::Null);
+                        if ack.get("protocol_version").and_then(Value::as_i64)==Some(1)
+                            && ack.get("state").and_then(Value::as_str)==Some("bound")
+                            && ack.get("topic_root").and_then(Value::as_str)==Some(root(config).as_str()) {
+                            enrolled=true;
+                            if client.subscribe(format!("{}/command/request",root(config)),QoS::AtLeastOnce).await.is_err() {
+                                bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
+                            }
+                            set_status(&status,"connected","");
+                            let snapshot=state_rx.borrow().clone();
+                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some() || panel_only,panel_only).await.is_err() {
+                                bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
+                            }
+                        } else {
+                            set_status(&status,"retrying","NMS 拒绝设备接入，请检查凭据及设备绑定状态");
+                            bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
+                        }
+                        continue;
+                    }
+                    if !enrolled { continue; }
                     if message.topic != format!("{}/command/request", root(config)) || message.retain || message.payload.len() > 8192 { continue; }
                     if let Ok(command) = serde_json::from_slice::<crate::cloud_update::Command>(&message.payload) {
                         if let Some(app) = &app {
@@ -487,12 +651,14 @@ async fn session(
                 Err(_) => { bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed; }
             },
             _ = heartbeat.tick(), if connected => {
-                if publish(&client, format!("{}/status", root(config)), json!({"online":true})).await.is_err() {
+                let (topic,body)=if pending && !enrolled {(format!("{enrollment_root}/hello"),bootstrap_report(config))}
+                    else {(format!("{}/status",root(config)),json!({"online":true}))};
+                if publish(&client, topic, body).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
             },
-            _ = ticker.tick(), if connected => {
+            _ = ticker.tick(), if connected && enrolled => {
                 if let Some(app) = &app
                     && let Some(result) = app.cloud_update_result().await {
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
@@ -552,6 +718,9 @@ async fn report(
     }
     if panel_available {
         capabilities.push("datad.panel");
+        if !panel_only && config.remote_enabled && config.remote_panel_control_enabled {
+            capabilities.push("datad.panel.control");
+        }
     }
     let firmware = state
         .get("system")
@@ -564,6 +733,7 @@ async fn report(
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
         "capabilities":capabilities,"remote_services":if panel_only { &[][..] } else { &config.services },"remote_enabled":config.remote_enabled,
         "remote_origins":reported_remote_origins(config),
+        "remote_panel_control_enabled":!panel_only && config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     })).await?;
     publish(
@@ -578,21 +748,10 @@ async fn report(
         system_telemetry(&state),
     )
     .await?;
-    let addresses = |family: &str| -> Vec<Value> {
-        state
-            .pointer(&format!("/net/interfaces/{family}/{family}"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.get("address").and_then(Value::as_str))
-            .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
-            .map(|address| json!(address))
-            .collect()
-    };
     publish(
         client,
         format!("{}/telemetry/network", root(config)),
-        json!({"upstream":{"ipv4":addresses("ipv4"),"ipv6":addresses("ipv6")}}),
+        json!({"upstream":{"ipv4":upstream_addresses(&state,"wan4","ipv4"),"ipv6":upstream_addresses(&state,"wan6","ipv6")},"cell":serving_cell(&state)}),
     )
     .await?;
     let mut guard = status.lock().unwrap();
@@ -619,6 +778,63 @@ fn envelope(mut payload: Value) -> Value {
         object.insert("timestamp".into(), json!(now()));
     }
     payload
+}
+
+/// WAN addresses from `/state.interfaces.wan4|wan6.<family>` (ubus
+/// `network.interface.*` `ipv4-address`/`ipv6-address` entries). Only valid
+/// addresses of the requested family are reported, capped like the panel view.
+fn upstream_addresses(state: &Value, interface: &str, family: &str) -> Vec<Value> {
+    state
+        .pointer(&format!("/interfaces/{interface}/{family}"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let address: std::net::IpAddr = entry.get("address")?.as_str()?.parse().ok()?;
+            (address.is_ipv4() == (family == "ipv4")).then(|| json!(address.to_string()))
+        })
+        .take(4)
+        .collect()
+}
+
+/// Serving-cell identity for NMS cell-based positioning. Zero-valued OEM
+/// fields are omitted instead of being sent as a misleading location. A modem
+/// can retain a prior cell value after a RAT switch, so consumers must also
+/// inspect the reported RAT and timestamp. MNC is the exception: 0 is a real
+/// network code (for example 460-00), so it follows a known MCC.
+fn serving_cell(state: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(rat) = state
+        .pointer("/net/type")
+        .and_then(Value::as_str)
+        .filter(|rat| !rat.is_empty())
+    {
+        out.insert("rat".into(), json!(rat));
+    }
+    let net_i64 = |key: &str| {
+        state
+            .pointer(&format!("/net/{key}"))
+            .and_then(Value::as_i64)
+    };
+    if let Some(mcc) = net_i64("mcc").filter(|mcc| *mcc > 0) {
+        out.insert("mcc".into(), json!(mcc));
+        if let Some(mnc) = net_i64("mnc").filter(|mnc| *mnc >= 0) {
+            out.insert("mnc".into(), json!(mnc));
+        }
+    }
+    for key in [
+        "lte_tac",
+        "lte_cell_id",
+        "lte_pci",
+        "nr_tac",
+        "nr_cell_id",
+        "nr_pci",
+    ] {
+        if let Some(value) = net_i64(key).filter(|value| *value > 0) {
+            out.insert(key.into(), json!(value));
+        }
+    }
+    Value::Object(out)
 }
 
 fn system_telemetry(state: &Value) -> Value {
@@ -728,8 +944,10 @@ impl BridgeManager {
         } else {
             None
         };
-        if command.target_service == "datad_panel"
-            && self.app.is_none()
+        if matches!(
+            command.target_service.as_str(),
+            "datad_panel" | "datad_panel_control"
+        ) && self.app.is_none()
             && self.panel_state.is_none()
         {
             return Some(reject("panel_unavailable".into()));
@@ -765,7 +983,10 @@ impl BridgeManager {
             self.state.lock().await.active.remove(&command.request_id);
             return;
         }
-        if command.target_service == "datad_panel" {
+        if matches!(
+            command.target_service.as_str(),
+            "datad_panel" | "datad_panel_control"
+        ) {
             if let Some(state) = self
                 .panel_state
                 .clone()
@@ -773,6 +994,7 @@ impl BridgeManager {
             {
                 crate::cloud_panel::run(
                     state,
+                    command.target_service == "datad_panel_control" && self.app.is_some(),
                     &self.config,
                     &command.remote_url,
                     &command.token,
@@ -868,7 +1090,13 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
         }
         return Ok(());
     }
-    if command.target_service == "datad_panel" {
+    if matches!(
+        command.target_service.as_str(),
+        "datad_panel" | "datad_panel_control"
+    ) {
+        if command.target_service == "datad_panel_control" && !config.remote_panel_control_enabled {
+            return Err("panel_control_disabled".into());
+        }
         if command.target_port != 0
             || !command.target_ports.is_empty()
             || command.ttl_seconds > 3600
@@ -989,6 +1217,38 @@ fn root(config: &Config) -> String {
         "devices/{}/{}/{}",
         config.vendor, config.model, config.identity
     )
+}
+
+fn bootstrap_proof(config: &Config) -> String {
+    let key = Sha256::digest(config.password.as_bytes());
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..key.len() {
+        inner_pad[index] ^= key[index];
+        outer_pad[index] ^= key[index];
+    }
+    let message = format!(
+        "nms-onboard-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        config.username,
+        config.vendor,
+        config.model,
+        config.identity_type,
+        config.identity,
+        config.platform
+    );
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message.as_bytes());
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    hex(&outer.finalize())
+}
+
+fn bootstrap_report(config: &Config) -> Value {
+    json!({"protocol_version":1,"vendor":config.vendor,"model":config.model,
+        "device_id":config.identity,"id_type":config.identity_type,"platform":config.platform,
+        "proof":bootstrap_proof(config)})
 }
 
 fn topic(value: &str) -> bool {
@@ -1176,6 +1436,110 @@ mod tests {
     use tokio_tungstenite::accept_hdr_async;
 
     #[test]
+    fn pending_credentials_derive_stable_device_identity_and_proof() {
+        let username = format!("enr_{}", "a".repeat(32));
+        let config = Config {
+            username: username.clone(),
+            password: "sample-secret".into(),
+            model: "MU5250".into(),
+            identity: "11111111-1111-4111-8111-111111111111".into(),
+            ..Default::default()
+        };
+        assert!(pending_username(&username));
+        assert_eq!(
+            bootstrap_proof(&config),
+            "ca7356594d85a66c7dd411ae8afaf01705a986c6d521dd6e905ebdd9348a1647"
+        );
+        assert_eq!(
+            deterministic_uuid("ufi-device:modem_msn:MSN-fixture"),
+            "7d77fceb-0592-529a-8d12-2b54068aaaff"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "datad-quick-connect-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "device".into(),
+            json!({"api_template":"MU5250","vendor":"ZTE"}),
+        );
+        fields.insert("uci_device_info".into(), json!({"modem_msn":"MSN-fixture"}));
+        let snapshot = Snapshot {
+            ts: 1,
+            datad: crate::model::DatadVersion::default(),
+            fields,
+        };
+        let mut cloud = Cloud::load(&dir);
+        cloud.config.broker = "wss://legacy.example/mqtt".into();
+        cloud.config.platform_url = "https://legacy.example".into();
+        cloud.config.remote_panel_control_enabled = true;
+        cloud.config.remote_webshell_enabled = true;
+        let public = cloud
+            .quick_connect(
+                QuickConnect {
+                    username,
+                    password: "sample-secret".into(),
+                },
+                &snapshot,
+            )
+            .unwrap();
+        assert_eq!(public["config"]["model"], "MU5250");
+        assert_eq!(public["config"]["broker"], DEFAULT_BROKER);
+        assert_eq!(public["config"]["platform_url"], DEFAULT_PLATFORM_URL);
+        assert_eq!(
+            public["config"]["identity"],
+            "7d77fceb-0592-529a-8d12-2b54068aaaff"
+        );
+        assert_eq!(public["config"]["remote_enabled"], true);
+        assert_eq!(public["config"]["remote_panel_control_enabled"], false);
+        assert_eq!(public["config"]["remote_webshell_enabled"], false);
+        assert_eq!(public["password_configured"], true);
+        assert!(!public.to_string().contains("sample-secret"));
+        assert!(
+            cloud
+                .quick_connect(
+                    QuickConnect {
+                        username: "enr_".to_owned() + &"b".repeat(32),
+                        password: "other".into()
+                    },
+                    &snapshot
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let fallback_dir = std::env::temp_dir().join(format!(
+            "datad-quick-connect-fallback-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&fallback_dir).unwrap();
+        let mut fallback = snapshot.clone();
+        fallback.fields.insert(
+            "uci_device_info".into(),
+            json!({"serial_number":"SERIAL-fixture"}),
+        );
+        let mut cloud = Cloud::load(&fallback_dir);
+        cloud
+            .quick_connect(
+                QuickConnect {
+                    username: format!("enr_{}", "b".repeat(32)),
+                    password: "sample-secret".into(),
+                },
+                &fallback,
+            )
+            .unwrap();
+        assert_eq!(
+            cloud.public_config()["config"]["identity"],
+            deterministic_uuid("ufi-device:serial_number:SERIAL-fixture")
+        );
+        fs::remove_dir_all(fallback_dir).unwrap();
+    }
+
+    #[test]
     fn mqtt_addresses_require_encryption_and_keep_wss_paths() {
         init_crypto();
         for address in [
@@ -1245,6 +1609,151 @@ mod tests {
             multiplier *= 128;
         }
         panic!("invalid fixture MQTT remaining length");
+    }
+
+    fn mqtt_publish(topic: &str, payload: &Value) -> Vec<u8> {
+        let body = payload.to_string();
+        let length = topic.len() + body.len() + 2;
+        let mut packet = vec![0x30];
+        let mut remaining = length;
+        loop {
+            let mut byte = (remaining % 128) as u8;
+            remaining /= 128;
+            if remaining > 0 {
+                byte |= 128;
+            }
+            packet.push(byte);
+            if remaining == 0 {
+                break;
+            }
+        }
+        packet.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        packet.extend_from_slice(topic.as_bytes());
+        packet.extend_from_slice(body.as_bytes());
+        packet
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn pending_mqtt_reports_identity_before_telemetry() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let username = format!("enr_{}", "a".repeat(32));
+        let identity = "11111111-1111-4111-8111-111111111111";
+        let root = format!("devices/ZTE/MU5250/{identity}");
+        let (reports_tx, mut reports_rx) = mpsc::channel(8);
+        let broker_username = username.clone();
+        let broker_root = root.clone();
+        let broker = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            let mut ws = accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                assert_eq!(request.uri().path(), "/mqtt");
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static("mqtt"));
+                Ok(response)
+            }).await.unwrap();
+            let mut pending = Vec::new();
+            let mut bound = false;
+            'messages: while let Some(Ok(message)) = ws.next().await {
+                if let Message::Binary(data) = message {
+                    pending.extend_from_slice(&data);
+                }
+                while let Some((header, payload)) = take_mqtt_packet(&mut pending) {
+                    match header >> 4 {
+                        1 => {
+                            assert!(
+                                payload
+                                    .windows(broker_username.len())
+                                    .any(|bytes| bytes == broker_username.as_bytes())
+                            );
+                            ws.send(Message::Binary(vec![0x20, 2, 0, 0].into()))
+                                .await
+                                .unwrap();
+                        }
+                        8 => {
+                            let topic = String::from_utf8_lossy(&payload[4..]);
+                            assert!(
+                                topic.starts_with(if bound { &broker_root } else { "onboard/" }),
+                                "unexpected subscription {topic:?}, bound={bound}"
+                            );
+                            ws.send(Message::Binary(
+                                vec![0x90, 3, payload[0], payload[1], 1].into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        3 => {
+                            let topic_len =
+                                usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                            let topic = std::str::from_utf8(&payload[2..2 + topic_len]).unwrap();
+                            let packet_id = 2 + topic_len;
+                            let value: Value =
+                                serde_json::from_slice(&payload[packet_id + 2..]).unwrap();
+                            if !bound {
+                                assert_eq!(topic, format!("onboard/{broker_username}/hello"));
+                                assert_eq!(value["model"], "MU5250");
+                                assert_eq!(value["device_id"], identity);
+                                assert_eq!(
+                                    value["proof"],
+                                    "ca7356594d85a66c7dd411ae8afaf01705a986c6d521dd6e905ebdd9348a1647"
+                                );
+                                bound = true;
+                                ws.send(Message::Binary(
+                                    vec![0x40, 2, payload[packet_id], payload[packet_id + 1]]
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                ws.send(Message::Binary(mqtt_publish(&format!("onboard/{broker_username}/result"), &json!({"protocol_version":1,"state":"bound","topic_root":broker_root})).into())).await.unwrap();
+                            } else {
+                                assert!(topic.starts_with(&broker_root));
+                                reports_tx.send(topic.to_owned()).await.unwrap();
+                                ws.send(Message::Binary(
+                                    vec![0x40, 2, payload[packet_id], payload[packet_id + 1]]
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                if topic.ends_with("/telemetry/device") {
+                                    break 'messages;
+                                }
+                            }
+                        }
+                        12 => ws
+                            .send(Message::Binary(vec![0xd0, 0].into()))
+                            .await
+                            .unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let config = Config {
+            enabled: true,
+            broker: format!("wss://{address}/mqtt"),
+            username,
+            password: "sample-secret".into(),
+            ca_pem,
+            model: "MU5250".into(),
+            identity: identity.into(),
+            ..Default::default()
+        };
+        let (_config_tx, config_rx) = watch::channel(Some(config));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: serde_json::Map::new(),
+        });
+        let status = Arc::new(Mutex::new(Status::default()));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None, false));
+        let topic = tokio::time::timeout(Duration::from_secs(10), reports_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(topic.starts_with(&root));
+        task.abort();
+        broker.await.unwrap();
     }
 
     #[tokio::test]
@@ -1525,6 +2034,42 @@ mod tests {
     }
 
     #[test]
+    fn network_telemetry_reads_wan_addresses_from_state_interfaces() {
+        let state = json!({
+            "interfaces":{
+                "wan4":{"ipv4":[{"address":"10.20.30.40","mask":8},{"address":"not-an-ip"},{"address":"2001:db8::1"}]},
+                "wan6":{"ipv6":[{"address":"2001:db8::7","mask":64},{"address":"10.0.0.1"}]},
+                "lan":{"ipv4":[{"address":"192.168.0.1","mask":24}]}
+            },
+            "net":{"interfaces":{"ipv4":{"ipv4":[{"address":"203.0.113.9"}]}}}
+        });
+        assert_eq!(
+            upstream_addresses(&state, "wan4", "ipv4"),
+            vec![json!("10.20.30.40")]
+        );
+        assert_eq!(
+            upstream_addresses(&state, "wan6", "ipv6"),
+            vec![json!("2001:db8::7")]
+        );
+        assert!(upstream_addresses(&json!({}), "wan4", "ipv4").is_empty());
+    }
+
+    #[test]
+    fn network_telemetry_reports_only_known_serving_cell_identity() {
+        let value = serving_cell(&json!({
+            "net":{"type":"ENDC","mcc":460,"mnc":0,"lte_tac":40302,"lte_cell_id":23621663,
+                "lte_pci":123,"nr_tac":0,"nr_cell_id":0,"nr_pci":321,"imsi":"do-not-upload"}
+        }));
+        assert_eq!(
+            value,
+            json!({"rat":"ENDC","mcc":460,"mnc":0,"lte_tac":40302,"lte_cell_id":23621663,"lte_pci":123,"nr_pci":321})
+        );
+        assert_eq!(serving_cell(&json!({})), json!({}));
+        // Without a registered PLMN an MNC of 0 is only the collector default.
+        assert_eq!(serving_cell(&json!({"net":{"mcc":0,"mnc":0}})), json!({}));
+    }
+
+    #[test]
     fn remote_validation_is_strict() {
         let config = Config {
             enabled: true,
@@ -1591,6 +2136,19 @@ mod tests {
         command.token = "z".repeat(64);
         assert!(validate_remote(&config, &command).is_err());
         command.token = "a".repeat(64);
+        command.target_service = "datad_panel_control".into();
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "panel_control_disabled"
+        );
+        config.remote_panel_control_enabled = true;
+        validate_remote(&config, &command).unwrap();
+        command.target_port = 9460;
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "invalid_panel_request"
+        );
+        command.target_port = 0;
         config.remote_enabled = false;
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
@@ -1759,6 +2317,7 @@ mod tests {
         let config = Config {
             enabled: true,
             remote_enabled: true,
+            remote_panel_control_enabled: true,
             platform_url: "https://nms.example.com".into(),
             services: Vec::new(),
             ..Default::default()
@@ -1769,7 +2328,7 @@ mod tests {
             fields: Default::default(),
         });
         let manager = BridgeManager::new(config, None, Some(state));
-        let command = RemoteCommand {
+        let mut command = RemoteCommand {
             protocol_version: 1,
             request_id: "u50-proxy-denied".into(),
             action: "remote.open".into(),
@@ -1780,6 +2339,12 @@ mod tests {
             target_ports: Vec::new(),
             ttl_seconds: 60,
         };
+        assert_eq!(
+            manager.receive(command.clone()).await.unwrap()["error"]["code"],
+            "panel_only"
+        );
+        command.target_service = "datad_panel_control".into();
+        command.target_port = 0;
         assert_eq!(
             manager.receive(command).await.unwrap()["error"]["code"],
             "panel_only"

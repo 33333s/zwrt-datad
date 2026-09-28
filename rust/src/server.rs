@@ -231,6 +231,10 @@ impl App {
                     "/cloud/config",
                     get(cloud_config_get).post(cloud_config_post),
                 )
+                .route(
+                    "/cloud/quick-connect",
+                    post(cloud_quick_connect).layer(RequestBodyLimitLayer::new(4096)),
+                )
                 .route("/cloud/status", get(cloud_status));
             router = router
                 .route("/ota/config", get(ota_config_get).post(ota_config_post))
@@ -685,7 +689,6 @@ fn capability_controls() -> Vec<&'static str> {
         "wifi.dual_band_status",
         "wifi.txpower.status",
         "wifi.advanced.status",
-        "wireless.config",
         "sleep.status",
         "usb.status",
         "power.direct_supply.status",
@@ -1110,6 +1113,22 @@ async fn cloud_status(State(app): State<App>) -> Json<Value> {
 }
 async fn cloud_config_post(State(app): State<App>, Json(update): Json<CloudUpdate>) -> Response {
     match app.inner.cloud.write().await.update(update) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
+    }
+}
+async fn cloud_quick_connect(
+    State(app): State<App>,
+    Json(input): Json<crate::cloud::QuickConnect>,
+) -> Response {
+    let snapshot = app.snapshot().await;
+    match app
+        .inner
+        .cloud
+        .write()
+        .await
+        .quick_connect(input, &snapshot)
+    {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
     }

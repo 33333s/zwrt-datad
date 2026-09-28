@@ -3,6 +3,7 @@
 //! This path deliberately does not expose ZWRT UBus/UCI or mutating routes.
 //! The firmware proves names and code paths, not successful device responses.
 use crate::{
+    cloud::{Cloud, QuickConnect},
     command,
     model::{DatadVersion, Snapshot},
     u50_oem::Bridge,
@@ -156,6 +157,64 @@ fn source_number(
 
 fn cfg_bin() -> String {
     std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into())
+}
+
+async fn enrollment_identity() -> Result<(&'static str, String)> {
+    let program = cfg_bin();
+    for key in ["modem_msn", "serial_number", "imei"] {
+        let Ok(raw) = command::run(&program, ["get", key], Duration::from_secs(2)).await else {
+            continue;
+        };
+        if raw.len() > 128 {
+            continue;
+        }
+        let Ok(value) = String::from_utf8(raw) else {
+            continue;
+        };
+        let value = value.trim();
+        let valid = if key == "imei" {
+            (14..=16).contains(&value.len()) && value.bytes().all(|c| c.is_ascii_digit())
+        } else {
+            (6..=64).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "unknown" | "invalid" | "null"
+                )
+        };
+        if valid {
+            return Ok((key, value.to_owned()));
+        }
+    }
+    anyhow::bail!("U50 stable device identity unavailable")
+}
+
+/// Provision a private cloud config without exposing the hardware identifier
+/// or one-time MQTT password through the public U50 state or CLI output.
+pub async fn enroll(model: Model, dir: &Path, input: QuickConnect) -> Result<()> {
+    ensure!(
+        !dir.join("cloud.json").exists(),
+        "U50 cloud config already exists; enrollment would replace it"
+    );
+    let cfg = cfg_values().await?;
+    let mut snapshot = from_sources(model, &cfg, None)?;
+    let (key, value) = enrollment_identity().await?;
+    let mut private_info = Map::new();
+    private_info.insert(key.into(), json!(value));
+    snapshot
+        .fields
+        .insert("uci_device_info".into(), Value::Object(private_info));
+    let mut cloud = Cloud::load(dir);
+    cloud
+        .quick_connect(input, &snapshot)
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "{}",
+        json!({"configured":true,"model":model.template(),"password_configured":true})
+    );
+    Ok(())
 }
 
 async fn cfg_values() -> Result<BTreeMap<String, String>> {

@@ -46,6 +46,7 @@ try:
         cfg.write_text('''#!/bin/sh
 case "$1:$2" in
   get:model_name) printf '%s\\n' "${MOCK_U50_MODEL:-U50Pro}" ;;
+  get:modem_msn) if [ "${MOCK_U50_NO_ID:-0}" = 1 ]; then exit 1; fi; printf '%s\\n' 'MSN-fixture' ;;
   get:integrate_version) printf '%s\\n' 'B02' ;;
   get:lan_ipaddr) printf '%s\\n' '192.168.0.1' ;;
   get:lan_netmask) printf '%s\\n' '255.255.255.0' ;;
@@ -161,6 +162,31 @@ esac
         u50s_env = {**env, "MOCK_U50_MODEL": "U50S"}
         u50s = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--once"], env=u50s_env, capture_output=True, text=True, timeout=15, check=True)
         assert json.loads(u50s.stdout)["device"]["api_template"] == "U50S"
+        enroll_dir = Path(tmp) / "enroll"
+        enrollment = json.dumps({"username": "enr_" + "a" * 32, "password": "fixture-secret"})
+        enroll_cmd = [BINARY, "--u50-model", "u50s", "--u50-enroll-dir", str(enroll_dir)]
+        enrolled = subprocess.run(enroll_cmd, input=enrollment, env=u50s_env,
+                                  capture_output=True, text=True, timeout=15, check=True)
+        assert json.loads(enrolled.stdout) == {"configured": True, "model": "U50S", "password_configured": True}
+        assert "fixture-secret" not in enrolled.stdout and "MSN-fixture" not in enrolled.stdout
+        cloud_file = enroll_dir / "cloud.json"
+        saved = json.loads(cloud_file.read_text())
+        assert cloud_file.stat().st_mode & 0o077 == 0
+        assert saved["username"] == "enr_" + "a" * 32
+        assert saved["password"] == "fixture-secret"
+        assert saved["identity"] == "7d77fceb-0592-529a-8d12-2b54068aaaff"
+        assert saved["remote_panel_control_enabled"] is False
+        assert saved["remote_webshell_enabled"] is False
+        assert "MSN-fixture" not in cloud_file.read_text()
+        saved_bytes = cloud_file.read_bytes()
+        duplicate = subprocess.run(enroll_cmd, input=enrollment, env=u50s_env,
+                                   capture_output=True, text=True, timeout=15)
+        assert duplicate.returncode != 0 and cloud_file.read_bytes() == saved_bytes
+        no_identity = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-enroll-dir", str(Path(tmp) / "no-id")],
+                                     input=enrollment, env={**u50s_env, "MOCK_U50_NO_ID": "1"},
+                                     capture_output=True, text=True, timeout=15)
+        assert no_identity.returncode != 0
+        assert "fixture-secret" not in no_identity.stderr
         wrong = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--once"], env=env, capture_output=True, text=True, timeout=15)
         assert wrong.returncode != 0
         print("U50 firmware cfg and optional GoAhead probe OK")

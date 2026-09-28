@@ -252,6 +252,9 @@ def main():
             assert accept in header, header
             opcode, ready, pending = recv_frame(shell, pending)
             assert opcode == 1 and json.loads(ready) == {"type": "ready", "cols": 80, "rows": 24}
+            shell.sendall(masked_frame(2, b"printf '__PWD__%s__\\n' \"$PWD\"\n"))
+            cwd_output, pending, _ = recv_until_pattern(shell, rb"__PWD__(/[^\r\n]*)__", pending)
+            assert b"__PWD__/__" in cwd_output, cwd_output
             shell.sendall(masked_frame(2, b"env; printf '__ENV_END__\\n'\n"))
             env_output, pending = recv_until(shell, b"__ENV_END__", pending)
             assert b"must-not-reach-shell" not in env_output, env_output

@@ -35,6 +35,10 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `cellular.connect` | 无 |
 | `cellular.disconnect` | 无 |
 | `cellular.set` | `enabled?`, `roaming?`, `connect_mode?` |
+
+`cellular.set` 只提交调用方指定的字段及 `source_module/cid`。`get_wwaniface` 的
+`enable` 是状态响应中的写入参数，可能在已连接时仍为 0；不得将整个读取结果
+作为写入模板，否则仅修改漫游设置也会断开数据连接。
 | `network.set_mode` | `mode` |
 | `band.set_lte` | `bands`，逗号分隔；空串表示自动 |
 | `band.set_nr_sa` | `bands` |
@@ -124,7 +128,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `usb.set` | `mode/port_switch/network_protocol` |
 | `sleep.status` | 无 |
 | `sleep.set` | `seconds` |
-| `nfc.set` | `enabled`, `flag?` |
+| `nfc.set` | `enabled`（布尔或 0/1），`flag?`（1–6；省略时保留原厂当前 NFC Wi-Fi 目标，无法读取时回退 2） |
 
 `usb.status` 保留原有 `result.typec`、`result.usb` 厂商字段，新增 `result.link`，内容等同于 `GET /usb/status` 与 `/state.usb`。仅查询握手速率推荐直接使用只读 `GET /usb/status`，不依赖厂商 UBus 查询成功。
 
@@ -133,7 +137,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | action | params |
 |---|---|
 | `traffic.set_limit` | `enabled`, `value?`, `type?`, `ratio?` |
-| `traffic.set_clear_day` | `day` |
+| `traffic.set_clear_day` | `day`（1–31），`enabled?`（0/1，省略时为 1） |
 | `traffic.calibrate` | `value` |
 | `qos.reload` | 无，重新扫描 QoS 日志 |
 | `qos.clear` | 无，截断已有的 `key.log/key.log.0` 并重读；轮转文件不存在不算失败 |

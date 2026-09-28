@@ -89,6 +89,9 @@ case "$service:$method" in
     zwrt_zte_mdm.api:get_imei)
         printf '%s\n' '{"imei":"860000000000001"}'
         ;;
+    zwrt_mc.device.manager:get_device_info)
+        printf '%s\n' '{"hightemp_datalimit_status":"1","bat_mode":"2"}'
+        ;;
     zwrt_zte_mdm.api:get_sim_info)
         if [ -n "${MOCK_SIM_SLOT_FILE:-}" ] && [ -f "$MOCK_SIM_SLOT_FILE" ]; then
             MOCK_SIM_SLOT=$(cat "$MOCK_SIM_SLOT_FILE")
@@ -114,7 +117,7 @@ case "$service:$method" in
         ;;
     zte_nwinfo_api:nwinfo_get_netinfo)
         [ "${MOCK_NWINFO_FAIL:-0}" = '1' ] && exit 1
-        printf '%s\n' '{"network_type":"SA","signalbar":4,"simcard_roam":"Home","network_provider_fullname":"Fixture Mobile","wan_active_band":"n78","nr5g_action_band":"78","nr5g_rsrp":-90,"nr5g_rsrq":-11,"nr5g_snr":"18.0","rmcc":460,"rmnc":0,"net_select":"WL_AND_5G","nr5g_sa_band_lock":"78","nr5g_nsa_band_lock":"","lte_band":"1,3"}'
+        printf '%s\n' '{"network_type":"SA","signalbar":4,"simcard_roam":"Home","network_provider_fullname":"Fixture Mobile","wan_active_band":"n78","nr5g_action_band":"78","nr5g_rsrp":-90,"nr5g_rsrq":-11,"nr5g_snr":"18.0","rmcc":460,"rmnc":0,"lac_code":40302,"net_select":"WL_AND_5G","nr5g_sa_band_lock":"78","nr5g_nsa_band_lock":"","lte_band":"1,3"}'
         ;;
     zte_nwinfo_api:nwinfo_get_msim_netinfo)
         [ "${MOCK_MSIM_NWINFO_FAIL:-0}" = '1' ] && exit 1
@@ -192,7 +195,18 @@ case "$service:$method" in
         ;;
     zwrt_nfc:zwrt_nfc_wifi_get)
         [ "${MOCK_NO_NFC:-0}" = '1' ] && exit 1
-        printf '%s\n' '{"switch":0,"ap":1}'
+        if [ -n "${MOCK_NFC_STATE_FILE:-}" ] && [ -f "$MOCK_NFC_STATE_FILE" ]; then
+            read -r nfc_switch nfc_flag <"$MOCK_NFC_STATE_FILE"
+        else
+            nfc_switch=0
+            nfc_flag=2
+        fi
+        printf '{"switch":%s,"flag":%s,"ap":1}\n' "$nfc_switch" "$nfc_flag"
+        ;;
+    zwrt_nfc:zwrt_nfc_wifi_set)
+        [ -n "${MOCK_NFC_STATE_FILE:-}" ] || exit 1
+        python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert isinstance(d.get("switch"),int); assert 1 <= d.get("flag",0) <= 6; open(sys.argv[2],"w").write("{} {}\n".format(d["switch"],d["flag"]))' "$args" "$MOCK_NFC_STATE_FILE"
+        printf '%s\n' '{"result":"0"}'
         ;;
     zwrt_bsp.thermal:get_cpu_temp)
         printf '%s\n' '{"cpuss_temp":42}'

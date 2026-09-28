@@ -131,6 +131,10 @@ const socket = new WebSocket("ws://<device-lan-ip>:9461/webshell", [
 服务端只协商并回显固定的 `datad-webshell-v1`，不会回显 Token。不得把 datad
 Token 放进 URL；`?access_token=` 对 WebShell 始终返回 `401`。
 
+WebShell 使用 OpenWrt 登录式交互 shell，默认工作目录固定为 `/`。标准
+OpenWrt 设备会由 `/etc/profile` 读取并显示设备自身的 `/etc/banner`；datad
+不会硬编码发行版名称或固件版本。
+
 ### `POST /auth/login`
 
 仅内网鉴权端口提供。使用 HTTP Basic 传递中兴后台用户名和密码：

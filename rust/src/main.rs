@@ -52,6 +52,9 @@ struct Args {
     /// Optional private cloud.json for NMS read-only panel sessions on U50.
     #[arg(long)]
     u50_panel_config: Option<PathBuf>,
+    /// Save one-time NMS enrollment credentials from stdin into private cloud.json.
+    #[arg(long)]
+    u50_enroll_dir: Option<PathBuf>,
     #[arg(long, default_value = "http://127.0.0.1/goform/goform_get_cmd_process")]
     u50_goform_url: String,
     /// Print USB sysfs link status without starting services or changing device state.
@@ -105,8 +108,9 @@ async fn main() -> Result<()> {
         "--u50-enable-writes requires --u50-model u50s"
     );
     anyhow::ensure!(
-        args.u50_model.is_some() || args.u50_panel_config.is_none(),
-        "--u50-panel-config requires --u50-model"
+        args.u50_model.is_some()
+            || (args.u50_panel_config.is_none() && args.u50_enroll_dir.is_none()),
+        "U50 panel and enrollment options require --u50-model"
     );
     #[cfg(target_arch = "arm")]
     anyhow::ensure!(
@@ -115,6 +119,11 @@ async fn main() -> Result<()> {
     );
     if let Some(model) = &args.u50_model {
         anyhow::ensure!(
+            args.u50_enroll_dir.is_none()
+                || (args.u50_panel_config.is_none() && !args.once && !args.u50_enable_writes),
+            "--u50-enroll-dir cannot be combined with server, write, or --once options"
+        );
+        anyhow::ensure!(
             !args.once || args.u50_panel_config.is_none(),
             "--u50-panel-config requires a running U50 server"
         );
@@ -122,9 +131,18 @@ async fn main() -> Result<()> {
             args.lan_bind.is_none() && !args.neighbor && !args.webshell && args.identity.is_none(),
             "U50 candidate mode supports read-only loopback state only"
         );
+        let model = u50::Model::parse(model)?;
+        if let Some(dir) = &args.u50_enroll_dir {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin().take(513).read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() <= 512, "U50 enrollment input too large");
+            let input: cloud::QuickConnect = serde_json::from_slice(&bytes)?;
+            return u50::enroll(model, dir, input).await;
+        }
         let bind: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
         return u50::run(
-            u50::Model::parse(model)?,
+            model,
             &args.u50_goform_url,
             bind,
             args.once,
