@@ -201,4 +201,83 @@ mod tests {
         };
         assert!(state_message(&snapshot).is_none());
     }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite handshake callback has a large error type.
+    async fn authenticated_wss_streams_changed_state_and_rejects_input() {
+        use rustls::{ServerConfig, pki_types::PrivateKeyDer};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::accept_hdr_async;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let config = Config {
+            ca_pem: certificate.cert.pem(),
+            ..Default::default()
+        };
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "wss://{}/api/remote/device/panel-fixture",
+            listener.local_addr().unwrap()
+        );
+        let mut fields = Map::new();
+        fields.insert("net".into(), json!({"type":"LTE"}));
+        let (sender, receiver) = watch::channel(Snapshot {
+            ts: 1,
+            datad: DatadVersion::default(),
+            fields,
+        });
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run(
+                receiver,
+                &config,
+                &url,
+                &"a".repeat(64),
+                Duration::from_secs(5),
+                shutdown,
+            )
+            .await;
+        });
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        let mut ws = accept_hdr_async(tls, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            assert_eq!(request.headers()["authorization"],format!("Bearer {}","a".repeat(64)));
+            assert_eq!(request.headers()["x-nms-target-port"],"0");
+            assert_eq!(request.headers()["sec-websocket-protocol"],PROTOCOL);
+            response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(PROTOCOL));
+            Ok(response)
+        }).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(matches!(ready,Message::Text(ref body) if body.contains("\"ready\"")));
+        let first = ws.next().await.unwrap().unwrap();
+        assert!(matches!(first,Message::Text(ref body) if body.contains("\"LTE\"")));
+        sender.send_modify(|snapshot| {
+            snapshot.ts = 2;
+            snapshot.fields.insert("net".into(), json!({"type":"SA"}));
+        });
+        let second = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(second,Message::Text(ref body) if body.contains("\"SA\"")));
+        ws.send(Message::Text(r#"{"type":"control"}"#.into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
