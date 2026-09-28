@@ -420,7 +420,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &snapshot, &status, webshell_available).await.is_err() {
+                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -457,7 +457,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &snapshot, &status, webshell_available).await.is_err() {
+                if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -497,11 +497,15 @@ async fn report(
     snapshot: &Snapshot,
     status: &Arc<Mutex<Status>>,
     webshell_available: bool,
+    panel_available: bool,
 ) -> Result<(), String> {
     let state = serde_json::to_value(snapshot).unwrap_or(Value::Null);
     let mut capabilities = vec!["datad.update", "datad.remote", "datad.remote_origins"];
     if webshell_available {
         capabilities.push("datad.webshell");
+    }
+    if panel_available {
+        capabilities.push("datad.panel");
     }
     let firmware = state
         .get("system")
@@ -669,6 +673,9 @@ impl BridgeManager {
         } else {
             None
         };
+        if command.target_service == "datad_panel" && self.app.is_none() {
+            return Some(reject("panel_unavailable".into()));
+        }
         state.active.insert(command.request_id.clone());
         state
             .seen
@@ -694,6 +701,21 @@ impl BridgeManager {
                     Duration::from_secs(command.ttl_seconds),
                     self.shutdown.subscribe(),
                     permit,
+                )
+                .await;
+            }
+            self.state.lock().await.active.remove(&command.request_id);
+            return;
+        }
+        if command.target_service == "datad_panel" {
+            if let Some(app) = &self.app {
+                crate::cloud_panel::run(
+                    app.cloud_panel_state(),
+                    &self.config,
+                    &command.remote_url,
+                    &command.token,
+                    Duration::from_secs(command.ttl_seconds),
+                    self.shutdown.subscribe(),
                 )
                 .await;
             }
@@ -788,6 +810,16 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
             || !command.token.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err("invalid_webshell_request".into());
+        }
+        return Ok(());
+    }
+    if command.target_service == "datad_panel" {
+        if command.target_port != 0
+            || !command.target_ports.is_empty()
+            || command.ttl_seconds > 3600
+            || !command.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid_panel_request".into());
         }
         return Ok(());
     }
@@ -1356,6 +1388,48 @@ mod tests {
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
             "multiple_ports_unsupported"
+        );
+    }
+
+    #[test]
+    fn panel_is_an_on_demand_zero_port_session_not_a_management_proxy() {
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            ..Default::default()
+        };
+        let mut command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "panel-session".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://nms.example.com/api/remote/device/panel-session".into(),
+            token: "a".repeat(64),
+            target_service: "datad_panel".into(),
+            target_port: 0,
+            target_ports: vec![],
+            ttl_seconds: 3600,
+        };
+        validate_remote(&config, &command).unwrap();
+        command.target_port = 9460;
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "invalid_panel_request"
+        );
+        command.target_port = 0;
+        command.target_ports = vec![0];
+        assert!(validate_remote(&config, &command).is_err());
+        command.target_ports.clear();
+        command.ttl_seconds = 3601;
+        assert!(validate_remote(&config, &command).is_err());
+        command.ttl_seconds = 60;
+        command.token = "z".repeat(64);
+        assert!(validate_remote(&config, &command).is_err());
+        command.token = "a".repeat(64);
+        config.remote_enabled = false;
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "remote_disabled"
         );
     }
 

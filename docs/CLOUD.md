@@ -40,3 +40,9 @@ WSS 必须协商 `nms-webshell-v1`。设备使用 `Authorization: Bearer <sessio
 `remote.open` 可连接主地址或已配置备用地址对应的 WSS，其他主机、端口和会话路径仍被拒绝。遥测声明 `datad.remote_origins` 并上报规范化后的全部允许地址。空列表保持旧版只允许主平台的行为。保存配置会关闭旧会话并重新上报；原有本地认证、WebShell 开关、资源上限和签名更新规则保持不变。
 
 NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将设备 WebUI/WebShell 数据通道切换至已授权中转。两个远程地址都在设备白名单中时，会员过期后可以回到免费入口，无需重新修改设备配置。会员资格和限速由 NMS 执行，设备备用地址本身不是付费凭据。
+
+## 按需远程面板状态通道
+
+云端连接且 `remote_enabled` 开启时，datad 报告 `datad.panel` 能力。NMS 可用现有 `remote.open` 命令建立 `target_service: "datad_panel"`、`target_port: 0` 的独立 WSS 会话，最长一小时，不占用 9460/9461 TCP 管理端口，也不需要设备本地 UFI 进程。设备必须验证配置的平台/备用 HTTPS 来源、TLS 主机名、一次性会话票据和 `nms-datad-panel-v1` WebSocket 子协议。
+
+连接后设备先发送 `ready`，再以最多每秒一次的 `state` 文本帧发送当前 datad 快照。只允许本模块显式列出的状态块；每帧至多 192 KiB，不上传 datad Bearer Token、云配置或未来新增的未知块。状态只在远程面板会话期间传输，不加入常规 MQTT 遥测或设备历史记录。会话到期、远程开关关闭、配置变化或 WSS 中断即停止。此协议第一阶段只读，设备拒绝浏览器/平台发来的数据帧；后续控制需另行逐项授权和审计。
