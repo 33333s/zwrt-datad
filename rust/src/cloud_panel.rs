@@ -294,26 +294,27 @@ fn valid_remote_band_list(action: &str, params: &Value) -> bool {
 }
 
 async fn control_result(request: ControlRequest) -> Message {
-    let code = if !control::ACTIONS.contains(&request.action.as_str()) {
-        Some("unsupported_action")
-    } else if needs_confirmation(&request.action) && !request.confirmed {
-        Some("confirmation_required")
-    } else if !valid_remote_band_list(&request.action, &request.params) {
-        Some("invalid_parameter")
-    } else {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            control::execute(&request.action, &request.params),
-        )
-        .await
-        {
-            Ok(Outcome::Ok(_)) => None,
-            Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
-            Ok(Outcome::Failed(_)) => Some("device_call_failed"),
-            Ok(Outcome::NotHandled) => Some("unsupported_action"),
-            Err(_) => Some("device_call_timeout"),
-        }
-    };
+    let code =
+        if request.action == "usb.set" || !control::ACTIONS.contains(&request.action.as_str()) {
+            Some("unsupported_action")
+        } else if needs_confirmation(&request.action) && !request.confirmed {
+            Some("confirmation_required")
+        } else if !valid_remote_band_list(&request.action, &request.params) {
+            Some("invalid_parameter")
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(20),
+                control::execute(&request.action, &request.params),
+            )
+            .await
+            {
+                Ok(Outcome::Ok(_)) => None,
+                Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
+                Ok(Outcome::Failed(_)) => Some("device_call_failed"),
+                Ok(Outcome::NotHandled) => Some("unsupported_action"),
+                Err(_) => Some("device_call_timeout"),
+            }
+        };
     Message::Text(
         json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code})
             .to_string()
@@ -576,6 +577,15 @@ mod tests {
         let Message::Text(reply) = control_result(parse_control(&unsupported).unwrap()).await
         else {
             panic!("expected an unsupported-action result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["code"],
+            "unsupported_action"
+        );
+        let skipped_adb = allowed.replace("device.reboot", "usb.set");
+        let Message::Text(reply) = control_result(parse_control(&skipped_adb).unwrap()).await
+        else {
+            panic!("expected USB mode to be excluded from the remote panel")
         };
         assert_eq!(
             serde_json::from_str::<Value>(&reply).unwrap()["code"],
