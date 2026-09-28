@@ -65,18 +65,23 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
 }
 
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
-    state_message_with_wifi(snapshot, version, None)
+    state_message_with_config(snapshot, version, None, None)
 }
 
-fn state_message_with_wifi(
+fn state_message_with_config(
     snapshot: &Snapshot,
     version: u8,
     wifi_config: Option<&Value>,
+    apn_config: Option<&Value>,
 ) -> Option<Message> {
     let mut view = panel_snapshot(snapshot);
     if let Some(wifi_config) = wifi_config {
         view.as_object_mut()?
             .insert("wifi_config".into(), wifi_config.clone());
+    }
+    if let Some(apn_config) = apn_config {
+        view.as_object_mut()?
+            .insert("apn_config".into(), apn_config.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -147,6 +152,47 @@ async fn wifi_panel_config() -> Option<Value> {
     Some(json!({"countries":countries,"bands":bands,"dual_band":dual_band}))
 }
 
+fn panel_apn_profiles(reply: &Value) -> Vec<Value> {
+    reply.get("apnListArray").and_then(Value::as_array)
+        .into_iter().flatten().take(64).filter_map(|item| {
+            let id=item.get("profileId")?.as_str()?;
+            if id.is_empty() || id.len()>64 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte)) {return None;}
+            let limited=|name:&str,max:usize|->String{
+                item.get(name).and_then(Value::as_str).unwrap_or("").chars().take(max).collect()
+            };
+            Some(json!({
+                "id":id,"name":limited("profilename",64),"apn":limited("wanapn",128),
+                "pdp_type":item.get("pdpType").and_then(Value::as_i64).filter(|v|(0..=3).contains(v)),
+                "auth_mode":item.get("pppAuthMode").and_then(Value::as_i64).filter(|v|(0..=3).contains(v)),
+                "enabled":item.get("isEnable").and_then(Value::as_bool)==Some(true)
+            }))
+        }).collect()
+}
+
+async fn apn_panel_config() -> Option<Value> {
+    let (mode, automatic, manual, enabled) = tokio::join!(
+        state::ubus("zwrt_apn_object", "get_apn_mode", json!({})),
+        state::ubus("zwrt_apn_object", "getAutoApnList", json!({})),
+        state::ubus("zwrt_apn_object", "getManuApnList", json!({})),
+        state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({}))
+    );
+    let (Ok(mode), Ok(automatic), Ok(manual), Ok(enabled)) = (mode, automatic, manual, enabled)
+    else {
+        return None;
+    };
+    let mode = mode
+        .get("apn_mode")
+        .and_then(Value::as_i64)
+        .filter(|v| *v == 0 || *v == 1)?;
+    let enabled_id = enabled
+        .get("profileId")
+        .and_then(Value::as_str)
+        .filter(|v| v.len() <= 64)
+        .unwrap_or("");
+    Some(json!({"mode":mode,"enabled_id":enabled_id,
+        "automatic":panel_apn_profiles(&automatic),"manual":panel_apn_profiles(&manual)}))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlRequest {
@@ -195,6 +241,10 @@ fn needs_confirmation(action: &str) -> bool {
             | "wifi.configure"
             | "wireless.config"
             | "lan.set"
+            | "apn.set_mode"
+            | "apn.add"
+            | "apn.modify"
+            | "apn.enable"
             | "apn.delete"
             | "aggregation.set"
             | "sms.delete"
@@ -342,11 +392,13 @@ pub(crate) async fn run(
     }
     // Extra configuration is fetched only while a remote panel is open. It
     // contains reviewed UI fields, never Wi-Fi keys or raw vendor responses.
-    let mut wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config())
-        .await
-        .ok()
-        .flatten();
-    let mut wifi_config_pending = wifi_config.is_some();
+    let (wifi_result, apn_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()),
+        tokio::time::timeout(Duration::from_secs(6), apn_panel_config())
+    );
+    let mut wifi_config = wifi_result.ok().flatten();
+    let mut apn_config = apn_result.ok().flatten();
+    let mut config_pending = wifi_config.is_some() || apn_config.is_some();
     let mut sample = tokio::time::interval(Duration::from_secs(1));
     sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -360,11 +412,11 @@ pub(crate) async fn run(
             _ = shutdown.changed() => return,
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
-                if next != last || wifi_config_pending {
-                    let Some(message) = state_message_with_wifi(&next, if control_mode {2} else {1}, wifi_config.as_ref()) else { return; };
+                if next != last || config_pending {
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref()) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
-                    wifi_config_pending = false;
+                    config_pending = false;
                 }
             },
             _ = ping.tick() => {
@@ -380,10 +432,12 @@ pub(crate) async fn run(
                     let Some(request) = parse_control(&raw) else { return; };
                     if used_ids.len() >= MAX_CONTROLS_PER_SESSION || !used_ids.insert(request.request_id.clone()) { return; }
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
+                    let refresh_apn = request.action.starts_with("apn.");
                     if socket.send(control_result(request).await).await.is_err() { return; }
-                    if refresh_wifi {
-                        wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();
-                        if let Some(message) = state_message_with_wifi(&last, 2, wifi_config.as_ref())
+                    if refresh_wifi || refresh_apn {
+                        if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
+                        if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref())
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -422,6 +476,27 @@ mod tests {
         assert!(parsed["snapshot"].get("future_secret").is_none());
         assert!(parsed["snapshot"].get("interfaces").is_none());
         assert_eq!(parsed["protocol_version"], 1);
+    }
+
+    #[test]
+    fn apn_panel_profiles_never_copy_account_secrets() {
+        let raw = json!({"apnListArray":[
+            {"profileId":"profile-1","profilename":"Carrier","wanapn":"internet",
+             "pdpType":3,"pppAuthMode":2,"isEnable":true,
+             "username":"must-not-leak","password":"must-not-leak"},
+            {"profileId":"../bad","profilename":"Bad","password":"must-not-leak"}
+        ]});
+        let filtered = panel_apn_profiles(&raw);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["id"], "profile-1");
+        assert_eq!(filtered[0]["apn"], "internet");
+        assert!(
+            !serde_json::to_string(&filtered)
+                .unwrap()
+                .contains("must-not-leak")
+        );
+        assert!(filtered[0].get("username").is_none());
+        assert!(filtered[0].get("password").is_none());
     }
 
     #[test]

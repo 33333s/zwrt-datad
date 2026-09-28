@@ -658,8 +658,26 @@ async fn nfc(params: &Value) -> Outcome {
     }
 }
 async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
+    let mut effective = params.clone();
+    if profile_required {
+        let Some(id) = params.get("profile_id").and_then(Value::as_str) else {
+            return Outcome::Invalid("profile_id is required".into());
+        };
+        let list = match state::ubus("zwrt_apn_object", "getManuApnList", json!({})).await {
+            Ok(value) => value,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let Some(existing) = existing_apn_fields(&list, id) else {
+            return Outcome::Invalid("profile not found".into());
+        };
+        if let Value::Object(ref mut fields) = effective {
+            for (name, value) in existing {
+                fields.entry(name).or_insert(value);
+            }
+        }
+    }
     mapped_call(
-        params,
+        &effective,
         "zwrt_apn_object",
         method,
         &[
@@ -675,6 +693,35 @@ async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
         false,
     )
     .await
+}
+fn existing_apn_fields(reply: &Value, id: &str) -> Option<Map<String, Value>> {
+    let profile = reply
+        .get("apnListArray")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("profileId").and_then(Value::as_str) == Some(id))?;
+    let mut fields = Map::new();
+    for name in ["username", "password"] {
+        let value = profile.get(name).and_then(Value::as_str)?;
+        if value.len() > 1024 {
+            return None;
+        }
+        fields.insert(name.into(), json!(value));
+    }
+    for (input, vendor) in [
+        ("auth_mode", "pppAuthMode"),
+        ("pdp_type", "pdpType"),
+        ("roaming_pdp_type", "roamingPdpType"),
+    ] {
+        if let Some(value) = profile
+            .get(vendor)
+            .and_then(Value::as_i64)
+            .filter(|value| (0..=3).contains(value))
+        {
+            fields.insert(input.into(), json!(value));
+        }
+    }
+    Some(fields)
 }
 async fn traffic(
     params: &Value,
@@ -1945,6 +1992,17 @@ async fn qos_clear() -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn apn_edit_keeps_existing_credentials_on_device() {
+        let reply = json!({"apnListArray":[{"profileId":"profile-1","username":"device-user","password":"device-secret","pppAuthMode":3,"pdpType":2,"roamingPdpType":1}]});
+        let fields = existing_apn_fields(&reply, "profile-1").unwrap();
+        assert_eq!(fields["username"], "device-user");
+        assert_eq!(fields["password"], "device-secret");
+        assert_eq!(fields["auth_mode"], 3);
+        assert_eq!(fields["pdp_type"], 2);
+        assert_eq!(fields["roaming_pdp_type"], 1);
+        assert!(existing_apn_fields(&reply, "missing").is_none());
+    }
     #[test]
     fn rejects_non_hex_mac() {
         assert!(!valid_mac("00:11:22:33:44:zz"));

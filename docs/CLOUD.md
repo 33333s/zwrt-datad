@@ -55,6 +55,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 云端 v2 的 LTE/NR 锁频动作另行拒绝空频段、0、重复或越界频段。设备原版实测空串可能清空允许频段导致断网；NMS 恢复自动模式必须使用设备报告的完整支持频段列表，不发送空串。
 
+APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 ID、名称、APN、鉴权/PDP 类型与启用状态；原厂回包中的 APN 用户名和密码不会上传。修改既有手动 APN 时，前端留空的用户名、密码和其他未改动可选字段由 datad 在设备本地读取并保留。云端 v2 的 APN 模式、添加、修改、启用、删除都要求显式确认。
+
 ## 可选面板控制通道（0.10.21）
 
 原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。
