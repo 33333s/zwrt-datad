@@ -1887,7 +1887,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     } else {
         fields.insert("modems".into(), json!([]));
     }
-    fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
+    fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"netmask":uci_get(&uci_sets,"network.lan.netmask"),"disabled":uci_get(&uci_sets,"dhcp.lan.ignore")=="1","start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"range_start":uci_get(&uci_sets,"dhcp.lan.zte_start"),"range_end":uci_get(&uci_sets,"dhcp.lan.zte_end"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
     let template_label = if template == "legacy_compat" {
         "Legacy compatibility fallback"
     } else {
