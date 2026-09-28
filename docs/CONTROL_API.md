@@ -133,7 +133,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | action | params |
 |---|---|
 | `traffic.set_limit` | `enabled`, `value?`, `type?`, `ratio?` |
-| `traffic.set_clear_day` | `day` |
+| `traffic.set_clear_day` | `day`（1–31），`enabled?`（0/1，省略时为 1） |
 | `traffic.calibrate` | `value` |
 | `qos.reload` | 无，重新扫描 QoS 日志 |
 | `qos.clear` | 无，截断已有的 `key.log/key.log.0` 并重读；轮转文件不存在不算失败 |

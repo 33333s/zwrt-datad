@@ -142,6 +142,13 @@ post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
 post '{"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}' >/dev/null
 post '{"action":"apn.add","params":{"name":"fixture","apn":"internet","auth_mode":0}}' >/dev/null
 post '{"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}' >/dev/null
+post '{"action":"traffic.set_clear_day","params":{"day":15,"enabled":0}}' >/dev/null
+python3 - "$MOCK_CALL_LOG" <<'PY'
+import json, sys
+calls = [line.split('\t', 2) for line in open(sys.argv[1]) if '\tset_wwandst_clearday\t' in line]
+assert calls and json.loads(calls[-1][2])["enable"] == 0
+assert json.loads(calls[-1][2])["clearday"] == 15
+PY
 post '{"action":"sms.send_raw","params":{"sender":"v3e1","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$TMP/sms-http.log" >/dev/null
 post '{"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null

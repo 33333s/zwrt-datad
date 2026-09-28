@@ -350,6 +350,19 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "traffic.set_limit" => {
+            let enabled = match integer(params, "enabled", true) {
+                Ok(Some(value @ (0 | 1))) => value,
+                _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
+            };
+            if enabled == 1
+                && (!valid_traffic_bytes(params, "value", false)
+                    || !matches!(integer(params, "type", true), Ok(Some(1..=3))))
+            {
+                return Outcome::Invalid("invalid traffic limit".into());
+            }
+            if !matches!(integer(params, "ratio", false), Ok(None | Some(0..=100))) {
+                return Outcome::Invalid("ratio must be 0 through 100".into());
+            }
             traffic(
                 params,
                 "set_wwandst_monthlimit",
@@ -364,15 +377,28 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "traffic.set_clear_day" => {
+            let day = match integer(params, "day", true) {
+                Ok(Some(value @ 1..=31)) => value,
+                _ => return Outcome::Invalid("day must be 1 through 31".into()),
+            };
+            let enabled = match integer(params, "enabled", false) {
+                Ok(Some(value @ (0 | 1))) => value,
+                Ok(Some(_)) => return Outcome::Invalid("enabled must be 0 or 1".into()),
+                Ok(None) => 1,
+                Err(error) => return Outcome::Invalid(error),
+            };
             traffic(
-                params,
+                &json!({"day":day}),
                 "set_wwandst_clearday",
                 &[("day", "clearday", true, true)],
-                json!({"enable":1}),
+                json!({"enable":enabled}),
             )
             .await
         }
         "traffic.calibrate" => {
+            if !valid_traffic_bytes(params, "value", true) {
+                return Outcome::Invalid("invalid traffic calibration".into());
+            }
             traffic(
                 params,
                 "set_wwandst_calibmonth",
@@ -723,6 +749,19 @@ fn existing_apn_fields(reply: &Value, id: &str) -> Option<Map<String, Value>> {
     }
     Some(fields)
 }
+fn valid_traffic_bytes(params: &Value, name: &str, allow_zero: bool) -> bool {
+    const MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024 * 1024;
+    let Ok(Some(value)) = string(params, name, true) else {
+        return false;
+    };
+    !value.is_empty()
+        && value.len() <= 15
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u64>()
+            .is_ok_and(|amount| (allow_zero || amount > 0) && amount <= MAX_BYTES)
+}
+
 async fn traffic(
     params: &Value,
     method: &str,
@@ -2013,6 +2052,36 @@ mod tests {
         for bad in ["1 3", "n78", "1;reboot"] {
             assert!(!bad.bytes().all(|b| b.is_ascii_digit() || b == b','));
         }
+    }
+    #[tokio::test]
+    async fn traffic_controls_reject_unsafe_values_before_ubus() {
+        for params in [
+            json!({"enabled":1,"value":"1;reboot","type":2}),
+            json!({"enabled":1,"value":"0","type":2}),
+            json!({"enabled":1,"value":"1024","type":9}),
+            json!({"enabled":1,"value":"1024","type":2,"ratio":101}),
+            json!({"enabled":2}),
+        ] {
+            assert!(matches!(
+                execute("traffic.set_limit", &params).await,
+                Outcome::Invalid(_)
+            ));
+        }
+        for params in [
+            json!({"day":0}),
+            json!({"day":32}),
+            json!({"day":15,"enabled":2}),
+        ] {
+            assert!(matches!(
+                execute("traffic.set_clear_day", &params).await,
+                Outcome::Invalid(_)
+            ));
+        }
+        assert!(matches!(
+            execute("traffic.calibrate", &json!({"value":"-1"})).await,
+            Outcome::Invalid(_)
+        ));
+        assert!(valid_traffic_bytes(&json!({"value":"0"}), "value", true));
     }
     #[test]
     fn unlocked_cell_readback_accepts_absent_empty_and_zero_values() {
