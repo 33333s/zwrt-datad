@@ -250,6 +250,11 @@ fn needs_confirmation(action: &str) -> bool {
             | "multiwan.member.set"
             | "multiwan.policy.set"
             | "multiwan.rule.set"
+            | "cooling.fan.set_enabled"
+            | "cooling.fan.set_mode"
+            | "cooling.fan.set_curve"
+            | "cooling.liquid.set_enabled"
+            | "cooling.liquid.set_mode"
             | "aggregation.set"
             | "sms.delete"
             | "sms.send_raw"
@@ -525,6 +530,8 @@ mod tests {
         assert!(needs_confirmation(&request.action));
         assert!(control::ACTIONS.contains(&"wireless.config"));
         assert!(needs_confirmation("wireless.config"));
+        assert!(needs_confirmation("cooling.fan.set_curve"));
+        assert!(needs_confirmation("cooling.liquid.set_mode"));
         for invalid in ["", "0", "1,,3", "1,1", "1025", "1;reboot"] {
             assert!(!valid_remote_band_list(
                 "band.set_lte",
