@@ -1,5 +1,11 @@
 # NMS 云端管理
 
+## 仅凭 MQTT 凭据接入（0.10.23）
+
+NMS 创建待接入凭据后，只把一次显示的 MQTT 用户名（`enr_` 前缀）和密码填入设备。UFI 的简易接入表单调用本机 `POST /cloud/quick-connect`；datad 只在该路径下自动选用内置 NMS HTTPS/WSS 地址，并从本机状态读取厂商、型号、固件平台和稳定标识。已有高级配置不会因加载而改写；已启用的云端账户须在高级配置中更换。远程面板控制仍默认关闭。
+
+datad 优先使用 modem MSN 生成与 UFI 相同的稳定 UUID；若没有 MSN，依次使用设备序列号、IMEI，生成后固定保存在 `cloud.json`，后续状态变化不会重算。若取不到可靠标识或型号，保存失败，不注册随机身份。首次连接仅向 `onboard/<用户名>/hello` 发送签名身份报告；NMS 校验凭据、签名、账户和设备占用后返回绑定结果，datad 才订阅正式命令并发送正常遥测。待接入凭据只能绑定首台设备，失效、撤销或已被占用的身份不能继续接入。旧 `dev_` 凭据继续按原流程连接。
+
 默认关闭。首次没有 `cloud.json` 时，NMS 地址预填 `https://nms.ericsfj.com`，MQTT 地址预填 `wss://nms.ericsfj.com/mqtt`；用户名、密码和设备标识仍需独立填写，datad 不会自行启用或连接。已有配置文件中的自定义地址、凭据、开关及后台列表保持原值，不在加载时重写。云端 TLS/MQTT/WebSocket 运行时由 Rust datad 进程直接提供，共享同一二进制和 PID。`scripts/build.sh` 只从 `rust/Cargo.toml` 构建最终 ARM64 musl 静态二进制；设备不再安装或启动 `zwrt-datad-cloud`、`cloud-service.sh` 或 `cloud.sock`。
 
 UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。请求由 datad 进程内直接处理。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。

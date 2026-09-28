@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.22",
+    "version": "0.10.23",
     "asset": "zwrt-datad-aarch64",
-    "notes": "NMS 面板按需提供筛选后的设备标识与 WAN 地址，不传递原始 UCI 或接口配置"
+    "notes": "新增仅填 MQTT 凭据的设备自报接入与 NMS 首报绑定流程"
   }
 }
