@@ -1,7 +1,7 @@
 use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::CString,
     fs,
     path::Path,
@@ -105,6 +105,27 @@ fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
         .find_map(|s| s.get(path))
         .map(String::as_str)
         .unwrap_or_default()
+}
+fn blocked_client_macs(sets: &[BTreeMap<String, String>]) -> Vec<String> {
+    let mut blocked = BTreeSet::new();
+    'sections: for section in ["main_2g", "main_5g", "guest_2g", "guest_5g"] {
+        let path = format!("wireless.{section}.denymaclist");
+        for entry in uci_get(sets, &path).split_whitespace() {
+            let mac = entry.trim_matches('\'').to_ascii_lowercase();
+            if mac.len() == 17
+                && mac.split(':').count() == 6
+                && mac.split(':').all(|part| {
+                    part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                blocked.insert(mac);
+                if blocked.len() >= 128 {
+                    break 'sections;
+                }
+            }
+        }
+    }
+    blocked.into_iter().take(128).collect()
 }
 fn supported_band_list(value: &str) -> Option<Vec<u32>> {
     if value.is_empty() {
@@ -1401,9 +1422,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("net".into(), Value::Object(net));
     fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
     let (client_list, wifi_count, lan_count) = connected_clients(&lan_clients, &wifi_clients);
+    let blocked = blocked_client_macs(&uci_sets);
     fields.insert(
         "clients".into(),
-        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list}),
+        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list,"blocked":blocked}),
     );
     let hide_battery = matches!(template, "MC7523" | "MC8532B");
     if !hide_battery
@@ -1937,6 +1959,23 @@ fn validate_name(v: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_client_macs_are_bounded_and_validated() {
+        let wireless = BTreeMap::from([
+            (
+                "wireless.main_2g.denymaclist".to_owned(),
+                "'AA:BB:CC:DD:EE:FF' 'not-a-mac' '11:22:33:44:55:66'".to_owned(),
+            ),
+            (
+                "wireless.main_5g.denymaclist".to_owned(),
+                "aa:bb:cc:dd:ee:ff".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            blocked_client_macs(&[wireless]),
+            vec!["11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"]
+        );
+    }
     #[test]
     fn profile() {
         assert_eq!(normalize_profile("MC7523 HW1.0"), "mc7523_hw1_0");
