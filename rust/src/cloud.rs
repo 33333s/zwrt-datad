@@ -939,6 +939,7 @@ impl BridgeManager {
                     crate::cloud_panel::PanelFeeds {
                         state: app.cloud_panel_state(),
                         history: app.cloud_panel_history(),
+                        schedule: Some(app.cloud_panel_schedule()),
                     },
                     command.target_service == "datad_panel_control",
                     &self.config,

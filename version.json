@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.26",
+    "version": "0.10.27",
     "asset": "zwrt-datad-aarch64",
-    "notes": "远程面板涉及联网、供电、流量和访问控制的操作补齐双端确认"
+    "notes": "为 NMS 原版远程面板增加设备本地每日定时重启与原厂计划冲突保护"
   }
 }

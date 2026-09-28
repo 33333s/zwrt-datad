@@ -324,6 +324,7 @@ SSE  /events
 - `net.lte_tac` / `net.nr_tac`：服务小区跟踪区码（十进制）。LTE 取原厂 `nwinfo_get_netinfo.lac_code`（缺失时回退 UCI `zte_nwinfo.cell_info.lac_code`），NR 取 `nr5g_tac`（原厂 netinfo 通常不带，回退 UCI `zte_nwinfo.cell_info.nr5g_tac`）。未注册该制式或超出 3GPP 位宽（LTE 16 位、NR 24 位）时为 `0`；NSA/ENDC 下 NR TAC 通常为 `0`。`modems[id=x75].net` 同步提供这两个字段。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
 - `net.HSR` 与 `net.high_speed_rail` 表示中兴原厂后台的高铁模式状态，来自 `zte_nwinfo.sys_info.hst_info`；值为 `1` 时 `HSR/high_speed_rail.active=true`。`high_speed_rail.raw` 保留原厂原值，字段缺失时为 `null`。这不按 ARFCN/EARFCN 推断，也不声称自行解析 SIB1 或完成独立信令确认。
+- `reboot_schedule`：datad 自管的每日定时重启，包含 `supported/enabled/time/device_time/timezone_offset/oem_conflict/last_attempt_date/error`。`time` 为设备本地 `HH:MM`，默认关闭；原厂周/间隔日计划开启时 `oem_conflict=true` 且不执行 datad 计划。触发日期先持久化到设备本地 `reboot-schedule.json`（0600），不会把完整配置或原厂调度数据写入常规 MQTT 遥测。
 - `thermal.protection`：中兴原厂高温保护状态，来自 `hightemp_datalimit_status`。原值 `0` 映射为 level 0/未触发，`1` 映射为 level 2/高温限速，`2` 映射为 level 3/超高温限制上网；同时提供 `active`、`speed_limited`、`network_restricted` 与 `raw`。
 - `battery.charge_protection`：中兴原厂安全保护性充电状态，来自 `bat_mode`。`mode >= 2` 时 `active=true`，表示因长时间充电而将电量维持在约 80%；仅在机型具有真实电池状态块时输出。
 - `nfc.switch/enabled/flag`：中兴原厂 NFC Wi-Fi 状态与目标 AP 标记。`nfc.set` 省略 `flag` 时保持当前原厂值，写入后必须读回确认；不再调用原厂页面未使用的 `zwrt_nfc_wifi_change`。

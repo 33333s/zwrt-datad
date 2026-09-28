@@ -24,6 +24,7 @@ Content-Type: application/json
 | `device.session_status` | 无 | 返回 datad 当前设备会话状态 |
 | `device.change_password` | `old_hash`, `new_hash` | 修改某兴后台密码 |
 | `device.reboot` | 无 | 重启设备 |
+| `schedule.reboot.set` | `enabled`（布尔）、`time`（设备本地 `HH:MM`） | 保存 datad 每日定时重启；原厂周/间隔日计划开启时拒绝启用 |
 | `device.poweroff` | 无 | 关闭设备 |
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
