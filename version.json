@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.25",
+    "version": "0.10.26",
     "asset": "zwrt-datad-aarch64",
-    "notes": "NMS 原版远程面板增加设备本地持久化的每日流量历史，按需传输"
+    "notes": "远程面板涉及联网、供电、流量和访问控制的操作补齐双端确认"
   }
 }

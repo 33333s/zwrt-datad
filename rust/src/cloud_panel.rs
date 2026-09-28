@@ -306,10 +306,26 @@ fn needs_confirmation(action: &str) -> bool {
             | "cell.lock_nr"
             | "cell.unlock_all"
             | "sim.set_slot"
+            | "wifi.set_dual_band"
             | "wifi.set_module"
+            | "wifi.set_chip"
             | "wifi.configure"
             | "wireless.config"
+            | "wifi.txpower.apply"
+            | "wifi.txpower.set_percent"
+            | "wifi.txpower.set_limit"
+            | "wifi.txpower.restore_limit"
+            | "wifi.psm.set"
+            | "wifi.txpower.set_dbm"
+            | "wifi.interface.create"
+            | "wifi.interface.configure"
+            | "wifi.interface.delete"
             | "lan.set"
+            | "lan.set_mtu"
+            | "dns.set"
+            | "power.direct_supply.set"
+            | "sleep.set"
+            | "nfc.set"
             | "apn.set_mode"
             | "apn.add"
             | "apn.modify"
@@ -325,10 +341,15 @@ fn needs_confirmation(action: &str) -> bool {
             | "cooling.liquid.set_enabled"
             | "cooling.liquid.set_mode"
             | "aggregation.set"
+            | "traffic.set_limit"
+            | "traffic.set_clear_day"
+            | "traffic.calibrate"
             | "sms.delete"
             | "sms.send_raw"
             | "client.kick"
             | "client.block"
+            | "client.unblock"
+            | "qos.clear"
     )
 }
 
@@ -683,6 +704,24 @@ mod tests {
         assert!(needs_confirmation("cellular.set"));
         assert!(needs_confirmation("cooling.fan.set_curve"));
         assert!(needs_confirmation("cooling.liquid.set_mode"));
+        for action in [
+            "wifi.set_dual_band",
+            "wifi.interface.delete",
+            "dns.set",
+            "power.direct_supply.set",
+            "sleep.set",
+            "nfc.set",
+            "traffic.set_limit",
+            "traffic.set_clear_day",
+            "traffic.calibrate",
+            "client.unblock",
+            "qos.clear",
+        ] {
+            assert!(
+                needs_confirmation(action),
+                "{action} must require confirmation"
+            );
+        }
         for invalid in ["", "0", "1,,3", "1,1", "1025", "1;reboot"] {
             assert!(!valid_remote_band_list(
                 "band.set_lte",
