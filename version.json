@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.22",
+    "version": "0.10.23",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：补全 NR 信号与原厂登录和语言控制"
+    "notes": "ARM32 U50S 候选版：补全读写映射并同步主线 NMS 只读面板状态流"
   }
 }

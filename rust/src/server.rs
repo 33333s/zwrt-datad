@@ -64,6 +64,10 @@ struct DeviceSession {
 }
 
 impl App {
+    pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
+        self.inner.tx.subscribe()
+    }
+
     pub(crate) fn cloud_webshell_available(&self) -> bool {
         self.inner.webshell.enabled()
     }

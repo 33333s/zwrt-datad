@@ -118,6 +118,39 @@ esac
         finally:
             process.terminate()
             process.wait(timeout=5)
+        panel_file = Path(tmp) / "cloud.json"
+        panel_file.write_text(json.dumps({
+            "enabled": True,
+            "remote_enabled": True,
+            "broker": "wss://127.0.0.1:1/mqtt",
+            "platform_url": "https://nms.example.com",
+            "username": "fixture-user",
+            "password": "fixture-password",
+            "model": "U50Pro",
+            "identity": "fixture-device",
+            "services": [],
+        }))
+        panel_cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url,
+                     "--u50-panel-config", str(panel_file), "--port", str(port)]
+        panel_file.chmod(0o644)
+        denied = subprocess.run(panel_cmd, env=env, capture_output=True, text=True, timeout=15)
+        assert denied.returncode != 0 and "private regular file" in denied.stderr
+        panel_file.chmod(0o600)
+        panel_process = subprocess.Popen(panel_cmd, env=env, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(40):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/state", timeout=1) as response:
+                        assert json.load(response)["device"]["api_template"] == "U50PRO"
+                    break
+                except urllib.error.URLError:
+                    time.sleep(0.1)
+            else:
+                raise AssertionError("panel-enabled candidate server did not start")
+        finally:
+            panel_process.terminate()
+            panel_process.wait(timeout=5)
         Handler.reply = b"<html>login required</html>"
         fallback = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
         partial = json.loads(fallback.stdout)

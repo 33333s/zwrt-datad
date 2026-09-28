@@ -21,6 +21,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -647,6 +648,7 @@ pub async fn run(
     once: bool,
     interval: Duration,
     enable_writes: bool,
+    panel_config: Option<&Path>,
 ) -> Result<()> {
     ensure!(
         bind.ip().is_loopback(),
@@ -678,6 +680,9 @@ pub async fn run(
         None
     };
     let (tx, _) = watch::channel(initial.clone());
+    if let Some(file) = panel_config {
+        crate::cloud::Cloud::start_panel_only(file, tx.subscribe()).map_err(anyhow::Error::msg)?;
+    }
     let app = App {
         snapshot: Arc::new(RwLock::new(initial)),
         tx,

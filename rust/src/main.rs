@@ -1,5 +1,6 @@
 mod auth;
 mod cloud;
+mod cloud_panel;
 mod cloud_shell;
 mod cloud_update;
 mod command;
@@ -48,6 +49,9 @@ struct Args {
     /// Enable authenticated OEM write compatibility on the loopback U50S server.
     #[arg(long)]
     u50_enable_writes: bool,
+    /// Optional private cloud.json for NMS read-only panel sessions on U50.
+    #[arg(long)]
+    u50_panel_config: Option<PathBuf>,
     #[arg(long, default_value = "http://127.0.0.1/goform/goform_get_cmd_process")]
     u50_goform_url: String,
     /// Print USB sysfs link status without starting services or changing device state.
@@ -100,12 +104,20 @@ async fn main() -> Result<()> {
         args.u50_model.is_some() || !args.u50_enable_writes,
         "--u50-enable-writes requires --u50-model u50s"
     );
+    anyhow::ensure!(
+        args.u50_model.is_some() || args.u50_panel_config.is_none(),
+        "--u50-panel-config requires --u50-model"
+    );
     #[cfg(target_arch = "arm")]
     anyhow::ensure!(
         args.u50_model.is_some(),
         "ARM32 candidate requires --u50-model u50pro|u50s"
     );
     if let Some(model) = &args.u50_model {
+        anyhow::ensure!(
+            !args.once || args.u50_panel_config.is_none(),
+            "--u50-panel-config requires a running U50 server"
+        );
         anyhow::ensure!(
             args.lan_bind.is_none() && !args.neighbor && !args.webshell && args.identity.is_none(),
             "U50 candidate mode supports read-only loopback state only"
@@ -118,6 +130,7 @@ async fn main() -> Result<()> {
             args.once,
             Duration::from_millis(args.interval.clamp(500, 5000)),
             args.u50_enable_writes,
+            args.u50_panel_config.as_deref(),
         )
         .await;
     }

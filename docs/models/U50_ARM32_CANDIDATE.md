@@ -25,7 +25,7 @@ Both GoAhead binaries contain the same read keys `model_name`, `wa_inner_version
 ./build/zwrt-datad-armv7-candidate --u50-model u50s --bind 127.0.0.1 --port 19460
 ```
 
-The ARM32 binary requires `--u50-model`; it cannot accidentally start the ZWRT collector. The candidate server binds only loopback and exposes `/healthz`, `/version`, `/state`, and `/capabilities`. It does not expose `/control`, `/ubus`, `/ota`, cloud, or WebShell. Build with `scripts/build-arm32-candidate.sh`; this produces an experimental ARMv7 musl binary without changing the ARM64 release asset or `version.json`.
+The ARM32 binary requires `--u50-model`; it cannot accidentally start the ZWRT collector. The candidate server binds only loopback and exposes `/healthz`, `/version`, `/state`, `/events`, and `/capabilities`. It does not expose `/ubus`, `/ota`, or WebShell. The OEM write bridge is an explicit U50S-only opt-in. Build with `scripts/build-arm32-candidate.sh`; this produces an experimental ARMv7 musl binary without changing the ARM64 release asset.
 
 Static analysis cannot establish the real device's `cfg` values, GoAhead authentication/response types, network and battery units, sampling costs, or safe control semantics. Verify on each real model before expanding the stable state contract or marking the template supported. No installation or service replacement is part of this branch.
 
@@ -33,7 +33,7 @@ Static analysis cannot establish the real device's `cfg` values, GoAhead authent
 
 The U50S read-only snapshot uses live-checked `cfg` keys for LTE bars/RSRP/RSRQ/SNR, battery percentage/temperature, cellular byte rates and counters, Wi-Fi enabled state, connected client count, SIM slot and modem state. The current WebUI's `transUnit(rate, true)` converts the rate from bytes per second to bits per second for display; datad keeps the source bytes-per-second value. Absent fields are omitted, not changed to zero. `/events` emits the same state snapshot on content changes, including an immediate initial event.
 
-The OEM WebUI responds with empty status values when a loopback request sends `Host: 127.0.0.1`; datad keeps the TCP destination on loopback but uses the validated LAN IP in `Host` and `Referer`, as the original WebUI does. `cfg` remains the fallback when GoAhead cannot return a field. The installed 0.10.19 binary predates this expanded mapping; this document describes the branch under development.
+The OEM WebUI responds with empty status values when a loopback request sends `Host: 127.0.0.1`; datad keeps the TCP destination on loopback but uses the validated LAN IP in `Host` and `Referer`, as the original WebUI does. `cfg` remains the fallback when GoAhead cannot return a field. U50S 0.10.22 has been installed and checked on the borrowed device, but it is not a running service.
 
 For the U50S only, `--u50-enable-writes` adds guarded loopback routes. They are absent by default and are not available for U50 Pro:
 
@@ -42,7 +42,13 @@ For the U50S only, `--u50-enable-writes` adds guarded loopback routes. They are 
 - `POST /control` with `{ "action":"u50.oem.goform", "goform_id":"SET_DEVICE_LED", "params":{"night_mode_switch":"0"}, "confirm":true }` requires the token. It accepts only action IDs present in the current U50S WebUI, validates field names/sizes, computes the fresh OEM RD challenge response, and returns `verified:false` until a separate readback proves the effect.
 - `POST /auth/logout` invalidates the datad token. `/capabilities` lists the OEM IDs only when write compatibility is explicitly enabled.
 
-These routes provide a bounded compatibility layer for the current OEM action set; they do not imply that every vendor command has been individually verified on hardware. The borrowed device's live deployment remains read-only while owner-admin login and reversible write testing are pending. Firmware upgrade, reboot, network disconnect, SMS transmission, and other consequential commands must not be used as smoke tests.
+These routes provide a bounded compatibility layer for the current OEM action set; they do not imply that every vendor command has been individually verified on hardware. The borrowed device's installed binary remains read-only by default; only same-value WebUI language and upgrade-notice writes were verified in a temporary opt-in process. Firmware upgrade, reboot, network disconnect, SMS transmission, and other consequential commands must not be used as smoke tests.
+
+## Optional NMS read-only panel
+
+The `arm32` branch includes the mainline NMS `datad_panel` stream. U50 uses a separate collector, so panel support requires an explicit private `cloud.json` path via `--u50-panel-config /path/to/cloud.json` when starting the U50 server. The file must be a regular file with no group/other permissions, and must contain valid enabled MQTT credentials, `remote_enabled: true`, and an HTTPS `platform_url`. No cloud connection or panel capability is started without that flag. `--once` cannot use it.
+
+In this mode the device advertises only `datad.panel`, with no remote services, datad self-update, WebShell, or TCP management proxy. Remote commands other than `datad_panel` are rejected even if the file lists services. Panel frames reuse the mainline field allowlist and read-only WSS protocol; U50-specific raw `u50_cfg` and `u50_unverified` blocks are not exported. NMS registration and a live U50 end-to-end panel session remain unverified. The installed U50S 0.10.22 binary does not contain this optional integration.
 
 The next candidate also maps the current firmware's LTE band/channel, Wi-Fi chip/modem thermal zones, traffic-limit switch, five-GHz/band-steering flags, and per-chip client counts when their OEM values are present. `/state` omits absent fields and keeps device identifiers and passwords out of the public snapshot. The OEM action bridge remains optional and reports `verified:false` for generic writes; clients must read back the affected OEM state to establish the result.
 
