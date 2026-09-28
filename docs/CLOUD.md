@@ -51,6 +51,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 `clients` 状态包含在线设备列表和经过 MAC 格式校验、去重并限制为 128 条的 `blocked` 黑名单，用于 NMS 托管的原版接入设备弹窗；不会把 Wi-Fi 密钥或原厂管理凭据放入该状态块。
 
+远程面板会话开启后按需读取 `wifi_config`：仅包含双频合一状态、各频段 SSID、加密模式、隐藏/PMF/最大接入、国家、信道与设备允许的选项；不读取或传输已保存的 Wi-Fi 密钥。改动 Wi-Fi 后重新读取这些字段。`wireless.config` 作为 v2 受确认的频段配置动作，仍由 datad 验证国家和信道并执行读回；普通 MQTT 遥测不含该配置。
+
 ## 可选面板控制通道（0.10.21）
 
 原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。

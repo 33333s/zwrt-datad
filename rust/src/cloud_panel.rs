@@ -4,6 +4,7 @@ use crate::{
     cloud::{Config, websocket_tls},
     control::{self, Outcome},
     model::Snapshot,
+    state, wifi,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -64,14 +65,86 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
 }
 
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
+    state_message_with_wifi(snapshot, version, None)
+}
+
+fn state_message_with_wifi(
+    snapshot: &Snapshot,
+    version: u8,
+    wifi_config: Option<&Value>,
+) -> Option<Message> {
+    let mut view = panel_snapshot(snapshot);
+    if let Some(wifi_config) = wifi_config {
+        view.as_object_mut()?
+            .insert("wifi_config".into(), wifi_config.clone());
+    }
     let raw = serde_json::to_vec(&json!({
-        "type": "state", "protocol_version": version, "snapshot": panel_snapshot(snapshot)
+        "type": "state", "protocol_version": version, "snapshot": view
     }))
     .ok()?;
     if raw.len() > MAX_STATE_BYTES {
         return None;
     }
     Some(Message::Text(String::from_utf8(raw).ok()?.into()))
+}
+
+async fn wifi_panel_config() -> Option<Value> {
+    let status = wifi::wireless_config_status().await.ok()?;
+    let countries: Vec<String> = status
+        .get("countries")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_uppercase)
+        .filter(|country| {
+            country == "00"
+                || (country.len() == 2 && country.bytes().all(|b| b.is_ascii_alphabetic()))
+        })
+        .take(256)
+        .collect();
+    let mut bands = Map::new();
+    for (band, section) in [("2g", "main_2g"), ("5g", "main_5g")] {
+        let radio = status.get("radios")?.get(band)?;
+        let radio_name = if band == "2g" { "wifi0" } else { "wifi1" };
+        let prefix = format!("wireless.{section}");
+        let supported = !state::uci_read(&format!("{prefix}.device"))
+            .await
+            .is_empty();
+        let ssid: String = state::uci_read(&format!("{prefix}.ssid"))
+            .await
+            .chars()
+            .take(32)
+            .collect();
+        let encryption = state::uci_read(&format!("{prefix}.encryption")).await;
+        let channels: Vec<i64> = radio
+            .get("supported_channels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_i64)
+            .filter(|value| (0..=255).contains(value))
+            .take(128)
+            .collect();
+        let country = radio.get("country").and_then(Value::as_str).unwrap_or("");
+        bands.insert(band.into(),json!({
+            "ssid":ssid,
+            "supported":supported,
+            "encryption":if encryption.len() <= 64 { encryption } else { String::new() },
+            "hidden":state::uci_read(&format!("{prefix}.hidden")).await == "1",
+            "pmf":state::uci_read(&format!("{prefix}.pmf")).await.chars().take(16).collect::<String>(),
+            "enabled":state::uci_read(&format!("{prefix}.disabled")).await != "1",
+            "maxassoc":state::uci_read(&format!("wireless.{radio_name}.maxassoc")).await.parse::<u32>().ok().filter(|value| *value <= 1024),
+            "country":if country.len()==2 { country } else { "" },
+            "channel":radio.get("channel").and_then(Value::as_str).unwrap_or("0"),
+            "htmode":radio.get("htmode").and_then(Value::as_str).unwrap_or("").chars().take(20).collect::<String>(),
+            "channels":channels
+        }));
+    }
+    let dual_band = wifi::dual_band_status()
+        .await
+        .ok()
+        .and_then(|value| value.get("enabled").and_then(Value::as_bool));
+    Some(json!({"countries":countries,"bands":bands,"dual_band":dual_band}))
 }
 
 #[derive(Deserialize)]
@@ -120,6 +193,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "sim.set_slot"
             | "wifi.set_module"
             | "wifi.configure"
+            | "wireless.config"
             | "lan.set"
             | "apn.delete"
             | "aggregation.set"
@@ -241,6 +315,13 @@ pub(crate) async fn run(
     if socket.send(first).await.is_err() {
         return;
     }
+    // Extra configuration is fetched only while a remote panel is open. It
+    // contains reviewed UI fields, never Wi-Fi keys or raw vendor responses.
+    let mut wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config())
+        .await
+        .ok()
+        .flatten();
+    let mut wifi_config_pending = wifi_config.is_some();
     let mut sample = tokio::time::interval(Duration::from_secs(1));
     sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -254,10 +335,11 @@ pub(crate) async fn run(
             _ = shutdown.changed() => return,
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
-                if next != last {
-                    let Some(message) = (if control_mode {state_message_version(&next, 2)} else {state_message(&next)}) else { return; };
+                if next != last || wifi_config_pending {
+                    let Some(message) = state_message_with_wifi(&next, if control_mode {2} else {1}, wifi_config.as_ref()) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
+                    wifi_config_pending = false;
                 }
             },
             _ = ping.tick() => {
@@ -272,7 +354,13 @@ pub(crate) async fn run(
                 Some(Ok(Message::Text(raw))) if control_mode => {
                     let Some(request) = parse_control(&raw) else { return; };
                     if used_ids.len() >= MAX_CONTROLS_PER_SESSION || !used_ids.insert(request.request_id.clone()) { return; }
+                    let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     if socket.send(control_result(request).await).await.is_err() { return; }
+                    if refresh_wifi {
+                        wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();
+                        if let Some(message) = state_message_with_wifi(&last, 2, wifi_config.as_ref())
+                            && socket.send(message).await.is_err() { return; }
+                    }
                 },
                 // V1 remains strictly read-only. V2 refuses binary and unknown frames.
                 Some(Ok(_)) => return,
@@ -331,6 +419,8 @@ mod tests {
         );
         let request = parse_control(&allowed).unwrap();
         assert!(needs_confirmation(&request.action));
+        assert!(control::ACTIONS.contains(&"wireless.config"));
+        assert!(needs_confirmation("wireless.config"));
         let Message::Text(reply) = control_result(request).await else {
             panic!("expected a text result")
         };

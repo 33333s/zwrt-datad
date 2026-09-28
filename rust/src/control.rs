@@ -27,6 +27,7 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_module",
     "wifi.set_chip",
     "wifi.configure",
+    "wireless.config",
     "wifi.txpower.apply",
     "wifi.txpower.set_percent",
     "wifi.txpower.set_limit",
