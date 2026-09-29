@@ -253,7 +253,7 @@ is selected.
 | action | params | Result |
 |---|---|---|
 | `neighbor.status` | none | Current cached neighbor block |
-| `neighbor.set` | `enabled`: boolean or 0/1 | Process-scoped enablement and current lifecycle state |
+| `neighbor.set` | `enabled`: boolean or 0/1 locally; exact boolean remotely | Process-scoped enablement and current lifecycle state. Remote v2 requires `confirmed=true`, an executable collector, and panel-control permission |
 
 Collection is off by default and enabling lasts only until datad restarts. Older
 saved `enabled:true` values are reset to false during startup. Disabling waits for

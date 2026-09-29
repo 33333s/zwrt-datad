@@ -393,6 +393,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "schedule.reboot.set"
             | "schedule.task.put"
             | "schedule.task.remove"
+            | "neighbor.set"
             | "speedtest.start"
             | "cloud.remote_features.set"
     )
@@ -421,6 +422,14 @@ fn valid_remote_band_list(action: &str, params: &Value) -> bool {
         })
 }
 
+fn remote_neighbor_enabled(params: &Value) -> Option<bool> {
+    let fields = params.as_object()?;
+    if fields.len() != 1 {
+        return None;
+    }
+    fields.get("enabled")?.as_bool()
+}
+
 async fn control_result(
     request: ControlRequest,
     schedule: Option<&Arc<Mutex<Schedule>>>,
@@ -428,13 +437,30 @@ async fn control_result(
     cloud_app: Option<&App>,
 ) -> Message {
     let code = if request.action == "usb.set"
-        || !control::ACTIONS.contains(&request.action.as_str())
+        || (!control::ACTIONS.contains(&request.action.as_str())
+            && request.action != "neighbor.set")
     {
         Some("unsupported_action")
     } else if needs_confirmation(&request.action) && !request.confirmed {
         Some("confirmation_required")
     } else if !valid_remote_band_list(&request.action, &request.params) {
         Some("invalid_parameter")
+    } else if request.action == "neighbor.set" {
+        match (cloud_app, remote_neighbor_enabled(&request.params)) {
+            (Some(app), Some(enabled)) => {
+                match tokio::time::timeout(Duration::from_secs(8), app.panel_neighbor_set(enabled))
+                    .await
+                {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(error)) if error == "neighbor_dependency_missing" => {
+                        Some("unsupported_action")
+                    }
+                    Ok(Err(_)) => Some("device_call_failed"),
+                    Err(_) => Some("device_call_timeout"),
+                }
+            }
+            _ => Some("invalid_parameter"),
+        }
     } else if request.action == "schedule.reboot.set" {
         let params = request
             .params
@@ -1031,6 +1057,20 @@ mod tests {
         assert!(needs_confirmation("cloud.remote_features.set"));
         assert!(needs_confirmation("schedule.task.put"));
         assert!(needs_confirmation("schedule.task.remove"));
+        assert!(needs_confirmation("neighbor.set"));
+        assert_eq!(
+            remote_neighbor_enabled(&json!({"enabled":true})),
+            Some(true)
+        );
+        assert_eq!(
+            remote_neighbor_enabled(&json!({"enabled":false})),
+            Some(false)
+        );
+        assert_eq!(remote_neighbor_enabled(&json!({"enabled":1})), None);
+        assert_eq!(
+            remote_neighbor_enabled(&json!({"enabled":true,"shell":"x"})),
+            None
+        );
         assert!(needs_confirmation("sms.forward.set"));
         assert!(needs_confirmation("sms.forward.test"));
         assert!(!needs_confirmation("speedtest.stop"));
@@ -1088,6 +1128,32 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&reply).unwrap()["code"],
             "unsupported_action"
+        );
+        let neighbor = allowed
+            .replace("device.reboot", "neighbor.set")
+            .replace("\"params\":{}", "\"params\":{\"enabled\":true}");
+        let Message::Text(reply) =
+            control_result(parse_control(&neighbor).unwrap(), None, None, None).await
+        else {
+            panic!("expected a neighbor confirmation result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["code"],
+            "confirmation_required"
+        );
+        let Message::Text(reply) = control_result(
+            parse_control(&neighbor.replace("\"confirmed\":false", "\"confirmed\":true")).unwrap(),
+            None,
+            None,
+            None,
+        )
+        .await
+        else {
+            panic!("expected a missing-collector result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["code"],
+            "invalid_parameter"
         );
         let skipped_adb = allowed.replace("device.reboot", "usb.set");
         let Message::Text(reply) =
