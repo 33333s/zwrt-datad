@@ -63,6 +63,10 @@ struct Args {
     /// `remote_webshell_enabled: true` in the private cloud.json.
     #[arg(long)]
     u50_enable_webshell: bool,
+    /// Directory for U50 OTA state and the staged update binary (same volume
+    /// as the executable).
+    #[arg(long, default_value = "/etc_rw/zwrt-datad")]
+    u50_data_dir: PathBuf,
     /// Save one-time NMS enrollment credentials from stdin into private cloud.json.
     #[arg(long)]
     u50_enroll_dir: Option<PathBuf>,
@@ -167,6 +171,7 @@ async fn main() -> Result<()> {
             u50::RunOptions {
                 enable_writes: args.u50_enable_writes,
                 enable_webshell: args.u50_enable_webshell,
+                data_dir: args.u50_data_dir.clone(),
             },
             args.u50_panel_config.as_deref(),
         )

@@ -10,6 +10,7 @@ root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
 parser.add_argument("binary", type=Path)
 parser.add_argument("output", type=Path)
+parser.add_argument("--profile", choices=["zwrt", "armv7"], default="zwrt")
 parser.add_argument("--url", default="https://pan.ericsfj.com/d/github%20releases/zwrt-datad/zwrt-datad-aarch64?sign=ZclbVT-Ki4a-_Fr6FG57o0JE15dxKYdheBOae8yWr_g=:0")
 args = parser.parse_args()
 manifest_bytes = (root / "version.json").read_bytes()
@@ -18,6 +19,21 @@ manifest = document["datad"]
 if document.get("schema") != 1 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", manifest["version"]) or manifest["asset"] != "zwrt-datad-aarch64":
     parser.error("invalid release version/schema/asset name")
 binary = args.binary.read_bytes()
+if args.profile == "armv7":
+    if not (binary[:6] == b"\x7fELF\x01\x01" and binary[18:20] == b"\x28\x00"):
+        parser.error("expected a little-endian ELF32 ARM release binary")
+    values = {"VERSION": manifest["version"], "SHA256": hashlib.sha256(binary).hexdigest()}
+    text = (root / "scripts/install-u50.sh.in").read_text()
+    for key, value in values.items():
+        marker = "@@" + key + "@@"
+        if text.count(marker) != 1:
+            parser.error("expected one template marker " + marker)
+        text = text.replace(marker, value)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(text)
+    args.output.chmod(0o755)
+    print(f"Installer v{manifest['version']}: {args.output} (ARMv7 binary SHA-256 {values['SHA256']})")
+    raise SystemExit(0)
 if not (binary[:6] == b"\x7fELF\x02\x01" and binary[18:20] == b"\xb7\x00"):
     parser.error("expected a little-endian ELF64 AArch64 release binary")
 if not args.url.startswith("https://") or any(c in args.url for c in "'\n\r"):

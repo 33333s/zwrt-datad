@@ -63,7 +63,12 @@ if provenance != expected:
 PY
     cp "$DATAD_ARMV7_BINARY" build/zwrt-datad-armv7
     (cd build && sha256sum zwrt-datad-armv7 > zwrt-datad-armv7.sha256)
-    extra_assets=(build/zwrt-datad-armv7 build/zwrt-datad-armv7.sha256)
+    # Separate signed manifest + pinned installer so the ARM64 update.json (and
+    # every deployed ARM64 datad) is unaffected.
+    python3 scripts/render-installer.py --profile armv7 build/zwrt-datad-armv7 build/install-datad-armv7.sh
+    sh -n build/install-datad-armv7.sh
+    python3 scripts/sign-update.py --profile armv7 --key "$DATAD_OTA_SIGNING_KEY_FILE"
+    extra_assets=(build/zwrt-datad-armv7 build/zwrt-datad-armv7.sha256 build/install-datad-armv7.sh build/update-armv7.json build/update-armv7.json.sig)
 fi
 for required in "$asset" version.json scripts/service.sh build/install-datad.sh build/update.json build/update.json.sig; do
     [[ -s "$required" ]] || { echo "Missing required asset: $required" >&2; exit 1; }
