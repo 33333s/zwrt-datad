@@ -106,6 +106,21 @@ fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
         .map(String::as_str)
         .unwrap_or_default()
 }
+fn sleep_minutes(raw: &str) -> Option<i64> {
+    let value = raw.trim().parse::<i64>().ok()?;
+    if value == -1 || value == 0 {
+        return Some(-1);
+    }
+    const CHOICES: [i64; 6] = [5, 10, 20, 30, 60, 120];
+    if CHOICES.contains(&value) {
+        return Some(value);
+    }
+    (value >= 300 && value % 60 == 0 && CHOICES.contains(&(value / 60))).then_some(value / 60)
+}
+fn sleep_state(sets: &[BTreeMap<String, String>]) -> Value {
+    let minutes = sleep_minutes(uci_get(sets, "zwrt_sleep.ztmp_time.SysIdTime"));
+    json!({"supported":minutes.is_some(),"minutes":minutes})
+}
 const LTE_TAC_MAX: i64 = 0xFFFF;
 const NR_TAC_MAX: i64 = 0xFF_FFFF;
 /// Serving-cell tracking area code. The OEM names the LTE/EPS TAC `lac_code`
@@ -1309,6 +1324,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "zwrt_router",
         "zte_nwinfo",
         "zwrt_zte_nwinfo",
+        "zwrt_sleep",
         "wireless",
         "mwan3",
     ];
@@ -1962,6 +1978,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         fields.insert("modems".into(), json!([]));
     }
     fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"netmask":uci_get(&uci_sets,"network.lan.netmask"),"disabled":uci_get(&uci_sets,"dhcp.lan.ignore")=="1","start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"range_start":uci_get(&uci_sets,"dhcp.lan.zte_start"),"range_end":uci_get(&uci_sets,"dhcp.lan.zte_end"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
+    fields.insert("sleep".into(), sleep_state(&uci_sets));
     let template_label = if template == "legacy_compat" {
         "Legacy compatibility fallback"
     } else {
@@ -2033,6 +2050,27 @@ fn validate_name(v: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sleep_state_only_reports_original_ufi_choices() {
+        for (raw, expected) in [
+            ("-1", Some(-1)),
+            ("0", Some(-1)),
+            ("5", Some(5)),
+            ("300", Some(5)),
+            ("7200", Some(120)),
+            ("1", None),
+            ("999999", None),
+        ] {
+            let sets = [BTreeMap::from([(
+                "zwrt_sleep.ztmp_time.SysIdTime".into(),
+                raw.into(),
+            )])];
+            let status = sleep_state(&sets);
+            assert_eq!(status["supported"], expected.is_some(), "raw={raw}");
+            assert_eq!(status["minutes"], json!(expected), "raw={raw}");
+        }
+        assert_eq!(sleep_state(&[])["supported"], false);
+    }
     #[test]
     fn liquid_driver_playback_takes_precedence_over_configured_mode() {
         assert!(!liquid_active(Some(false), true, 2));

@@ -108,3 +108,5 @@ APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 
 原 `datad_panel` / `nms-datad-panel-v1` 继续严格只读。新增 `remote_panel_control_enabled` 默认 false，只有设备已启用云端和远程访问且明确打开此独立开关时，才声明 `datad.panel.control` 并接受 `datad_panel_control` / `nms-datad-panel-v2` 会话。它仍使用 NMS 下发的单次票据、已配置 HTTPS 来源、TLS 主机名和最长一小时的 0 端口 WSS；不开放 datad HTTP Token 或设备本地 UFI 代理。
 
 V2 的状态帧带 `protocol_version:2`，仍只含显式允许的快照块。来自 NMS 的文本控制帧只接受结构化的 `type/control`、32 位十六进制 request_id、已列入 datad 控制动作白名单的 action、JSON 对象 params 和 confirmed 布尔值，最大 8 KiB；每会话最多 128 个不同 request_id，按顺序执行，每个动作最多 20 秒。重启、每日定时重启、关机、断网、锁频锁小区、SIM/Wi-Fi/LAN/DNS/供电/休眠/聚合变更、流量计数及限制、客户端解禁、QoS 日志清理、短信发送删除等动作要求 confirmed=true。结果只包含成功布尔值或有限错误码，不回传原厂响应或可能含密钥的原始内容。NMS 必须在每个动作前验证当前设备 Owner/管理员权限、CSRF 与会话有效性，记录不含秘密参数的审计；设备本身不会从浏览器直接接收控制帧。
+
+休眠状态来自设备 UCI `zwrt_sleep.ztmp_time.SysIdTime`，`sleep` 快照仅提供 `supported` 和经过校验的 `minutes`（`-1/5/10/20/30/60/120`）；缺失或异常值不作为可配置档位显示。NMS 的 `sleep.set` 仍经设备控制白名单、确认和审计。
