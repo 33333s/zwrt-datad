@@ -25,6 +25,9 @@ const MAX_SMS_TARGETS: usize = 3;
 const MAX_SMS_DAILY_SENDS: u16 = 60;
 const MAX_SMS_UNITS: usize = 280;
 const MAX_POWER_DAILY_SENDS: u16 = 60;
+const MAX_BLACKLIST_PHONES: usize = 64;
+const MAX_BLACKLIST_KEYWORDS: usize = 32;
+const MAX_KEYWORD_BYTES: usize = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +56,10 @@ struct Config {
     power_quota_date: String,
     #[serde(default)]
     power_quota_used: u16,
+    #[serde(default)]
+    blacklist_phone: Vec<String>,
+    #[serde(default)]
+    blacklist_keywords: Vec<String>,
     seen: Vec<String>,
 }
 
@@ -74,6 +81,8 @@ impl Default for Config {
             power_last_charging: None,
             power_quota_date: String::new(),
             power_quota_used: 0,
+            blacklist_phone: Vec::new(),
+            blacklist_keywords: Vec::new(),
             seen: Vec::new(),
         }
     }
@@ -90,6 +99,8 @@ pub struct Update {
     pub sms_to_phone: Option<Vec<String>>,
     pub smtp: Option<smtp_forward::Update>,
     pub power_forward_enabled: Option<bool>,
+    pub blacklist_phone: Option<Vec<String>>,
+    pub blacklist_keywords: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +201,24 @@ fn phone_matches(a: &str, b: &str) -> bool {
     a.trim_start_matches('+') == b.trim_start_matches('+')
 }
 
+fn valid_keyword(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.len() <= MAX_KEYWORD_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn blacklisted(config: &Config, message: &Message) -> bool {
+    config
+        .blacklist_phone
+        .iter()
+        .any(|phone| phone_matches(phone, &message.from))
+        || config
+            .blacklist_keywords
+            .iter()
+            .any(|keyword| message.text.contains(keyword))
+}
+
 pub fn power_state(value: Option<&Value>) -> Option<(i64, i64)> {
     let battery = value?;
     let percent = battery.get("percent")?.as_i64()?;
@@ -228,6 +257,29 @@ fn valid_config(config: &Config) -> bool {
             .collect::<HashSet<_>>()
             .len()
             == config.sms_to_phone.len()
+        && config.blacklist_phone.len() <= MAX_BLACKLIST_PHONES
+        && config
+            .blacklist_phone
+            .iter()
+            .all(|phone| valid_phone(phone))
+        && config
+            .blacklist_phone
+            .iter()
+            .map(|phone| phone.trim_start_matches('+'))
+            .collect::<HashSet<_>>()
+            .len()
+            == config.blacklist_phone.len()
+        && config.blacklist_keywords.len() <= MAX_BLACKLIST_KEYWORDS
+        && config
+            .blacklist_keywords
+            .iter()
+            .all(|word| valid_keyword(word))
+        && config
+            .blacklist_keywords
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            == config.blacklist_keywords.len()
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
         && config.power_quota_used <= MAX_POWER_DAILY_SENDS
         && (config.power_quota_date.is_empty()
@@ -377,6 +429,9 @@ impl Forwarder {
             "power_forward_enabled":self.config.power_forward_enabled,
             "power_daily_remaining":power_remaining,
             "power_last_result":self.power_last_result,
+            "rules_supported":true,
+            "blacklist_phone_count":self.config.blacklist_phone.len(),
+            "blacklist_keywords_count":self.config.blacklist_keywords.len(),
             "last_result":self.last_result})
     }
 
@@ -451,6 +506,12 @@ impl Forwarder {
         if let Some(smtp) = input.smtp {
             next.smtp.apply(smtp);
         }
+        if let Some(phones) = input.blacklist_phone {
+            next.blacklist_phone = phones;
+        }
+        if let Some(keywords) = input.blacklist_keywords {
+            next.blacklist_keywords = keywords;
+        }
         if let Some(enabled) = power_change {
             let baseline = power_state(battery);
             if enabled && baseline.is_none() {
@@ -501,21 +562,28 @@ impl Forwarder {
         if !self.config.enabled {
             return Ok(None);
         }
-        let seen: HashSet<_> = self.config.seen.iter().map(String::as_str).collect();
-        let Some((hash, message)) = messages(snapshot)?
-            .into_iter()
-            .find(|(hash, _)| !seen.contains(hash.as_str()))
-        else {
-            return Ok(None);
-        };
+        let mut seen: HashSet<_> = self.config.seen.iter().cloned().collect();
         let mut next = self.config.clone();
-        next.seen.push(hash);
-        if next.seen.len() > MAX_SEEN {
-            next.seen.drain(..next.seen.len() - MAX_SEEN);
+        let mut deliverable = None;
+        for (hash, message) in messages(snapshot)? {
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            next.seen.push(hash);
+            if next.seen.len() > MAX_SEEN {
+                next.seen.drain(..next.seen.len() - MAX_SEEN);
+            }
+            if !blacklisted(&next, &message) {
+                deliverable = Some(message);
+                break;
+            }
+        }
+        if next.seen == self.config.seen {
+            return Ok(None);
         }
         self.save(&next)?;
         self.config = next;
-        Ok(Some(message))
+        Ok(deliverable)
     }
 
     pub fn mark_delivery(&mut self, result: &Result<(), String>) {
@@ -917,6 +985,82 @@ mod tests {
         assert!(messages(&unknown).is_err());
     }
     #[test]
+    fn blacklist_filters_incoming_sms_and_persists_skipped_fingerprints() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-sms-rules-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        let update = |phones, keywords| Update {
+            enabled: true,
+            method: "webhook".into(),
+            webhook_url: Some("https://example.com/hook".into()),
+            dingtalk_webhook: None,
+            dingtalk_secret: None,
+            sms_to_phone: None,
+            smtp: None,
+            power_forward_enabled: None,
+            blacklist_phone: Some(phones),
+            blacklist_keywords: Some(keywords),
+        };
+        let empty = json!({"stale":false,"truncated":false,"list":[]});
+        let status = manager
+            .update(
+                update(vec!["+10086".into()], vec!["验证码".into(), "敏感".into()]),
+                Some(&empty),
+                None,
+            )
+            .unwrap();
+        assert_eq!(status["blacklist_phone_count"], 1);
+        assert_eq!(status["blacklist_keywords_count"], 2);
+        assert!(status.to_string().len() < 768);
+        assert!(!status.to_string().contains("10086"));
+        assert!(!status.to_string().contains("验证码"));
+        let fresh = json!({"stale":false,"truncated":false,"list":[
+            {"id":3,"num":"10010","date":"09-29 11:03","tag":1,"text":"普通通知"},
+            {"id":2,"num":"10010","date":"09-29 11:02","tag":1,"text":"验证码123"},
+            {"id":1,"num":"10086","date":"09-29 11:01","tag":1,"text":"服务消息"}
+        ]});
+        let message = manager.next(&fresh).unwrap().unwrap();
+        assert_eq!(message.text, "普通通知");
+        assert!(manager.next(&fresh).unwrap().is_none());
+        let mut reloaded = Forwarder::load(&dir);
+        reloaded
+            .update(update(Vec::new(), Vec::new()), None, None)
+            .unwrap();
+        assert!(reloaded.next(&fresh).unwrap().is_none());
+        assert_eq!(reloaded.status()["blacklist_phone_count"], 0);
+        assert_eq!(reloaded.status()["blacklist_keywords_count"], 0);
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            reloaded
+                .update(
+                    update(vec!["10086".into(), "+10086".into()], Vec::new()),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            reloaded
+                .update(
+                    update(Vec::new(), vec!["字".repeat(MAX_KEYWORD_BYTES)]),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn phone_forwarding_validates_targets_length_and_persistent_daily_quota() {
         let dir = std::env::temp_dir().join(format!(
             "datad-phone-forward-{}-{}",
@@ -936,6 +1080,8 @@ mod tests {
                     sms_to_phone: Some(vec!["+10086".into(), "10010".into()]),
                     smtp: None,
                     power_forward_enabled: None,
+                    blacklist_phone: None,
+                    blacklist_keywords: None,
                 },
                 Some(&old),
                 None,
@@ -1025,6 +1171,8 @@ mod tests {
             sms_to_phone: None,
             smtp: None,
             power_forward_enabled,
+            blacklist_phone: None,
+            blacklist_keywords: None,
         };
         assert_eq!(
             manager
@@ -1138,6 +1286,8 @@ mod tests {
             sms_to_phone: None,
             smtp: Some(smtp),
             power_forward_enabled: None,
+            blacklist_phone: None,
+            blacklist_keywords: None,
         };
         let status = manager
             .update(
@@ -1207,7 +1357,9 @@ mod tests {
                         dingtalk_secret: None,
                         sms_to_phone: None,
                         smtp: None,
-                        power_forward_enabled: None
+                        power_forward_enabled: None,
+                        blacklist_phone: None,
+                        blacklist_keywords: None
                     },
                     Some(&old),
                     None

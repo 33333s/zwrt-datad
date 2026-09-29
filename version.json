@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.34",
+    "version": "0.10.35",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加受限的电源状态通知"
+    "notes": "为 NMS 原版远程面板增加短信转发黑名单规则"
   }
 }
