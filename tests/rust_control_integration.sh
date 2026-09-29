@@ -257,6 +257,12 @@ curl -fsS "http://127.0.0.1:$PORT/capabilities" |
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"webhook","webhook_url":"https://example.com/hook"}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["enabled"] is False and d["result"]["webhook_configured"] is True; assert "webhook_url" not in d["result"]'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"sms","sms_to_phone":["+10086"]}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_configured"] is True; assert "sms_to_phone" not in d["result"] and "10086" not in json.dumps(d)'
+post '{"action":"sms.forward.test","params":{}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_daily_remaining"] == 59'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"sms","sms_to_phone":[]}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_configured"] is False and d["result"]["sms_daily_remaining"] == 59'
 status=$(curl -sS -o "$TMP/bad-forward.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"sms.forward.set","params":{"enabled":true,"method":"webhook","webhook_url":"http://127.0.0.1/private"}}' \
     "http://127.0.0.1:$PORT/control")
@@ -323,7 +329,7 @@ registration = next(json.loads(row[2])["web_enstr"] for row in rows if len(row) 
 import base64
 assert len(base64.b64decode(registration)) == 256
 sends = [json.loads(row[2]) for row in rows if len(row) == 3 and row[0] == "zwrt_wms" and row[1] == "zte_libwms_send_sms"]
-assert len(sends) == 2
+assert len(sends) == 3
 for send in sends:
     assert len(base64.b64decode(send["number"])) > 28
     assert len(base64.b64decode(send["message_body"])) > 28

@@ -135,15 +135,12 @@ impl App {
             .to_owned();
         let mut manager = self.inner.sms_forward.lock().await;
         let details = manager.delivery();
-        let result = sms_forward::deliver(
-            &details.0,
-            &details.1,
-            &details.2,
-            &details.3,
-            &time_origin,
-            &sms_forward::Message::test(),
-        )
-        .await;
+        let test_message = sms_forward::Message::test();
+        if let Err(error) = manager.reserve_sms(&test_message) {
+            manager.mark_delivery(&Err(error.clone()));
+            return Err(error);
+        }
+        let result = sms_forward::deliver(&details, &time_origin, &test_message).await;
         manager.mark_delivery(&result);
         let status = manager.status();
         result.map(|()| status)
@@ -380,16 +377,12 @@ impl App {
                             break;
                         }
                     };
-                    let (method, webhook, dingtalk, secret) = manager.delivery();
-                    let result = sms_forward::deliver(
-                        &method,
-                        &webhook,
-                        &dingtalk,
-                        &secret,
-                        &time_origin,
-                        &message,
-                    )
-                    .await;
+                    let details = manager.delivery();
+                    if let Err(error) = manager.reserve_sms(&message) {
+                        manager.mark_delivery(&Err(error));
+                        break;
+                    }
+                    let result = sms_forward::deliver(&details, &time_origin, &message).await;
                     manager.mark_delivery(&result);
                 }
             }
