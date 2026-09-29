@@ -13,18 +13,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 root = Path(__file__).resolve().parent.parent
 p = argparse.ArgumentParser()
 p.add_argument("--key", type=Path, required=True)
-p.add_argument("--profile", choices=["zwrt", "armv7"], default="zwrt")
-p.add_argument("--binary", type=Path)
-p.add_argument("--installer", type=Path)
-p.add_argument("--output", type=Path)
+p.add_argument("--binary", type=Path, default=root / "zwrt-datad-aarch64")
+p.add_argument("--installer", type=Path, default=root / "build/install-datad.sh")
+p.add_argument("--output", type=Path, default=root / "build/update.json")
 args = p.parse_args()
-defaults = {
-    "zwrt": ("zwrt-datad-aarch64", "build/install-datad.sh", "build/update.json"),
-    "armv7": ("build/zwrt-datad-armv7", "build/install-datad-armv7.sh", "build/update-armv7.json"),
-}[args.profile]
-args.binary = args.binary or root / defaults[0]
-args.installer = args.installer or root / defaults[1]
-args.output = args.output or root / defaults[2]
 release = json.loads((root / "version.json").read_text())["datad"]
 def artifact(path: Path):
     data = path.read_bytes()

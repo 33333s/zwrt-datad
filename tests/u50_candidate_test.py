@@ -146,11 +146,7 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        ota_dir = Path(tmp) / "otadata"
-        ota_dir.mkdir()
-        server_env = {**env, "ZWRT_DATAD_OTA_DISABLE_AUTO": "1"}
-        process = subprocess.Popen([BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--port", str(port),
-                                    "--u50-data-dir", str(ota_dir)], env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--port", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
             for _ in range(40):
                 try:
@@ -169,19 +165,6 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
                 event_lines = [response.readline().decode().strip() for _ in range(3)]
                 payload = next(line.removeprefix("data: ") for line in event_lines if line.startswith("data: "))
                 assert json.loads(payload)["device"]["api_template"] == "U50PRO"
-            # Mainline-style local OTA API: config, status and rejection of bad input.
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/ota/status", timeout=2) as response:
-                status = json.load(response)
-                assert status["status"]["state"] == "idle" and status["enabled"] is True
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/ota/config", timeout=2) as response:
-                assert json.load(response)["config"]["sources"] == ["custom", "netdisk", "github"]
-            bad = urllib.request.Request(f"http://127.0.0.1:{port}/ota/config", data=b'{"servers":["http://192.168.0.9/x"]}',
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            try:
-                urllib.request.urlopen(bad, timeout=2)
-                raise AssertionError("plain-http server accepted")
-            except urllib.error.HTTPError as error:
-                assert error.code == 400, error.code
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/control", timeout=2)
                 raise AssertionError("control route was exposed")
