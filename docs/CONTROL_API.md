@@ -24,6 +24,14 @@ Content-Type: application/json
 | `device.session_status` | 无 | 返回 datad 当前设备会话状态 |
 | `device.change_password` | `old_hash`, `new_hash` | 修改某兴后台密码 |
 | `device.reboot` | 无 | 重启设备 |
+| `schedule.reboot.set` | `enabled`（布尔）、`time`（设备本地 `HH:MM`） | 保存 datad 每日定时重启；原厂周/间隔日计划开启时拒绝启用 |
+| `speedtest.start` | `bytes`（1–50 MiB）、`threads`（1–5）、`runs`（1 或 3） | 设备默认出口直连固定 Cloudflare HTTPS 下载端点，异步返回状态；总量不超过 `bytes` |
+| `speedtest.stop` | 无 | 取消正在运行的下载测试 |
+| `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
+| `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项；远程 v2 要求 `confirmed=true` |
+| `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
+| `sms.forward.set` | `enabled`、`method=webhook|dingtalk|sms|smtp`，可选 `webhook_url` / `dingtalk_webhook` / `dingtalk_secret` / `sms_to_phone` / `smtp:{host,port,username,password?,to}` / `power_forward_enabled` / `blacklist_phone` / `blacklist_keywords` | 保存受限转发设置；省略目标字段则保留，URL 设为空串、手机号数组设为空或 SMTP 字段全部置空可在关闭该方式时清除；SMTP 只接受证书验证的 TLS 465 或 STARTTLS 587，省略密码表示保留设备上现有密码；有电池且读数可用的设备可单独启用电源状态通知，开启时记录当前基线，总开关关闭时不投递。号码/关键词黑名单是可清空的数组，命中的新短信只登记指纹不投递，规则不影响电源通知；首次启用总开关先强制刷新短信列表并建立基线；远程 v2 要求 `confirmed=true` |
+| `sms.forward.test` | 无 | 向当前已配置目的地发送固定测试消息，不含真实收到的短信；短信方式会使用本机 SIM 向目标号码发短信并可能产生费用，SMTP 方式会发送一封测试邮件；远程 v2 要求 `confirmed=true` |
 | `device.poweroff` | 无 | 关闭设备 |
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
@@ -156,7 +164,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 ## MU5252 Aggregation And Cooling
 
-已配置 datad 散热后，采样同步原厂常开开关的变化：风扇开启为128、关闭恢复自定义曲线，液冷开启为最高档、关闭交还 thermal。`cooling.vendor_sync_error` 报告同步失败。旧采样不会覆盖较新的 datad 控制请求；复用已有字段读取，不增加轮询。80°C 过热保护保持不变。
+已配置 datad 散热后，采样同步原厂常开开关的变化：风扇开启为128、关闭恢复自定义曲线，液冷开启为最高档、关闭交还 thermal。液冷始终保持驱动 `thermal_enable=1`，常开写原厂高档波形，关闭写 `0 0 0`；驱动在 `thermal_enable=0` 时只保存波形参数而不播放。`cooling.vendor_sync_error` 报告同步失败。旧采样不会覆盖较新的 datad 控制请求；复用已有字段读取，不增加轮询。80°C 过热保护保持不变。
 
 以下动作只应在 `/state` 实际输出 `aggregation` / `cooling` 的 MU5252 模板上显示：
 

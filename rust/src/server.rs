@@ -1,10 +1,15 @@
 use crate::{
     auth::{self, Sessions},
-    cloud::{Cloud, Update as CloudUpdate},
+    cloud::{Cloud, RemoteFeatures, Update as CloudUpdate},
     model::{DatadVersion, Snapshot, UbusCall},
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
+    reboot_schedule::{self, Schedule},
+    sms_forward::{self, Forwarder, Update as SmsForwardUpdate},
+    speedtest::SpeedTest,
     state,
+    task_schedule::{TaskInput, TaskSchedule},
+    traffic_history::{History, Usage},
     webshell::WebShell,
 };
 use anyhow::Result;
@@ -56,6 +61,12 @@ pub(crate) struct Inner {
     pub(crate) ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
+    history: Mutex<History>,
+    history_tx: watch::Sender<Vec<Usage>>,
+    schedule: Arc<Mutex<Schedule>>,
+    tasks: Arc<Mutex<TaskSchedule>>,
+    speedtest: Arc<Mutex<SpeedTest>>,
+    sms_forward: Arc<Mutex<Forwarder>>,
 }
 
 struct DeviceSession {
@@ -66,6 +77,149 @@ struct DeviceSession {
 impl App {
     pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
         self.inner.tx.subscribe()
+    }
+
+    pub(crate) fn cloud_panel_history(&self) -> watch::Receiver<Vec<Usage>> {
+        self.inner.history_tx.subscribe()
+    }
+
+    pub(crate) fn cloud_panel_schedule(&self) -> Arc<Mutex<Schedule>> {
+        self.inner.schedule.clone()
+    }
+
+    pub(crate) fn cloud_panel_speedtest(&self) -> Arc<Mutex<SpeedTest>> {
+        self.inner.speedtest.clone()
+    }
+
+    pub(crate) async fn panel_task_status(&self) -> Value {
+        self.inner.tasks.lock().await.status()
+    }
+
+    pub(crate) async fn panel_task_upsert(&self, input: TaskInput) -> Result<Value, String> {
+        if input.action == "device.reboot" {
+            let plan = self.inner.schedule.lock().await.status();
+            if reboot_schedule::oem_conflict().await
+                || plan["enabled"] == true && plan["time"] == input.time
+            {
+                return Err("reboot_schedule_conflict".into());
+            }
+        }
+        self.inner.tasks.lock().await.upsert(input)
+    }
+
+    pub(crate) async fn panel_task_remove(&self, id: &str) -> Result<Value, String> {
+        self.inner.tasks.lock().await.remove(id)
+    }
+
+    pub(crate) async fn panel_sms_forward_status(&self) -> Value {
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
+        let mut status = self.inner.sms_forward.lock().await.status();
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
+        status
+    }
+
+    pub(crate) async fn panel_sms_forward_update(
+        &self,
+        input: SmsForwardUpdate,
+    ) -> Result<Value, String> {
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
+        let mut manager = self.inner.sms_forward.lock().await;
+        let baseline = if manager.requires_baseline(&input) {
+            Some(sms_forward::fresh_baseline().await?)
+        } else {
+            None
+        };
+        let mut status = manager.update(input, baseline.as_ref(), battery.as_ref())?;
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
+        Ok(status)
+    }
+
+    pub(crate) async fn panel_sms_forward_test(&self) -> Result<Value, String> {
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
+        let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let mut manager = self.inner.sms_forward.lock().await;
+        let details = manager.delivery();
+        let test_message = sms_forward::Message::test();
+        if let Err(error) = manager.reserve_sms(&test_message) {
+            manager.mark_delivery(&Err(error.clone()));
+            return Err(error);
+        }
+        let result = sms_forward::deliver(&details, &time_origin, &test_message).await;
+        manager.mark_delivery(&result);
+        let mut status = manager.status();
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
+        result.map(|()| status)
+    }
+
+    pub(crate) async fn cloud_panel_config(&self) -> Value {
+        let mut view = self.inner.cloud.read().await.panel_config();
+        if let Some(fields) = view.as_object_mut() {
+            fields.insert(
+                "webshell_available".into(),
+                json!(self.cloud_webshell_available()),
+            );
+        }
+        view
+    }
+
+    pub(crate) async fn cloud_panel_save_features(
+        &self,
+        input: RemoteFeatures,
+    ) -> Result<Value, String> {
+        let (mut view, changed) = self.inner.cloud.write().await.save_remote_features(input)?;
+        if let Some(fields) = view.as_object_mut() {
+            fields.insert(
+                "webshell_available".into(),
+                json!(self.cloud_webshell_available()),
+            );
+        }
+        if changed {
+            let app = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                app.inner.cloud.read().await.activate_saved_features();
+            });
+        }
+        Ok(view)
     }
 
     pub(crate) fn cloud_webshell_available(&self) -> bool {
@@ -102,6 +256,23 @@ impl App {
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
             .await;
         initial.fields.insert("neighbor".into(), neighbor.status());
+        let mut schedule = Schedule::load(&data_dir);
+        schedule.set_environment(
+            reboot_schedule::local_clock(),
+            reboot_schedule::oem_conflict().await,
+        );
+        initial
+            .fields
+            .insert("reboot_schedule".into(), schedule.status());
+        let speedtest = SpeedTest::new();
+        initial
+            .fields
+            .insert("speedtest".into(), speedtest.status());
+        let tasks = TaskSchedule::load(&data_dir);
+        let sms_forward = Forwarder::load(&data_dir);
+        let mut history = History::load(&data_dir);
+        history.record(&initial);
+        let (history_tx, _) = watch::channel(history.days());
         let (tx, _) = watch::channel(initial.clone());
         let app = Self {
             inner: Arc::new(Inner {
@@ -118,6 +289,12 @@ impl App {
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
                 webshell: WebShell::new(webshell_enabled),
+                history: Mutex::new(history),
+                history_tx,
+                schedule: Arc::new(Mutex::new(schedule)),
+                tasks: Arc::new(Mutex::new(tasks)),
+                speedtest: Arc::new(Mutex::new(speedtest)),
+                sms_forward: Arc::new(Mutex::new(sms_forward)),
             }),
         };
         app.inner
@@ -141,6 +318,146 @@ impl App {
                 ))
                 .await;
                 app.refresh_snapshot().await;
+            }
+        });
+    }
+    pub fn spawn_reboot_schedule(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(10));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let clock = reboot_schedule::local_clock();
+                let conflict = reboot_schedule::oem_conflict().await;
+                let due = app.inner.schedule.lock().await.observe(clock, conflict);
+                if due
+                    && !matches!(
+                        crate::control::execute("device.reboot", &json!({})).await,
+                        crate::control::Outcome::Ok(_)
+                    )
+                {
+                    app.inner.schedule.lock().await.reboot_failed();
+                }
+            }
+        });
+    }
+
+    pub fn spawn_task_schedule(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(10));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let clock = reboot_schedule::local_clock();
+                let due = app.inner.tasks.lock().await.observe(clock.as_ref());
+                let (Some(task), Some(clock)) = (due, clock) else {
+                    continue;
+                };
+                if task.action == "device.reboot" {
+                    let plan = app.inner.schedule.lock().await.status();
+                    if reboot_schedule::oem_conflict().await
+                        || plan["enabled"] == true && plan["time"] == task.time
+                    {
+                        app.inner
+                            .tasks
+                            .lock()
+                            .await
+                            .finish(&task.id, &clock.date, false);
+                        continue;
+                    }
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    crate::control::execute(&task.action, &task.params),
+                )
+                .await;
+                let success = matches!(result, Ok(crate::control::Outcome::Ok(_)));
+                app.inner
+                    .tasks
+                    .lock()
+                    .await
+                    .finish(&task.id, &clock.date, success);
+            }
+        });
+    }
+
+    pub fn spawn_sms_forward(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(15));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let battery = app
+                    .inner
+                    .snapshot
+                    .read()
+                    .await
+                    .fields
+                    .get("battery")
+                    .cloned();
+                let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                {
+                    let mut manager = app.inner.sms_forward.lock().await;
+                    match manager.observe_power(battery.as_ref()) {
+                        Ok(Some(message)) => {
+                            let details = manager.delivery();
+                            let result = match manager.reserve_sms(&message) {
+                                Ok(()) => {
+                                    sms_forward::deliver(&details, &time_origin, &message).await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            manager.mark_power_delivery(&result);
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.mark_power_delivery(&Err(error)),
+                    }
+                }
+                if app.panel_sms_forward_status().await["enabled"] != true {
+                    continue;
+                }
+                let snapshot = match sms_forward::baseline().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        app.inner.sms_forward.lock().await.mark_source_unavailable();
+                        continue;
+                    }
+                };
+                for _ in 0..4 {
+                    let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut manager = app.inner.sms_forward.lock().await;
+                    let message = match manager.next(&snapshot) {
+                        Ok(Some(message)) => message,
+                        Ok(None) => break,
+                        Err(error) => {
+                            if error == "forward_storage_failed" {
+                                manager.mark_storage_failed();
+                            } else {
+                                manager.mark_source_unavailable();
+                            }
+                            break;
+                        }
+                    };
+                    let details = manager.delivery();
+                    if let Err(error) = manager.reserve_sms(&message) {
+                        manager.mark_delivery(&Err(error));
+                        break;
+                    }
+                    let result = sms_forward::deliver(&details, &time_origin, &message).await;
+                    manager.mark_delivery(&result);
+                }
             }
         });
     }
@@ -179,6 +496,19 @@ impl App {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        next.fields.insert(
+            "reboot_schedule".into(),
+            self.inner.schedule.lock().await.status(),
+        );
+        let mut speedtest = self.inner.speedtest.lock().await;
+        speedtest.refresh_availability();
+        next.fields.insert("speedtest".into(), speedtest.status());
+        drop(speedtest);
+        let mut history = self.inner.history.lock().await;
+        if history.record(&next) {
+            self.inner.history_tx.send_replace(history.days());
+        }
+        drop(history);
         let mut neighbor = self.inner.neighbor.lock().await;
         neighbor
             .tick(next.fields.get("net").unwrap_or(&Value::Null))
@@ -805,6 +1135,119 @@ async fn control(
         };
         return match app.inner.neighbor.lock().await.set_enabled(enabled).await {Ok(value)=>(StatusCode::OK,Json(json!({"ok":true,"action":action,"result":value}))).into_response(),Err(error)=>(StatusCode::BAD_GATEWAY,Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}}))).into_response()};
     }
+    if action == "schedule.reboot.set" {
+        let params = body.get("params").and_then(Value::as_object);
+        if params.is_none_or(|params| params.len() != 2) {
+            return invalid_parameter(action, "enabled and time are the only accepted fields");
+        }
+        let enabled = params
+            .and_then(|params| params.get("enabled"))
+            .and_then(Value::as_bool);
+        let time = params
+            .and_then(|params| params.get("time"))
+            .and_then(Value::as_str);
+        let (Some(enabled), Some(time)) = (enabled, time) else {
+            return invalid_parameter(action, "enabled must be boolean and time must be HH:MM");
+        };
+        let conflict = reboot_schedule::oem_conflict().await;
+        let result = app.inner.schedule.lock().await.set(enabled, time, conflict);
+        return match result {
+            Ok(value) => {
+                let refresh = app.clone();
+                tokio::spawn(async move { refresh.refresh_snapshot().await });
+                control_ok(action, value)
+            }
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "schedule.task.put" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: TaskInput = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid scheduled task"),
+        };
+        return match app.panel_task_upsert(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "task_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "schedule.task.remove" {
+        let params = body.get("params").and_then(Value::as_object);
+        let id = params
+            .filter(|params| params.len() == 1)
+            .and_then(|params| params.get("id"))
+            .and_then(Value::as_str);
+        let Some(id) = id else {
+            return invalid_parameter(action, "id is required");
+        };
+        return match app.panel_task_remove(id).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "task_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "speedtest.start" {
+        let params = body.get("params").unwrap_or(&Value::Null);
+        return match SpeedTest::start(app.inner.speedtest.clone(), params).await {
+            Ok(value) => {
+                let refresh = app.clone();
+                tokio::spawn(async move { refresh.refresh_snapshot().await });
+                control_ok(action, value)
+            }
+            Err(error) => invalid_parameter(action, error),
+        };
+    }
+    if action == "speedtest.stop" {
+        if !body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            return invalid_parameter(action, "stop accepts no params");
+        }
+        let value = SpeedTest::stop(app.inner.speedtest.clone()).await;
+        let refresh = app.clone();
+        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        return control_ok(action, value);
+    }
+    if action == "cloud.remote_features.set" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: RemoteFeatures = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid remote features"),
+        };
+        return match app.cloud_panel_save_features(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "保存配置失败" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "sms.forward.set" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: SmsForwardUpdate = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid SMS forwarding config"),
+        };
+        return match app.panel_sms_forward_update(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "forward_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "sms.forward.test" {
+        if !body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            return invalid_parameter(action, "test accepts no params");
+        }
+        return match app.panel_sms_forward_test().await {
+            Ok(value) => control_ok(action, value),
+            Err(error) => control_failed(action, error),
+        };
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1246,8 +1689,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 79);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 79);
+        assert_eq!(controls.len(), 87);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 87);
     }
 
     #[test]

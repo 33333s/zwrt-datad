@@ -191,7 +191,7 @@ case "$service:$method" in
         ;;
     zwrt_bsp.charger:list)
         [ "${MOCK_NO_BATTERY:-0}" = '1' ] && exit 1
-        printf '%s\n' '{"charge_status":0,"charger_connect":1,"charger_type":4}'
+        printf '{"charge_status":%s,"charger_connect":1,"charger_type":4}\n' "${MOCK_CHARGE_STATUS:-0}"
         ;;
     zwrt_nfc:zwrt_nfc_wifi_get)
         [ "${MOCK_NO_NFC:-0}" = '1' ] && exit 1

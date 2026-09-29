@@ -2428,6 +2428,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "futures-util",
+ "httpdate",
  "libc",
  "rand 0.8.8",
  "rcgen",

@@ -377,16 +377,18 @@ fn normalize_lists(replies: &[Value], key: Option<&[u8; 32]>) -> Result<Vec<Valu
         let text = decrypt(text_raw, key)?;
         let number = number.map_or_else(|| number_raw.to_owned(), |value| utf16be_hex(&value));
         let text = utf16be_hex(text.as_deref().unwrap_or(text_raw));
-        let unread = item.get("tag").and_then(|value| {
+        let tag = item.get("tag").and_then(|value| {
             value
                 .as_i64()
                 .or_else(|| value.as_str()?.parse::<i64>().ok())
-        }) == Some(1);
+        });
+        let unread = tag == Some(1);
         output.push(json!({
             "id":id,
             "num":number,
             "date":sms_date(item.get("date").and_then(Value::as_str).unwrap_or_default()),
             "unread":i64::from(unread),
+            "tag":tag,
             "text":text
         }));
     }
@@ -583,6 +585,7 @@ mod tests {
         assert_eq!(list[0]["text"], "测试");
         assert_eq!(list[0]["date"], "08-27 04:00");
         assert_eq!(list[0]["unread"], 1);
+        assert_eq!(list[0]["tag"], 1);
     }
 
     #[test]

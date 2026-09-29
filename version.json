@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.25",
+    "version": "0.10.37",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：同步主线设备自报接入与只读远程面板"
+    "notes": "ARM32 U50S 候选版：同步主线 v0.10.36 与 NMS 设备自报接入"
   }
 }

@@ -36,6 +36,18 @@ def fd_count(pid):
     return len(list(directory.iterdir())) if directory.exists() else None
 
 
+def wait_fds_at_most(pid, limit, timeout=3):
+    # The final HTTP status probe may outlive its active-session counter for a
+    # brief moment. Keep the original FD limit, but allow asynchronous socket
+    # close to finish; a persistent leak still fails after this bounded wait.
+    deadline = time.monotonic() + timeout
+    count = fd_count(pid)
+    while count is not None and count > limit and time.monotonic() < deadline:
+        time.sleep(0.02)
+        count = fd_count(pid)
+    return count
+
+
 def wait_zero(port, timeout=3):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -100,7 +112,10 @@ def main():
             for _ in range(128):
                 one_session(port)
             after_rss = rss_kib(proc.pid)
-            after_fds = fd_count(proc.pid)
+            after_fds = (
+                wait_fds_at_most(proc.pid, baseline_fds + 2)
+                if baseline_fds is not None else None
+            )
             assert after_rss - baseline_rss <= 12 * 1024, (baseline_rss, after_rss)
             if baseline_fds is not None:
                 assert after_fds <= baseline_fds + 2, (baseline_fds, after_fds)

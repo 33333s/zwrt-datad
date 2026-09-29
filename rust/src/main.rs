@@ -14,9 +14,15 @@ mod neighbor_manager;
 mod ota;
 mod qos;
 mod qtrace_mask;
+mod reboot_schedule;
 mod server;
 mod sms;
+mod sms_forward;
+mod smtp_forward;
+mod speedtest;
 mod state;
+mod task_schedule;
+mod traffic_history;
 mod u50;
 mod u50_oem;
 mod u50_oem_ids;
@@ -207,6 +213,9 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
     }
+    app.spawn_reboot_schedule();
+    app.spawn_task_schedule();
+    app.spawn_sms_forward();
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     validate_listener_security(addr, local_requires_auth)?;
     if let Some(lan_bind) = args.lan_bind {
