@@ -993,8 +993,8 @@ fn meminfo() -> Value {
 
 // libc exposes statvfs counters with different integer widths across targets.
 #[allow(clippy::unnecessary_cast)]
-fn storage() -> Value {
-    let Ok(path) = CString::new("/data") else {
+fn storage(mount: &str) -> Value {
+    let Ok(path) = CString::new(mount) else {
         return json!({"total":0,"used":0,"available":0});
     };
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1075,7 +1075,8 @@ fn link_rates(now: u64) -> Value {
 }
 
 fn user_bytes() -> (u64, u64) {
-    if let Some((rx, tx)) = iface_bytes("br-lan") {
+    // ZWRT names the LAN bridge br-lan; the ARM32 U50 firmware uses bridge0.
+    if let Some((rx, tx)) = ["br-lan", "bridge0"].into_iter().find_map(iface_bytes) {
         return (tx, rx);
     }
     let wifi: Vec<_> = ["wlan0", "wlan2"]
@@ -1120,6 +1121,12 @@ fn throughput(now: u64) -> Value {
 }
 
 fn runtime(runtime_zones: Value) -> (i64, Value) {
+    runtime_with(runtime_zones, "/data")
+}
+
+/// Shared CPU/memory/storage/connection/throughput sampler. `storage_mount`
+/// is the filesystem reported as `storage` (`/data` on ZWRT, `/etc_rw` on U50).
+pub(crate) fn runtime_with(runtime_zones: Value, storage_mount: &str) -> (i64, Value) {
     let mut current = BTreeMap::new();
     for line in fs::read_to_string("/proc/stat").unwrap_or_default().lines() {
         let mut parts = line.split_whitespace();
@@ -1182,7 +1189,7 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
     let now = now_ms();
     (
         total_usage,
-        json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":runtime_zones,"memory_kb":meminfo(),"storage":storage(),"connections":connections,"link_rates":link_rates(now),"throughput":throughput(now)}),
+        json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":runtime_zones,"memory_kb":meminfo(),"storage":storage(storage_mount),"connections":connections,"link_rates":link_rates(now),"throughput":throughput(now)}),
     )
 }
 
