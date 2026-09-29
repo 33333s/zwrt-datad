@@ -1,6 +1,6 @@
 //! Opt-in SMS forwarding over fixed HTTPS POST, authenticated SMTP or the device's own SIM.
 //! This does not execute UFI's legacy curl_text or copy its local database.
-use crate::{reboot_schedule, sms, smtp_forward};
+use crate::{model::Snapshot, reboot_schedule, sms, smtp_forward};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, header::DATE, redirect::Policy};
 use ring::hmac;
@@ -62,6 +62,12 @@ struct Config {
     blacklist_keywords: Vec<String>,
     #[serde(default)]
     nickname: String,
+    #[serde(default)]
+    smtp_forward_device_info: bool,
+    #[serde(default)]
+    dingtalk_forward_device_info: bool,
+    #[serde(default)]
+    sms_forward_device_info: bool,
     seen: Vec<String>,
 }
 
@@ -86,6 +92,9 @@ impl Default for Config {
             blacklist_phone: Vec::new(),
             blacklist_keywords: Vec::new(),
             nickname: String::new(),
+            smtp_forward_device_info: false,
+            dingtalk_forward_device_info: false,
+            sms_forward_device_info: false,
             seen: Vec::new(),
         }
     }
@@ -105,12 +114,16 @@ pub struct Update {
     pub blacklist_phone: Option<Vec<String>>,
     pub blacklist_keywords: Option<Vec<String>>,
     pub nickname: Option<String>,
+    pub smtp_forward_device_info: Option<bool>,
+    pub dingtalk_forward_device_info: Option<bool>,
+    pub sms_forward_device_info: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Sms,
     Power,
+    Device,
 }
 
 #[derive(Clone)]
@@ -128,6 +141,211 @@ pub struct Destination {
     dingtalk_secret: String,
     sms_to_phone: Vec<String>,
     smtp: smtp_forward::Settings,
+    include_device_info: bool,
+    nickname: String,
+    device_info: Option<DeviceInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct DeviceInfo {
+    model: String,
+    nickname: String,
+    firmware: String,
+    daily_flow: String,
+    monthly_flow: String,
+    battery_level: String,
+    battery_temp: String,
+    cpu_temp: String,
+    cpu_usage: String,
+    mem_usage: String,
+    uptime: String,
+    datad_version: String,
+    msisdn: String,
+}
+
+fn safe_info_text(value: Option<&Value>, max_bytes: usize) -> String {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn measured(value: Option<&Value>, min: f64, max: f64, suffix: &str) -> String {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (min..=max).contains(value))
+        .map(|value| format!("{value:.1}{suffix}"))
+        .unwrap_or_default()
+}
+
+fn total_bytes(value: Option<&Value>, rx: &str, tx: &str) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let Some(rx) = value.get(rx).and_then(Value::as_u64) else {
+        return String::new();
+    };
+    let Some(tx) = value.get(tx).and_then(Value::as_u64) else {
+        return String::new();
+    };
+    let Some(total) = rx.checked_add(tx).filter(|total| *total > 0) else {
+        return String::new();
+    };
+    for (unit, name) in [
+        (1024_u64.pow(4), "TB"),
+        (1024_u64.pow(3), "GB"),
+        (1024_u64.pow(2), "MB"),
+        (1024, "KB"),
+    ] {
+        if total >= unit {
+            return format!("{:.2} {name}", total as f64 / unit as f64);
+        }
+    }
+    format!("{total} B")
+}
+
+impl DeviceInfo {
+    fn from_snapshot(snapshot: &Snapshot, nickname: &str) -> Self {
+        let device = snapshot.fields.get("device");
+        let system = snapshot.fields.get("system");
+        let battery = snapshot.fields.get("battery");
+        let thermal = snapshot.fields.get("thermal");
+        let traffic = snapshot.fields.get("traffic");
+        let sim = snapshot.fields.get("sim");
+        let market = safe_info_text(device.and_then(|item| item.get("market_name")), 80);
+        let model = if market.is_empty() {
+            safe_info_text(device.and_then(|item| item.get("model_name")), 80)
+        } else {
+            market
+        };
+        let msisdn = safe_info_text(sim.and_then(|item| item.get("msisdn")), 32);
+        let msisdn = if valid_phone(&msisdn) {
+            msisdn
+        } else {
+            String::new()
+        };
+        let uptime = system
+            .and_then(|item| item.get("uptime"))
+            .and_then(Value::as_u64)
+            .filter(|seconds| *seconds <= 100 * 365 * 24 * 3600)
+            .map(|seconds| {
+                let days = seconds / 86_400;
+                let hours = seconds / 3_600 % 24;
+                let minutes = seconds / 60 % 60;
+                if days > 0 {
+                    format!("{days}天 {hours}小时 {minutes}分")
+                } else {
+                    format!("{hours}小时 {minutes}分")
+                }
+            })
+            .unwrap_or_default();
+        Self {
+            model,
+            nickname: nickname.to_owned(),
+            firmware: safe_info_text(system.and_then(|item| item.get("sw_version")), 128),
+            daily_flow: total_bytes(traffic, "day_rx_bytes", "day_tx_bytes"),
+            monthly_flow: total_bytes(traffic, "month_rx_bytes", "month_tx_bytes"),
+            battery_level: battery
+                .and_then(|item| item.get("percent"))
+                .and_then(Value::as_u64)
+                .filter(|percent| *percent <= 100)
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_default(),
+            battery_temp: measured(
+                battery.and_then(|item| item.get("temp")),
+                -40.0,
+                120.0,
+                "°C",
+            ),
+            cpu_temp: measured(
+                thermal.and_then(|item| item.get("cpu_celsius")),
+                -40.0,
+                150.0,
+                "°C",
+            ),
+            cpu_usage: measured(
+                system.and_then(|item| item.get("cpu_usage")),
+                0.0,
+                100.0,
+                "%",
+            ),
+            mem_usage: measured(
+                system.and_then(|item| item.get("mem_used_pct")),
+                0.0,
+                100.0,
+                "%",
+            ),
+            uptime,
+            datad_version: snapshot.datad.version.to_owned(),
+            msisdn,
+        }
+    }
+
+    fn name(&self) -> String {
+        match (self.model.is_empty(), self.nickname.is_empty()) {
+            (false, false) if self.model != self.nickname => {
+                format!("{} ({})", self.model, self.nickname)
+            }
+            (false, _) => self.model.clone(),
+            (_, false) => self.nickname.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn details(&self) -> String {
+        let mut lines = vec!["设备信息".to_string()];
+        let name = self.name();
+        for (label, value) in [
+            ("设备名称", name.as_str()),
+            ("固件版本", self.firmware.as_str()),
+            ("当日用量", self.daily_flow.as_str()),
+            ("本月用量", self.monthly_flow.as_str()),
+            ("电池电量", self.battery_level.as_str()),
+            ("电池温度", self.battery_temp.as_str()),
+            ("CPU温度", self.cpu_temp.as_str()),
+            ("CPU占用", self.cpu_usage.as_str()),
+            ("内存占用", self.mem_usage.as_str()),
+            ("开机时长", self.uptime.as_str()),
+            ("datad版本", self.datad_version.as_str()),
+        ] {
+            if !value.is_empty() {
+                lines.push(format!("{label}: {value}"));
+            }
+        }
+        if lines.len() == 1 {
+            lines.push("暂不可用".into());
+        }
+        lines.join("\n")
+    }
+
+    fn sms_line(&self) -> String {
+        [
+            self.model.as_str(),
+            self.battery_level.as_str(),
+            self.msisdn.as_str(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+}
+
+impl Destination {
+    pub fn attach_device_info(&mut self, snapshot: &Snapshot) {
+        if self.include_device_info {
+            self.device_info = Some(DeviceInfo::from_snapshot(snapshot, &self.nickname));
+        }
+    }
+
+    pub fn force_device_info(&mut self, snapshot: &Snapshot) {
+        self.include_device_info = true;
+        self.attach_device_info(snapshot);
+    }
 }
 
 impl Message {
@@ -137,6 +355,15 @@ impl Message {
             text: "zwrt-datad 短信转发测试".into(),
             date: String::new(),
             kind: Kind::Sms,
+        }
+    }
+
+    pub fn device_info() -> Self {
+        Self {
+            from: "DeviceInfo".into(),
+            text: String::new(),
+            date: String::new(),
+            kind: Kind::Device,
         }
     }
 }
@@ -381,6 +608,7 @@ fn delivery_result_code(result: &Result<(), String>) -> &'static str {
     match result {
         Ok(()) => "sent",
         Err(error) if error == "clock_unavailable" => "clock_unavailable",
+        Err(error) if error == "source_unavailable" => "source_unavailable",
         Err(error) if error == "rate_limited" => "rate_limited",
         Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
         Err(error) if error == "message_too_long" => "message_too_long",
@@ -443,6 +671,10 @@ impl Forwarder {
             "blacklist_keywords_count":self.config.blacklist_keywords.len(),
             "nickname_supported":true,
             "nickname":self.config.nickname,
+            "device_info_supported":true,
+            "smtp_forward_device_info":self.config.smtp_forward_device_info,
+            "dingtalk_forward_device_info":self.config.dingtalk_forward_device_info,
+            "sms_forward_device_info":self.config.sms_forward_device_info,
             "last_result":self.last_result})
     }
 
@@ -525,6 +757,15 @@ impl Forwarder {
         }
         if let Some(nickname) = input.nickname {
             next.nickname = nickname;
+        }
+        if let Some(enabled) = input.smtp_forward_device_info {
+            next.smtp_forward_device_info = enabled;
+        }
+        if let Some(enabled) = input.dingtalk_forward_device_info {
+            next.dingtalk_forward_device_info = enabled;
+        }
+        if let Some(enabled) = input.sms_forward_device_info {
+            next.sms_forward_device_info = enabled;
         }
         if let Some(enabled) = power_change {
             let baseline = power_state(battery);
@@ -619,6 +860,12 @@ impl Forwarder {
     }
 
     pub fn delivery(&self) -> Destination {
+        let include_device_info = match self.config.method.as_str() {
+            "smtp" => self.config.smtp_forward_device_info,
+            "dingtalk" => self.config.dingtalk_forward_device_info,
+            "sms" => self.config.sms_forward_device_info,
+            _ => false,
+        };
         Destination {
             method: self.config.method.clone(),
             webhook_url: self.config.webhook_url.clone(),
@@ -626,7 +873,14 @@ impl Forwarder {
             dingtalk_secret: self.config.dingtalk_secret.clone(),
             sms_to_phone: self.config.sms_to_phone.clone(),
             smtp: self.config.smtp.clone(),
+            include_device_info,
+            nickname: self.config.nickname.clone(),
+            device_info: None,
         }
+    }
+
+    pub fn device_info_enabled(&self) -> bool {
+        self.config.enabled
     }
 
     /// Store the new battery baseline and the daily quota before any external
@@ -795,15 +1049,43 @@ fn timestamp_from_http_date(date: &str) -> Result<String, String> {
         .to_string())
 }
 
-fn smtp_content(message: &Message) -> (&'static str, String) {
-    if message.kind == Kind::Power {
-        ("电源状态通知", message.text.clone())
+fn with_device_info(mut body: String, info: Option<&DeviceInfo>) -> String {
+    if let Some(info) = info {
+        body.push_str("\n\n");
+        body.push_str(&info.details());
+    }
+    body
+}
+
+fn smtp_content(message: &Message, info: Option<&DeviceInfo>) -> (&'static str, String) {
+    if message.kind == Kind::Device {
+        (
+            "设备信息",
+            info.map(DeviceInfo::details)
+                .unwrap_or_else(|| "设备信息暂不可用".into()),
+        )
+    } else if message.kind == Kind::Power {
+        ("电源状态通知", with_device_info(message.text.clone(), info))
     } else {
         (
             "新短信通知",
-            format!("来自 {}:\n{}", message.from, message.text),
+            with_device_info(format!("来自 {}:\n{}", message.from, message.text), info),
         )
     }
+}
+
+fn dingtalk_content(message: &Message, info: Option<&DeviceInfo>) -> String {
+    if message.kind == Kind::Device {
+        return info
+            .map(DeviceInfo::details)
+            .unwrap_or_else(|| "设备信息暂不可用".into());
+    }
+    let content = if message.kind == Kind::Power {
+        format!("电源状态通知\n{}", message.text)
+    } else {
+        format!("短信来自 {}\n{}", message.from, message.text)
+    };
+    with_device_info(content, info)
 }
 
 pub async fn deliver(
@@ -815,7 +1097,7 @@ pub async fn deliver(
         return deliver_sms(destination_config, message).await;
     }
     if destination_config.method == "smtp" {
-        let (subject, body) = smtp_content(message);
+        let (subject, body) = smtp_content(message, destination_config.device_info.as_ref());
         return smtp_forward::send(&destination_config.smtp, subject, &body).await;
     }
     let method = destination_config.method.as_str();
@@ -840,12 +1122,14 @@ pub async fn deliver(
                 .append_pair("timestamp", &timestamp)
                 .append_pair("sign", &signature);
         }
-        let content = if message.kind == Kind::Power {
-            format!("电源状态通知\n{}", message.text)
-        } else {
-            format!("短信来自 {}\n{}", message.from, message.text)
-        };
+        let content = dingtalk_content(message, destination_config.device_info.as_ref());
         json!({"msgtype":"text","text":{"content":content}})
+    } else if message.kind == Kind::Device {
+        let info = destination_config
+            .device_info
+            .as_ref()
+            .ok_or("source_unavailable")?;
+        json!({"kind":"device","text":info.details(),"date":message.date})
     } else if message.kind == Kind::Power {
         json!({"kind":"power","from":message.from,"text":message.text,"date":message.date})
     } else {
@@ -855,12 +1139,27 @@ pub async fn deliver(
     post_payload(&client, url, &body, method).await
 }
 
-fn sms_message_hex(message: &Message) -> Result<String, String> {
-    let body = if message.kind == Kind::Power {
+fn sms_message_hex(message: &Message, info: Option<&DeviceInfo>) -> Result<String, String> {
+    let mut body = if message.kind == Kind::Device {
+        let line = info.map(DeviceInfo::sms_line).unwrap_or_default();
+        if line.is_empty() {
+            return Err("source_unavailable".into());
+        }
+        format!("设备信息:\n{line}")
+    } else if message.kind == Kind::Power {
         format!("电源状态通知:\n{}", message.text)
     } else {
         format!("来自 {}:\n{}", message.from, message.text)
     };
+    if message.kind != Kind::Device
+        && let Some(info) = info
+    {
+        let line = info.sms_line();
+        if !line.is_empty() {
+            body.push('\n');
+            body.push_str(&line);
+        }
+    }
     let units: Vec<_> = body.encode_utf16().collect();
     if units.is_empty() || units.len() > MAX_SMS_UNITS {
         return Err("message_too_long".into());
@@ -874,7 +1173,7 @@ fn sms_message_hex(message: &Message) -> Result<String, String> {
 }
 
 async fn deliver_sms(destination_config: &Destination, message: &Message) -> Result<(), String> {
-    let message_hex = sms_message_hex(message)?;
+    let message_hex = sms_message_hex(message, destination_config.device_info.as_ref())?;
     let clock = reboot_schedule::local_clock().ok_or("clock_unavailable")?;
     let sms_time = format!(
         "{};{};{};{};{};00;+;0",
@@ -1018,6 +1317,9 @@ mod tests {
             blacklist_phone: Some(phones),
             blacklist_keywords: Some(keywords),
             nickname: None,
+            smtp_forward_device_info: None,
+            dingtalk_forward_device_info: None,
+            sms_forward_device_info: None,
         };
         let empty = json!({"stale":false,"truncated":false,"list":[]});
         let status = manager
@@ -1098,6 +1400,9 @@ mod tests {
                     blacklist_phone: None,
                     blacklist_keywords: None,
                     nickname: None,
+                    smtp_forward_device_info: None,
+                    dingtalk_forward_device_info: None,
+                    sms_forward_device_info: None,
                 },
                 Some(&old),
                 None,
@@ -1110,7 +1415,7 @@ mod tests {
             kind: Kind::Sms,
         };
         assert_eq!(
-            sms_message_hex(&message),
+            sms_message_hex(&message, None),
             Ok("676581EA002000310030003000380036003A000A6D4B8BD5".into())
         );
         manager.reserve_sms(&message).unwrap();
@@ -1134,7 +1439,7 @@ mod tests {
             date: String::new(),
             kind: Kind::Sms,
         };
-        assert!(sms_message_hex(&long).is_err());
+        assert!(sms_message_hex(&long, None).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1190,6 +1495,9 @@ mod tests {
             blacklist_phone: None,
             blacklist_keywords: None,
             nickname: None,
+            smtp_forward_device_info: None,
+            dingtalk_forward_device_info: None,
+            sms_forward_device_info: None,
         };
         assert_eq!(
             manager
@@ -1211,10 +1519,10 @@ mod tests {
         let event = manager.observe_power(Some(&third)).unwrap().unwrap();
         assert_eq!(event.kind, Kind::Power);
         assert!(event.text.contains("+1%"));
-        let (subject, body) = smtp_content(&event);
+        let (subject, body) = smtp_content(&event, None);
         assert_eq!(subject, "电源状态通知");
         assert_eq!(body, event.text);
-        let phone_hex = sms_message_hex(&event).unwrap();
+        let phone_hex = sms_message_hex(&event, None).unwrap();
         let units: Vec<u16> = phone_hex
             .as_bytes()
             .chunks_exact(4)
@@ -1306,6 +1614,9 @@ mod tests {
             blacklist_phone: None,
             blacklist_keywords: None,
             nickname: None,
+            smtp_forward_device_info: None,
+            dingtalk_forward_device_info: None,
+            sms_forward_device_info: None,
         };
         let status = manager
             .update(
@@ -1378,7 +1689,10 @@ mod tests {
                         power_forward_enabled: None,
                         blacklist_phone: None,
                         blacklist_keywords: None,
-                        nickname: None
+                        nickname: None,
+                        smtp_forward_device_info: None,
+                        dingtalk_forward_device_info: None,
+                        sms_forward_device_info: None
                     },
                     Some(&old),
                     None
@@ -1457,6 +1771,126 @@ mod tests {
         );
         assert_eq!(Forwarder::load(&dir).status()["nickname"], "");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn device_info_flags_are_independent_off_by_default_and_persist() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-forward-info-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        for key in [
+            "smtp_forward_device_info",
+            "dingtalk_forward_device_info",
+            "sms_forward_device_info",
+        ] {
+            assert_eq!(manager.status()[key], false);
+        }
+        let update = |method: &str, flag: &str, enabled: bool| {
+            let mut value = json!({"enabled":false,"method":method});
+            value[flag] = json!(enabled);
+            serde_json::from_value::<Update>(value).unwrap()
+        };
+        manager
+            .update(update("smtp", "smtp_forward_device_info", true), None, None)
+            .unwrap();
+        assert_eq!(manager.status()["enabled"], false);
+        assert!(manager.delivery().include_device_info);
+        manager
+            .update(update("sms", "sms_forward_device_info", true), None, None)
+            .unwrap();
+        assert!(manager.delivery().include_device_info);
+        let mut reloaded = Forwarder::load(&dir);
+        assert_eq!(reloaded.status()["smtp_forward_device_info"], true);
+        assert_eq!(reloaded.status()["sms_forward_device_info"], true);
+        assert_eq!(reloaded.status()["dingtalk_forward_device_info"], false);
+        reloaded
+            .update(
+                update("webhook", "sms_forward_device_info", false),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!reloaded.delivery().include_device_info);
+        assert_eq!(reloaded.status()["sms_forward_device_info"], false);
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn device_info_uses_bounded_status_without_leaking_identifiers_to_mail_or_dingtalk() {
+        let fields = json!({
+            "device":{"market_name":"U60 Pro"},
+            "system":{"sw_version":"B28","uptime":3600,"cpu_usage":17,"mem_used_pct":52,
+                "imei":"863500074315883"},
+            "sim":{"msisdn":"+8613800000000","iccid":"8986000000000000000","imsi":"460000000000001"},
+            "battery":{"percent":66,"temp":32.5},
+            "thermal":{"cpu_celsius":41.0},
+            "traffic":{"day_rx_bytes":1024,"day_tx_bytes":1024,
+                "month_rx_bytes":1048576,"month_tx_bytes":1048576}
+        });
+        let snapshot = Snapshot {
+            ts: 0,
+            datad: crate::model::DatadVersion::default(),
+            fields: fields.as_object().unwrap().clone(),
+        };
+        let info = DeviceInfo::from_snapshot(&snapshot, "客厅");
+        let details = info.details();
+        for expected in [
+            "U60 Pro (客厅)",
+            "B28",
+            "2.00 KB",
+            "2.00 MB",
+            "66%",
+            "41.0°C",
+        ] {
+            assert!(details.contains(expected), "missing {expected}");
+        }
+        for secret in [
+            "863500074315883",
+            "8986000000000000000",
+            "460000000000001",
+            "+8613800000000",
+        ] {
+            assert!(!details.contains(secret), "identifier in verbose status");
+        }
+        assert_eq!(info.sms_line(), "U60 Pro 66% +8613800000000");
+        let message = Message::test();
+        let (_, mail) = smtp_content(&message, Some(&info));
+        assert!(mail.starts_with("来自 NMS:\nzwrt-datad 短信转发测试"));
+        assert!(mail.contains("设备信息\n设备名称: U60 Pro (客厅)"));
+        let dingtalk = dingtalk_content(&message, Some(&info));
+        assert!(dingtalk.starts_with("短信来自 NMS\nzwrt-datad 短信转发测试"));
+        assert!(dingtalk.contains("设备信息\n设备名称: U60 Pro (客厅)"));
+        assert!(!dingtalk.contains("+8613800000000"));
+        let hex = sms_message_hex(&message, Some(&info)).unwrap();
+        let units = (0..hex.len())
+            .step_by(4)
+            .map(|index| u16::from_str_radix(&hex[index..index + 4], 16).unwrap())
+            .collect::<Vec<_>>();
+        let sms = String::from_utf16(&units).unwrap();
+        assert!(sms.ends_with("U60 Pro 66% +8613800000000"));
+        assert!(!sms.contains("863500074315883"));
+        let mut unsafe_fields = fields.as_object().unwrap().clone();
+        unsafe_fields.insert("sim".into(), json!({"msisdn":"10086\r\nBcc:target"}));
+        let unsafe_snapshot = Snapshot {
+            fields: unsafe_fields,
+            ..snapshot
+        };
+        assert!(
+            !DeviceInfo::from_snapshot(&unsafe_snapshot, "")
+                .sms_line()
+                .contains("Bcc")
+        );
     }
 
     #[test]
