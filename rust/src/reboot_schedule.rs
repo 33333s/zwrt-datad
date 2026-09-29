@@ -37,12 +37,12 @@ impl Default for Stored {
 
 #[derive(Clone, Debug)]
 pub struct Clock {
-    date: String,
-    time: String,
-    offset: String,
+    pub(crate) date: String,
+    pub(crate) time: String,
+    pub(crate) offset: String,
 }
 
-fn valid_time(value: &str) -> bool {
+pub(crate) fn valid_time(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 5
         && bytes[2] == b':'
@@ -51,7 +51,7 @@ fn valid_time(value: &str) -> bool {
         && value[3..5].parse::<u8>().is_ok_and(|minute| minute < 60)
 }
 
-fn valid_date(value: &str) -> bool {
+pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10
         || bytes[4] != b'-'

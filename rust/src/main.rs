@@ -19,6 +19,7 @@ mod server;
 mod sms;
 mod speedtest;
 mod state;
+mod task_schedule;
 mod traffic_history;
 mod usb;
 mod webshell;
@@ -145,6 +146,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     app.spawn_reboot_schedule();
+    app.spawn_task_schedule();
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     validate_listener_security(addr, local_requires_auth)?;
     if let Some(lan_bind) = args.lan_bind {

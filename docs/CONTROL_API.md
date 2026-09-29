@@ -28,6 +28,8 @@ Content-Type: application/json
 | `speedtest.start` | `bytes`（1–50 MiB）、`threads`（1–5）、`runs`（1 或 3） | 设备默认出口直连固定 Cloudflare HTTPS 下载端点，异步返回状态；总量不超过 `bytes` |
 | `speedtest.stop` | 无 | 取消正在运行的下载测试 |
 | `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
+| `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项；远程 v2 要求 `confirmed=true` |
+| `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
 | `device.poweroff` | 无 | 关闭设备 |
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
