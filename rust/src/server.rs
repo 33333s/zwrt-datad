@@ -396,6 +396,22 @@ impl App {
                         .await,
                         Ok(Ok(()))
                     )
+                } else if task.action == "sms.send_scheduled" {
+                    if let Some(params) = crate::task_schedule::scheduled_sms_params(&task, &clock)
+                    {
+                        let reserved = app.inner.sms_forward.lock().await.reserve_scheduled_sms();
+                        reserved.is_ok()
+                            && matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(50),
+                                    crate::sms::send(&params),
+                                )
+                                .await,
+                                Ok(Ok(_))
+                            )
+                    } else {
+                        false
+                    }
                 } else {
                     matches!(
                         tokio::time::timeout(
