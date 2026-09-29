@@ -7,6 +7,7 @@ use crate::{
     model::Snapshot,
     reboot_schedule::{self, Schedule},
     server::App,
+    sms_forward::Update as SmsForwardUpdate,
     speedtest::SpeedTest,
     state,
     task_schedule::TaskInput,
@@ -147,6 +148,7 @@ fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
 struct PanelManagement<'a> {
     cloud: Option<&'a Value>,
     tasks: Option<&'a Value>,
+    sms_forward: Option<&'a Value>,
 }
 
 fn state_message_with_config(
@@ -182,6 +184,10 @@ fn state_message_with_config(
     if let Some(scheduled_tasks) = management.tasks {
         view.as_object_mut()?
             .insert("scheduled_tasks".into(), scheduled_tasks.clone());
+    }
+    if let Some(sms_forward) = management.sms_forward {
+        view.as_object_mut()?
+            .insert("sms_forward".into(), sms_forward.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -378,6 +384,8 @@ fn needs_confirmation(action: &str) -> bool {
             | "traffic.calibrate"
             | "sms.delete"
             | "sms.send_raw"
+            | "sms.forward.set"
+            | "sms.forward.test"
             | "client.kick"
             | "client.block"
             | "client.unblock"
@@ -474,6 +482,45 @@ async fn control_result(
                 Err(_) => Some("invalid_parameter"),
             },
             _ => Some("invalid_parameter"),
+        }
+    } else if request.action == "sms.forward.set" {
+        match (
+            cloud_app,
+            serde_json::from_value::<SmsForwardUpdate>(request.params.clone()),
+        ) {
+            (Some(app), Ok(input)) => match tokio::time::timeout(
+                Duration::from_secs(40),
+                app.panel_sms_forward_update(input),
+            )
+            .await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(error))
+                    if error == "forward_storage_failed" || error == "sms_list_unavailable" =>
+                {
+                    Some("device_call_failed")
+                }
+                Ok(Err(_)) => Some("invalid_parameter"),
+                Err(_) => Some("device_call_timeout"),
+            },
+            _ => Some("invalid_parameter"),
+        }
+    } else if request.action == "sms.forward.test" {
+        if !request
+            .params
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            Some("invalid_parameter")
+        } else if let Some(app) = cloud_app {
+            match tokio::time::timeout(Duration::from_secs(40), app.panel_sms_forward_test()).await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(_)) => Some("device_call_failed"),
+                Err(_) => Some("device_call_timeout"),
+            }
+        } else {
+            Some("unsupported_action")
         }
     } else if request.action == "speedtest.start" {
         match speedtest {
@@ -622,6 +669,11 @@ pub(crate) async fn run(
     } else {
         None
     };
+    let mut sms_forward_status = if let Some(app) = &cloud_app {
+        Some(app.panel_sms_forward_status().await)
+    } else {
+        None
+    };
     let Some(first) = state_message_with_config(
         &last,
         if control_mode { 2 } else { 1 },
@@ -632,6 +684,7 @@ pub(crate) async fn run(
         PanelManagement {
             cloud: cloud_management.as_ref(),
             tasks: scheduled_tasks.as_ref(),
+            sms_forward: sms_forward_status.as_ref(),
         },
     ) else {
         return;
@@ -666,12 +719,14 @@ pub(crate) async fn run(
                 let next = state_rx.borrow().clone();
                 let next_history = history_rx.borrow_and_update().clone();
                 let next_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None};
-                if next != last || config_pending || next_history != history || next_tasks != scheduled_tasks {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref()}) else { return; };
+                let next_sms_forward = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};
+                if next != last || config_pending || next_history != history || next_tasks != scheduled_tasks || next_sms_forward != sms_forward_status {
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref(),sms_forward:next_sms_forward.as_ref()}) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     history = next_history;
                     scheduled_tasks = next_tasks;
+                    sms_forward_status = next_sms_forward;
                     config_pending = false;
                 }
             },
@@ -691,13 +746,15 @@ pub(crate) async fn run(
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
                     let refresh_tasks = request.action.starts_with("schedule.task.");
+                    let refresh_sms_forward = request.action.starts_with("sms.forward.");
                     if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref(), cloud_app.as_ref()).await).await.is_err() { return; }
-                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks {
+                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks || refresh_sms_forward {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
                         if refresh_tasks { scheduled_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None}; }
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref()})
+                        if refresh_sms_forward {sms_forward_status = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};}
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref()})
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -808,6 +865,7 @@ mod tests {
             PanelManagement {
                 cloud: Some(&reviewed),
                 tasks: None,
+                sms_forward: None,
             },
         )
         .unwrap() else {
@@ -845,6 +903,7 @@ mod tests {
             PanelManagement {
                 cloud: None,
                 tasks: Some(&tasks),
+                sms_forward: None,
             },
         )
         .unwrap() else {
@@ -852,6 +911,39 @@ mod tests {
         };
         let frame: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(frame["snapshot"]["scheduled_tasks"], tasks);
+    }
+
+    #[test]
+    fn sms_forward_status_is_panel_only_and_contains_no_destination() {
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::new(),
+        };
+        let status = json!({"supported":true,"enabled":false,"method":"webhook","webhook_configured":true,"dingtalk_configured":false,"dingtalk_secret_configured":false,"last_result":"idle"});
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected state")
+        };
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain["snapshot"].get("sms_forward").is_none());
+        let Message::Text(raw) = state_message_with_config(
+            &snapshot,
+            2,
+            None,
+            None,
+            None,
+            None,
+            PanelManagement {
+                sms_forward: Some(&status),
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            panic!("expected panel state")
+        };
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["snapshot"]["sms_forward"], status);
+        assert!(!raw.contains("webhook_url"));
     }
 
     #[test]
@@ -939,6 +1031,8 @@ mod tests {
         assert!(needs_confirmation("cloud.remote_features.set"));
         assert!(needs_confirmation("schedule.task.put"));
         assert!(needs_confirmation("schedule.task.remove"));
+        assert!(needs_confirmation("sms.forward.set"));
+        assert!(needs_confirmation("sms.forward.test"));
         assert!(!needs_confirmation("speedtest.stop"));
         for action in [
             "wifi.set_dual_band",

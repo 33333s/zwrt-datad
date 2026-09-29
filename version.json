@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.30",
+    "version": "0.10.31",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加受限的设备本地定时任务"
+    "notes": "为 NMS 原版远程面板增加受限 HTTPS 短信转发"
   }
 }
