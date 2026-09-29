@@ -849,7 +849,7 @@ impl Ctl {
                 Ok(Some(2)) => "time",
                 _ => return Outcome::Invalid("type must be 1 (data) or 2 (time)".into()),
             };
-            size = match text(params, "value").or_else(|| None) {
+            size = match text(params, "value") {
                 Some(v)
                     if !v.is_empty()
                         && v.len() <= 15
