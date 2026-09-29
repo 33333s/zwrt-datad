@@ -55,6 +55,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 ## 按需远程面板状态通道
 
+从 0.10.29 起，已授权的按需远程面板会话还可读取 `cloud_management`：仅含云连接状态、非秘密配置字段、密码与自定义 CA 是否存在的布尔值，以及最多 8 个本机后台名称/端口/类型。MQTT 密码与 CA 内容不会上传。远程写操作 `cloud.remote_features.set` 只接收 `remote_panel_control_enabled`、`remote_webshell_enabled` 和完整 `services` 列表；不能改写 MQTT 目标、设备身份、凭据或证书。NMS 和 datad 双层校验，v2 控制帧必须 `confirmed=true`，保存后先返回控制结果，再重连云端会话；远程面板控制被关闭后，后续会话恢复只读。
+
 从 0.10.25 起，datad 在设备本地每五分钟记录一次蜂窝日流量计数变化，最多保留 400 个自然日，文件 `traffic-history.json` 以 0600 权限原子保存。首次安装从设备当前“今日流量”计数开始，不回填此前日期；设备日期未就绪时不记样本。计数在同一天归零时按新计数继续累计；跨日时若原厂计数尚未归零，先扣除上一日的末次计数，避免把昨日用量记入新一天。
 
 只有已授权的 `datad_panel` / `datad_panel_control` 按需会话接收 `traffic_history:[{date,bytes}]`；常规 MQTT 遥测、本地 `/state` 与 SSE 不含历史文件内容。该数组只含日期和上下行总字节，不含原始 UCI、IP、SIM 标识或每秒速率。NMS 再对日期、顺序、长度和字节范围校验，浏览器只在打开原版“流量历史”弹窗时按日期筛选显示。

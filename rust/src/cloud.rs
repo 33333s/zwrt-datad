@@ -43,7 +43,7 @@ const DEFAULT_PLATFORM_URL: &str = "https://nms.ericsfj.com";
 const DEFAULT_BROKER: &str = "wss://nms.ericsfj.com/mqtt";
 const DEFAULT_MEMBER_ORIGIN: &str = "https://a.ericsfj.com:16001";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub name: String,
@@ -122,6 +122,14 @@ pub struct Update {
     pub config: Config,
     #[serde(default)]
     pub clear_password: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFeatures {
+    pub remote_panel_control_enabled: bool,
+    pub remote_webshell_enabled: bool,
+    pub services: Vec<Service>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +230,66 @@ impl Cloud {
         let configured = !config.password.is_empty();
         config.password.clear();
         json!({"config":config,"password_configured":configured})
+    }
+
+    /// Only fields needed by the authorized NMS-hosted UFI settings panel.
+    /// MQTT password, custom CA PEM and other private runtime data never leave
+    /// the device through this view.
+    pub fn panel_config(&self) -> Value {
+        json!({
+            "state":self.status.lock().unwrap().state,
+            "enabled":self.config.enabled,
+            "remote_enabled":self.config.remote_enabled,
+            "remote_panel_control_enabled":self.config.remote_panel_control_enabled,
+            "remote_webshell_enabled":self.config.remote_webshell_enabled,
+            "platform_url":self.config.platform_url,
+            "broker":self.config.broker,
+            "username":self.config.username,
+            "password_configured":!self.config.password.is_empty(),
+            "custom_ca_configured":!self.config.ca_pem.is_empty(),
+            "vendor":self.config.vendor,
+            "model":self.config.model,
+            "identity_type":self.config.identity_type,
+            "identity":self.config.identity,
+            "platform":self.config.platform,
+            "report_interval_seconds":self.config.report_interval_seconds,
+            "services":self.config.services,
+        })
+    }
+
+    /// Persist only remote feature switches and reviewed local services. The
+    /// caller sends its control acknowledgement before activating the new
+    /// supervisor configuration, which may close the current panel session.
+    pub fn save_remote_features(&mut self, input: RemoteFeatures) -> Result<(Value, bool), String> {
+        if !self.config.enabled || !self.config.remote_enabled {
+            return Err("远程管理未启用".into());
+        }
+        if input
+            .services
+            .iter()
+            .any(|service| service.port == 0 || service.name.chars().any(char::is_control))
+        {
+            return Err("远程后台名称或端口无效".into());
+        }
+        if self.config.remote_panel_control_enabled == input.remote_panel_control_enabled
+            && self.config.remote_webshell_enabled == input.remote_webshell_enabled
+            && self.config.services == input.services
+        {
+            return Ok((self.panel_config(), false));
+        }
+        let mut next = self.config.clone();
+        next.remote_panel_control_enabled = input.remote_panel_control_enabled;
+        next.remote_webshell_enabled = input.remote_webshell_enabled;
+        next.services = input.services;
+        validate(&next)?;
+        atomic_json(&self.file, &next)?;
+        self.config = next;
+        set_status(&self.status, "reconfiguring", "");
+        Ok((self.panel_config(), true))
+    }
+
+    pub fn activate_saved_features(&self) {
+        let _ = self.tx.send(Some(self.config.clone()));
     }
 
     pub fn status(&self) -> Value {
@@ -941,6 +1009,7 @@ impl BridgeManager {
                         history: app.cloud_panel_history(),
                         schedule: Some(app.cloud_panel_schedule()),
                         speedtest: Some(app.cloud_panel_speedtest()),
+                        cloud_app: Some(app.clone()),
                     },
                     command.target_service == "datad_panel_control",
                     &self.config,
@@ -1867,6 +1936,92 @@ mod tests {
     #[test]
     fn defaults_validate() {
         validate(&Config::default()).unwrap()
+    }
+
+    #[test]
+    fn remote_feature_updates_keep_cloud_credentials_and_defer_reconnect() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-cloud-panel-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut cloud = Cloud::load(&dir);
+        let _receiver = cloud.tx.subscribe();
+        let config = Config {
+            enabled: true,
+            remote_enabled: true,
+            username: "dev_fixture".into(),
+            password: "must-not-leak".into(),
+            model: "MU5250".into(),
+            identity: "fixture-id".into(),
+            platform_url: "https://custom.example".into(),
+            broker: "wss://custom.example/mqtt".into(),
+            ..Config::default()
+        };
+        cloud
+            .update(Update {
+                config,
+                clear_password: false,
+            })
+            .unwrap();
+        let before = cloud.config.clone();
+        let first = cloud.panel_config();
+        assert!(first["password_configured"].as_bool().unwrap());
+        assert!(!first.to_string().contains("must-not-leak"));
+        assert!(first.get("ca_pem").is_none());
+        let service = Service {
+            name: "UFI Test".into(),
+            port: 2333,
+            kind: "web".into(),
+        };
+        let (view, changed) = cloud
+            .save_remote_features(RemoteFeatures {
+                remote_panel_control_enabled: true,
+                remote_webshell_enabled: true,
+                services: vec![service.clone()],
+            })
+            .unwrap();
+        assert!(changed && view["remote_webshell_enabled"] == true);
+        assert_eq!(cloud.config.password, before.password);
+        assert_eq!(cloud.config.broker, before.broker);
+        assert_eq!(cloud.config.platform_url, before.platform_url);
+        assert_eq!(cloud.config.username, before.username);
+        assert_eq!(cloud.config.identity, before.identity);
+        assert_eq!(cloud.config.services, vec![service]);
+        assert!(!cloud.tx.borrow().as_ref().unwrap().remote_webshell_enabled);
+        cloud.activate_saved_features();
+        assert!(cloud.tx.borrow().as_ref().unwrap().remote_webshell_enabled);
+        let raw = std::fs::read(&cloud.file).unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains("must-not-leak"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&cloud.file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !cloud
+                .save_remote_features(RemoteFeatures {
+                    remote_panel_control_enabled: true,
+                    remote_webshell_enabled: true,
+                    services: cloud.config.services.clone()
+                })
+                .unwrap()
+                .1
+        );
+        assert!(
+            cloud
+                .save_remote_features(RemoteFeatures {
+                    remote_panel_control_enabled: true,
+                    remote_webshell_enabled: true,
+                    services: vec![Service {
+                        name: "Bad".into(),
+                        port: 9460,
+                        kind: "web".into()
+                    }]
+                })
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
