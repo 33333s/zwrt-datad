@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.41",
+    "version": "0.10.42",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板加入邻区采集启停"
+    "notes": "远程面板上报设备休眠档位"
   }
 }

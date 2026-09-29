@@ -53,6 +53,7 @@ const EXPOSED_BLOCKS: &[&str] = &[
     "multiwan",
     "cooling",
     "dhcp",
+    "sleep",
     "device",
     "system",
     "thermal",
@@ -800,6 +801,7 @@ mod tests {
     fn only_reviewed_state_blocks_leave_the_device() {
         let mut fields = Map::new();
         fields.insert("net".into(), json!({"type":"SA"}));
+        fields.insert("sleep".into(), json!({"supported":true,"minutes":-1}));
         fields.insert(
             "reboot_schedule".into(),
             json!({"supported":true,"enabled":false,"time":"02:03"}),
@@ -838,6 +840,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["snapshot"]["speedtest"]["provider"], "cloudflare");
         assert_eq!(parsed["snapshot"]["net"]["type"], "SA");
+        assert_eq!(parsed["snapshot"]["sleep"]["minutes"], -1);
         assert!(parsed["snapshot"].get("future_secret").is_none());
         assert_eq!(
             parsed["snapshot"]["uci_device_info"]["mac_address"],
