@@ -192,7 +192,7 @@ fn advertises(lines: &[String], capability: &str) -> bool {
 async fn submit<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     settings: &Settings,
-    from: &str,
+    subject: &str,
     body: &str,
     greeting: bool,
 ) -> Result<(), String> {
@@ -226,9 +226,8 @@ async fn submit<S: AsyncRead + AsyncWrite + Unpin>(
     command(stream, "DATA").await?;
     expect(stream, 354).await?;
 
-    let subject = STANDARD.encode("新短信通知".as_bytes());
-    let message = format!("来自 {from}:\n{body}");
-    let encoded_body = STANDARD.encode(message.as_bytes());
+    let subject = STANDARD.encode(subject.as_bytes());
+    let encoded_body = STANDARD.encode(body.as_bytes());
     let headers = format!(
         "From: <{}>\r\nTo: <{}>\r\nSubject: =?UTF-8?B?{subject}?=\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
         settings.username, settings.to
@@ -267,7 +266,7 @@ async fn send_to(
     settings: &Settings,
     socket: TcpStream,
     roots: RootCertStore,
-    from: &str,
+    subject: &str,
     body: &str,
 ) -> Result<(), String> {
     let name = ServerName::try_from(settings.host.clone()).map_err(|_| "delivery_failed")?;
@@ -277,7 +276,7 @@ async fn send_to(
             .connect(name, socket)
             .await
             .map_err(|_| "delivery_failed")?;
-        return submit(&mut stream, settings, from, body, true).await;
+        return submit(&mut stream, settings, subject, body, true).await;
     }
     let mut socket = socket;
     expect(&mut socket, 220).await?;
@@ -292,11 +291,15 @@ async fn send_to(
         .connect(name, socket)
         .await
         .map_err(|_| "delivery_failed")?;
-    submit(&mut stream, settings, from, body, false).await
+    submit(&mut stream, settings, subject, body, false).await
 }
 
-pub async fn send(settings: &Settings, from: &str, body: &str) -> Result<(), String> {
-    if !settings.configured() || from.len() > 64 || body.len() > 4096 {
+pub async fn send(settings: &Settings, subject: &str, body: &str) -> Result<(), String> {
+    if !settings.configured()
+        || subject.len() > 64
+        || subject.chars().any(char::is_control)
+        || body.len() > 4096
+    {
         return Err("invalid_forward_config".into());
     }
     timeout(Duration::from_secs(20), async {
@@ -325,7 +328,7 @@ pub async fn send(settings: &Settings, from: &str, body: &str) -> Result<(), Str
         }
         let socket = connected.ok_or("delivery_failed")?;
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        send_to(settings, socket, roots, from, body).await
+        send_to(settings, socket, roots, subject, body).await
     })
     .await
     .map_err(|_| "delivery_failed".to_string())?
@@ -472,7 +475,13 @@ mod tests {
             let socket = TcpStream::connect(address).await.unwrap();
             timeout(
                 Duration::from_secs(5),
-                send_to(&settings, socket, roots, "10086", "合成测试短信"),
+                send_to(
+                    &settings,
+                    socket,
+                    roots,
+                    "新短信通知",
+                    "来自 10086:\n合成测试短信",
+                ),
             )
             .await
             .unwrap()
@@ -506,7 +515,7 @@ mod tests {
                 &settings,
                 socket,
                 RootCertStore::empty(),
-                "10086",
+                "新短信通知",
                 "synthetic"
             )
             .await
@@ -545,7 +554,7 @@ mod tests {
         };
         let socket = TcpStream::connect(address).await.unwrap();
         assert!(
-            send_to(&settings, socket, roots, "10086", "synthetic")
+            send_to(&settings, socket, roots, "新短信通知", "synthetic")
                 .await
                 .is_err()
         );

@@ -19,6 +19,7 @@ export ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
 export MOCK_CALL_LOG="$TMP/calls.log"
 export ZWRT_DATAD_OTA_DISABLE_AUTO=1
+export MOCK_CHARGE_STATUS=4
 export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
 export ZWRT_DATAD_HOSTAPD_BIN="$ROOT/tests/mock_hostapd.py"
@@ -268,6 +269,11 @@ post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smt
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smtp":{"host":"","port":0,"username":"","password":"","to":""}}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["smtp_configured"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","power_forward_enabled":true}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_supported"] is True and d["result"]["power_forward_enabled"] is True and d["result"]["power_daily_remaining"] == 60 and d["result"]["enabled"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","power_forward_enabled":false}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_forward_enabled"] is False and d["result"]["power_daily_remaining"] == 60'
+[ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
 status=$(curl -sS -o "$TMP/bad-forward.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"sms.forward.set","params":{"enabled":true,"method":"webhook","webhook_url":"http://127.0.0.1/private"}}' \
     "http://127.0.0.1:$PORT/control")
