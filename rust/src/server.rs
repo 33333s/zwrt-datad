@@ -185,6 +185,14 @@ impl App {
         result.map(|()| status)
     }
 
+    pub(crate) async fn panel_neighbor_set(&self, enabled: bool) -> Result<Value, String> {
+        let mut neighbor = self.inner.neighbor.lock().await;
+        if enabled && neighbor.status()["collector_supported"] != true {
+            return Err("neighbor_dependency_missing".into());
+        }
+        neighbor.set_enabled(enabled).await
+    }
+
     async fn scheduled_device_info_forward(&self) -> Result<(), String> {
         let device_snapshot = self.inner.snapshot.read().await.clone();
         let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]

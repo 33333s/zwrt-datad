@@ -343,6 +343,8 @@ SSE  /events
 ## Neighbor and charger direct supply
 
 `neighbor` is always present and is `enabled:false,status:disabled` by default.
+From 0.10.41, `collector_supported` reports whether the local collector executable
+is available; NMS uses this flag to keep unsupported remote controls disabled.
 It has an independent collection lifecycle and can be enabled through
 `neighbor.set` for the current datad process. Restarting datad restores disabled;
 disabling stops the collector and removes its capture logs before returning.

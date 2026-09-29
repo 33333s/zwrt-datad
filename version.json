@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.40",
+    "version": "0.10.41",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板加入受限定时短信动作"
+    "notes": "为 NMS 原版远程面板加入邻区采集启停"
   }
 }
