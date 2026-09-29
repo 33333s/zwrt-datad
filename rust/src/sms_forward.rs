@@ -1,6 +1,6 @@
-//! Opt-in SMS forwarding over fixed HTTPS POST. This does not execute UFI's
-//! legacy curl_text or copy its local forwarding database.
-use crate::sms;
+//! Opt-in SMS forwarding over fixed HTTPS POST or the device's own SIM.
+//! This does not execute UFI's legacy curl_text or copy its local database.
+use crate::{reboot_schedule, sms};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, header::DATE, redirect::Policy};
 use ring::hmac;
@@ -20,6 +20,9 @@ use std::{
 const FILE_NAME: &str = "sms-forward.json";
 const MAX_FILE_BYTES: u64 = 128 * 1024;
 const MAX_SEEN: usize = 1024;
+const MAX_SMS_TARGETS: usize = 3;
+const MAX_SMS_DAILY_SENDS: u16 = 60;
+const MAX_SMS_UNITS: usize = 280;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,12 @@ struct Config {
     webhook_url: String,
     dingtalk_webhook: String,
     dingtalk_secret: String,
+    #[serde(default)]
+    sms_to_phone: Vec<String>,
+    #[serde(default)]
+    sms_quota_date: String,
+    #[serde(default)]
+    sms_quota_used: u16,
     seen: Vec<String>,
 }
 
@@ -42,6 +51,9 @@ impl Default for Config {
             webhook_url: String::new(),
             dingtalk_webhook: String::new(),
             dingtalk_secret: String::new(),
+            sms_to_phone: Vec::new(),
+            sms_quota_date: String::new(),
+            sms_quota_used: 0,
             seen: Vec::new(),
         }
     }
@@ -55,6 +67,7 @@ pub struct Update {
     pub webhook_url: Option<String>,
     pub dingtalk_webhook: Option<String>,
     pub dingtalk_secret: Option<String>,
+    pub sms_to_phone: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +75,14 @@ pub struct Message {
     from: String,
     text: String,
     date: String,
+}
+
+pub struct Destination {
+    method: String,
+    webhook_url: String,
+    dingtalk_webhook: String,
+    dingtalk_secret: String,
+    sms_to_phone: Vec<String>,
 }
 
 impl Message {
@@ -126,12 +147,34 @@ fn destination(raw: &str, method: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+fn valid_phone(value: &str) -> bool {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    (3..=32).contains(&value.len())
+        && !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn phone_matches(a: &str, b: &str) -> bool {
+    a.trim_start_matches('+') == b.trim_start_matches('+')
+}
+
 fn valid_config(config: &Config) -> bool {
     config.schema == 1
-        && matches!(config.method.as_str(), "webhook" | "dingtalk")
+        && matches!(config.method.as_str(), "webhook" | "dingtalk" | "sms")
         && config.dingtalk_secret.len() <= 256
         && !config.dingtalk_secret.chars().any(char::is_control)
         && config.seen.len() <= MAX_SEEN
+        && config.sms_to_phone.len() <= MAX_SMS_TARGETS
+        && config.sms_to_phone.iter().all(|phone| valid_phone(phone))
+        && config
+            .sms_to_phone
+            .iter()
+            .map(|phone| phone.trim_start_matches('+'))
+            .collect::<HashSet<_>>()
+            .len()
+            == config.sms_to_phone.len()
+        && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
+        && (config.sms_quota_date.is_empty() || reboot_schedule::valid_date(&config.sms_quota_date))
         && config
             .seen
             .iter()
@@ -143,6 +186,7 @@ fn valid_config(config: &Config) -> bool {
             || match config.method.as_str() {
                 "webhook" => !config.webhook_url.is_empty(),
                 "dingtalk" => !config.dingtalk_webhook.is_empty(),
+                "sms" => !config.sms_to_phone.is_empty(),
                 _ => false,
             })
 }
@@ -160,6 +204,13 @@ fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
         .ok_or("sms_list_unavailable")?;
     let mut output = Vec::with_capacity(list.len());
     for item in list.iter().rev() {
+        let tag = item
+            .get("tag")
+            .and_then(Value::as_i64)
+            .ok_or("sms_list_unavailable")?;
+        if tag != 0 && tag != 1 {
+            continue;
+        }
         let id = item
             .get("id")
             .and_then(Value::as_i64)
@@ -219,10 +270,18 @@ impl Forwarder {
     }
 
     pub fn status(&self) -> Value {
+        let today = reboot_schedule::local_clock().map(|clock| clock.date);
+        let remaining = if today.as_deref() == Some(&self.config.sms_quota_date) {
+            MAX_SMS_DAILY_SENDS - self.config.sms_quota_used
+        } else {
+            MAX_SMS_DAILY_SENDS
+        };
         json!({"supported":true,"enabled":self.config.enabled,"method":self.config.method,
             "webhook_configured":!self.config.webhook_url.is_empty(),
             "dingtalk_configured":!self.config.dingtalk_webhook.is_empty(),
             "dingtalk_secret_configured":!self.config.dingtalk_secret.is_empty(),
+            "sms_configured":!self.config.sms_to_phone.is_empty(),
+            "sms_daily_remaining":remaining,
             "last_result":self.last_result})
     }
 
@@ -282,6 +341,9 @@ impl Forwarder {
         if let Some(secret) = input.dingtalk_secret {
             next.dingtalk_secret = secret;
         }
+        if let Some(phones) = input.sms_to_phone {
+            next.sms_to_phone = phones;
+        }
         if !valid_config(&next) {
             return Err("invalid_forward_config".into());
         }
@@ -334,6 +396,10 @@ impl Forwarder {
         self.last_result = match result {
             Ok(()) => "sent",
             Err(error) if error == "clock_unavailable" => "clock_unavailable",
+            Err(error) if error == "rate_limited" => "rate_limited",
+            Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
+            Err(error) if error == "message_too_long" => "message_too_long",
+            Err(error) if error == "forward_storage_failed" => "storage_failed",
             Err(_) => "delivery_failed",
         };
     }
@@ -348,13 +414,44 @@ impl Forwarder {
         self.last_result = "storage_failed";
     }
 
-    pub fn delivery(&self) -> (String, String, String, String) {
-        (
-            self.config.method.clone(),
-            self.config.webhook_url.clone(),
-            self.config.dingtalk_webhook.clone(),
-            self.config.dingtalk_secret.clone(),
-        )
+    pub fn delivery(&self) -> Destination {
+        Destination {
+            method: self.config.method.clone(),
+            webhook_url: self.config.webhook_url.clone(),
+            dingtalk_webhook: self.config.dingtalk_webhook.clone(),
+            dingtalk_secret: self.config.dingtalk_secret.clone(),
+            sms_to_phone: self.config.sms_to_phone.clone(),
+        }
+    }
+
+    pub fn reserve_sms(&mut self, message: &Message) -> Result<(), String> {
+        if self.config.method != "sms" {
+            return Ok(());
+        }
+        let count = self
+            .config
+            .sms_to_phone
+            .iter()
+            .filter(|phone| !phone_matches(phone, &message.from))
+            .count();
+        if count == 0 {
+            return Err("self_forward_blocked".into());
+        }
+        let date = reboot_schedule::local_clock()
+            .ok_or("clock_unavailable")?
+            .date;
+        let mut next = self.config.clone();
+        if next.sms_quota_date != date {
+            next.sms_quota_date = date;
+            next.sms_quota_used = 0;
+        }
+        if usize::from(next.sms_quota_used) + count > usize::from(MAX_SMS_DAILY_SENDS) {
+            return Err("rate_limited".into());
+        }
+        next.sms_quota_used += count as u16;
+        self.save(&next)?;
+        self.config = next;
+        Ok(())
     }
 }
 
@@ -417,26 +514,30 @@ fn timestamp_from_http_date(date: &str) -> Result<String, String> {
 }
 
 pub async fn deliver(
-    method: &str,
-    webhook_url: &str,
-    dingtalk_url: &str,
-    secret: &str,
+    destination_config: &Destination,
     time_origin: &str,
     message: &Message,
 ) -> Result<(), String> {
+    if destination_config.method == "sms" {
+        return deliver_sms(destination_config, message).await;
+    }
+    let method = destination_config.method.as_str();
     let mut url = destination(
         if method == "dingtalk" {
-            dingtalk_url
+            &destination_config.dingtalk_webhook
         } else {
-            webhook_url
+            &destination_config.webhook_url
         },
         method,
     )?;
     let body = if method == "dingtalk" {
-        if !secret.is_empty() {
+        if !destination_config.dingtalk_secret.is_empty() {
             let timestamp = trusted_timestamp_ms(time_origin).await?;
-            let text = format!("{timestamp}\n{secret}");
-            let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+            let text = format!("{timestamp}\n{}", destination_config.dingtalk_secret);
+            let key = hmac::Key::new(
+                hmac::HMAC_SHA256,
+                destination_config.dingtalk_secret.as_bytes(),
+            );
             let signature = STANDARD.encode(hmac::sign(&key, text.as_bytes()).as_ref());
             url.query_pairs_mut()
                 .append_pair("timestamp", &timestamp)
@@ -448,6 +549,47 @@ pub async fn deliver(
     };
     let client = public_client(&url).await?;
     post_payload(&client, url, &body, method).await
+}
+
+fn sms_message_hex(message: &Message) -> Result<String, String> {
+    let body = format!("来自 {}:\n{}", message.from, message.text);
+    let units: Vec<_> = body.encode_utf16().collect();
+    if units.is_empty() || units.len() > MAX_SMS_UNITS {
+        return Err("message_too_long".into());
+    }
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(units.len() * 4);
+    for unit in units {
+        write!(&mut hex, "{unit:04X}").map_err(|_| "delivery_failed")?;
+    }
+    Ok(hex)
+}
+
+async fn deliver_sms(destination_config: &Destination, message: &Message) -> Result<(), String> {
+    let message_hex = sms_message_hex(message)?;
+    let clock = reboot_schedule::local_clock().ok_or("clock_unavailable")?;
+    let sms_time = format!(
+        "{};{};{};{};{};00;+;0",
+        &clock.date[2..4],
+        &clock.date[5..7],
+        &clock.date[8..10],
+        &clock.time[0..2],
+        &clock.time[3..5]
+    );
+    let mut sent = 0;
+    for phone in &destination_config.sms_to_phone {
+        if phone_matches(phone, &message.from) {
+            continue;
+        }
+        let params =
+            json!({"sender":"host","number":phone,"message_hex":message_hex,"sms_time":sms_time});
+        sms::send(&params).await.map_err(|_| "delivery_failed")?;
+        sent += 1;
+    }
+    if sent == 0 {
+        return Err("self_forward_blocked".into());
+    }
+    Ok(())
 }
 
 async fn post_payload(client: &Client, url: Url, body: &Value, method: &str) -> Result<(), String> {
@@ -542,6 +684,83 @@ mod tests {
         assert!(timestamp_from_http_date("not-a-date").is_err());
     }
     #[test]
+    fn only_incoming_sms_are_forwarding_candidates() {
+        let sent = json!({"stale":false,"truncated":false,"list":[{"id":3,"num":"10086","date":"09-29 11:00","tag":3,"text":"outgoing"}]});
+        assert!(messages(&sent).unwrap().is_empty());
+        let unknown = json!({"stale":false,"truncated":false,"list":[{"id":4,"num":"10086","date":"09-29 11:00","text":"unknown"}]});
+        assert!(messages(&unknown).is_err());
+    }
+    #[test]
+    fn phone_forwarding_validates_targets_length_and_persistent_daily_quota() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-phone-forward-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        let old = json!({"stale":false,"truncated":false,"list":[]});
+        manager
+            .update(
+                Update {
+                    enabled: true,
+                    method: "sms".into(),
+                    webhook_url: None,
+                    dingtalk_webhook: None,
+                    dingtalk_secret: None,
+                    sms_to_phone: Some(vec!["+10086".into(), "10010".into()]),
+                },
+                Some(&old),
+            )
+            .unwrap();
+        let message = Message {
+            from: "10086".into(),
+            text: "测试".into(),
+            date: String::new(),
+        };
+        assert_eq!(
+            sms_message_hex(&message),
+            Ok("676581EA002000310030003000380036003A000A6D4B8BD5".into())
+        );
+        manager.reserve_sms(&message).unwrap();
+        assert_eq!(
+            manager.status()["sms_daily_remaining"],
+            MAX_SMS_DAILY_SENDS - 1
+        );
+        let reloaded = Forwarder::load(&dir);
+        assert_eq!(
+            reloaded.status()["sms_daily_remaining"],
+            MAX_SMS_DAILY_SENDS - 1
+        );
+        let mut invalid = reloaded.config.clone();
+        invalid.sms_to_phone = vec!["+10086".into(), "10086".into()];
+        assert!(!valid_config(&invalid));
+        invalid.sms_to_phone = vec!["10086;reboot".into()];
+        assert!(!valid_config(&invalid));
+        let long = Message {
+            from: "10086".into(),
+            text: "字".repeat(MAX_SMS_UNITS),
+            date: String::new(),
+        };
+        assert!(sms_message_hex(&long).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pre_phone_schema_loads_with_forwarding_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-phone-migrate-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(FILE_NAME),br#"{"schema":1,"enabled":false,"method":"webhook","webhook_url":"","dingtalk_webhook":"","dingtalk_secret":"","seen":[]}"#).unwrap();
+        let manager = Forwarder::load(&dir);
+        assert_eq!(manager.status()["enabled"], false);
+        assert_eq!(manager.status()["sms_configured"], false);
+        assert_eq!(manager.status()["last_result"], "idle");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn enabling_baselines_history_and_marks_new_sms_before_delivery() {
         let dir = std::env::temp_dir().join(format!(
             "datad-forward-{}-{}",
@@ -549,7 +768,7 @@ mod tests {
             rand::random::<u64>()
         ));
         let mut manager = Forwarder::load(&dir);
-        let old = json!({"stale":false,"truncated":false,"list":[{"id":1,"num":"10001","date":"09-29 11:00","text":"old"}]});
+        let old = json!({"stale":false,"truncated":false,"list":[{"id":1,"num":"10001","date":"09-29 11:00","tag":1,"text":"old"}]});
         assert!(
             manager
                 .update(
@@ -558,7 +777,8 @@ mod tests {
                         method: "webhook".into(),
                         webhook_url: Some("https://example.com/hook".into()),
                         dingtalk_webhook: None,
-                        dingtalk_secret: None
+                        dingtalk_secret: None,
+                        sms_to_phone: None
                     },
                     Some(&old)
                 )
@@ -566,7 +786,7 @@ mod tests {
         );
         assert!(!manager.status().to_string().contains("example.com"));
         assert!(manager.next(&old).unwrap().is_none());
-        let fresh = json!({"stale":false,"truncated":false,"list":[{"id":2,"num":"10002","date":"09-29 11:01","text":"new"},{"id":1,"num":"10001","date":"09-29 11:00","text":"old"}]});
+        let fresh = json!({"stale":false,"truncated":false,"list":[{"id":2,"num":"10002","date":"09-29 11:01","tag":1,"text":"new"},{"id":1,"num":"10001","date":"09-29 11:00","tag":1,"text":"old"}]});
         let next = manager.next(&fresh).unwrap().unwrap();
         assert_eq!(next.text, "new");
         assert!(manager.next(&fresh).unwrap().is_none());

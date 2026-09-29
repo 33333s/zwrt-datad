@@ -30,8 +30,8 @@ Content-Type: application/json
 | `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
 | `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项；远程 v2 要求 `confirmed=true` |
 | `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
-| `sms.forward.set` | `enabled`、`method=webhook|dingtalk`，可选 `webhook_url` / `dingtalk_webhook` / `dingtalk_secret` | 保存受限 HTTPS 转发设置；省略目标字段则保留，设为空串可在关闭该方式时清除；首次启用先强制刷新短信列表并建立基线；远程 v2 要求 `confirmed=true` |
-| `sms.forward.test` | 无 | 向当前已配置目的地发送固定测试消息，不含真实短信；远程 v2 要求 `confirmed=true` |
+| `sms.forward.set` | `enabled`、`method=webhook|dingtalk|sms`，可选 `webhook_url` / `dingtalk_webhook` / `dingtalk_secret` / `sms_to_phone` | 保存受限转发设置；省略目标字段则保留，URL 设为空串或手机号数组设为空可在关闭该方式时清除；手机号最多三个；首次启用先强制刷新短信列表并建立基线；远程 v2 要求 `confirmed=true` |
+| `sms.forward.test` | 无 | 向当前已配置目的地发送固定测试消息，不含真实收到的短信；短信方式会使用本机 SIM 向目标号码发短信并可能产生费用；远程 v2 要求 `confirmed=true` |
 | `device.poweroff` | 无 | 关闭设备 |
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
