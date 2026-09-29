@@ -61,6 +61,31 @@ fn exact_object<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
     (object.len() == 1).then(|| object.get(key)).flatten()
 }
 
+fn decimal_parameter(value: Option<&Value>, digits: usize, min: u64, max: u64) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        !text.is_empty()
+            && text.len() <= digits
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text
+                .parse::<u64>()
+                .is_ok_and(|number| (min..=max).contains(&number))
+    })
+}
+
+fn cell_lock_valid(params: &Value, nr: bool) -> bool {
+    params.as_object().is_some_and(|fields| {
+        fields.len() == if nr { 3 } else { 2 }
+            && decimal_parameter(fields.get("pci"), 4, 0, 1007)
+            && decimal_parameter(
+                fields.get(if nr { "arfcn" } else { "earfcn" }),
+                8,
+                1,
+                99_999_999,
+            )
+            && (!nr || decimal_parameter(fields.get("band"), 3, 1, 999))
+    })
+}
+
 fn action_valid(action: &str, params: &Value) -> bool {
     match action {
         "device.reboot"
@@ -69,6 +94,8 @@ fn action_valid(action: &str, params: &Value) -> bool {
         | "cellular.connect"
         | "cellular.disconnect"
         | "cell.unlock_all" => params.as_object().is_some_and(Map::is_empty),
+        "cell.lock_lte" => cell_lock_valid(params, false),
+        "cell.lock_nr" => cell_lock_valid(params, true),
         "cellular.set" => exact_object(params, "roaming")
             .and_then(Value::as_i64)
             .is_some_and(|value| value == 0 || value == 1),
@@ -170,6 +197,7 @@ impl TaskSchedule {
         let clock = reboot_schedule::local_clock();
         json!({
             "supported":true,
+            "cell_lock_supported":true,
             "device_time":clock.as_ref().map(|clock| format!("{} {}",clock.date,clock.time)),
             "timezone_offset":clock.as_ref().map(|clock| clock.offset.as_str()),
             "tasks":self.stored.tasks,
@@ -335,6 +363,11 @@ mod tests {
         for (action, params) in [
             ("device.reboot", json!({})),
             ("sms.forward.device_info", json!({})),
+            ("cell.lock_lte", json!({"pci":"57","earfcn":"9510"})),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"78"}),
+            ),
             ("cellular.set", json!({"roaming":0})),
             ("network.set_mode", json!({"mode":"Only_LTE"})),
             ("nfc.set", json!({"enabled":false})),
@@ -354,6 +387,22 @@ mod tests {
             ),
             ("network.set_mode", json!({"mode":"anything"})),
             ("wifi.set_module", json!({"enabled":2})),
+            ("cell.lock_lte", json!({"pci":57,"earfcn":"9510"})),
+            ("cell.lock_lte", json!({"pci":"1008","earfcn":"9510"})),
+            ("cell.lock_lte", json!({"pci":"57","earfcn":"0"})),
+            (
+                "cell.lock_lte",
+                json!({"pci":"57","earfcn":"9510","shell":"reboot"}),
+            ),
+            ("cell.lock_nr", json!({"pci":"384","arfcn":"633984"})),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"N78"}),
+            ),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"78\n"}),
+            ),
         ] {
             assert!(!input_valid(&input(action, params)), "{action}");
         }

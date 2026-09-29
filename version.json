@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.38",
+    "version": "0.10.39",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板加入短信转发设备信息选项"
+    "notes": "为 NMS 原版远程面板加入受限定时锁基站动作"
   }
 }
