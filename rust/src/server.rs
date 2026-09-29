@@ -5,6 +5,7 @@ use crate::{
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
     reboot_schedule::{self, Schedule},
+    sms_forward::{self, Forwarder, Update as SmsForwardUpdate},
     speedtest::SpeedTest,
     state,
     task_schedule::{TaskInput, TaskSchedule},
@@ -65,6 +66,7 @@ pub(crate) struct Inner {
     schedule: Arc<Mutex<Schedule>>,
     tasks: Arc<Mutex<TaskSchedule>>,
     speedtest: Arc<Mutex<SpeedTest>>,
+    sms_forward: Arc<Mutex<Forwarder>>,
 }
 
 struct DeviceSession {
@@ -107,6 +109,44 @@ impl App {
 
     pub(crate) async fn panel_task_remove(&self, id: &str) -> Result<Value, String> {
         self.inner.tasks.lock().await.remove(id)
+    }
+
+    pub(crate) async fn panel_sms_forward_status(&self) -> Value {
+        self.inner.sms_forward.lock().await.status()
+    }
+
+    pub(crate) async fn panel_sms_forward_update(
+        &self,
+        input: SmsForwardUpdate,
+    ) -> Result<Value, String> {
+        let mut manager = self.inner.sms_forward.lock().await;
+        let baseline = if manager.requires_baseline(&input) {
+            Some(sms_forward::baseline().await?)
+        } else {
+            None
+        };
+        manager.update(input, baseline.as_ref())
+    }
+
+    pub(crate) async fn panel_sms_forward_test(&self) -> Result<Value, String> {
+        let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let mut manager = self.inner.sms_forward.lock().await;
+        let details = manager.delivery();
+        let result = sms_forward::deliver(
+            &details.0,
+            &details.1,
+            &details.2,
+            &details.3,
+            &time_origin,
+            &sms_forward::Message::test(),
+        )
+        .await;
+        manager.mark_delivery(&result);
+        let status = manager.status();
+        result.map(|()| status)
     }
 
     pub(crate) async fn cloud_panel_config(&self) -> Value {
@@ -188,6 +228,7 @@ impl App {
             .fields
             .insert("speedtest".into(), speedtest.status());
         let tasks = TaskSchedule::load(&data_dir);
+        let sms_forward = Forwarder::load(&data_dir);
         let mut history = History::load(&data_dir);
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
@@ -212,6 +253,7 @@ impl App {
                 schedule: Arc::new(Mutex::new(schedule)),
                 tasks: Arc::new(Mutex::new(tasks)),
                 speedtest: Arc::new(Mutex::new(speedtest)),
+                sms_forward: Arc::new(Mutex::new(sms_forward)),
             }),
         };
         app.inner
@@ -298,6 +340,58 @@ impl App {
                     .lock()
                     .await
                     .finish(&task.id, &clock.date, success);
+            }
+        });
+    }
+
+    pub fn spawn_sms_forward(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(15));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                if app.panel_sms_forward_status().await["enabled"] != true {
+                    continue;
+                }
+                let snapshot = match sms_forward::baseline().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        app.inner.sms_forward.lock().await.mark_source_unavailable();
+                        continue;
+                    }
+                };
+                for _ in 0..4 {
+                    let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut manager = app.inner.sms_forward.lock().await;
+                    let message = match manager.next(&snapshot) {
+                        Ok(Some(message)) => message,
+                        Ok(None) => break,
+                        Err(error) => {
+                            if error == "forward_storage_failed" {
+                                manager.mark_storage_failed();
+                            } else {
+                                manager.mark_source_unavailable();
+                            }
+                            break;
+                        }
+                    };
+                    let (method, webhook, dingtalk, secret) = manager.delivery();
+                    let result = sms_forward::deliver(
+                        &method,
+                        &webhook,
+                        &dingtalk,
+                        &secret,
+                        &time_origin,
+                        &message,
+                    )
+                    .await;
+                    manager.mark_delivery(&result);
+                }
             }
         });
     }
@@ -1063,6 +1157,31 @@ async fn control(
             Err(error) => invalid_parameter(action, &error),
         };
     }
+    if action == "sms.forward.set" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: SmsForwardUpdate = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid SMS forwarding config"),
+        };
+        return match app.panel_sms_forward_update(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "forward_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "sms.forward.test" {
+        if !body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            return invalid_parameter(action, "test accepts no params");
+        }
+        return match app.panel_sms_forward_test().await {
+            Ok(value) => control_ok(action, value),
+            Err(error) => control_failed(action, error),
+        };
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1504,8 +1623,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 85);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 85);
+        assert_eq!(controls.len(), 87);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 87);
     }
 
     #[test]

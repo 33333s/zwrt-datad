@@ -17,6 +17,7 @@ mod qtrace_mask;
 mod reboot_schedule;
 mod server;
 mod sms;
+mod sms_forward;
 mod speedtest;
 mod state;
 mod task_schedule;
@@ -147,6 +148,7 @@ async fn main() -> Result<()> {
     }
     app.spawn_reboot_schedule();
     app.spawn_task_schedule();
+    app.spawn_sms_forward();
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     validate_listener_security(addr, local_requires_auth)?;
     if let Some(lan_bind) = args.lan_bind {

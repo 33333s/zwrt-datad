@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 futures-util = "0.3"
 fs2 = "0.4"
+httpdate = "1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rsa = "0.9"
