@@ -109,6 +109,9 @@ const CFG_KEYS: &[&str] = &[
     "peak_rx_bytes",
     "peak_tx_bytes",
     "data_volume_limit_unit",
+    "traffic_clear_date",
+    "wan_auto_clear_flow_data_switch",
+    "flux_limited_disconnect",
     "dhcpEnabled",
     "dhcpStart",
     "dhcpEnd",
@@ -803,19 +806,27 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
                 traffic.insert(target.into(), json!(home.saturating_add(roam)));
             }
         }
+        // Same shapes as the ZWRT collector: `limit` and `clear_day`.
         let mut limit = Map::new();
-        insert_number(&mut limit, "enabled", cfg, "data_volume_limit_switch", 1);
-        insert_text(&mut limit, "size", cfg, "data_volume_limit_size");
-        insert_text(&mut limit, "unit", cfg, "data_volume_limit_unit");
-        insert_number(
-            &mut limit,
-            "alert_percent",
-            cfg,
-            "data_volume_alert_percent",
-            100,
-        );
+        insert_number(&mut limit, "enable", cfg, "data_volume_limit_switch", 1);
+        if let Some(unit) = cfg.get("data_volume_limit_unit") {
+            limit.insert("type".into(), json!(if unit == "time" { 2 } else { 1 }));
+        }
+        insert_text(&mut limit, "value", cfg, "data_volume_limit_size");
+        insert_number(&mut limit, "ratio", cfg, "data_volume_alert_percent", 100);
         if !limit.is_empty() {
             traffic.insert("limit".into(), Value::Object(limit));
+        }
+        let mut clear_day = Map::new();
+        insert_number(&mut clear_day, "clearday", cfg, "traffic_clear_date", 31);
+        if let Some(auto) = cfg
+            .get("wan_auto_clear_flow_data_switch")
+            .filter(|v| matches!(v.as_str(), "on" | "off"))
+        {
+            clear_day.insert("enable".into(), json!(i64::from(auto == "on")));
+        }
+        if !clear_day.is_empty() {
+            traffic.insert("clear_day".into(), Value::Object(clear_day));
         }
         if traffic.is_empty() {
             fields.remove("traffic");
