@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.33",
+    "version": "0.10.34",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加受限的 SMTP 短信转发"
+    "notes": "为 NMS 原版远程面板增加受限的电源状态通知"
   }
 }

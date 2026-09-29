@@ -24,6 +24,7 @@ const MAX_SEEN: usize = 1024;
 const MAX_SMS_TARGETS: usize = 3;
 const MAX_SMS_DAILY_SENDS: u16 = 60;
 const MAX_SMS_UNITS: usize = 280;
+const MAX_POWER_DAILY_SENDS: u16 = 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,16 @@ struct Config {
     sms_quota_used: u16,
     #[serde(default)]
     smtp: smtp_forward::Settings,
+    #[serde(default)]
+    power_forward_enabled: bool,
+    #[serde(default)]
+    power_last_percent: Option<i64>,
+    #[serde(default)]
+    power_last_charging: Option<i64>,
+    #[serde(default)]
+    power_quota_date: String,
+    #[serde(default)]
+    power_quota_used: u16,
     seen: Vec<String>,
 }
 
@@ -58,6 +69,11 @@ impl Default for Config {
             sms_quota_date: String::new(),
             sms_quota_used: 0,
             smtp: smtp_forward::Settings::default(),
+            power_forward_enabled: false,
+            power_last_percent: None,
+            power_last_charging: None,
+            power_quota_date: String::new(),
+            power_quota_used: 0,
             seen: Vec::new(),
         }
     }
@@ -73,6 +89,13 @@ pub struct Update {
     pub dingtalk_secret: Option<String>,
     pub sms_to_phone: Option<Vec<String>>,
     pub smtp: Option<smtp_forward::Update>,
+    pub power_forward_enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Sms,
+    Power,
 }
 
 #[derive(Clone)]
@@ -80,6 +103,7 @@ pub struct Message {
     from: String,
     text: String,
     date: String,
+    kind: Kind,
 }
 
 pub struct Destination {
@@ -97,6 +121,7 @@ impl Message {
             from: "NMS".into(),
             text: "zwrt-datad 短信转发测试".into(),
             date: String::new(),
+            kind: Kind::Sms,
         }
     }
 }
@@ -105,6 +130,7 @@ pub struct Forwarder {
     path: PathBuf,
     config: Config,
     last_result: &'static str,
+    power_last_result: &'static str,
 }
 
 pub(crate) fn public_ip(ip: IpAddr) -> bool {
@@ -164,6 +190,26 @@ fn phone_matches(a: &str, b: &str) -> bool {
     a.trim_start_matches('+') == b.trim_start_matches('+')
 }
 
+pub fn power_state(value: Option<&Value>) -> Option<(i64, i64)> {
+    let battery = value?;
+    let percent = battery.get("percent")?.as_i64()?;
+    let charging = battery.get("charging")?.as_i64()?;
+    if !(0..=100).contains(&percent) || !(1..=4).contains(&charging) {
+        return None;
+    }
+    Some((percent, charging))
+}
+
+fn charge_label(charging: i64) -> &'static str {
+    match charging {
+        1 => "充电中",
+        2 => "放电中",
+        3 => "未在充电",
+        4 => "已充满",
+        _ => "未知",
+    }
+}
+
 fn valid_config(config: &Config) -> bool {
     config.schema == 1
         && matches!(
@@ -183,6 +229,16 @@ fn valid_config(config: &Config) -> bool {
             .len()
             == config.sms_to_phone.len()
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
+        && config.power_quota_used <= MAX_POWER_DAILY_SENDS
+        && (config.power_quota_date.is_empty()
+            || reboot_schedule::valid_date(&config.power_quota_date))
+        && match (config.power_last_percent, config.power_last_charging) {
+            (None, None) => true,
+            (Some(percent), Some(charging)) => {
+                (0..=100).contains(&percent) && (1..=4).contains(&charging)
+            }
+            _ => false,
+        }
         && config.smtp.safe()
         && (config.sms_quota_date.is_empty() || reboot_schedule::valid_date(&config.sms_quota_date))
         && config
@@ -253,10 +309,24 @@ fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
                 from: from.into(),
                 text: text.into(),
                 date: date.into(),
+                kind: Kind::Sms,
             },
         ));
     }
     Ok(output)
+}
+
+fn delivery_result_code(result: &Result<(), String>) -> &'static str {
+    match result {
+        Ok(()) => "sent",
+        Err(error) if error == "clock_unavailable" => "clock_unavailable",
+        Err(error) if error == "rate_limited" => "rate_limited",
+        Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
+        Err(error) if error == "message_too_long" => "message_too_long",
+        Err(error) if error == "smtp_auth_failed" => "smtp_auth_failed",
+        Err(error) if error == "forward_storage_failed" => "storage_failed",
+        Err(_) => "delivery_failed",
+    }
 }
 
 impl Forwarder {
@@ -280,6 +350,7 @@ impl Forwarder {
             path,
             config: config.unwrap_or_default(),
             last_result: if failed { "invalid_config" } else { "idle" },
+            power_last_result: if failed { "invalid_config" } else { "idle" },
         }
     }
 
@@ -290,6 +361,11 @@ impl Forwarder {
         } else {
             MAX_SMS_DAILY_SENDS
         };
+        let power_remaining = if today.as_deref() == Some(&self.config.power_quota_date) {
+            MAX_POWER_DAILY_SENDS - self.config.power_quota_used
+        } else {
+            MAX_POWER_DAILY_SENDS
+        };
         json!({"supported":true,"enabled":self.config.enabled,"method":self.config.method,
             "webhook_configured":!self.config.webhook_url.is_empty(),
             "dingtalk_configured":!self.config.dingtalk_webhook.is_empty(),
@@ -298,6 +374,9 @@ impl Forwarder {
             "sms_daily_remaining":remaining,
             "smtp_configured":self.config.smtp.configured(),
             "smtp_supported":true,
+            "power_forward_enabled":self.config.power_forward_enabled,
+            "power_daily_remaining":power_remaining,
+            "power_last_result":self.power_last_result,
             "last_result":self.last_result})
     }
 
@@ -345,10 +424,18 @@ impl Forwarder {
         result.map_err(str::to_string)
     }
 
-    pub fn update(&mut self, input: Update, snapshot: Option<&Value>) -> Result<Value, String> {
+    pub fn update(
+        &mut self,
+        input: Update,
+        snapshot: Option<&Value>,
+        battery: Option<&Value>,
+    ) -> Result<Value, String> {
+        let power_change = input.power_forward_enabled;
         let mut next = self.config.clone();
         next.enabled = input.enabled;
         next.method = input.method;
+        let reset_power_baseline = power_change.is_some()
+            || next.enabled && !self.config.enabled && next.power_forward_enabled;
         if let Some(url) = input.webhook_url {
             next.webhook_url = url;
         }
@@ -363,6 +450,22 @@ impl Forwarder {
         }
         if let Some(smtp) = input.smtp {
             next.smtp.apply(smtp);
+        }
+        if let Some(enabled) = power_change {
+            let baseline = power_state(battery);
+            if enabled && baseline.is_none() {
+                return Err("power_unavailable".into());
+            }
+            next.power_forward_enabled = enabled;
+            (next.power_last_percent, next.power_last_charging) = baseline
+                .map_or((None, None), |(percent, charging)| {
+                    (Some(percent), Some(charging))
+                });
+        } else if reset_power_baseline {
+            (next.power_last_percent, next.power_last_charging) = power_state(battery)
+                .map_or((None, None), |(percent, charging)| {
+                    (Some(percent), Some(charging))
+                });
         }
         if !valid_config(&next) {
             return Err("invalid_forward_config".into());
@@ -386,6 +489,9 @@ impl Forwarder {
         self.save(&next)?;
         self.config = next;
         self.last_result = "idle";
+        if reset_power_baseline {
+            self.power_last_result = "idle";
+        }
         Ok(self.status())
     }
 
@@ -413,16 +519,11 @@ impl Forwarder {
     }
 
     pub fn mark_delivery(&mut self, result: &Result<(), String>) {
-        self.last_result = match result {
-            Ok(()) => "sent",
-            Err(error) if error == "clock_unavailable" => "clock_unavailable",
-            Err(error) if error == "rate_limited" => "rate_limited",
-            Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
-            Err(error) if error == "message_too_long" => "message_too_long",
-            Err(error) if error == "smtp_auth_failed" => "smtp_auth_failed",
-            Err(error) if error == "forward_storage_failed" => "storage_failed",
-            Err(_) => "delivery_failed",
-        };
+        self.last_result = delivery_result_code(result);
+    }
+
+    pub fn mark_power_delivery(&mut self, result: &Result<(), String>) {
+        self.power_last_result = delivery_result_code(result);
     }
 
     pub fn mark_source_unavailable(&mut self) {
@@ -444,6 +545,83 @@ impl Forwarder {
             sms_to_phone: self.config.sms_to_phone.clone(),
             smtp: self.config.smtp.clone(),
         }
+    }
+
+    /// Store the new battery baseline and the daily quota before any external
+    /// delivery. Reboots and failed sends cannot replay an old power event.
+    pub fn observe_power(&mut self, battery: Option<&Value>) -> Result<Option<Message>, String> {
+        let current = power_state(battery);
+        let previous = match (
+            self.config.power_last_percent,
+            self.config.power_last_charging,
+        ) {
+            (Some(percent), Some(charging)) => Some((percent, charging)),
+            _ => None,
+        };
+        if current == previous {
+            return Ok(None);
+        }
+        let mut next = self.config.clone();
+        (next.power_last_percent, next.power_last_charging) = current
+            .map_or((None, None), |(percent, charging)| {
+                (Some(percent), Some(charging))
+            });
+        if !self.config.power_forward_enabled || !self.config.enabled {
+            self.config.power_last_percent = next.power_last_percent;
+            self.config.power_last_charging = next.power_last_charging;
+            self.power_last_result = "idle";
+            return Ok(None);
+        }
+        let Some((percent, charging)) = current else {
+            self.save(&next)?;
+            self.config = next;
+            if self.config.power_forward_enabled && self.config.enabled {
+                self.power_last_result = "source_unavailable";
+            }
+            return Ok(None);
+        };
+        if previous.is_none() {
+            self.save(&next)?;
+            self.config = next;
+            self.power_last_result = "idle";
+            return Ok(None);
+        }
+        let Some(clock) = reboot_schedule::local_clock() else {
+            self.save(&next)?;
+            self.config = next;
+            self.power_last_result = "clock_unavailable";
+            return Ok(None);
+        };
+        if next.power_quota_date != clock.date {
+            next.power_quota_date = clock.date.clone();
+            next.power_quota_used = 0;
+        }
+        if next.power_quota_used >= MAX_POWER_DAILY_SENDS {
+            self.save(&next)?;
+            self.config = next;
+            self.power_last_result = "rate_limited";
+            return Ok(None);
+        }
+        next.power_quota_used += 1;
+        self.save(&next)?;
+        self.config = next;
+        let (old_percent, old_charging) = previous.expect("checked above");
+        let text = if old_charging != charging {
+            format!("充电状态：{}\n当前电量：{percent}%", charge_label(charging))
+        } else {
+            format!(
+                "电量变化：{:+}%（{old_percent}% → {percent}%）\n充电状态：{}",
+                percent - old_percent,
+                charge_label(charging)
+            )
+        };
+        self.power_last_result = "idle";
+        Ok(Some(Message {
+            from: "PowerMonitor".into(),
+            text,
+            date: format!("{} {}", clock.date, clock.time),
+            kind: Kind::Power,
+        }))
     }
 
     pub fn reserve_sms(&mut self, message: &Message) -> Result<(), String> {
@@ -535,6 +713,17 @@ fn timestamp_from_http_date(date: &str) -> Result<String, String> {
         .to_string())
 }
 
+fn smtp_content(message: &Message) -> (&'static str, String) {
+    if message.kind == Kind::Power {
+        ("电源状态通知", message.text.clone())
+    } else {
+        (
+            "新短信通知",
+            format!("来自 {}:\n{}", message.from, message.text),
+        )
+    }
+}
+
 pub async fn deliver(
     destination_config: &Destination,
     time_origin: &str,
@@ -544,7 +733,8 @@ pub async fn deliver(
         return deliver_sms(destination_config, message).await;
     }
     if destination_config.method == "smtp" {
-        return smtp_forward::send(&destination_config.smtp, &message.from, &message.text).await;
+        let (subject, body) = smtp_content(message);
+        return smtp_forward::send(&destination_config.smtp, subject, &body).await;
     }
     let method = destination_config.method.as_str();
     let mut url = destination(
@@ -568,7 +758,14 @@ pub async fn deliver(
                 .append_pair("timestamp", &timestamp)
                 .append_pair("sign", &signature);
         }
-        json!({"msgtype":"text","text":{"content":format!("短信来自 {}\n{}",message.from,message.text)}})
+        let content = if message.kind == Kind::Power {
+            format!("电源状态通知\n{}", message.text)
+        } else {
+            format!("短信来自 {}\n{}", message.from, message.text)
+        };
+        json!({"msgtype":"text","text":{"content":content}})
+    } else if message.kind == Kind::Power {
+        json!({"kind":"power","from":message.from,"text":message.text,"date":message.date})
     } else {
         json!({"from":message.from,"text":message.text,"date":message.date})
     };
@@ -577,7 +774,11 @@ pub async fn deliver(
 }
 
 fn sms_message_hex(message: &Message) -> Result<String, String> {
-    let body = format!("来自 {}:\n{}", message.from, message.text);
+    let body = if message.kind == Kind::Power {
+        format!("电源状态通知:\n{}", message.text)
+    } else {
+        format!("来自 {}:\n{}", message.from, message.text)
+    };
     let units: Vec<_> = body.encode_utf16().collect();
     if units.is_empty() || units.len() > MAX_SMS_UNITS {
         return Err("message_too_long".into());
@@ -734,14 +935,17 @@ mod tests {
                     dingtalk_secret: None,
                     sms_to_phone: Some(vec!["+10086".into(), "10010".into()]),
                     smtp: None,
+                    power_forward_enabled: None,
                 },
                 Some(&old),
+                None,
             )
             .unwrap();
         let message = Message {
             from: "10086".into(),
             text: "测试".into(),
             date: String::new(),
+            kind: Kind::Sms,
         };
         assert_eq!(
             sms_message_hex(&message),
@@ -766,6 +970,7 @@ mod tests {
             from: "10086".into(),
             text: "字".repeat(MAX_SMS_UNITS),
             date: String::new(),
+            kind: Kind::Sms,
         };
         assert!(sms_message_hex(&long).is_err());
         fs::remove_dir_all(dir).unwrap();
@@ -784,7 +989,135 @@ mod tests {
         assert_eq!(manager.status()["enabled"], false);
         assert_eq!(manager.status()["sms_configured"], false);
         assert_eq!(manager.status()["smtp_configured"], false);
+        assert_eq!(manager.status()["power_forward_enabled"], false);
+        assert_eq!(
+            manager.status()["power_daily_remaining"],
+            MAX_POWER_DAILY_SENDS
+        );
         assert_eq!(manager.status()["last_result"], "idle");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn power_events_baseline_before_delivery_and_do_not_replay_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-power-forward-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        let first = json!({"percent":50,"charging":1});
+        let second = json!({"percent":51,"charging":1});
+        let third = json!({"percent":52,"charging":1});
+        let full = json!({"percent":52,"charging":4});
+        let sms_baseline = json!({"stale":false,"truncated":false,"list":[]});
+        assert!(power_state(Some(&first)).is_some());
+        assert!(power_state(Some(&json!({"percent":100,"charging":0}))).is_none());
+        assert!(power_state(Some(&json!({"percent":101,"charging":4}))).is_none());
+        assert!(manager.observe_power(Some(&first)).unwrap().is_none());
+        assert!(!dir.join(FILE_NAME).exists());
+        let settings = |enabled, power_forward_enabled| Update {
+            enabled,
+            method: "webhook".into(),
+            webhook_url: Some("https://example.com/hook".into()),
+            dingtalk_webhook: None,
+            dingtalk_secret: None,
+            sms_to_phone: None,
+            smtp: None,
+            power_forward_enabled,
+        };
+        assert_eq!(
+            manager
+                .update(settings(false, Some(true)), None, None)
+                .unwrap_err(),
+            "power_unavailable"
+        );
+        assert_eq!(
+            manager
+                .update(settings(false, Some(true)), None, Some(&first))
+                .unwrap()["power_forward_enabled"],
+            true
+        );
+        assert!(manager.observe_power(Some(&second)).unwrap().is_none());
+        manager
+            .update(settings(true, None), Some(&sms_baseline), Some(&second))
+            .unwrap();
+        assert!(manager.observe_power(Some(&second)).unwrap().is_none());
+        let event = manager.observe_power(Some(&third)).unwrap().unwrap();
+        assert_eq!(event.kind, Kind::Power);
+        assert!(event.text.contains("+1%"));
+        let (subject, body) = smtp_content(&event);
+        assert_eq!(subject, "电源状态通知");
+        assert_eq!(body, event.text);
+        let phone_hex = sms_message_hex(&event).unwrap();
+        let units: Vec<u16> = phone_hex
+            .as_bytes()
+            .chunks_exact(4)
+            .map(|digits| u16::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect();
+        assert!(
+            String::from_utf16(&units)
+                .unwrap()
+                .starts_with("电源状态通知:")
+        );
+        assert_eq!(manager.status()["power_daily_remaining"], 59);
+        let mut restarted = Forwarder::load(&dir);
+        assert!(restarted.observe_power(Some(&third)).unwrap().is_none());
+        let event = restarted.observe_power(Some(&full)).unwrap().unwrap();
+        assert!(event.text.contains("已充满"));
+        assert_eq!(restarted.status()["power_daily_remaining"], 58);
+        restarted
+            .update(settings(false, None), None, Some(&full))
+            .unwrap();
+        assert!(
+            restarted
+                .observe_power(Some(&json!({"percent":53,"charging":4})))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn power_events_fail_closed_without_battery_or_after_daily_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-power-limit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        let first = json!({"percent":90,"charging":2});
+        let mut config = manager.config.clone();
+        config.enabled = true;
+        config.webhook_url = "https://example.com/hook".into();
+        config.power_forward_enabled = true;
+        config.power_last_percent = Some(90);
+        config.power_last_charging = Some(2);
+        config.power_quota_date = reboot_schedule::local_clock().unwrap().date;
+        config.power_quota_used = MAX_POWER_DAILY_SENDS;
+        manager.save(&config).unwrap();
+        manager.config = config;
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":91,"charging":2})))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.status()["power_last_result"], "rate_limited");
+        assert!(manager.observe_power(None).unwrap().is_none());
+        assert_eq!(manager.status()["power_last_result"], "source_unavailable");
+        assert!(manager.observe_power(Some(&first)).unwrap().is_none());
+        assert_eq!(manager.status()["power_last_result"], "idle");
+        let status = Forwarder::load(&dir).status();
+        assert_eq!(status["power_daily_remaining"], 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -804,6 +1137,7 @@ mod tests {
             dingtalk_secret: None,
             sms_to_phone: None,
             smtp: Some(smtp),
+            power_forward_enabled: None,
         };
         let status = manager
             .update(
@@ -814,6 +1148,7 @@ mod tests {
                     password: Some("fixture-app-password".into()),
                     to: "recipient@example.net".into(),
                 }),
+                None,
                 None,
             )
             .unwrap();
@@ -846,6 +1181,7 @@ mod tests {
                     to: String::new(),
                 }),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(reloaded.status()["smtp_configured"], false);
@@ -870,9 +1206,11 @@ mod tests {
                         dingtalk_webhook: None,
                         dingtalk_secret: None,
                         sms_to_phone: None,
-                        smtp: None
+                        smtp: None,
+                        power_forward_enabled: None
                     },
-                    Some(&old)
+                    Some(&old),
+                    None
                 )
                 .is_ok()
         );

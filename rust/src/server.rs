@@ -112,23 +112,61 @@ impl App {
     }
 
     pub(crate) async fn panel_sms_forward_status(&self) -> Value {
-        self.inner.sms_forward.lock().await.status()
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
+        let mut status = self.inner.sms_forward.lock().await.status();
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
+        status
     }
 
     pub(crate) async fn panel_sms_forward_update(
         &self,
         input: SmsForwardUpdate,
     ) -> Result<Value, String> {
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
         let mut manager = self.inner.sms_forward.lock().await;
         let baseline = if manager.requires_baseline(&input) {
             Some(sms_forward::fresh_baseline().await?)
         } else {
             None
         };
-        manager.update(input, baseline.as_ref())
+        let mut status = manager.update(input, baseline.as_ref(), battery.as_ref())?;
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
+        Ok(status)
     }
 
     pub(crate) async fn panel_sms_forward_test(&self) -> Result<Value, String> {
+        let battery = self
+            .inner
+            .snapshot
+            .read()
+            .await
+            .fields
+            .get("battery")
+            .cloned();
         let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
             .as_str()
             .unwrap_or_default()
@@ -142,7 +180,13 @@ impl App {
         }
         let result = sms_forward::deliver(&details, &time_origin, &test_message).await;
         manager.mark_delivery(&result);
-        let status = manager.status();
+        let mut status = manager.status();
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert(
+                "power_supported".into(),
+                json!(sms_forward::power_state(battery.as_ref()).is_some()),
+            );
+        }
         result.map(|()| status)
     }
 
@@ -349,6 +393,35 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                let battery = app
+                    .inner
+                    .snapshot
+                    .read()
+                    .await
+                    .fields
+                    .get("battery")
+                    .cloned();
+                let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                {
+                    let mut manager = app.inner.sms_forward.lock().await;
+                    match manager.observe_power(battery.as_ref()) {
+                        Ok(Some(message)) => {
+                            let details = manager.delivery();
+                            let result = match manager.reserve_sms(&message) {
+                                Ok(()) => {
+                                    sms_forward::deliver(&details, &time_origin, &message).await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            manager.mark_power_delivery(&result);
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.mark_power_delivery(&Err(error)),
+                    }
+                }
                 if app.panel_sms_forward_status().await["enabled"] != true {
                     continue;
                 }
