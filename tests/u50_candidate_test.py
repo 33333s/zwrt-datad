@@ -68,7 +68,46 @@ case "$1:$2" in
 esac
 ''')
         cfg.chmod(0o700)
-        env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg)}
+        # Fixture tree for the kernel-level readers (thermal/battery/net/proc).
+        root = Path(tmp) / "root"
+        for name, values in {
+            "sys/class/thermal/thermal_zone0": {"type": "cpu0-0-usr", "temp": "42800"},
+            "sys/class/thermal/thermal_zone1": {"type": "modem-mmw0-usr", "temp": "-273000"},
+            "sys/class/power_supply/battery_zte": {"online": "1", "status": "Charging", "health": "Good"},
+            "sys/class/power_supply/battery": {"voltage_now": "4360000", "current_now": "-114000", "cycle_count": "103"},
+            "sys/class/power_supply/charger_zte": {"present": "1", "type": "Mains"},
+            "sys/class/net/bridge0": {"flags": "0x1103", "address": "b8:d4:bc:00:00:01"},
+            "sys/class/net/rmnet_data0": {"flags": "0x1"},
+            "sys/class/net/wlan0": {"address": "b8:d4:bc:00:00:02"},
+            "proc/sys/kernel": {"hostname": "sdxprairie", "osrelease": "4.14.206"},
+        }.items():
+            (root / name).mkdir(parents=True)
+            for file, text in values.items():
+                (root / name / file).write_text(text + "\n")
+        (root / "proc/uptime").write_text("100.5 90.0\n")
+        (root / "proc/meminfo").write_text("MemTotal: 1000 kB\nMemAvailable: 250 kB\n")
+        (root / "proc/net").mkdir(parents=True, exist_ok=True)
+        (root / "proc/net/arp").write_text(
+            "IP address       HW type     Flags       HW address            Mask     Device\n"
+            "192.168.0.7      0x1         0x2         aa:bb:cc:00:11:22     *        bridge0\n")
+        (root / "etc_rw/ztembb/configs").mkdir(parents=True)
+        (root / "etc_rw/ztembb/configs/dnsmasq.leases").write_text("1790785134 aa:bb:cc:00:11:22 192.168.0.7 PHONE 01\n")
+        ip = Path(tmp) / "ip"
+        ip.write_text('''#!/bin/sh
+case "$*" in
+  *"-4 addr show dev bridge0"*) echo '11: bridge0    inet 192.168.0.1/24 brd 192.168.0.255 scope global bridge0\\ valid_lft forever' ;;
+  *"-4 addr show dev rmnet_data0"*) echo '12: rmnet_data0    inet 10.38.1.22/30 scope global rmnet_data0\\ valid_lft forever' ;;
+  *"-6 addr show dev rmnet_data0"*) echo '12: rmnet_data0    inet6 2001:db8::5/64 scope global \\ valid_lft forever' ;;
+esac
+''')
+        ip.chmod(0o700)
+        iw = Path(tmp) / "iw"
+        iw.write_text('''#!/bin/sh
+printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wlan0)\\n'
+''')
+        iw.chmod(0o700)
+        env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_U50_ROOT": str(root),
+               "ZWRT_DATAD_U50_IP_BIN": str(ip), "ZWRT_DATAD_U50_IW_BIN": str(iw)}
         cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--once"]
         result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
         state = json.loads(result.stdout)
@@ -82,9 +121,24 @@ esac
         assert state["battery"]["percent"] == 66
         assert state["traffic"]["tx_speed"] == 4980
         assert state["wlan"]["enabled"] == 1
-        assert state["clients"]["wifi"] == 2
+        # Live station list (1 real client) wins over the OEM counter (2).
+        assert state["clients"]["wifi"] == 1
         assert state["sim"]["current_slot"] == 1
         assert "sim_iccid" not in result.stdout
+        assert state["thermal"]["cpu_celsius"] == 43
+        assert [z["name"] for z in state["thermal"]["zones"]] == ["cpu0-0-usr"]
+        assert state["system"]["mem_used_pct"] == 75 and state["system"]["uptime"] == 100
+        assert state["system"]["hostname"] == "sdxprairie"
+        assert state["battery"]["charging"] == 1 and state["battery"]["bat_ua"] == 114000
+        assert state["battery"]["charger_type_name"] == "Mains"
+        assert state["interfaces"]["wan4"]["ipv4"] == [{"address": "10.38.1.22", "mask": 30}]
+        assert state["interfaces"]["wan6"]["ipv6"] == [{"address": "2001:db8::5", "mask": 64}]
+        assert state["interfaces"]["lan"]["up"] is True
+        # The AP's own address is skipped; the lease supplies the name.
+        assert state["clients"]["wifi"] == 1 and state["clients"]["list"] == [
+            {"name": "PHONE", "ip": "192.168.0.7", "mac": "aa:bb:cc:00:11:22"}]
+        # CPU/memory/connections come from the shared sampler on the real /proc.
+        assert {"cpu_usage_tenths", "memory_kb", "storage", "throughput"} <= set(state["runtime"])
         assert Handler.query[0] == "/goform/goform_get_cmd_process"
         assert Handler.host == "192.168.0.1"
         assert Handler.referer == "http://192.168.0.1/"

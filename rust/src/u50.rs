@@ -7,6 +7,7 @@ use crate::{
     command,
     model::{DatadVersion, Snapshot},
     u50_oem::Bridge,
+    u50_sys,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -80,6 +81,59 @@ const CFG_KEYS: &[&str] = &[
     "nr5g_pci",
     "Z5g_rsrp",
     "Z5g_SINR",
+    "Z5g_rsrq",
+    "Z5g_rssi",
+    "bandwidth",
+    "rmcc",
+    "rmnc",
+    "rplmn_num",
+    "simcard_roam",
+    "roam_setting_option",
+    "inter_roam_switch",
+    "cell_id",
+    "nr5g_cell_id",
+    "nr5g_tac",
+    "lte_rssi",
+    "net_select",
+    "nr5g_sa_band_lock",
+    "nr5g_nsa_band_lock",
+    "nr5g_sa_band_factory",
+    "nr5g_nsa_band_factory",
+    "lte_band_ext_lock",
+    "lte_band_lock",
+    "lte_band_1_64_factory",
+    "hightemp_datalimit_status",
+    "imei",
+    "sim_imsi",
+    "iccid",
+    "sim_iccid",
+    "msisdn",
+    "sim_states",
+    "wifi_chip1_ssid1_ssid",
+    "wifi_chip1_ssid1_auth_mode",
+    "slot1_daily_rx_bytes",
+    "slot1_daily_tx_bytes",
+    "traffic_total_home_rx",
+    "traffic_total_home_tx",
+    "traffic_total_roam_rx",
+    "traffic_total_roam_tx",
+    "realtime_time",
+    "peak_rx_bytes",
+    "peak_tx_bytes",
+    "data_volume_limit_unit",
+    "dhcpEnabled",
+    "dhcpStart",
+    "dhcpEnd",
+    "dhcpLease",
+    "prefer_dns_auto",
+    "standby_dns_auto",
+    "ipv6_prefer_dns_auto",
+    "ipv6_standby_dns_auto",
+    "wan_v4_dev_name",
+    "wan_v6_dev_name",
+    "device_alias_name",
+    "product_manufacturer",
+    "hardware_version",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,18 +271,41 @@ pub async fn enroll(model: Model, dir: &Path, input: QuickConnect) -> Result<()>
     Ok(())
 }
 
+fn accept_cfg_value(raw: &str) -> Option<&str> {
+    let value = raw.trim();
+    (!value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control))
+        .then_some(value)
+}
+
+/// One `cfg show` replaces ~100 `cfg get` forks per sample. Only the keys this
+/// collector maps are kept (the dump also contains passwords and tokens, which
+/// are dropped before anything else can see them).
+fn cfg_from_show(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| CFG_KEYS.contains(key))
+        .filter_map(|(key, value)| Some((key.to_owned(), accept_cfg_value(value)?.to_owned())))
+        .collect()
+}
+
 async fn cfg_values() -> Result<BTreeMap<String, String>> {
     let program = cfg_bin();
-    let mut values = BTreeMap::new();
-    for key in CFG_KEYS {
-        let Ok(raw) = command::run(&program, ["get", key], Duration::from_secs(2)).await else {
-            continue;
-        };
-        ensure!(raw.len() <= 512, "U50 cfg output too large for {key}");
-        let value = String::from_utf8(raw).context("U50 cfg returned invalid UTF-8")?;
-        let value = value.trim();
-        if !value.is_empty() && !value.chars().any(char::is_control) {
-            values.insert((*key).into(), value.into());
+    let mut values = match command::run(&program, ["show"], Duration::from_secs(4)).await {
+        Ok(raw) => cfg_from_show(&String::from_utf8_lossy(&raw)),
+        Err(_) => BTreeMap::new(),
+    };
+    if !values.contains_key("model_name") {
+        // Older firmware or a mock without `show`: fall back to per-key reads.
+        values.clear();
+        for key in CFG_KEYS {
+            let Ok(raw) = command::run(&program, ["get", key], Duration::from_secs(2)).await else {
+                continue;
+            };
+            ensure!(raw.len() <= 512, "U50 cfg output too large for {key}");
+            let value = String::from_utf8(raw).context("U50 cfg returned invalid UTF-8")?;
+            if let Some(value) = accept_cfg_value(&value) {
+                values.insert((*key).into(), value.into());
+            }
         }
     }
     ensure!(
@@ -358,7 +435,7 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "wan_active_channel", 0, 1_000_000) {
         net.insert("lte_channel".into(), json!(value));
     }
-    if let Some(value) = cfg_number(cfg, "lte_pci", 0, 1007) {
+    if let Some(value) = cfg.get("lte_pci").and_then(|v| hex_number(v, 1007)) {
         net.insert("lte_pci".into(), json!(value));
     }
     if let Some(value) = cfg.get("wan_lte_ca") {
@@ -370,7 +447,7 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "nr5g_action_channel", 0, 1_000_000) {
         net.insert("nr_channel".into(), json!(value));
     }
-    if let Some(value) = cfg_number(cfg, "nr5g_pci", 0, 1007) {
+    if let Some(value) = cfg.get("nr5g_pci").and_then(|v| hex_number(v, 1007)) {
         net.insert("nr_pci".into(), json!(value));
     }
     if let Some(value) = cfg_number(cfg, "Z5g_rsrp", -160, -20) {
@@ -472,6 +549,7 @@ fn from_sources(
     if !sim.is_empty() {
         fields.insert("sim".into(), Value::Object(sim));
     }
+    extend_from_cfg(&mut fields, cfg);
     fields.insert(
         "u50_sources".into(),
         json!({"cfg":"ok", "goform":if goform.is_some() {"ok"} else {"unavailable"}}),
@@ -484,6 +562,322 @@ fn from_sources(
         datad: DatadVersion::default(),
         fields,
     })
+}
+
+/// The OEM WebUI renders these cfg values with `parseInt(value, 16)`: cell ids,
+/// PCIs and (by the same adapter) the NR TAC are hexadecimal strings.
+fn hex_number(value: &str, max: u64) -> Option<i64> {
+    let digits = value.trim().trim_start_matches("0x");
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16)
+        .ok()
+        .filter(|v| *v <= max)
+        .and_then(|v| i64::try_from(v).ok())
+}
+
+/// Bands from a `0x…` bitmask where bit 0 is band `offset + 1`.
+fn band_mask(value: &str, offset: u32) -> Vec<u32> {
+    let digits = value.trim().trim_start_matches("0x");
+    let Ok(mask) = u64::from_str_radix(digits, 16) else {
+        return Vec::new();
+    };
+    (0..64)
+        .filter(|bit| mask >> bit & 1 == 1)
+        .map(|bit| offset + bit + 1)
+        .collect()
+}
+
+/// A comma-separated band list; invalid entries invalidate the whole list.
+fn band_csv(value: &str) -> Vec<u32> {
+    let mut bands = Vec::new();
+    for part in value.split(',') {
+        match part.trim().parse::<u32>() {
+            Ok(band) if (1..=512).contains(&band) => bands.push(band),
+            _ => return Vec::new(),
+        }
+    }
+    bands.sort_unstable();
+    bands.dedup();
+    bands
+}
+
+fn join_bands(bands: &[u32]) -> String {
+    bands
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn insert_text(
+    map: &mut Map<String, Value>,
+    target: &str,
+    cfg: &BTreeMap<String, String>,
+    key: &str,
+) {
+    if let Some(value) = cfg.get(key) {
+        map.insert(target.into(), json!(value));
+    }
+}
+
+fn insert_number(
+    map: &mut Map<String, Value>,
+    target: &str,
+    cfg: &BTreeMap<String, String>,
+    key: &str,
+    max: i64,
+) {
+    if let Some(value) = cfg_number(cfg, key, 0, max) {
+        map.insert(target.into(), json!(value));
+    }
+}
+
+fn block<'a>(fields: &'a mut Map<String, Value>, name: &str) -> &'a mut Map<String, Value> {
+    let entry = fields
+        .entry(name.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry.as_object_mut().expect("object block")
+}
+
+/// Everything beyond the first-pass mapping that the OEM `cfg` store provides:
+/// registration/cell identity, band locks and capabilities, SIM, Wi-Fi and
+/// traffic accounting, DHCP and device labels.
+fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, String>) {
+    {
+        let net = block(fields, "net");
+        insert_number(net, "mcc", cfg, "rmcc", 999);
+        insert_number(net, "mnc", cfg, "rmnc", 999);
+        if let Some(plmn) = cfg
+            .get("rplmn_num")
+            .filter(|v| (5..=6).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit()))
+        {
+            net.insert("plmn".into(), json!(plmn));
+        }
+        insert_text(net, "roaming", cfg, "simcard_roam");
+        if let Some(value) = cfg
+            .get("roam_setting_option")
+            .or_else(|| cfg.get("inter_roam_switch"))
+            .filter(|v| matches!(v.as_str(), "on" | "off"))
+        {
+            net.insert("roaming_allowed".into(), json!(i64::from(value == "on")));
+        }
+        insert_text(net, "net_select", cfg, "net_select");
+        insert_text(net, "nr_bw", cfg, "bandwidth");
+        if let Some(value) = cfg_number(cfg, "Z5g_rsrq", -50, 0) {
+            net.insert("nr_rsrq".into(), json!(value));
+        }
+        if let Some(value) = cfg
+            .get("Z5g_rssi")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (-140.0..=-20.0).contains(v))
+        {
+            net.insert("nr_rssi".into(), json!(value.round() as i64));
+        }
+        if let Some(value) = cfg_number(cfg, "lte_rssi", -140, -20) {
+            net.insert("lte_rssi".into(), json!(value));
+        }
+        if let Some(value) = cfg
+            .get("nr5g_cell_id")
+            .and_then(|v| hex_number(v, (1 << 36) - 1))
+        {
+            net.insert("nr_cell_id".into(), json!(value));
+        }
+        if let Some(value) = cfg
+            .get("cell_id")
+            .and_then(|v| hex_number(v, (1 << 28) - 1))
+        {
+            net.insert("lte_cell_id".into(), json!(value));
+        }
+        if let Some(value) = cfg.get("nr5g_tac").and_then(|v| hex_number(v, 0xFF_FFFF)) {
+            net.insert("nr_tac".into(), json!(value));
+        }
+        for (source, target) in [
+            ("nr5g_sa_band_lock", "sa_bands"),
+            ("nr5g_nsa_band_lock", "nsa_bands"),
+        ] {
+            let bands = cfg.get(source).map(|v| band_csv(v)).unwrap_or_default();
+            if !bands.is_empty() {
+                net.insert(target.into(), json!(join_bands(&bands)));
+            }
+        }
+        let lte_locked = cfg
+            .get("lte_band_ext_lock")
+            .map(|v| band_csv(v))
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                cfg.get("lte_band_lock")
+                    .map(|v| band_mask(v, 0))
+                    .filter(|v| !v.is_empty())
+            });
+        if let Some(bands) = lte_locked {
+            net.insert("lte_bands".into(), json!(join_bands(&bands)));
+        }
+        let lte = cfg
+            .get("lte_band_1_64_factory")
+            .map(|v| band_mask(v, 0))
+            .unwrap_or_default();
+        let nr_sa = cfg
+            .get("nr5g_sa_band_factory")
+            .map(|v| band_csv(v))
+            .unwrap_or_default();
+        let nr_nsa = cfg
+            .get("nr5g_nsa_band_factory")
+            .map(|v| band_csv(v))
+            .unwrap_or_default();
+        let complete = !lte.is_empty() && !nr_sa.is_empty() && !nr_nsa.is_empty();
+        if complete {
+            net.insert("lte_supported_bands".into(), json!(join_bands(&lte)));
+            net.insert("nr_sa_supported_bands".into(), json!(join_bands(&nr_sa)));
+            net.insert("nr_nsa_supported_bands".into(), json!(join_bands(&nr_nsa)));
+        }
+        net.insert(
+            "band_capabilities".into(),
+            json!({
+                "source": if complete { "device_factory_band_lock" } else { "unavailable" },
+                "complete": complete,
+                "lte": if complete { json!(lte) } else { json!([]) },
+                "nr_sa": if complete { json!(nr_sa) } else { json!([]) },
+                "nr_nsa": if complete { json!(nr_nsa) } else { json!([]) },
+            }),
+        );
+    }
+    {
+        let sim = block(fields, "sim");
+        insert_text(sim, "imsi", cfg, "sim_imsi");
+        insert_text(sim, "msisdn", cfg, "msisdn");
+        insert_text(sim, "state", cfg, "sim_states");
+        if let Some(iccid) = cfg.get("iccid").or_else(|| cfg.get("sim_iccid")) {
+            sim.insert("iccid".into(), json!(iccid));
+        }
+        if sim.is_empty() {
+            fields.remove("sim");
+        }
+    }
+    {
+        let system = block(fields, "system");
+        insert_text(system, "imei", cfg, "imei");
+        insert_text(system, "model", cfg, "device_alias_name");
+    }
+    {
+        let device = block(fields, "device");
+        insert_text(device, "vendor", cfg, "product_manufacturer");
+        insert_text(device, "alias_name", cfg, "device_alias_name");
+        insert_text(device, "market_name", cfg, "device_alias_name");
+        insert_text(device, "hardware_version", cfg, "hardware_version");
+    }
+    {
+        let wlan = block(fields, "wlan");
+        insert_text(wlan, "ssid", cfg, "wifi_chip1_ssid1_ssid");
+        insert_text(wlan, "enc", cfg, "wifi_chip1_ssid1_auth_mode");
+        if wlan.is_empty() {
+            fields.remove("wlan");
+        }
+    }
+    {
+        let traffic = block(fields, "traffic");
+        insert_number(traffic, "session_time", cfg, "realtime_time", i64::MAX);
+        insert_number(
+            traffic,
+            "day_rx_bytes",
+            cfg,
+            "slot1_daily_rx_bytes",
+            i64::MAX,
+        );
+        insert_number(
+            traffic,
+            "day_tx_bytes",
+            cfg,
+            "slot1_daily_tx_bytes",
+            i64::MAX,
+        );
+        insert_number(traffic, "max_rx_speed", cfg, "peak_rx_bytes", i64::MAX);
+        insert_number(traffic, "max_tx_speed", cfg, "peak_tx_bytes", i64::MAX);
+        for (target, home, roam) in [
+            (
+                "total_rx_bytes",
+                "traffic_total_home_rx",
+                "traffic_total_roam_rx",
+            ),
+            (
+                "total_tx_bytes",
+                "traffic_total_home_tx",
+                "traffic_total_roam_tx",
+            ),
+        ] {
+            if let Some(home) = cfg_number(cfg, home, 0, i64::MAX) {
+                let roam = cfg_number(cfg, roam, 0, i64::MAX).unwrap_or_default();
+                traffic.insert(target.into(), json!(home.saturating_add(roam)));
+            }
+        }
+        let mut limit = Map::new();
+        insert_number(&mut limit, "enabled", cfg, "data_volume_limit_switch", 1);
+        insert_text(&mut limit, "size", cfg, "data_volume_limit_size");
+        insert_text(&mut limit, "unit", cfg, "data_volume_limit_unit");
+        insert_number(
+            &mut limit,
+            "alert_percent",
+            cfg,
+            "data_volume_alert_percent",
+            100,
+        );
+        if !limit.is_empty() {
+            traffic.insert("limit".into(), Value::Object(limit));
+        }
+        if traffic.is_empty() {
+            fields.remove("traffic");
+        }
+    }
+    {
+        let dhcp = block(fields, "dhcp");
+        for (source, target) in [
+            ("lan_netmask", "netmask"),
+            ("dhcpStart", "range_start"),
+            ("dhcpEnd", "range_end"),
+            ("dhcpLease", "leasetime"),
+        ] {
+            if let Some(value) = cfg
+                .get(source)
+                .filter(|v| target == "leasetime" || v.parse::<Ipv4Addr>().is_ok())
+            {
+                dhcp.insert(target.into(), json!(value));
+            }
+        }
+        if let Some(value) = cfg
+            .get("dhcpEnabled")
+            .filter(|v| matches!(v.as_str(), "0" | "1"))
+        {
+            dhcp.insert("disabled".into(), json!(value == "0"));
+        }
+        if dhcp.is_empty() {
+            fields.remove("dhcp");
+        }
+    }
+    // `hightemp_datalimit_status` exists on this firmware but is empty when no
+    // protection is active, so an absent value is level 0 (same levels as the
+    // ZWRT collector: 1 = speed limited, 2 = network restricted).
+    let raw = cfg
+        .get("hightemp_datalimit_status")
+        .map_or("", String::as_str);
+    let level = match raw {
+        "1" => 2,
+        "2" => 3,
+        _ => 0,
+    };
+    block(fields, "thermal").insert(
+        "protection".into(),
+        json!({
+            "active": level > 0,
+            "level": level,
+            "speed_limited": level == 2,
+            "network_restricted": level == 3,
+            "raw": if raw.is_empty() { Value::Null } else { json!(raw) }
+        }),
+    );
 }
 
 #[derive(Clone)]
@@ -694,10 +1088,77 @@ async fn fetch_goform(
     Ok(raw)
 }
 
-async fn collect(client: &reqwest::Client, url: &reqwest::Url, model: Model) -> Result<Snapshot> {
+/// Kernel-level data that does not come from the OEM `cfg` store: CPU/memory,
+/// thermal zones, battery telemetry, interfaces and online clients. Blocks
+/// already produced from `cfg` are merged, never replaced by empty values.
+async fn enrich(
+    fields: &mut Map<String, Value>,
+    cfg: &BTreeMap<String, String>,
+    interval: Duration,
+) {
+    let zones = u50_sys::thermal_zones();
+    let cpu_celsius = u50_sys::cpu_celsius(&zones);
+    let (cpu_tenths, runtime) =
+        crate::state::runtime_with(u50_sys::runtime_zones(&zones), "/etc_rw");
+    {
+        let system = block(fields, "system");
+        for (key, value) in u50_sys::system_block(
+            (cpu_tenths >= 0).then_some((cpu_tenths + 5) / 10),
+            cpu_celsius,
+        ) {
+            system.insert(key, value);
+        }
+    }
+    fields.insert("runtime".into(), runtime);
+    let thermal = block(fields, "thermal");
+    let sysfs = u50_sys::thermal_block(&zones);
+    if let Some(list) = sysfs
+        .get("zones")
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        thermal.insert("zones".into(), list.clone());
+    }
+    if let Some(cpu) = sysfs.get("cpu_celsius") {
+        thermal.insert("cpu_celsius".into(), cpu.clone());
+    }
+    thermal.entry("modems").or_insert_with(|| json!([]));
+    let extra = u50_sys::battery_extra();
+    if !extra.is_empty() {
+        let battery = block(fields, "battery");
+        for (key, value) in extra {
+            battery.entry(key).or_insert(value);
+        }
+    }
+    fields.insert("interfaces".into(), u50_sys::interfaces(cfg).await);
+    if let Some(clients) = u50_sys::clients().await {
+        // The OEM per-chip counters stay when they are present.
+        if let Some(Value::Object(old)) = fields.get("clients") {
+            let mut merged = old.clone();
+            if let Value::Object(new) = clients {
+                merged.extend(new);
+            }
+            fields.insert("clients".into(), Value::Object(merged));
+        } else {
+            fields.insert("clients".into(), clients);
+        }
+    }
+    fields.insert(
+        "sample_interval_ms".into(),
+        json!(u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)),
+    );
+}
+
+async fn collect(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    model: Model,
+    interval: Duration,
+) -> Result<Snapshot> {
     let cfg = cfg_values().await?;
     let goform = fetch_goform(client, url, &cfg).await.ok();
-    from_sources(model, &cfg, goform.as_ref())
+    let mut snapshot = from_sources(model, &cfg, goform.as_ref())?;
+    enrich(&mut snapshot.fields, &cfg, interval).await;
+    Ok(snapshot)
 }
 
 pub async fn run(
@@ -718,7 +1179,7 @@ pub async fn run(
         .timeout(Duration::from_secs(2))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let initial = collect(&client, &url, model).await?;
+    let initial = collect(&client, &url, model, interval).await?;
     if once {
         println!("{}", serde_json::to_string(&initial)?);
         return Ok(());
@@ -754,7 +1215,7 @@ pub async fn run(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Ok(next) = collect(&client, &url, model).await {
+            if let Ok(next) = collect(&client, &url, model, interval).await {
                 let mut current = state.snapshot.write().await;
                 let mut comparable = next.clone();
                 comparable.ts = current.ts;
@@ -845,6 +1306,92 @@ mod tests {
         assert_eq!(value.fields["thermal"]["zones"][0]["celsius"], 43);
         assert_eq!(value.fields["u50_sources"]["goform"], "unavailable");
     }
+    #[test]
+    fn maps_extended_cfg_like_a_real_u50s_on_sa() {
+        let cfg: BTreeMap<String, String> = [
+            ("model_name", "ZTE U50S"),
+            ("rmcc", "460"),
+            ("rmnc", "1"),
+            ("rplmn_num", "46001"),
+            ("roam_setting_option", "off"),
+            ("net_select", "4G_AND_5G"),
+            ("bandwidth", "100MHz"),
+            ("Z5g_rsrq", "-11"),
+            ("Z5g_rssi", "-71.2"),
+            ("nr5g_pci", "384"),
+            ("nr5g_cell_id", "32343f007"),
+            ("nr5g_tac", "320903"),
+            ("nr5g_sa_band_lock", "5,7,78,257,258"),
+            ("nr5g_sa_band_factory", "1,3,5,8,28,41,78"),
+            ("nr5g_nsa_band_factory", "1,3,5,8,28,41,78"),
+            ("lte_band_ext_lock", "1,3,5,8,34,39,40,41"),
+            ("lte_band_1_64_factory", "0x1c200000095"),
+            ("sim_imsi", "460010000000000"),
+            ("iccid", "89860100000000000000"),
+            ("slot1_daily_rx_bytes", "100"),
+            ("traffic_total_home_rx", "1000"),
+            ("traffic_total_roam_rx", "5"),
+            ("dhcpStart", "192.168.0.2"),
+            ("dhcpEnd", "192.168.0.253"),
+            ("dhcpLease", "86400"),
+            ("dhcpEnabled", "1"),
+            ("lan_netmask", "255.255.255.0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let state = from_sources(Model::U50S, &cfg, None).unwrap().fields;
+        let net = &state["net"];
+        assert_eq!(
+            (net["mcc"].as_i64(), net["mnc"].as_i64()),
+            (Some(460), Some(1))
+        );
+        assert_eq!(net["plmn"], "46001");
+        assert_eq!(net["roaming_allowed"], 0);
+        // OEM WebUI parses PCI, cell id and TAC with parseInt(x, 16).
+        assert_eq!(net["nr_pci"], 0x384);
+        assert_eq!(net["nr_cell_id"], 0x32343f007_i64);
+        assert_eq!(net["nr_tac"], 0x320903);
+        assert_eq!(net["nr_rssi"], -71);
+        assert_eq!(net["nr_bw"], "100MHz");
+        assert_eq!(net["sa_bands"], "5,7,78,257,258");
+        assert_eq!(net["lte_bands"], "1,3,5,8,34,39,40,41");
+        assert_eq!(net["lte_supported_bands"], "1,3,5,8,34,39,40,41");
+        assert_eq!(net["nr_sa_supported_bands"], "1,3,5,8,28,41,78");
+        assert_eq!(net["band_capabilities"]["complete"], true);
+        assert_eq!(state["sim"]["imsi"], "460010000000000");
+        assert_eq!(state["traffic"]["day_rx_bytes"], 100);
+        assert_eq!(state["traffic"]["total_rx_bytes"], 1005);
+        assert_eq!(state["dhcp"]["range_end"], "192.168.0.253");
+        assert_eq!(state["dhcp"]["disabled"], false);
+        assert_eq!(state["thermal"]["protection"]["level"], 0);
+        // Secrets and unmapped keys never leak into the snapshot.
+        assert!(!Value::Object(state).to_string().contains("password"));
+    }
+
+    #[test]
+    fn cfg_show_keeps_only_mapped_keys() {
+        let dump = "model_name=ZTE U50S\nadmin_password=secret\nzte_web_cookie=abc\nrmcc=460\nnotakeyline\nlte_pci=\n";
+        let parsed = cfg_from_show(dump);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["rmcc"], "460");
+        assert!(!parsed.values().any(|v| v == "secret"));
+    }
+
+    #[test]
+    fn band_decoding_is_strict() {
+        assert_eq!(
+            band_mask("0x1c200000095", 0),
+            vec![1, 3, 5, 8, 34, 39, 40, 41]
+        );
+        assert_eq!(band_csv("78,1,3,3"), vec![1, 3, 78]);
+        assert!(band_csv("1,x").is_empty());
+        assert!(band_csv("0").is_empty());
+        assert_eq!(hex_number("0x1F", 100), Some(31));
+        assert_eq!(hex_number("zz", 100), None);
+        assert_eq!(hex_number("ffff", 100), None);
+    }
+
     #[test]
     fn maps_only_readable_goform_fields() {
         let cfg = BTreeMap::from([("model_name".into(), "U50S".into())]);
