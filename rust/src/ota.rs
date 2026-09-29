@@ -34,6 +34,10 @@ pub struct Profile {
     /// Start the installer as a transient systemd unit so it survives the
     /// restart of the service that spawned it.
     pub detached_systemd: bool,
+    /// Base URL of the built-in GitHub source.
+    pub github: &'static str,
+    /// Whether the netdisk mirror carries this platform's manifest.
+    pub netdisk: bool,
 }
 
 impl Profile {
@@ -42,6 +46,8 @@ impl Profile {
         min_free_bytes: 64.0 * 1024.0 * 1024.0,
         download_in_process: false,
         detached_systemd: false,
+        github: GITHUB,
+        netdisk: true,
     };
     pub const U50: Profile = Profile {
         manifest: "update-armv7.json",
@@ -49,6 +55,12 @@ impl Profile {
         min_free_bytes: 7.0 * 1024.0 * 1024.0,
         download_in_process: true,
         detached_systemd: true,
+        // GitHub's "latest" is the ARM64 line's newest release, which has no
+        // ARMv7 assets. ARM32 releases are published as ordinary vX.Y.Z
+        // releases that are never "latest", and each one also refreshes this
+        // rolling channel release so devices have one stable URL.
+        github: "https://github.com/33333s/zwrt-datad/releases/download/arm32-latest",
+        netdisk: false,
     };
 }
 
@@ -230,11 +242,11 @@ impl Ota {
         if enabled.contains("custom") {
             ordered.extend(self.config.servers.iter().map(String::as_str));
         }
-        if enabled.contains("netdisk") {
+        if enabled.contains("netdisk") && self.profile.netdisk {
             ordered.push(NETDISK);
         }
         if enabled.contains("github") {
-            ordered.push(GITHUB);
+            ordered.push(self.profile.github);
         }
         ordered
             .into_iter()
@@ -1084,6 +1096,21 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("校验失败"), "{error}");
         assert!(!dir.join("zwrt-datad.new").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn u50_profile_uses_its_own_channel_and_skips_the_arm64_mirror() {
+        let dir =
+            std::env::temp_dir().join(format!("zwrt-datad-ota-servers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let zwrt = Ota::load(&dir).unwrap();
+        assert_eq!(zwrt.servers(), vec![NETDISK.to_owned(), GITHUB.to_owned()]);
+        let u50 = Ota::load_with(&dir, Profile::U50).unwrap();
+        assert_eq!(
+            u50.servers(),
+            vec!["https://github.com/33333s/zwrt-datad/releases/download/arm32-latest".to_owned()]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }
