@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.44",
+    "version": "0.10.45",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 新增与主线相同的自更新（本地 /ota、自动 OTA、NMS 签名更新），使用独立的 update-armv7.json 与固定安装器；ARM64 更新清单不变"
+    "notes": "ARM32 U50S 独立发布线：自更新改用 arm32-latest 更新通道，ARM32 Release 不占用 Latest"
   }
 }
