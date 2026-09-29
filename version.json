@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.42",
+    "version": "0.10.44",
     "asset": "zwrt-datad-aarch64",
-    "notes": "远程面板上报设备休眠档位"
+    "notes": "主线不再包含 ARM32/U50 代码，ARM32 改由独立的 arm32 分支维护；版本号保持已发布的 0.10.44，下次发布递增"
   }
 }
