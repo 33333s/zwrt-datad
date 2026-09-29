@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.46",
+    "version": "0.10.47",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 改为运行与 ARM64 相同的 App：短信收发/转发、漫游/网络模式/SIM 控制、定时与 OTA/NMS 等主线能力（无测速）"
+    "notes": "ARM32 U50S 新增频段锁/锁小区、流量限额与结算日、客户端列表/拉黑/踢出/改名控制"
   }
 }

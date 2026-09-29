@@ -63,6 +63,18 @@ pub const CONTROLS: &[&str] = &[
     "sms.delete",
     "sms.mark_read",
     "sms.send_raw",
+    "band.set_lte",
+    "band.set_nr_sa",
+    "band.set_nr_nsa",
+    "cell.lock_lte",
+    "cell.lock_nr",
+    "cell.unlock_all",
+    "traffic.set_limit",
+    "traffic.set_clear_day",
+    "client.block",
+    "client.unblock",
+    "client.kick",
+    "client.rename",
 ];
 
 pub fn ota_profile() -> Profile {
@@ -132,6 +144,83 @@ fn id_list(params: &Value, key: &str) -> Result<String, String> {
     Ok(raw.iter().map(|id| format!("{id};")).collect())
 }
 
+/// A comma-separated band list of positive numbers up to `max` (`1,3,78`).
+fn band_list(params: &Value, key: &str, max: u32) -> Result<Vec<u32>, String> {
+    let raw = text(params, key).ok_or_else(|| format!("{key} is required"))?;
+    let mut bands = Vec::new();
+    for part in raw.split(',') {
+        match part.trim().parse::<u32>() {
+            Ok(band) if (1..=max).contains(&band) => bands.push(band),
+            _ => return Err(format!("{key} must be comma-separated band numbers")),
+        }
+    }
+    if bands.is_empty() || bands.len() > 64 {
+        return Err(format!("{key} must list 1 to 64 bands"));
+    }
+    bands.sort_unstable();
+    bands.dedup();
+    Ok(bands)
+}
+
+/// LTE band bitmask in the WebUI's format: `0x` + 16 hex digits, bit 0 = B1.
+fn lte_mask(bands: &[u32]) -> String {
+    let mask = bands
+        .iter()
+        .fold(0u64, |mask, band| mask | 1u64 << (band - 1));
+    format!("0x{mask:016x}")
+}
+
+fn mask_value(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
+fn digits(params: &Value, key: &str, max: i64) -> Result<i64, String> {
+    match integer(params, key)? {
+        Some(value) if (0..=max).contains(&value) => Ok(value),
+        _ => Err(format!("{key} must be between 0 and {max}")),
+    }
+}
+
+/// Default NR subcarrier spacing (kHz) for a band, as the OEM cell-lock form
+/// needs it: the FR1 TDD mid-band bands use 30 kHz, the rest 15 kHz.
+fn nr_scs(band: i64) -> i64 {
+    if matches!(band, 34 | 38 | 39 | 40 | 41 | 46 | 48 | 77 | 78 | 79) {
+        30
+    } else {
+        15
+    }
+}
+
+fn valid_mac(value: &str) -> bool {
+    value.len() == 17
+        && value.split(':').count() == 6
+        && value
+            .split(':')
+            .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// `a;b;c` — the OEM access-list format; empty entries are dropped.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn join_list(items: &[String]) -> String {
+    items.iter().map(|item| format!("{item};")).collect()
+}
+
+/// A hostname the OEM list can carry: printable, no list separators.
+fn clean_hostname(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() && *c != ';' && *c != ',')
+        .take(32)
+        .collect()
+}
+
 fn outcome_from(result: Result<Value, String>) -> Outcome {
     match result {
         Ok(value) => Outcome::Ok(value),
@@ -158,6 +247,15 @@ impl Ctl {
                 }
             }
         };
+        if let Some(Value::Object(clients)) = self.clients_block().await {
+            let entry = fresh
+                .fields
+                .entry("clients".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(existing) = entry.as_object_mut() {
+                existing.extend(clients);
+            }
+        }
         if let Some(sms) = crate::sms::snapshot().await {
             fresh.fields.insert("sms".into(), sms);
         }
@@ -334,7 +432,491 @@ impl Ctl {
                 Err((true, error)) => Outcome::Invalid(error),
                 Err((false, error)) => Outcome::Failed(error),
             },
+            "band.set_lte" => self.band_set_lte(params).await,
+            "band.set_nr_sa" => self.band_set_nr(params, false).await,
+            "band.set_nr_nsa" => self.band_set_nr(params, true).await,
+            "cell.lock_lte" => self.cell_lock_lte(params).await,
+            "cell.lock_nr" => self.cell_lock_nr(params).await,
+            "cell.unlock_all" => self.cell_unlock_all().await,
+            "traffic.set_limit" => self.traffic_set_limit(params).await,
+            "traffic.set_clear_day" => self.traffic_set_clear_day(params).await,
+            "client.block" => self.client_access(params, true).await,
+            "client.unblock" => self.client_access(params, false).await,
+            "client.kick" => self.client_kick(params).await,
+            "client.rename" => self.client_rename(params).await,
             _ => Outcome::NotHandled,
+        }
+    }
+
+    async fn band_set_lte(&self, params: &Value) -> Outcome {
+        let bands = match band_list(params, "bands", 64) {
+            Ok(bands) => bands,
+            Err(error) => return Outcome::Invalid(error),
+        };
+        let mask = lte_mask(&bands);
+        if let Err(error) = self
+            .write(
+                "BAND_SELECT",
+                &[
+                    ("is_gw_band", "0".into()),
+                    ("gw_band_mask", "0".into()),
+                    ("is_lte_band", "1".into()),
+                    ("lte_band_mask", mask.clone()),
+                ],
+            )
+            .await
+        {
+            return Outcome::Failed(error);
+        }
+        let readback = self.field("lte_band_lock").await;
+        let verified = readback.as_deref().and_then(mask_value) == mask_value(&mask);
+        Outcome::Ok(json!({"bands":bands,"mask":mask,"verified":verified}))
+    }
+
+    async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
+        let bands = match band_list(params, "bands", 512) {
+            Ok(bands) => bands,
+            Err(error) => return Outcome::Invalid(error),
+        };
+        let csv = bands
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Err(error) = self
+            .write(
+                "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
+                &[
+                    ("nr5g_band_mask", csv.clone()),
+                    ("type", if nsa { "1" } else { "0" }.into()),
+                ],
+            )
+            .await
+        {
+            return Outcome::Failed(error);
+        }
+        let key = if nsa {
+            "nr5g_nsa_band_lock"
+        } else {
+            "nr5g_sa_band_lock"
+        };
+        let readback = self.field(key).await.map(|value| {
+            let mut list: Vec<u32> = value
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect();
+            list.sort_unstable();
+            list
+        });
+        Outcome::Ok(json!({"bands":bands,"verified":readback.as_deref() == Some(bands.as_slice())}))
+    }
+
+    async fn cell_lock_lte(&self, params: &Value) -> Outcome {
+        let (pci, earfcn) = match (
+            digits(params, "pci", 1007),
+            digits(params, "earfcn", 262_143),
+        ) {
+            (Ok(pci), Ok(earfcn)) => (pci, earfcn),
+            (Err(error), _) | (_, Err(error)) => return Outcome::Invalid(error),
+        };
+        outcome_from(
+            self.write(
+                "LTE_LOCK_CELL_SET",
+                &[
+                    ("lte_pci_lock", pci.to_string()),
+                    ("lte_earfcn_lock", earfcn.to_string()),
+                ],
+            )
+            .await,
+        )
+    }
+
+    async fn cell_lock_nr(&self, params: &Value) -> Outcome {
+        let (pci, arfcn, band) = match (
+            digits(params, "pci", 1007),
+            digits(params, "arfcn", 3_279_165),
+            digits(params, "band", 512),
+        ) {
+            (Ok(pci), Ok(arfcn), Ok(band)) if band > 0 => (pci, arfcn, band),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                return Outcome::Invalid(error);
+            }
+            _ => return Outcome::Invalid("band must be between 1 and 512".into()),
+        };
+        let scs = match integer(params, "scs") {
+            Ok(Some(scs)) if matches!(scs, 15 | 30 | 60 | 120) => scs,
+            Ok(None) => nr_scs(band),
+            _ => return Outcome::Invalid("scs must be 15, 30, 60 or 120".into()),
+        };
+        outcome_from(
+            self.write(
+                "NR5G_LOCK_CELL_SET",
+                &[("nr5g_cell_lock", format!("{pci},{arfcn},{band},{scs}"))],
+            )
+            .await,
+        )
+    }
+
+    /// LTE: zero PCI/EARFCN; NR: the WebUI's `1,1,1,1` unlock value.
+    async fn cell_unlock_all(&self) -> Outcome {
+        let lte = self
+            .write(
+                "LTE_LOCK_CELL_SET",
+                &[
+                    ("lte_pci_lock", "0".into()),
+                    ("lte_earfcn_lock", "0".into()),
+                ],
+            )
+            .await;
+        let nr = self
+            .write(
+                "NR5G_LOCK_CELL_SET",
+                &[("nr5g_cell_lock", "1,1,1,1".into())],
+            )
+            .await;
+        match (lte, nr) {
+            (Ok(_), Ok(_)) => Outcome::Ok(json!({"lte":true,"nr":true})),
+            (Err(error), _) | (_, Err(error)) => Outcome::Failed(error),
+        }
+    }
+
+    /// Access control: `AclMode` 2 = blacklist. Mac and name lists are
+    /// index-aligned, `;`-separated.
+    async fn acl(&self) -> Result<(String, Vec<String>, Vec<String>, String, String), String> {
+        let reply = self
+            .oem
+            .local_read_single("queryDeviceAccessControlList", &BTreeMap::new())
+            .await?;
+        let get = |key: &str| {
+            reply
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        Ok((
+            get("AclMode"),
+            split_list(&get("BlackMacList")),
+            split_list(&get("BlackNameList")),
+            get("WhiteMacList"),
+            get("WhiteNameList"),
+        ))
+    }
+
+    async fn acl_write(
+        &self,
+        macs: &[String],
+        names: &[String],
+        white_macs: &str,
+        white_names: &str,
+    ) -> Result<Value, String> {
+        self.write(
+            "setDeviceAccessControlList",
+            &[
+                ("AclMode", "2".into()),
+                ("WhiteMacList", white_macs.to_owned()),
+                ("BlackMacList", join_list(macs)),
+                ("WhiteNameList", white_names.to_owned()),
+                ("BlackNameList", join_list(names)),
+            ],
+        )
+        .await
+    }
+
+    async fn client_access(&self, params: &Value, block: bool) -> Outcome {
+        let mac = match text(params, "mac") {
+            Some(mac) if valid_mac(mac) => mac.to_ascii_lowercase(),
+            _ => return Outcome::Invalid("invalid mac address".into()),
+        };
+        let (mode, mut macs, mut names, white_macs, white_names) = match self.acl().await {
+            Ok(acl) => acl,
+            Err(error) => return Outcome::Failed(error),
+        };
+        // Keep the name list aligned with the mac list.
+        names.resize(macs.len(), String::new());
+        if mode == "1" && block {
+            return Outcome::Failed("the OEM access list is in whitelist mode".into());
+        }
+        let position = macs.iter().position(|m| m.eq_ignore_ascii_case(&mac));
+        match (block, position) {
+            (true, None) => {
+                let name = self.station_name(&mac).await.unwrap_or_default();
+                macs.push(mac.clone());
+                names.push(name);
+            }
+            (false, Some(index)) => {
+                macs.remove(index);
+                names.remove(index);
+            }
+            _ => {}
+        }
+        if let Err(error) = self
+            .acl_write(&macs, &names, &white_macs, &white_names)
+            .await
+        {
+            return Outcome::Failed(error);
+        }
+        let verified = match self.acl().await {
+            Ok((_, after, _, _, _)) => after.iter().any(|m| m.eq_ignore_ascii_case(&mac)) == block,
+            Err(_) => false,
+        };
+        Outcome::Ok(json!({"mac":mac,"blocked":block,"verified":verified}))
+    }
+
+    /// Disconnect a Wi-Fi client: blocking removes it from the AP at once and
+    /// it is allowed back immediately unless it was blocked before.
+    async fn client_kick(&self, params: &Value) -> Outcome {
+        let raw = match text(params, "macs") {
+            Some(raw) => raw,
+            None => return Outcome::Invalid("macs is required".into()),
+        };
+        let macs: Vec<String> = raw
+            .split([',', ';'])
+            .filter(|m| !m.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if macs.is_empty() || macs.len() > 8 || !macs.iter().all(|m| valid_mac(m)) {
+            return Outcome::Invalid("macs must list 1 to 8 mac addresses".into());
+        }
+        let Ok((_, blocked, _, _, _)) = self.acl().await else {
+            return Outcome::Failed("OEM access list unavailable".into());
+        };
+        let mut kicked = Vec::new();
+        for mac in macs {
+            if blocked.iter().any(|m| m.eq_ignore_ascii_case(&mac)) {
+                continue;
+            }
+            if !matches!(
+                self.client_access(&json!({"mac":mac}), true).await,
+                Outcome::Ok(_)
+            ) {
+                return Outcome::Failed("could not disconnect the client".into());
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if !matches!(
+                self.client_access(&json!({"mac":mac}), false).await,
+                Outcome::Ok(_)
+            ) {
+                return Outcome::Failed(
+                    "client was disconnected but could not be re-allowed".into(),
+                );
+            }
+            kicked.push(mac);
+        }
+        Outcome::Ok(json!({"kicked":kicked}))
+    }
+
+    async fn client_rename(&self, params: &Value) -> Outcome {
+        let mac = match text(params, "mac") {
+            Some(mac) if valid_mac(mac) => mac.to_ascii_lowercase(),
+            _ => return Outcome::Invalid("invalid mac address".into()),
+        };
+        let hostname = match text(params, "hostname") {
+            Some(name) if !name.is_empty() && name.len() <= 32 && clean_hostname(name) == name => {
+                name
+            }
+            _ => return Outcome::Invalid("hostname must be 1 to 32 printable characters".into()),
+        };
+        outcome_from(
+            self.write(
+                "EDIT_HOSTNAME",
+                &[("mac", mac.clone()), ("hostname", hostname.to_owned())],
+            )
+            .await
+            .map(|_| json!({"mac":mac,"hostname":hostname})),
+        )
+    }
+
+    async fn station_name(&self, mac: &str) -> Option<String> {
+        let stations = self.stations().await.ok()?;
+        stations
+            .into_iter()
+            .find(|(m, _, _, _)| m.eq_ignore_ascii_case(mac))
+            .map(|(_, name, _, _)| clean_hostname(&name))
+    }
+
+    /// Connected devices: `(mac, hostname, ip, wired)`. Wi-Fi first.
+    async fn stations(&self) -> Result<Vec<(String, String, String, bool)>, String> {
+        let mut out = Vec::new();
+        for (cmd, wired) in [("station_list", false), ("lan_station_list", true)] {
+            let reply = match self.oem.local_read_single(cmd, &BTreeMap::new()).await {
+                Ok(reply) => reply,
+                Err(error) if wired => {
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let rows = reply
+                .get(cmd)
+                .or_else(|| reply.get("station_list"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for row in rows.iter().take(32) {
+                let field = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                let mac = field("mac_addr").to_ascii_lowercase();
+                if valid_mac(&mac) {
+                    out.push((mac, field("hostname"), field("ip_addr"), wired));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `clients` block from the firmware's own device lists and blacklist.
+    async fn clients_block(&self) -> Option<Value> {
+        let stations = self.stations().await.ok()?;
+        let (_, blocked, _, _, _) = self.acl().await.ok()?;
+        let wifi = stations.iter().filter(|s| !s.3).count();
+        let lan = stations.len() - wifi;
+        let list: Vec<Value> = stations
+            .iter()
+            .map(|(mac, name, ip, _)| json!({"name":clean_hostname(name),"ip":ip,"mac":mac}))
+            .collect();
+        Some(json!({"total":stations.len(),"wifi":wifi,"lan":lan,"list":list,"blocked":blocked}))
+    }
+
+    /// The OEM form always posts the whole data-limit block, so the untouched
+    /// fields are read back from the firmware and re-sent unchanged.
+    async fn data_limit_write(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<String, String>),
+    ) -> Result<Value, String> {
+        let current = self
+            .read(
+                "data_volume_limit_switch,data_volume_limit_unit,data_volume_limit_size,data_volume_alert_percent,wan_auto_clear_flow_data_switch,traffic_clear_date,flux_limited_disconnect",
+            )
+            .await?;
+        let mut form: BTreeMap<String, String> = current
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+            .collect();
+        form.entry("wan_auto_clear_flow_data_switch".into())
+            .or_insert_with(|| "on".into());
+        form.entry("traffic_clear_date".into())
+            .or_insert_with(|| "1".into());
+        form.entry("flux_limited_disconnect".into())
+            .or_insert_with(|| "off".into());
+        form.entry("data_volume_limit_switch".into())
+            .or_insert_with(|| "0".into());
+        edit(&mut form);
+        let mut pairs: Vec<(&str, String)> = vec![
+            (
+                "wan_auto_clear_flow_data_switch",
+                form["wan_auto_clear_flow_data_switch"].clone(),
+            ),
+            ("traffic_clear_date", form["traffic_clear_date"].clone()),
+            (
+                "flux_limited_disconnect",
+                form["flux_limited_disconnect"].clone(),
+            ),
+            (
+                "data_volume_limit_switch",
+                form["data_volume_limit_switch"].clone(),
+            ),
+            ("notify_deviceui_enable", "0".into()),
+        ];
+        if form["data_volume_limit_switch"] == "1" {
+            for key in [
+                "data_volume_limit_unit",
+                "data_volume_limit_size",
+                "data_volume_alert_percent",
+            ] {
+                pairs.push((key, form.get(key).cloned().unwrap_or_default()));
+            }
+        }
+        self.write("DATA_LIMIT_SETTING", &pairs).await?;
+        self.read(
+            "data_volume_limit_switch,data_volume_limit_unit,data_volume_limit_size,data_volume_alert_percent,wan_auto_clear_flow_data_switch,traffic_clear_date",
+        )
+        .await
+    }
+
+    async fn traffic_set_limit(&self, params: &Value) -> Outcome {
+        let enabled = match integer(params, "enabled") {
+            Ok(Some(v @ (0 | 1))) => v,
+            _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
+        };
+        let mut unit = "data";
+        let mut size = String::new();
+        let mut ratio = String::new();
+        if enabled == 1 {
+            unit = match integer(params, "type") {
+                Ok(Some(1)) => "data",
+                Ok(Some(2)) => "time",
+                _ => return Outcome::Invalid("type must be 1 (data) or 2 (time)".into()),
+            };
+            size = match text(params, "value") {
+                Some(v)
+                    if !v.is_empty()
+                        && v.len() <= 15
+                        && v.bytes().all(|b| b.is_ascii_digit())
+                        && v != "0" =>
+                {
+                    v.to_owned()
+                }
+                _ => match integer(params, "value") {
+                    Ok(Some(v)) if v > 0 => v.to_string(),
+                    _ => return Outcome::Invalid("value must be a positive number".into()),
+                },
+            };
+            ratio = match integer(params, "ratio") {
+                Ok(Some(v)) if (0..=100).contains(&v) => v.to_string(),
+                Ok(None) => "80".into(),
+                _ => return Outcome::Invalid("ratio must be 0 through 100".into()),
+            };
+        }
+        let result = self
+            .data_limit_write(|form| {
+                form.insert("data_volume_limit_switch".into(), enabled.to_string());
+                if enabled == 1 {
+                    form.insert("data_volume_limit_unit".into(), unit.into());
+                    form.insert("data_volume_limit_size".into(), size.clone());
+                    form.insert("data_volume_alert_percent".into(), ratio.clone());
+                }
+            })
+            .await;
+        match result {
+            Ok(after) => {
+                let on = after
+                    .get("data_volume_limit_switch")
+                    .and_then(Value::as_str)
+                    == Some("1");
+                let verified = on == (enabled == 1)
+                    && (enabled == 0
+                        || after.get("data_volume_limit_size").and_then(Value::as_str)
+                            == Some(size.as_str()));
+                Outcome::Ok(json!({"enabled":enabled,"verified":verified}))
+            }
+            Err(error) => Outcome::Failed(error),
+        }
+    }
+
+    async fn traffic_set_clear_day(&self, params: &Value) -> Outcome {
+        let day = match integer(params, "day") {
+            Ok(Some(day)) if (1..=31).contains(&day) => day,
+            _ => return Outcome::Invalid("day must be 1 through 31".into()),
+        };
+        let enabled = match integer(params, "enabled") {
+            Ok(Some(v @ (0 | 1))) => v,
+            Ok(None) => 1,
+            _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
+        };
+        let wanted = if enabled == 1 { "on" } else { "off" };
+        let result = self
+            .data_limit_write(|form| {
+                form.insert("traffic_clear_date".into(), day.to_string());
+                form.insert("wan_auto_clear_flow_data_switch".into(), wanted.into());
+            })
+            .await;
+        match result {
+            Ok(after) => Outcome::Ok(json!({"day":day,"enabled":enabled,"verified":
+                after.get("traffic_clear_date").and_then(Value::as_str) == Some(day.to_string().as_str())
+                && after.get("wan_auto_clear_flow_data_switch").and_then(Value::as_str) == Some(wanted)})),
+            Err(error) => Outcome::Failed(error),
         }
     }
 

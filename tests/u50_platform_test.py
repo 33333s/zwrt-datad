@@ -37,6 +37,10 @@ STORE = {
     "dial_mode": "manual_dial", "roam_setting_option": "off", "net_select": "4G_AND_5G",
     "simcard_active_slot": "1", "sms_unread_num": "1", "sms_dev_unread_num": "1",
     "sms_sim_unread_num": "0", "sms_nv_num_total": "1", "sms_sim_num_total": "0",
+    "lte_band_lock": "0x1c200000095", "nr5g_sa_band_lock": "5,7,78", "nr5g_nsa_band_lock": "5,7,78",
+    "data_volume_limit_switch": "0", "data_volume_limit_unit": "", "data_volume_limit_size": "",
+    "data_volume_alert_percent": "", "wan_auto_clear_flow_data_switch": "on", "traffic_clear_date": "1",
+    "flux_limited_disconnect": "off",
 }
 MESSAGES = [{"id": "7", "number": "10086", "content": "6D4B8BD5", "tag": "1",
              "date": "26,08,27,04,00,00,+,0"}]
@@ -79,12 +83,22 @@ class Vendor(BaseHTTPRequestHandler):
             LOG.append(("sms_read", store, page, query["data_per_page"][0]))
             rows = MESSAGES if store == "1" and page == "0" else []
             return self.send_json({"messages": rows} if rows else {"sms_data_total": ""})
+        if keys == ["station_list"]:
+            return self.send_json({"station_list": [
+                {"mac_addr": "AA:BB:CC:00:00:01", "hostname": "phone", "ip_addr": "192.168.0.10", "ssid_index": "0"}]})
+        if keys == ["lan_station_list"]:
+            return self.send_json({"station_list": [
+                {"mac_addr": "AA:BB:CC:00:00:02", "hostname": "desk", "ip_addr": "192.168.0.11"}]})
+        if keys == ["queryDeviceAccessControlList"]:
+            return self.send_json({"AclMode": STORE.get("AclMode", "2"), "BlackMacList": STORE.get("BlackMacList", ""),
+                                   "BlackNameList": STORE.get("BlackNameList", ""), "WhiteMacList": "", "WhiteNameList": ""})
         if keys == ["sms_cmd_status_info"]:
             return self.send_json({"sms_cmd_status_result": "3"})
         return self.send_json({key: STORE.get(key, "") for key in keys})
 
     def do_POST(self):
-        form = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode())
+        form = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode(),
+                                     keep_blank_values=True)
         action = form.get("goformId", [""])[0]
         if not self.trusted():
             return self.send_json({"result": "failure"})
@@ -105,6 +119,17 @@ class Vendor(BaseHTTPRequestHandler):
             STORE["net_select"] = one["BearerPreference"]
         elif action == "SWITCH_SIMCARD_SLOT":
             STORE["simcard_active_slot"] = one["simcard_active_slot"]
+        elif action == "BAND_SELECT":
+            STORE["lte_band_lock"] = one["lte_band_mask"]
+        elif action == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK":
+            STORE["nr5g_nsa_band_lock" if one["type"] == "1" else "nr5g_sa_band_lock"] = one["nr5g_band_mask"]
+        elif action == "setDeviceAccessControlList":
+            STORE["AclMode"], STORE["BlackMacList"], STORE["BlackNameList"] = one["AclMode"], one["BlackMacList"], one["BlackNameList"]
+        elif action == "DATA_LIMIT_SETTING":
+            for key in ("data_volume_limit_switch", "data_volume_limit_unit", "data_volume_limit_size",
+                        "data_volume_alert_percent", "wan_auto_clear_flow_data_switch", "traffic_clear_date"):
+                if key in one:
+                    STORE[key] = one[key]
         return self.send_json({"result": "success"})
 
     def log_message(self, *_args):
@@ -140,6 +165,9 @@ case "$1:$2" in
   get:integrate_version) echo {VERSION} ;;
   get:network_type) echo LTE ;;
   get:roam_setting_option) echo off ;;
+  get:data_volume_limit_switch) echo 0 ;;
+  get:wan_auto_clear_flow_data_switch) echo on ;;
+  get:traffic_clear_date) echo 1 ;;
   get:admin_Password) echo {ADMIN_HASH} ;;
   *) exit 1 ;;
 esac
@@ -229,6 +257,82 @@ esac
         status, _ = control(port, "sms.mark_read", {"ids": "7", "tag": 0})
         assert status == 200 and writes()[-1][2] == {"goformId": "SET_MSG_READ", "msg_id": "7;", "tag": "0"}
         assert control(port, "sms.mark_read", {"ids": "7", "tag": 5})[0] == 400
+
+        # Band locks: WebUI mask format, read back, invalid input refused.
+        status, result = control(port, "band.set_lte", {"bands": "1,3,41"})
+        assert status == 200 and result["result"]["mask"] == "0x0000010000000005" and result["result"]["verified"], result
+        assert writes()[-1] == ("write", "BAND_SELECT", {
+            "goformId": "BAND_SELECT", "is_gw_band": "0", "gw_band_mask": "0", "is_lte_band": "1",
+            "lte_band_mask": "0x0000010000000005"})
+        for bad in ({"bands": ""}, {"bands": "1,x"}, {"bands": "0"}, {"bands": "65"}, {}):
+            assert control(port, "band.set_lte", bad)[0] == 400, bad
+        status, result = control(port, "band.set_nr_nsa", {"bands": "78,41,78"})
+        assert status == 200 and result["result"] == {"bands": [41, 78], "verified": True}, result
+        assert writes()[-1][2] == {"goformId": "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "nr5g_band_mask": "41,78", "type": "1"}
+        status, result = control(port, "band.set_nr_sa", {"bands": "78"})
+        assert status == 200 and writes()[-1][2]["type"] == "0"
+
+        # Cell locks use the WebUI's formats; unlock zeroes LTE and sends 1,1,1,1 for NR.
+        assert control(port, "cell.lock_lte", {"pci": 57, "earfcn": 3725})[0] == 200
+        assert writes()[-1][2] == {"goformId": "LTE_LOCK_CELL_SET", "lte_pci_lock": "57", "lte_earfcn_lock": "3725"}
+        assert control(port, "cell.lock_nr", {"pci": 384, "arfcn": 633984, "band": 78})[0] == 200
+        assert writes()[-1][2] == {"goformId": "NR5G_LOCK_CELL_SET", "nr5g_cell_lock": "384,633984,78,30"}
+        assert control(port, "cell.lock_nr", {"pci": 5, "arfcn": 1, "band": 28, "scs": 15})[0] == 200
+        assert writes()[-1][2]["nr5g_cell_lock"] == "5,1,28,15"
+        for bad in ({"pci": 2000, "arfcn": 1, "band": 78}, {"pci": 1, "arfcn": 1, "band": 0}, {"pci": 1, "arfcn": 1, "band": 78, "scs": 5}):
+            assert control(port, "cell.lock_nr", bad)[0] == 400, bad
+        assert control(port, "cell.lock_lte", {"pci": "1;x", "earfcn": 1})[0] == 400
+        assert control(port, "cell.unlock_all", {})[0] == 200
+        assert writes()[-2][2] == {"goformId": "LTE_LOCK_CELL_SET", "lte_pci_lock": "0", "lte_earfcn_lock": "0"}
+        assert writes()[-1][2] == {"goformId": "NR5G_LOCK_CELL_SET", "nr5g_cell_lock": "1,1,1,1"}
+
+        # Traffic: the whole OEM limit block is re-sent, untouched fields preserved.
+        status, result = control(port, "traffic.set_limit", {"enabled": 1, "type": 1, "value": "107374182400", "ratio": 90})
+        assert status == 200 and result["result"]["verified"], result
+        assert writes()[-1][2] == {
+            "goformId": "DATA_LIMIT_SETTING", "wan_auto_clear_flow_data_switch": "on", "traffic_clear_date": "1",
+            "flux_limited_disconnect": "off", "data_volume_limit_switch": "1", "notify_deviceui_enable": "0",
+            "data_volume_limit_unit": "data", "data_volume_limit_size": "107374182400", "data_volume_alert_percent": "90"}
+        status, result = control(port, "traffic.set_clear_day", {"day": 15, "enabled": 0})
+        assert status == 200 and result["result"]["verified"], result
+        assert writes()[-1][2]["traffic_clear_date"] == "15" and writes()[-1][2]["wan_auto_clear_flow_data_switch"] == "off"
+        assert writes()[-1][2]["data_volume_limit_size"] == "107374182400", "limit fields must be preserved"
+        status, result = control(port, "traffic.set_limit", {"enabled": 0})
+        assert status == 200 and "data_volume_limit_size" not in writes()[-1][2] and writes()[-1][2]["data_volume_limit_switch"] == "0"
+        for bad in ({"enabled": 2}, {"enabled": 1, "type": 3, "value": "1"}, {"enabled": 1, "type": 1, "value": "0"},
+                    {"enabled": 1, "type": 1, "value": "1;x"}, {"enabled": 1, "type": 1, "value": "1", "ratio": 101}):
+            assert control(port, "traffic.set_limit", bad)[0] == 400, bad
+        assert control(port, "traffic.set_clear_day", {"day": 32})[0] == 400
+        _, traffic_state = call(port, "/state")
+        # State comes from the firmware cfg store (a static mock here), in the mainline shape.
+        assert traffic_state["traffic"]["clear_day"] == {"clearday": 1, "enable": 1}, traffic_state["traffic"]
+        assert traffic_state["traffic"]["limit"]["enable"] == 0
+
+        # Clients: lists come from the firmware, access control edits the OEM blacklist.
+        _, client_state = call(port, "/state")
+        clients = client_state["clients"]
+        assert clients["wifi"] == 1 and clients["lan"] == 1 and clients["total"] == 2, clients
+        assert {c["mac"] for c in clients["list"]} == {"aa:bb:cc:00:00:01", "aa:bb:cc:00:00:02"}
+        status, result = control(port, "client.block", {"mac": "AA:BB:CC:00:00:01"})
+        assert status == 200 and result["result"]["verified"], result
+        assert writes()[-1][2] == {"goformId": "setDeviceAccessControlList", "AclMode": "2", "WhiteMacList": "",
+                                   "BlackMacList": "aa:bb:cc:00:00:01;", "WhiteNameList": "", "BlackNameList": "phone;"}
+        for _ in range(40):  # /state is refreshed by the collector loop
+            if call(port, "/state")[1]["clients"].get("blocked") == ["aa:bb:cc:00:00:01"]:
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError(call(port, "/state")[1]["clients"])
+        assert control(port, "client.unblock", {"mac": "aa:bb:cc:00:00:01"})[0] == 200
+        assert writes()[-1][2]["BlackMacList"] == "" and STORE["BlackMacList"] == ""
+        status, result = control(port, "client.kick", {"macs": "aa:bb:cc:00:00:02"})
+        assert status == 200 and result["result"]["kicked"] == ["aa:bb:cc:00:00:02"], result
+        assert STORE["BlackMacList"] == "", "kick must leave the client allowed"
+        assert control(port, "client.rename", {"mac": "aa:bb:cc:00:00:01", "hostname": "living-room"})[0] == 200
+        assert writes()[-1][2] == {"goformId": "EDIT_HOSTNAME", "mac": "aa:bb:cc:00:00:01", "hostname": "living-room"}
+        for action, bad in (("client.block", {"mac": "nope"}), ("client.kick", {"macs": ""}),
+                            ("client.rename", {"mac": "aa:bb:cc:00:00:01", "hostname": "a;b"})):
+            assert control(port, action, bad)[0] == 400, (action, bad)
 
         # Device actions and unmapped actions.
         assert control(port, "device.reboot", {})[0] == 200 and writes()[-1][1] == "REBOOT_DEVICE"

@@ -104,3 +104,15 @@ Differences that come from the device:
 - **Storage gate.** The ~15 MB `/etc_rw` volume needs 7 MiB free (instead of 64 MiB) before an install starts.
 
 The first move to an OTA-capable build must be manual; later versions update themselves.
+
+
+## Controls added in v0.10.47
+
+Mapped onto OEM goform actions (same request shapes as the firmware WebUI):
+
+- `band.set_lte` / `band.set_nr_sa` / `band.set_nr_nsa` — `BAND_SELECT` / `WAN_PERFORM_NR5G_SANSA_BAND_LOCK`.
+- `cell.lock_lte` / `cell.lock_nr` / `cell.unlock_all` — `LTE_LOCK_CELL_SET` / `NR5G_LOCK_CELL_SET`.
+- `traffic.set_limit` / `traffic.set_clear_day` — `DATA_LIMIT_SETTING` (the whole block is re-sent, untouched fields preserved); state `traffic.limit` / `traffic.clear_day` in the mainline shape.
+- `client.block` / `client.unblock` — OEM blacklist (`setDeviceAccessControlList`, `AclMode` 2); refused while the firmware is in whitelist mode. `client.kick` blocks the station briefly and re-allows it (the firmware has no plain disassociate call). `client.rename` — `EDIT_HOSTNAME`. State `clients` (`total/wifi/lan/list/blocked`) comes from `station_list`, `lan_station_list` and `queryDeviceAccessControlList`.
+
+Verified against a fake GoAhead in `tests/u50_platform_test.py`. Not yet exercised with a write on a real device: band/cell locks and traffic limits (they change live radio/billing behaviour).
