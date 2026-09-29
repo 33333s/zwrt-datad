@@ -940,6 +940,7 @@ impl BridgeManager {
                         state: app.cloud_panel_state(),
                         history: app.cloud_panel_history(),
                         schedule: Some(app.cloud_panel_schedule()),
+                        speedtest: Some(app.cloud_panel_speedtest()),
                     },
                     command.target_service == "datad_panel_control",
                     &self.config,

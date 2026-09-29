@@ -25,6 +25,8 @@ Content-Type: application/json
 | `device.change_password` | `old_hash`, `new_hash` | 修改某兴后台密码 |
 | `device.reboot` | 无 | 重启设备 |
 | `schedule.reboot.set` | `enabled`（布尔）、`time`（设备本地 `HH:MM`） | 保存 datad 每日定时重启；原厂周/间隔日计划开启时拒绝启用 |
+| `speedtest.start` | `bytes`（1–50 MiB）、`threads`（1–5）、`runs`（1 或 3） | 设备默认出口直连固定 Cloudflare HTTPS 下载端点，异步返回状态；总量不超过 `bytes` |
+| `speedtest.stop` | 无 | 取消正在运行的下载测试 |
 | `device.poweroff` | 无 | 关闭设备 |
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。

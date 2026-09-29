@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.27",
+    "version": "0.10.28",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加设备本地每日定时重启与原厂计划冲突保护"
+    "notes": "为 NMS 原版远程面板增加设备直连的有界流量测速"
   }
 }
