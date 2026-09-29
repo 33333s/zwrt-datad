@@ -14,6 +14,7 @@ pub const ACTIONS: &[&str] = &[
     "schedule.reboot.set",
     "speedtest.start",
     "speedtest.stop",
+    "cloud.remote_features.set",
     "device.poweroff",
     "cellular.connect",
     "cellular.disconnect",

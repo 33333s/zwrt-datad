@@ -1,11 +1,12 @@
 //! On-demand state stream for an authenticated NMS panel session. No local
 //! HTTP port, datad bearer token, or UFI process is exposed to the cloud.
 use crate::{
-    cloud::{Config, websocket_tls},
+    cloud::{Config, RemoteFeatures, websocket_tls},
     control::{self, Outcome},
     cooling,
     model::Snapshot,
     reboot_schedule::{self, Schedule},
+    server::App,
     speedtest::SpeedTest,
     state,
     traffic_history::Usage,
@@ -30,6 +31,7 @@ pub(crate) struct PanelFeeds {
     pub history: watch::Receiver<Vec<Usage>>,
     pub schedule: Option<Arc<Mutex<Schedule>>>,
     pub speedtest: Option<Arc<Mutex<SpeedTest>>>,
+    pub cloud_app: Option<App>,
 }
 const MAX_STATE_BYTES: usize = 192 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024;
@@ -129,7 +131,7 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
 
 #[cfg(test)]
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
-    state_message_with_config(snapshot, version, None, None, None, None)
+    state_message_with_config(snapshot, version, None, None, None, None, None)
 }
 
 fn state_message_with_config(
@@ -139,6 +141,7 @@ fn state_message_with_config(
     apn_config: Option<&Value>,
     cooling_config: Option<&Value>,
     history: Option<&[Usage]>,
+    cloud_management: Option<&Value>,
 ) -> Option<Message> {
     let mut view = panel_snapshot(snapshot);
     if let Some(history) = history {
@@ -156,6 +159,10 @@ fn state_message_with_config(
     if let Some(cooling_config) = cooling_config {
         view.as_object_mut()?
             .insert("cooling_config".into(), cooling_config.clone());
+    }
+    if let Some(cloud_management) = cloud_management {
+        view.as_object_mut()?
+            .insert("cloud_management".into(), cloud_management.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -358,6 +365,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "qos.clear"
             | "schedule.reboot.set"
             | "speedtest.start"
+            | "cloud.remote_features.set"
     )
 }
 
@@ -388,6 +396,7 @@ async fn control_result(
     request: ControlRequest,
     schedule: Option<&Arc<Mutex<Schedule>>>,
     speedtest: Option<&Arc<Mutex<SpeedTest>>>,
+    cloud_app: Option<&App>,
 ) -> Message {
     let code = if request.action == "usb.set"
         || !control::ACTIONS.contains(&request.action.as_str())
@@ -439,6 +448,18 @@ async fn control_result(
         } else {
             Some("unsupported_action")
         }
+    } else if request.action == "cloud.remote_features.set" {
+        match (
+            cloud_app,
+            serde_json::from_value::<RemoteFeatures>(request.params.clone()),
+        ) {
+            (Some(app), Ok(input)) => match app.cloud_panel_save_features(input).await {
+                Ok(_) => None,
+                Err(error) if error == "保存配置失败" => Some("device_call_failed"),
+                Err(_) => Some("invalid_parameter"),
+            },
+            _ => Some("invalid_parameter"),
+        }
     } else {
         match tokio::time::timeout(
             Duration::from_secs(20),
@@ -474,6 +495,7 @@ pub(crate) async fn run(
         history: mut history_rx,
         schedule,
         speedtest,
+        cloud_app,
     } = feeds;
     if *shutdown.borrow() || ttl.is_zero() {
         return;
@@ -542,6 +564,11 @@ pub(crate) async fn run(
     }
     let mut last = state_rx.borrow().clone();
     let mut history = history_rx.borrow_and_update().clone();
+    let cloud_management = if let Some(app) = &cloud_app {
+        Some(app.cloud_panel_config().await)
+    } else {
+        None
+    };
     let Some(first) = state_message_with_config(
         &last,
         if control_mode { 2 } else { 1 },
@@ -549,6 +576,7 @@ pub(crate) async fn run(
         None,
         None,
         Some(&history),
+        cloud_management.as_ref(),
     ) else {
         return;
     };
@@ -582,7 +610,7 @@ pub(crate) async fn run(
                 let next = state_rx.borrow().clone();
                 let next_history = history_rx.borrow_and_update().clone();
                 if next != last || config_pending || next_history != history {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history)) else { return; };
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), cloud_management.as_ref()) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     history = next_history;
@@ -604,12 +632,12 @@ pub(crate) async fn run(
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
-                    if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref()).await).await.is_err() { return; }
+                    if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref(), cloud_app.as_ref()).await).await.is_err() { return; }
                     if refresh_wifi || refresh_apn || refresh_cooling {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history))
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), cloud_management.as_ref())
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -698,6 +726,31 @@ mod tests {
         );
         assert!(!raw.contains("must-not-leak"));
         assert_eq!(parsed["protocol_version"], 1);
+        assert!(parsed["snapshot"].get("cloud_management").is_none());
+    }
+
+    #[test]
+    fn cloud_management_is_only_added_to_authorized_panel_frames() {
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::new(),
+        };
+        let reviewed =
+            json!({"state":"connected","enabled":true,"password_configured":true,"services":[]});
+        let Message::Text(raw) =
+            state_message_with_config(&snapshot, 1, None, None, None, None, Some(&reviewed))
+                .unwrap()
+        else {
+            panic!("expected text frame")
+        };
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["snapshot"]["cloud_management"], reviewed);
+        assert!(
+            frame["snapshot"]["cloud_management"]
+                .get("password")
+                .is_none()
+        );
     }
 
     #[test]
@@ -717,7 +770,8 @@ mod tests {
         let plain: Value = serde_json::from_str(&plain).unwrap();
         assert!(plain["snapshot"].get("traffic_history").is_none());
         let Message::Text(with_history) =
-            state_message_with_config(&snapshot, 1, None, None, None, Some(&history)).unwrap()
+            state_message_with_config(&snapshot, 1, None, None, None, Some(&history), None)
+                .unwrap()
         else {
             panic!("expected a text frame")
         };
@@ -775,6 +829,7 @@ mod tests {
         assert!(needs_confirmation("cooling.fan.set_curve"));
         assert!(needs_confirmation("cooling.liquid.set_mode"));
         assert!(needs_confirmation("speedtest.start"));
+        assert!(needs_confirmation("cloud.remote_features.set"));
         assert!(!needs_confirmation("speedtest.stop"));
         for action in [
             "wifi.set_dual_band",
@@ -804,7 +859,7 @@ mod tests {
             "band.set_nr_sa",
             &json!({"bands":"28,78"})
         ));
-        let Message::Text(reply) = control_result(request, None, None).await else {
+        let Message::Text(reply) = control_result(request, None, None, None).await else {
             panic!("expected a text result")
         };
         let reply: Value = serde_json::from_str(&reply).unwrap();
@@ -823,7 +878,7 @@ mod tests {
         }
         let unsupported = allowed.replace("device.reboot", "ubus.call");
         let Message::Text(reply) =
-            control_result(parse_control(&unsupported).unwrap(), None, None).await
+            control_result(parse_control(&unsupported).unwrap(), None, None, None).await
         else {
             panic!("expected an unsupported-action result")
         };
@@ -833,7 +888,7 @@ mod tests {
         );
         let skipped_adb = allowed.replace("device.reboot", "usb.set");
         let Message::Text(reply) =
-            control_result(parse_control(&skipped_adb).unwrap(), None, None).await
+            control_result(parse_control(&skipped_adb).unwrap(), None, None, None).await
         else {
             panic!("expected USB mode to be excluded from the remote panel")
         };
@@ -853,7 +908,8 @@ mod tests {
         let manager = Arc::new(Mutex::new(Schedule::load(&dir)));
         let raw = json!({"type":"control","protocol_version":2,"request_id":"a".repeat(32),
             "action":"schedule.reboot.set","params":{"enabled":false,"time":"02:03"},"confirmed":false}).to_string();
-        let rejected = control_result(parse_control(&raw).unwrap(), Some(&manager), None).await;
+        let rejected =
+            control_result(parse_control(&raw).unwrap(), Some(&manager), None, None).await;
         let Message::Text(rejected) = rejected else {
             panic!("expected a text result")
         };
@@ -865,6 +921,7 @@ mod tests {
         let accepted = control_result(
             parse_control(&raw.replace("\"confirmed\":false", "\"confirmed\":true")).unwrap(),
             Some(&manager),
+            None,
             None,
         )
         .await;
@@ -926,6 +983,7 @@ mod tests {
                     history: history_receiver,
                     schedule: None,
                     speedtest: None,
+                    cloud_app: None,
                 },
                 false,
                 &config,
@@ -1014,6 +1072,7 @@ mod tests {
                     history: history_receiver,
                     schedule: None,
                     speedtest: None,
+                    cloud_app: None,
                 },
                 true,
                 &config,

@@ -1,6 +1,6 @@
 use crate::{
     auth::{self, Sessions},
-    cloud::{Cloud, Update as CloudUpdate},
+    cloud::{Cloud, RemoteFeatures, Update as CloudUpdate},
     model::{DatadVersion, Snapshot, UbusCall},
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
@@ -85,6 +85,38 @@ impl App {
 
     pub(crate) fn cloud_panel_speedtest(&self) -> Arc<Mutex<SpeedTest>> {
         self.inner.speedtest.clone()
+    }
+
+    pub(crate) async fn cloud_panel_config(&self) -> Value {
+        let mut view = self.inner.cloud.read().await.panel_config();
+        if let Some(fields) = view.as_object_mut() {
+            fields.insert(
+                "webshell_available".into(),
+                json!(self.cloud_webshell_available()),
+            );
+        }
+        view
+    }
+
+    pub(crate) async fn cloud_panel_save_features(
+        &self,
+        input: RemoteFeatures,
+    ) -> Result<Value, String> {
+        let (mut view, changed) = self.inner.cloud.write().await.save_remote_features(input)?;
+        if let Some(fields) = view.as_object_mut() {
+            fields.insert(
+                "webshell_available".into(),
+                json!(self.cloud_webshell_available()),
+            );
+        }
+        if changed {
+            let app = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                app.inner.cloud.read().await.activate_saved_features();
+            });
+        }
+        Ok(view)
     }
 
     pub(crate) fn cloud_webshell_available(&self) -> bool {
@@ -927,6 +959,18 @@ async fn control(
         tokio::spawn(async move { refresh.refresh_snapshot().await });
         return control_ok(action, value);
     }
+    if action == "cloud.remote_features.set" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: RemoteFeatures = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid remote features"),
+        };
+        return match app.cloud_panel_save_features(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "保存配置失败" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1368,8 +1412,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 82);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 82);
+        assert_eq!(controls.len(), 83);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 83);
     }
 
     #[test]

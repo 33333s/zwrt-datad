@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.28",
+    "version": "0.10.29",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加设备直连的有界流量测速"
+    "notes": "为 NMS 原版远程面板增加受限云端功能管理"
   }
 }
