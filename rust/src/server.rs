@@ -7,6 +7,7 @@ use crate::{
     reboot_schedule::{self, Schedule},
     speedtest::SpeedTest,
     state,
+    task_schedule::{TaskInput, TaskSchedule},
     traffic_history::{History, Usage},
     webshell::WebShell,
 };
@@ -62,6 +63,7 @@ pub(crate) struct Inner {
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
     schedule: Arc<Mutex<Schedule>>,
+    tasks: Arc<Mutex<TaskSchedule>>,
     speedtest: Arc<Mutex<SpeedTest>>,
 }
 
@@ -85,6 +87,26 @@ impl App {
 
     pub(crate) fn cloud_panel_speedtest(&self) -> Arc<Mutex<SpeedTest>> {
         self.inner.speedtest.clone()
+    }
+
+    pub(crate) async fn panel_task_status(&self) -> Value {
+        self.inner.tasks.lock().await.status()
+    }
+
+    pub(crate) async fn panel_task_upsert(&self, input: TaskInput) -> Result<Value, String> {
+        if input.action == "device.reboot" {
+            let plan = self.inner.schedule.lock().await.status();
+            if reboot_schedule::oem_conflict().await
+                || plan["enabled"] == true && plan["time"] == input.time
+            {
+                return Err("reboot_schedule_conflict".into());
+            }
+        }
+        self.inner.tasks.lock().await.upsert(input)
+    }
+
+    pub(crate) async fn panel_task_remove(&self, id: &str) -> Result<Value, String> {
+        self.inner.tasks.lock().await.remove(id)
     }
 
     pub(crate) async fn cloud_panel_config(&self) -> Value {
@@ -165,6 +187,7 @@ impl App {
         initial
             .fields
             .insert("speedtest".into(), speedtest.status());
+        let tasks = TaskSchedule::load(&data_dir);
         let mut history = History::load(&data_dir);
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
@@ -187,6 +210,7 @@ impl App {
                 history: Mutex::new(history),
                 history_tx,
                 schedule: Arc::new(Mutex::new(schedule)),
+                tasks: Arc::new(Mutex::new(tasks)),
                 speedtest: Arc::new(Mutex::new(speedtest)),
             }),
         };
@@ -233,6 +257,47 @@ impl App {
                 {
                     app.inner.schedule.lock().await.reboot_failed();
                 }
+            }
+        });
+    }
+
+    pub fn spawn_task_schedule(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticks = tokio::time::interval(Duration::from_secs(10));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let clock = reboot_schedule::local_clock();
+                let due = app.inner.tasks.lock().await.observe(clock.as_ref());
+                let (Some(task), Some(clock)) = (due, clock) else {
+                    continue;
+                };
+                if task.action == "device.reboot" {
+                    let plan = app.inner.schedule.lock().await.status();
+                    if reboot_schedule::oem_conflict().await
+                        || plan["enabled"] == true && plan["time"] == task.time
+                    {
+                        app.inner
+                            .tasks
+                            .lock()
+                            .await
+                            .finish(&task.id, &clock.date, false);
+                        continue;
+                    }
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    crate::control::execute(&task.action, &task.params),
+                )
+                .await;
+                let success = matches!(result, Ok(crate::control::Outcome::Ok(_)));
+                app.inner
+                    .tasks
+                    .lock()
+                    .await
+                    .finish(&task.id, &clock.date, success);
             }
         });
     }
@@ -935,6 +1000,33 @@ async fn control(
             Err(error) => invalid_parameter(action, &error),
         };
     }
+    if action == "schedule.task.put" {
+        let params = body.get("params").cloned().unwrap_or(Value::Null);
+        let input: TaskInput = match serde_json::from_value(params) {
+            Ok(input) => input,
+            Err(_) => return invalid_parameter(action, "invalid scheduled task"),
+        };
+        return match app.panel_task_upsert(input).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "task_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
+    if action == "schedule.task.remove" {
+        let params = body.get("params").and_then(Value::as_object);
+        let id = params
+            .filter(|params| params.len() == 1)
+            .and_then(|params| params.get("id"))
+            .and_then(Value::as_str);
+        let Some(id) = id else {
+            return invalid_parameter(action, "id is required");
+        };
+        return match app.panel_task_remove(id).await {
+            Ok(value) => control_ok(action, value),
+            Err(error) if error == "task_storage_failed" => control_failed(action, error),
+            Err(error) => invalid_parameter(action, &error),
+        };
+    }
     if action == "speedtest.start" {
         let params = body.get("params").unwrap_or(&Value::Null);
         return match SpeedTest::start(app.inner.speedtest.clone(), params).await {
@@ -1412,8 +1504,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 83);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 83);
+        assert_eq!(controls.len(), 85);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 85);
     }
 
     #[test]

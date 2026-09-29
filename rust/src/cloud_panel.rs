@@ -9,6 +9,7 @@ use crate::{
     server::App,
     speedtest::SpeedTest,
     state,
+    task_schedule::TaskInput,
     traffic_history::Usage,
     wifi,
 };
@@ -131,7 +132,21 @@ fn state_message(snapshot: &Snapshot) -> Option<Message> {
 
 #[cfg(test)]
 fn state_message_version(snapshot: &Snapshot, version: u8) -> Option<Message> {
-    state_message_with_config(snapshot, version, None, None, None, None, None)
+    state_message_with_config(
+        snapshot,
+        version,
+        None,
+        None,
+        None,
+        None,
+        PanelManagement::default(),
+    )
+}
+
+#[derive(Default)]
+struct PanelManagement<'a> {
+    cloud: Option<&'a Value>,
+    tasks: Option<&'a Value>,
 }
 
 fn state_message_with_config(
@@ -141,7 +156,7 @@ fn state_message_with_config(
     apn_config: Option<&Value>,
     cooling_config: Option<&Value>,
     history: Option<&[Usage]>,
-    cloud_management: Option<&Value>,
+    management: PanelManagement<'_>,
 ) -> Option<Message> {
     let mut view = panel_snapshot(snapshot);
     if let Some(history) = history {
@@ -160,9 +175,13 @@ fn state_message_with_config(
         view.as_object_mut()?
             .insert("cooling_config".into(), cooling_config.clone());
     }
-    if let Some(cloud_management) = cloud_management {
+    if let Some(cloud_management) = management.cloud {
         view.as_object_mut()?
             .insert("cloud_management".into(), cloud_management.clone());
+    }
+    if let Some(scheduled_tasks) = management.tasks {
+        view.as_object_mut()?
+            .insert("scheduled_tasks".into(), scheduled_tasks.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -364,6 +383,8 @@ fn needs_confirmation(action: &str) -> bool {
             | "client.unblock"
             | "qos.clear"
             | "schedule.reboot.set"
+            | "schedule.task.put"
+            | "schedule.task.remove"
             | "speedtest.start"
             | "cloud.remote_features.set"
     )
@@ -425,6 +446,33 @@ async fn control_result(
                     Err(_) => Some("invalid_parameter"),
                 }
             }
+            _ => Some("invalid_parameter"),
+        }
+    } else if request.action == "schedule.task.put" {
+        match (
+            cloud_app,
+            serde_json::from_value::<TaskInput>(request.params.clone()),
+        ) {
+            (Some(app), Ok(input)) => match app.panel_task_upsert(input).await {
+                Ok(_) => None,
+                Err(error) if error == "task_storage_failed" => Some("device_call_failed"),
+                Err(_) => Some("invalid_parameter"),
+            },
+            _ => Some("invalid_parameter"),
+        }
+    } else if request.action == "schedule.task.remove" {
+        let id = request
+            .params
+            .as_object()
+            .filter(|params| params.len() == 1)
+            .and_then(|params| params.get("id"))
+            .and_then(Value::as_str);
+        match (cloud_app, id) {
+            (Some(app), Some(id)) => match app.panel_task_remove(id).await {
+                Ok(_) => None,
+                Err(error) if error == "task_storage_failed" => Some("device_call_failed"),
+                Err(_) => Some("invalid_parameter"),
+            },
             _ => Some("invalid_parameter"),
         }
     } else if request.action == "speedtest.start" {
@@ -569,6 +617,11 @@ pub(crate) async fn run(
     } else {
         None
     };
+    let mut scheduled_tasks = if let Some(app) = &cloud_app {
+        Some(app.panel_task_status().await)
+    } else {
+        None
+    };
     let Some(first) = state_message_with_config(
         &last,
         if control_mode { 2 } else { 1 },
@@ -576,7 +629,10 @@ pub(crate) async fn run(
         None,
         None,
         Some(&history),
-        cloud_management.as_ref(),
+        PanelManagement {
+            cloud: cloud_management.as_ref(),
+            tasks: scheduled_tasks.as_ref(),
+        },
     ) else {
         return;
     };
@@ -609,11 +665,13 @@ pub(crate) async fn run(
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
                 let next_history = history_rx.borrow_and_update().clone();
-                if next != last || config_pending || next_history != history {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), cloud_management.as_ref()) else { return; };
+                let next_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None};
+                if next != last || config_pending || next_history != history || next_tasks != scheduled_tasks {
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref()}) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     history = next_history;
+                    scheduled_tasks = next_tasks;
                     config_pending = false;
                 }
             },
@@ -632,12 +690,14 @@ pub(crate) async fn run(
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
+                    let refresh_tasks = request.action.starts_with("schedule.task.");
                     if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref(), cloud_app.as_ref()).await).await.is_err() { return; }
-                    if refresh_wifi || refresh_apn || refresh_cooling {
+                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), cloud_management.as_ref())
+                        if refresh_tasks { scheduled_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None}; }
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref()})
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -738,10 +798,19 @@ mod tests {
         };
         let reviewed =
             json!({"state":"connected","enabled":true,"password_configured":true,"services":[]});
-        let Message::Text(raw) =
-            state_message_with_config(&snapshot, 1, None, None, None, None, Some(&reviewed))
-                .unwrap()
-        else {
+        let Message::Text(raw) = state_message_with_config(
+            &snapshot,
+            1,
+            None,
+            None,
+            None,
+            None,
+            PanelManagement {
+                cloud: Some(&reviewed),
+                tasks: None,
+            },
+        )
+        .unwrap() else {
             panic!("expected text frame")
         };
         let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -751,6 +820,38 @@ mod tests {
                 .get("password")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn scheduled_tasks_only_leave_through_an_open_panel_session() {
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::new(),
+        };
+        let tasks = json!({"supported":true,"tasks":[{"id":"fixture","time":"23:59","repeat_daily":false,"action":"nfc.set","params":{"enabled":true},"last_attempt_date":"","has_triggered":false,"last_result":""}],"error":null});
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected state");
+        };
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain["snapshot"].get("scheduled_tasks").is_none());
+        let Message::Text(raw) = state_message_with_config(
+            &snapshot,
+            2,
+            None,
+            None,
+            None,
+            None,
+            PanelManagement {
+                cloud: None,
+                tasks: Some(&tasks),
+            },
+        )
+        .unwrap() else {
+            panic!("expected panel state");
+        };
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["snapshot"]["scheduled_tasks"], tasks);
     }
 
     #[test]
@@ -769,10 +870,16 @@ mod tests {
         };
         let plain: Value = serde_json::from_str(&plain).unwrap();
         assert!(plain["snapshot"].get("traffic_history").is_none());
-        let Message::Text(with_history) =
-            state_message_with_config(&snapshot, 1, None, None, None, Some(&history), None)
-                .unwrap()
-        else {
+        let Message::Text(with_history) = state_message_with_config(
+            &snapshot,
+            1,
+            None,
+            None,
+            None,
+            Some(&history),
+            PanelManagement::default(),
+        )
+        .unwrap() else {
             panic!("expected a text frame")
         };
         let with_history: Value = serde_json::from_str(&with_history).unwrap();
@@ -830,6 +937,8 @@ mod tests {
         assert!(needs_confirmation("cooling.liquid.set_mode"));
         assert!(needs_confirmation("speedtest.start"));
         assert!(needs_confirmation("cloud.remote_features.set"));
+        assert!(needs_confirmation("schedule.task.put"));
+        assert!(needs_confirmation("schedule.task.remove"));
         assert!(!needs_confirmation("speedtest.stop"));
         for action in [
             "wifi.set_dual_band",
