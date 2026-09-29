@@ -18,7 +18,7 @@ use axum::{
     extract::rejection::JsonRejection,
     extract::{ConnectInfo, Request, WebSocketUpgrade},
     extract::{Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
@@ -632,7 +632,12 @@ impl App {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
         if open_auth_routes {
-            router = router.layer(middleware::from_fn(lan_source_filter));
+            // Outside `authenticate` so a browser preflight (which carries no
+            // token) is answered instead of rejected, inside the LAN filter so
+            // off-LAN peers never receive CORS grants.
+            router = router
+                .layer(middleware::from_fn(lan_cors))
+                .layer(middleware::from_fn(lan_source_filter));
         }
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -668,6 +673,89 @@ fn ipv4_lan_source_allowed(ip: Ipv4Addr) -> bool {
         || ip.is_loopback()
         || ip.is_link_local()
         || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+}
+
+/// Browser pages (dashboards, the UFI page) reach the LAN listener from another
+/// origin. Without CORS headers the browser blocks both `fetch` (its
+/// `Authorization` header forces a preflight that used to get a 401) and
+/// `EventSource`, so the token-authenticated HTTP/SSE API was unusable from any
+/// web page. Only origins that are themselves on the local network are echoed
+/// back: a page on the public Internet cannot use the victim's browser to reach
+/// (or password-guess) `/auth/login` on a LAN router.
+fn cors_origin_allowed(origin: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.path() != "/"
+        || url.query().is_some()
+        || !url.username().is_empty()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return lan_source_allowed(ip);
+    }
+    let name = host.to_ascii_lowercase();
+    !name.contains('.')
+        || [".local", ".lan", ".home.arpa"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+async fn lan_cors(request: Request, next: Next) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .filter(|origin| cors_origin_allowed(origin))
+        .and_then(|origin| HeaderValue::from_str(origin).ok());
+    let Some(origin) = origin else {
+        return next.run(request).await;
+    };
+    let private_network = request
+        .headers()
+        .get("access-control-request-private-network")
+        .is_some_and(|value| value == "true");
+    let mut response = if request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        let mut preflight = StatusCode::NO_CONTENT.into_response();
+        let headers = preflight.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static(
+                "authorization, content-type, x-auth-token, x-web-token, x-z-mode, x-z-tag",
+            ),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+        if private_network {
+            headers.insert(
+                "access-control-allow-private-network",
+                HeaderValue::from_static("true"),
+            );
+        }
+        preflight
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    headers.append(header::VARY, HeaderValue::from_static("Origin"));
+    response
 }
 
 async fn lan_source_filter(request: Request, next: Next) -> Response {
@@ -1730,6 +1818,39 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cors_origins_are_limited_to_the_local_network() {
+        for allowed in [
+            "http://192.168.0.2:2333",
+            "https://10.1.2.3",
+            "http://172.16.5.9:8080",
+            "http://100.64.1.1",
+            "http://127.0.0.1:2333",
+            "http://[::1]:2333",
+            "http://[fd00::5]",
+            "http://router",
+            "http://zte.lan",
+            "http://ufi.local:2333",
+            "http://localhost:3000",
+        ] {
+            assert!(cors_origin_allowed(allowed), "{allowed}");
+        }
+        for denied in [
+            "null",
+            "",
+            "https://evil.example.com",
+            "http://8.8.8.8",
+            "http://[2001:4860::1]",
+            "https://nms.ericsfj.com",
+            "http://192.168.0.2:2333/path",
+            "http://user@192.168.0.2",
+            "ftp://192.168.0.2",
+            "file://",
+        ] {
+            assert!(!cors_origin_allowed(denied), "{denied}");
+        }
+    }
+
     use std::collections::HashSet;
     #[test]
     fn version_shape() {

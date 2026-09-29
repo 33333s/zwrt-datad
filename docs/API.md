@@ -317,6 +317,10 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 
 上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、UFI 自身 OTA、插件、数据库和业务逻辑。datad 自身更新由本机 `/ota/*` 接口完成，UFI 只提供鉴权代理和设置界面。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
 
+### 浏览器跨域访问（CORS）
+
+网页（自建面板、UFI 页面等）与 9461 不同源，浏览器会先发无 Token 的 `OPTIONS` 预检，且 `EventSource` 必须读到 `Access-Control-Allow-Origin`。9461 现在对**来源本身位于内网**的页面放行：`Origin` 的主机是私网/回环/链路本地/100.64.0.0/10 的 IP、无点号的主机名，或以 `.local`、`.lan`、`.home.arpa` 结尾的域名时，原样回显该 `Origin`，预检返回 `204`（`Allow-Methods: GET, POST, OPTIONS`，允许 `authorization`、`content-type`、`x-auth-token`、`x-web-token`、`x-z-mode`、`x-z-tag`，`Max-Age: 600`；带 `Access-Control-Request-Private-Network: true` 时回 `Access-Control-Allow-Private-Network: true`）。`401` 等错误响应同样带该头，页面才能读到状态码。公网域名、`null`、带路径或用户名的 Origin 不放行，因此公网网页不能借访问者的浏览器猜测内网设备的 `/auth/login` 口令。Token 仍必须通过请求头或 `?access_token=` 提供；本机 9460 不变。
+
 内网读取与 SSE 示例：
 
 ```sh
