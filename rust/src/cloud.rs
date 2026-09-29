@@ -1,4 +1,4 @@
-use crate::model::Snapshot;
+use crate::{model::Snapshot, webshell::WebShell};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use rumqttc::{
@@ -18,7 +18,7 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Once},
+    sync::{Arc, Mutex, Once, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -227,7 +227,16 @@ impl Cloud {
 
     /// U50 runs its own collector and only permits the NMS read-only panel.
     /// The config is supplied explicitly and never written by this runtime.
-    pub fn start_panel_only(file: &Path, state: watch::Receiver<Snapshot>) -> Result<(), String> {
+    ///
+    /// `webshell` is the process-level opt-in for the NMS remote terminal
+    /// (`--u50-enable-webshell`). It only takes effect together with
+    /// `remote_webshell_enabled: true` in the private config, so a shell needs
+    /// two independent owner decisions.
+    pub fn start_panel_only(
+        file: &Path,
+        state: watch::Receiver<Snapshot>,
+        webshell: bool,
+    ) -> Result<(), String> {
         let metadata = fs::metadata(file).map_err(|_| "U50 panel config unavailable")?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
             return Err("U50 panel config must be a private regular file".into());
@@ -246,7 +255,10 @@ impl Cloud {
         validate(&validated)?;
         config.services.clear();
         config.remote_panel_control_enabled = false;
-        config.remote_webshell_enabled = false;
+        config.remote_webshell_enabled = webshell && config.remote_webshell_enabled;
+        if config.remote_webshell_enabled {
+            PANEL_SHELL.get_or_init(|| WebShell::new(true));
+        }
         let (tx, rx) = watch::channel(Some(config));
         let status = Arc::new(Mutex::new(Status::default()));
         tokio::spawn(async move {
@@ -618,7 +630,10 @@ async fn session(
     );
     let webshell_available = app
         .as_ref()
-        .is_some_and(|app| app.cloud_webshell_available());
+        .is_some_and(|app| app.cloud_webshell_available())
+        || (panel_only
+            && config.remote_webshell_enabled
+            && PANEL_SHELL.get().is_some_and(WebShell::enabled));
     let mut updates = JoinSet::new();
     let mut connected = false;
     let mut enrolled = !pending;
@@ -956,10 +971,15 @@ struct BridgeState {
     seen: HashMap<String, i64>,
 }
 
+/// Terminal used by the U50 panel-only runtime, which has no full `App`.
+/// Set once at startup and only when the U50 WebShell opt-in is active.
+static PANEL_SHELL: OnceLock<WebShell> = OnceLock::new();
+
 #[derive(Clone)]
 struct BridgeManager {
     config: Config,
     app: Option<crate::server::App>,
+    panel_shell: Option<WebShell>,
     panel_state: Option<watch::Receiver<Snapshot>>,
     state: Arc<AsyncMutex<BridgeState>>,
     shutdown: watch::Sender<bool>,
@@ -975,19 +995,37 @@ impl BridgeManager {
         Self {
             config,
             app,
+            panel_shell: panel_state
+                .as_ref()
+                .and_then(|_| PANEL_SHELL.get().cloned()),
             panel_state,
             state: Arc::new(AsyncMutex::new(BridgeState::default())),
             shutdown,
         }
     }
 
+    #[cfg(test)]
+    fn with_panel_shell(mut self, shell: Option<WebShell>) -> Self {
+        self.panel_shell = shell;
+        self
+    }
+
     fn shutdown(&self) {
         self.shutdown.send_replace(true);
     }
 
+    fn shell(&self) -> Option<WebShell> {
+        self.app
+            .as_ref()
+            .map(crate::server::App::cloud_webshell)
+            .or_else(|| self.panel_shell.clone())
+    }
+
     async fn receive(&self, command: RemoteCommand) -> Option<Value> {
         let reject = |code: String| json!({"request_id":command.request_id,"status":"rejected","error":{"code":code}});
-        if self.panel_state.is_some() && command.target_service != "datad_panel" {
+        let panel_terminal = command.target_service == "webshell" && self.panel_shell.is_some();
+        if self.panel_state.is_some() && command.target_service != "datad_panel" && !panel_terminal
+        {
             return Some(reject("panel_only".into()));
         }
         if let Err(error) = validate_remote(&self.config, &command) {
@@ -1002,10 +1040,14 @@ impl BridgeManager {
             return Some(reject("session_limit".into()));
         }
         let shell_permit = if command.target_service == "webshell" {
-            let Some(app) = &self.app else {
-                return Some(reject("webshell_disabled".into()));
+            let slot = match (&self.app, &self.panel_shell) {
+                (Some(app), _) => app.cloud_webshell_slot(),
+                (None, Some(shell)) if shell.enabled() => {
+                    shell.try_acquire().ok_or("webshell_session_limit")
+                }
+                _ => Err("webshell_disabled"),
             };
-            match app.cloud_webshell_slot() {
+            match slot {
                 Ok(permit) => Some(permit),
                 Err(error) => return Some(reject(error.into())),
             }
@@ -1036,9 +1078,9 @@ impl BridgeManager {
         shell_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         if let Some(permit) = shell_permit {
-            if let Some(app) = &self.app {
+            if let Some(shell) = self.shell() {
                 crate::cloud_shell::run(
-                    app.cloud_webshell(),
+                    shell,
                     &self.config,
                     &command.remote_url,
                     &command.token,
@@ -2480,6 +2522,60 @@ mod tests {
             *manager.shutdown.subscribe().borrow(),
             "shutdown lost before subscription"
         );
+    }
+
+    #[tokio::test]
+    async fn u50_panel_terminal_needs_both_process_and_config_opt_in() {
+        let (_tx, state) = watch::channel(Snapshot {
+            ts: 1,
+            datad: Default::default(),
+            fields: Default::default(),
+        });
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            services: Vec::new(),
+            ..Default::default()
+        };
+        let command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "u50-shell".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://nms.example.com/api/remote/device/u50-shell".into(),
+            token: "a".repeat(64),
+            target_service: "webshell".into(),
+            target_port: 0,
+            target_ports: Vec::new(),
+            ttl_seconds: 60,
+        };
+        let code = |reply: Option<Value>| reply.unwrap()["error"]["code"].clone();
+        // No process-level opt-in: the U50 runtime stays panel-only.
+        let manager =
+            BridgeManager::new(config.clone(), None, Some(state.clone())).with_panel_shell(None);
+        assert_eq!(code(manager.receive(command.clone()).await), "panel_only");
+        // Process opt-in but the owner's cloud.json does not allow a shell.
+        let manager = BridgeManager::new(config.clone(), None, Some(state.clone()))
+            .with_panel_shell(Some(WebShell::new(true)));
+        assert_eq!(
+            code(manager.receive(command.clone()).await),
+            "webshell_disabled"
+        );
+        // Both enabled: the request reaches the ordinary terminal validation
+        // (over-long sessions are refused), and proxies stay rejected.
+        config.remote_webshell_enabled = true;
+        let manager = BridgeManager::new(config, None, Some(state))
+            .with_panel_shell(Some(WebShell::new(true)));
+        let mut long = command.clone();
+        long.ttl_seconds = 3600;
+        assert_eq!(
+            code(manager.receive(long).await),
+            "invalid_webshell_request"
+        );
+        let mut proxy = command;
+        proxy.target_service = "router_web".into();
+        proxy.target_port = 80;
+        assert_eq!(code(manager.receive(proxy).await), "panel_only");
     }
 
     #[tokio::test]

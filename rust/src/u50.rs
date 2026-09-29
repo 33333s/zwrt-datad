@@ -1162,15 +1162,26 @@ async fn collect(
     Ok(snapshot)
 }
 
+/// Explicit owner opt-ins for the U50 runtime; both default to off.
+#[derive(Clone, Copy, Default)]
+pub struct RunOptions {
+    pub enable_writes: bool,
+    pub enable_webshell: bool,
+}
+
 pub async fn run(
     model: Model,
     goform_url: &str,
     bind: SocketAddr,
     once: bool,
     interval: Duration,
-    enable_writes: bool,
+    options: RunOptions,
     panel_config: Option<&Path>,
 ) -> Result<()> {
+    let RunOptions {
+        enable_writes,
+        enable_webshell,
+    } = options;
     ensure!(
         bind.ip().is_loopback(),
         "U50 candidate server is loopback-only"
@@ -1202,7 +1213,8 @@ pub async fn run(
     };
     let (tx, _) = watch::channel(initial.clone());
     if let Some(file) = panel_config {
-        crate::cloud::Cloud::start_panel_only(file, tx.subscribe()).map_err(anyhow::Error::msg)?;
+        crate::cloud::Cloud::start_panel_only(file, tx.subscribe(), enable_webshell)
+            .map_err(anyhow::Error::msg)?;
     }
     let app = App {
         snapshot: Arc::new(RwLock::new(initial)),

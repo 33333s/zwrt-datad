@@ -59,6 +59,10 @@ struct Args {
     /// Optional private cloud.json for NMS read-only panel sessions on U50.
     #[arg(long)]
     u50_panel_config: Option<PathBuf>,
+    /// Allow the NMS remote terminal on the U50 panel runtime. Also needs
+    /// `remote_webshell_enabled: true` in the private cloud.json.
+    #[arg(long)]
+    u50_enable_webshell: bool,
     /// Save one-time NMS enrollment credentials from stdin into private cloud.json.
     #[arg(long)]
     u50_enroll_dir: Option<PathBuf>,
@@ -115,8 +119,14 @@ async fn main() -> Result<()> {
         "--u50-enable-writes requires --u50-model u50s"
     );
     anyhow::ensure!(
+        !args.u50_enable_webshell || args.u50_panel_config.is_some(),
+        "--u50-enable-webshell requires --u50-panel-config"
+    );
+    anyhow::ensure!(
         args.u50_model.is_some()
-            || (args.u50_panel_config.is_none() && args.u50_enroll_dir.is_none()),
+            || (args.u50_panel_config.is_none()
+                && args.u50_enroll_dir.is_none()
+                && !args.u50_enable_webshell),
         "U50 panel and enrollment options require --u50-model"
     );
     #[cfg(target_arch = "arm")]
@@ -154,7 +164,10 @@ async fn main() -> Result<()> {
             bind,
             args.once,
             Duration::from_millis(args.interval.clamp(500, 5000)),
-            args.u50_enable_writes,
+            u50::RunOptions {
+                enable_writes: args.u50_enable_writes,
+                enable_webshell: args.u50_enable_webshell,
+            },
             args.u50_panel_config.as_deref(),
         )
         .await;

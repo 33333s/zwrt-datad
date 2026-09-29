@@ -105,3 +105,12 @@ sync; mount -o remount,ro /; systemctl daemon-reload
 ```
 
 `Restart=on-failure` also covers the first seconds after boot when the OEM `cfg` store is not ready yet (datad exits until `cfg get model_name` works). The binary stays in `/etc_rw/zwrt-datad/`, so datad updates never touch the root filesystem again. `/etc_rw/zwrt-datad/service.sh` now only drives the unit (`start|stop|restart|status`). A firmware upgrade rewrites the root filesystem and removes the unit; repeat the steps above afterwards. Removal: remount read-write, delete the unit and the symlink, remount read-only.
+
+## NMS remote terminal (opt-in, v0.10.41)
+
+The mainline WebShell (PTY-backed, 4 sessions, 15 min idle, 1800 s cap) is available on the U50S panel runtime, but only through the NMS remote channel: the U50 server has no local `/webshell` route (ADB already provides a local shell). It stays off unless the owner makes **two** independent decisions:
+
+1. start datad with `--u50-enable-webshell` (together with `--u50-panel-config`), and
+2. set `"remote_webshell_enabled": true` in the private `cloud.json` (with `remote_enabled: true`).
+
+Without both, a `webshell` request is answered `panel_only` / `webshell_disabled`. Proxies, remote control and updates remain rejected in this runtime. When enabled the device advertises `datad.webshell`, and NMS accepts the terminal only for the bound owner as for mainline devices. To enable on the device, add the flag to `ExecStart` in `/etc/systemd/system/zwrt-datad.service` (remount `/` read-write for the edit, then read-only again), edit `cloud.json`, and `systemctl daemon-reload && sh /etc_rw/zwrt-datad/service.sh restart`.
