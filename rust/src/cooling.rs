@@ -381,26 +381,19 @@ async fn apply_liquid(c: &Config) -> Result<(), String> {
         "ZWRT_DATAD_LIQUID_DRIVE_PATH",
         "/sys/class/leds/aw_vibrator/atsin0",
     );
+    // The aw86320 driver only plays an atsin0 waveform while its thermal
+    // control is enabled: with thermal_enable=0 the write is stored but never
+    // played (ws_active stays 0), so "always on" silently stopped the pump.
+    // The OEM switch (set_liquid_by_ui) likewise only writes atsin0.
+    write(thermal, "1").await?;
     if c.liquid_always {
-        write(thermal.clone(), "0").await?;
-        let result = write(
+        write(
             drive,
             &format!("1023 {} 200", if c.liquid_level >= 2 { 200 } else { 60 }),
         )
-        .await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => match write(thermal, "1").await {
-                Ok(()) => Err(format!("{error}; liquid thermal control restored")),
-                Err(recovery) => Err(format!(
-                    "{error}; liquid thermal recovery failed: {recovery}"
-                )),
-            },
-        }
+        .await
     } else {
-        let stop = write(drive, "0 0 0").await;
-        let restore = write(thermal, "1").await;
-        stop.and(restore)
+        write(drive, "0 0 0").await
     }
 }
 async fn vendor(path: &str, value: bool) -> Result<(), String> {

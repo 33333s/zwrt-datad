@@ -164,7 +164,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 ## MU5252 Aggregation And Cooling
 
-已配置 datad 散热后，采样同步原厂常开开关的变化：风扇开启为128、关闭恢复自定义曲线，液冷开启为最高档、关闭交还 thermal。`cooling.vendor_sync_error` 报告同步失败。旧采样不会覆盖较新的 datad 控制请求；复用已有字段读取，不增加轮询。80°C 过热保护保持不变。
+已配置 datad 散热后，采样同步原厂常开开关的变化：风扇开启为128、关闭恢复自定义曲线，液冷开启为最高档、关闭交还 thermal。液冷始终保持驱动 `thermal_enable=1`，常开写原厂高档波形，关闭写 `0 0 0`；驱动在 `thermal_enable=0` 时只保存波形参数而不播放。`cooling.vendor_sync_error` 报告同步失败。旧采样不会覆盖较新的 datad 控制请求；复用已有字段读取，不增加轮询。80°C 过热保护保持不变。
 
 以下动作只应在 `/state` 实际输出 `aggregation` / `cooling` 的 MU5252 模板上显示：
 

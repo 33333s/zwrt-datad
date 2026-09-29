@@ -137,21 +137,26 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
             wait_for(lambda: state()["mode"] == "custom" and state()["pwm"] == 113, "native off did not restore curve")
 
             action("cooling.liquid.set_mode", {"mode": "low"})
-            assert (base / "liquid-drive").read_text() == "1023 60 200"
+            # Always-on is re-applied by the periodic tick; regular files (unlike
+            # sysfs) can be observed mid-rewrite, so wait for a stable value.
+            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 60 200", "liquid low drive")
             result = action("cooling.liquid.set_enabled", {"enabled": True})
             assert result["mode"] == "high" and result["amplitude"] == 200
-            assert (base / "liquid-drive").read_text() == "1023 200 200"
+            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 200 200", "liquid high drive")
+            # The driver ignores atsin0 while thermal control is disabled.
+            wait_for(lambda: (base / "liquid-thermal").read_text() == "1", "liquid thermal kept enabled")
             action("cooling.liquid.set_enabled", {"enabled": False})
-            assert (base / "liquid-drive").read_text() == "0 0 0"
+            wait_for(lambda: (base / "liquid-drive").read_text() == "0 0 0", "liquid stop drive")
             replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "1")
             wait_for(lambda: (base / "liquid-drive").read_text() == "1023 200 200", "native liquid on not high")
             replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "0")
-            wait_for(lambda: (base / "liquid-thermal").read_text() == "1", "native liquid off did not restore thermal")
+            wait_for(lambda: (base / "liquid-drive").read_text() == "0 0 0", "native liquid off did not stop drive")
+            assert (base / "liquid-thermal").read_text() == "1"
             wait_for(lambda: request("/state")[1]["cooling"]["vendor_sync_error"] is None, "native sync error")
             (base / "liquid-drive").unlink()
             (base / "liquid-drive").mkdir()
             code, result = request("/control", {"action":"cooling.liquid.set_enabled", "params":{"enabled":True}})
-            assert code == 502 and "liquid thermal control restored" in result["error"]["message"]
+            assert code == 502
             assert (base / "liquid-thermal").read_text() == "1"
             (base / "liquid-drive").rmdir()
             (base / "liquid-drive").write_text("0 0 0")
