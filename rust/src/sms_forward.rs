@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     fs::{self, DirBuilder, OpenOptions, Permissions},
     io::Write,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -372,11 +372,15 @@ async fn public_client(url: &Url) -> Result<Client, String> {
     if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
         return Err("invalid_destination".into());
     }
+    pinned_client(host, &addresses)
+}
+
+fn pinned_client(host: &str, addresses: &[SocketAddr]) -> Result<Client, String> {
     Client::builder()
         .no_proxy()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(10))
-        .resolve(host, addresses[0])
+        .resolve_to_addrs(host, addresses)
         .build()
         .map_err(|_| "destination_unavailable".into())
 }
@@ -635,7 +639,26 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(received.lock().unwrap().as_slice(), &[payload]);
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            std::slice::from_ref(&payload)
+        );
+        let pinned = pinned_client(
+            "example.test",
+            &[SocketAddr::from(([127, 0, 0, 1], 1)), addr],
+        )
+        .unwrap();
+        post_payload(
+            &pinned,
+            format!("http://example.test:{}/hook", addr.port())
+                .parse()
+                .unwrap(),
+            &payload,
+            "webhook",
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.lock().unwrap().len(), 2);
         assert!(
             post_payload(
                 &client,
