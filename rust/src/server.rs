@@ -121,7 +121,7 @@ impl App {
     ) -> Result<Value, String> {
         let mut manager = self.inner.sms_forward.lock().await;
         let baseline = if manager.requires_baseline(&input) {
-            Some(sms_forward::baseline().await?)
+            Some(sms_forward::fresh_baseline().await?)
         } else {
             None
         };

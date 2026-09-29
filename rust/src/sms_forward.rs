@@ -480,6 +480,11 @@ pub async fn baseline() -> Result<Value, String> {
     sms::snapshot().await.ok_or("sms_list_unavailable".into())
 }
 
+pub async fn fresh_baseline() -> Result<Value, String> {
+    sms::invalidate();
+    baseline().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
