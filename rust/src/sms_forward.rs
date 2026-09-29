@@ -60,6 +60,8 @@ struct Config {
     blacklist_phone: Vec<String>,
     #[serde(default)]
     blacklist_keywords: Vec<String>,
+    #[serde(default)]
+    nickname: String,
     seen: Vec<String>,
 }
 
@@ -83,6 +85,7 @@ impl Default for Config {
             power_quota_used: 0,
             blacklist_phone: Vec::new(),
             blacklist_keywords: Vec::new(),
+            nickname: String::new(),
             seen: Vec::new(),
         }
     }
@@ -101,6 +104,7 @@ pub struct Update {
     pub power_forward_enabled: Option<bool>,
     pub blacklist_phone: Option<Vec<String>>,
     pub blacklist_keywords: Option<Vec<String>>,
+    pub nickname: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +212,10 @@ fn valid_keyword(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn valid_nickname(value: &str) -> bool {
+    value.len() <= 255 && value == value.trim() && !value.chars().any(char::is_control)
+}
+
 fn blacklisted(config: &Config, message: &Message) -> bool {
     config
         .blacklist_phone
@@ -280,6 +288,7 @@ fn valid_config(config: &Config) -> bool {
             .collect::<HashSet<_>>()
             .len()
             == config.blacklist_keywords.len()
+        && valid_nickname(&config.nickname)
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
         && config.power_quota_used <= MAX_POWER_DAILY_SENDS
         && (config.power_quota_date.is_empty()
@@ -432,6 +441,8 @@ impl Forwarder {
             "rules_supported":true,
             "blacklist_phone_count":self.config.blacklist_phone.len(),
             "blacklist_keywords_count":self.config.blacklist_keywords.len(),
+            "nickname_supported":true,
+            "nickname":self.config.nickname,
             "last_result":self.last_result})
     }
 
@@ -511,6 +522,9 @@ impl Forwarder {
         }
         if let Some(keywords) = input.blacklist_keywords {
             next.blacklist_keywords = keywords;
+        }
+        if let Some(nickname) = input.nickname {
+            next.nickname = nickname;
         }
         if let Some(enabled) = power_change {
             let baseline = power_state(battery);
@@ -1003,6 +1017,7 @@ mod tests {
             power_forward_enabled: None,
             blacklist_phone: Some(phones),
             blacklist_keywords: Some(keywords),
+            nickname: None,
         };
         let empty = json!({"stale":false,"truncated":false,"list":[]});
         let status = manager
@@ -1082,6 +1097,7 @@ mod tests {
                     power_forward_enabled: None,
                     blacklist_phone: None,
                     blacklist_keywords: None,
+                    nickname: None,
                 },
                 Some(&old),
                 None,
@@ -1173,6 +1189,7 @@ mod tests {
             power_forward_enabled,
             blacklist_phone: None,
             blacklist_keywords: None,
+            nickname: None,
         };
         assert_eq!(
             manager
@@ -1288,6 +1305,7 @@ mod tests {
             power_forward_enabled: None,
             blacklist_phone: None,
             blacklist_keywords: None,
+            nickname: None,
         };
         let status = manager
             .update(
@@ -1359,7 +1377,8 @@ mod tests {
                         smtp: None,
                         power_forward_enabled: None,
                         blacklist_phone: None,
-                        blacklist_keywords: None
+                        blacklist_keywords: None,
+                        nickname: None
                     },
                     Some(&old),
                     None
@@ -1382,6 +1401,61 @@ mod tests {
                 & 0o777,
             0o600
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nickname_migrates_persists_and_clears_without_enabling_forwarding() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-forward-nickname-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(FILE_NAME),
+            br#"{"schema":1,"enabled":false,"method":"webhook","webhook_url":"","dingtalk_webhook":"","dingtalk_secret":"","seen":[]}"#,
+        )
+        .unwrap();
+        let mut manager = Forwarder::load(&dir);
+        assert_eq!(manager.status()["nickname"], "");
+        assert_eq!(manager.status()["nickname_supported"], true);
+        let update = |nickname: String| {
+            serde_json::from_value::<Update>(json!({
+                "enabled":false,"method":"webhook","nickname":nickname
+            }))
+            .unwrap()
+        };
+        for bad in [
+            " padded ".to_string(),
+            "line\nbreak".into(),
+            "a".repeat(256),
+        ] {
+            assert_eq!(
+                manager.update(update(bad), None, None).unwrap_err(),
+                "invalid_forward_config"
+            );
+        }
+        let status = manager
+            .update(update("客厅 U60".into()), None, None)
+            .unwrap();
+        assert_eq!(status["nickname"], "客厅 U60");
+        assert_eq!(status["enabled"], false);
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let mut reloaded = Forwarder::load(&dir);
+        assert_eq!(reloaded.status()["nickname"], "客厅 U60");
+        assert_eq!(
+            reloaded.update(update(String::new()), None, None).unwrap()["nickname"],
+            ""
+        );
+        assert_eq!(Forwarder::load(&dir).status()["nickname"], "");
         fs::remove_dir_all(dir).unwrap();
     }
 
