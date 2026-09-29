@@ -44,6 +44,11 @@ fn disabled() -> Value {
     json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""})
 }
 
+fn collector_supported(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 impl Manager {
     pub fn new(force: bool) -> Self {
         let base = std::env::var("ZWRT_DATAD_NEIGHBOR_DIR")
@@ -89,6 +94,7 @@ impl Manager {
         let mut out = self.latest.clone();
         out["enabled"] = json!(self.enabled);
         out["collector_running"] = json!(self.child.as_ref().and_then(Child::id).is_some());
+        out["collector_supported"] = json!(collector_supported(&self.diag));
         if let Some(sampled) = self.sampled_ms {
             out["sampled_at"] = json!(sampled / 1000);
             out["age_ms"] = json!(now_ms().saturating_sub(sampled));
@@ -105,7 +111,13 @@ impl Manager {
             self.latest["enabled"] = json!(true);
             self.latest["status"] = json!("starting");
             self.latest["reason"] = json!("none");
-            self.start().await?;
+            if let Err(error) = self.start().await {
+                self.shutdown().await;
+                self.latest = disabled();
+                self.latest["status"] = json!("error");
+                self.latest["reason"] = json!("collector_start_failed");
+                return Err(error);
+            }
         } else {
             self.shutdown().await;
             self.latest = disabled();
@@ -428,4 +440,62 @@ fn filter_cells(cells: Vec<Value>, net: &Value) -> Vec<Value> {
             Some(cell)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn collector_requires_an_executable_regular_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-neighbor-capability-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("diag_mdlog");
+        assert!(!collector_supported(&binary));
+        fs::write(&binary, b"fixture").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!collector_supported(&binary));
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(collector_supported(&binary));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_collector_start_clears_process_scoped_enablement() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-neighbor-start-failure-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let diag = dir.join("diag_mdlog");
+        fs::write(&diag, b"fixture").unwrap();
+        fs::set_permissions(&diag, fs::Permissions::from_mode(0o700)).unwrap();
+        let occupied = dir.join("occupied");
+        fs::write(&occupied, b"not a directory").unwrap();
+        let mut manager = Manager {
+            enabled: false,
+            base: occupied,
+            _config: dir.join("neighbor.json"),
+            diag,
+            lock: None,
+            run: None,
+            child: None,
+            generation: 0,
+            context: String::new(),
+            latest: disabled(),
+            sampled_ms: None,
+            fingerprint: 0,
+        };
+        assert!(manager.set_enabled(true).await.is_err());
+        assert!(!manager.enabled);
+        assert!(manager.child.is_none());
+        assert_eq!(manager.status()["status"], "error");
+        assert_eq!(manager.status()["reason"], "collector_start_failed");
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

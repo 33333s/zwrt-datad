@@ -61,6 +61,52 @@ fn exact_object<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
     (object.len() == 1).then(|| object.get(key)).flatten()
 }
 
+fn decimal_parameter(value: Option<&Value>, digits: usize, min: u64, max: u64) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        !text.is_empty()
+            && text.len() <= digits
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text
+                .parse::<u64>()
+                .is_ok_and(|number| (min..=max).contains(&number))
+    })
+}
+
+fn cell_lock_valid(params: &Value, nr: bool) -> bool {
+    params.as_object().is_some_and(|fields| {
+        fields.len() == if nr { 3 } else { 2 }
+            && decimal_parameter(fields.get("pci"), 4, 0, 1007)
+            && decimal_parameter(
+                fields.get(if nr { "arfcn" } else { "earfcn" }),
+                8,
+                1,
+                99_999_999,
+            )
+            && (!nr || decimal_parameter(fields.get("band"), 3, 1, 999))
+    })
+}
+
+fn scheduled_sms_valid(params: &Value) -> bool {
+    params.as_object().is_some_and(|fields| {
+        if fields.len() != 2 {
+            return false;
+        }
+        let Some(number) = fields.get("number").and_then(Value::as_str) else {
+            return false;
+        };
+        let digits = number.strip_prefix('+').unwrap_or(number);
+        let Some(text) = fields.get("text").and_then(Value::as_str) else {
+            return false;
+        };
+        (3..=32).contains(&number.len())
+            && !digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+            && !text.trim().is_empty()
+            && !text.chars().any(|ch| ch.is_control() && ch != '\n')
+            && text.encode_utf16().count() <= 280
+    })
+}
+
 fn action_valid(action: &str, params: &Value) -> bool {
     match action {
         "device.reboot"
@@ -69,6 +115,9 @@ fn action_valid(action: &str, params: &Value) -> bool {
         | "cellular.connect"
         | "cellular.disconnect"
         | "cell.unlock_all" => params.as_object().is_some_and(Map::is_empty),
+        "cell.lock_lte" => cell_lock_valid(params, false),
+        "cell.lock_nr" => cell_lock_valid(params, true),
+        "sms.send_scheduled" => scheduled_sms_valid(params),
         "cellular.set" => exact_object(params, "roaming")
             .and_then(Value::as_i64)
             .is_some_and(|value| value == 0 || value == 1),
@@ -104,6 +153,32 @@ fn action_valid(action: &str, params: &Value) -> bool {
         }),
         _ => false,
     }
+}
+
+pub fn scheduled_sms_params(input: &TaskInput, clock: &Clock) -> Option<Value> {
+    if input.action != "sms.send_scheduled"
+        || !scheduled_sms_valid(&input.params)
+        || !reboot_schedule::valid_date(&clock.date)
+        || !reboot_schedule::valid_time(&clock.time)
+    {
+        return None;
+    }
+    let number = input.params.get("number")?.as_str()?;
+    let text = input.params.get("text")?.as_str()?;
+    let mut message_hex = String::with_capacity(text.encode_utf16().count() * 4);
+    for unit in text.encode_utf16() {
+        use std::fmt::Write as _;
+        write!(&mut message_hex, "{unit:04X}").ok()?;
+    }
+    let sms_time = format!(
+        "{};{};{};{};{};00;+;0",
+        &clock.date[2..4],
+        &clock.date[5..7],
+        &clock.date[8..10],
+        &clock.time[0..2],
+        &clock.time[3..5]
+    );
+    Some(json!({"sender":"host","number":number,"message_hex":message_hex,"sms_time":sms_time}))
 }
 
 fn input_valid(input: &TaskInput) -> bool {
@@ -170,6 +245,8 @@ impl TaskSchedule {
         let clock = reboot_schedule::local_clock();
         json!({
             "supported":true,
+            "cell_lock_supported":true,
+            "sms_send_supported":true,
             "device_time":clock.as_ref().map(|clock| format!("{} {}",clock.date,clock.time)),
             "timezone_offset":clock.as_ref().map(|clock| clock.offset.as_str()),
             "tasks":self.stored.tasks,
@@ -335,6 +412,15 @@ mod tests {
         for (action, params) in [
             ("device.reboot", json!({})),
             ("sms.forward.device_info", json!({})),
+            ("cell.lock_lte", json!({"pci":"57","earfcn":"9510"})),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"78"}),
+            ),
+            (
+                "sms.send_scheduled",
+                json!({"number":"+8613800000000","text":"测试短信"}),
+            ),
             ("cellular.set", json!({"roaming":0})),
             ("network.set_mode", json!({"mode":"Only_LTE"})),
             ("nfc.set", json!({"enabled":false})),
@@ -354,9 +440,63 @@ mod tests {
             ),
             ("network.set_mode", json!({"mode":"anything"})),
             ("wifi.set_module", json!({"enabled":2})),
+            ("cell.lock_lte", json!({"pci":57,"earfcn":"9510"})),
+            ("cell.lock_lte", json!({"pci":"1008","earfcn":"9510"})),
+            ("cell.lock_lte", json!({"pci":"57","earfcn":"0"})),
+            (
+                "cell.lock_lte",
+                json!({"pci":"57","earfcn":"9510","shell":"reboot"}),
+            ),
+            ("cell.lock_nr", json!({"pci":"384","arfcn":"633984"})),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"N78"}),
+            ),
+            (
+                "cell.lock_nr",
+                json!({"pci":"384","arfcn":"633984","band":"78\n"}),
+            ),
+            ("sms.send_scheduled", json!({"number":"+","text":"测试"})),
+            ("sms.send_scheduled", json!({"number":"10086","text":"   "})),
+            ("sms.send_scheduled", json!({"number":10086,"text":"测试"})),
+            (
+                "sms.send_scheduled",
+                json!({"number":"10086","text":"字".repeat(281)}),
+            ),
+            (
+                "sms.send_scheduled",
+                json!({"number":"10086","text":"一\r二"}),
+            ),
+            (
+                "sms.send_scheduled",
+                json!({"number":"10086","text":"测试","sender":"sim2"}),
+            ),
         ] {
             assert!(!input_valid(&input(action, params)), "{action}");
         }
+    }
+
+    #[test]
+    fn scheduled_sms_encodes_unicode_and_uses_due_device_time() {
+        let task = input(
+            "sms.send_scheduled",
+            json!({"number":"10086","text":"短信🙂"}),
+        );
+        let clock = Clock {
+            date: "2026-09-29".into(),
+            time: "08:30".into(),
+            offset: "+0800".into(),
+        };
+        assert_eq!(
+            scheduled_sms_params(&task, &clock),
+            Some(json!({
+                "sender":"host",
+                "number":"10086",
+                "message_hex":"77ED4FE1D83DDE42",
+                "sms_time":"26;09;29;08;30;00;+;0"
+            }))
+        );
+        assert!(scheduled_sms_params(&input("device.reboot", json!({})), &clock).is_none());
     }
 
     #[test]

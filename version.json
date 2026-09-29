@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.41",
+    "version": "0.10.43",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：新增需双重显式开启的 NMS 远程终端（--u50-enable-webshell 且 cloud.json remote_webshell_enabled=true）"
+    "notes": "新增 ARM32 U50S 完整只读状态、systemd 自启说明与需双重显式开启的 NMS 远程终端；ARM64 行为不变"
   }
 }

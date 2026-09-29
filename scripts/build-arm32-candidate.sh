@@ -32,3 +32,26 @@ cp "rust/target/$TARGET/release/zwrt-datad" "build/zwrt-datad-armv7-candidate"
 file build/zwrt-datad-armv7-candidate | grep -q "ELF 32-bit.*ARM.*statically linked.*stripped"
 file build/zwrt-datad-armv7-candidate
 shasum -a 256 build/zwrt-datad-armv7-candidate
+
+# Release provenance for the ARMv7 asset (checked by scripts/publish-release.sh).
+VERSION="$(python3 -c 'import json; print(json.load(open("version.json"))["datad"]["version"])')"
+python3 - "$VERSION" "$(git rev-parse HEAD)" "$(shasum -a 256 build/zwrt-datad-armv7-candidate | awk '{print $1}')" >build/rust-release-provenance-armv7.json <<'PY'
+import json
+import sys
+
+version, commit, sha256 = sys.argv[1:]
+json.dump(
+    {
+        "implementation": "rust",
+        "target": "armv7-unknown-linux-musleabihf",
+        "version": version,
+        "commit": commit,
+        "asset": "zwrt-datad-armv7",
+        "sha256": sha256,
+    },
+    sys.stdout,
+    indent=2,
+    sort_keys=True,
+)
+sys.stdout.write("\n")
+PY
