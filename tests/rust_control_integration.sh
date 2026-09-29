@@ -277,6 +277,10 @@ post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","bla
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["rules_supported"] is True and d["result"]["blacklist_phone_count"] == 1 and d["result"]["blacklist_keywords_count"] == 1 and "10086" not in json.dumps(d) and "验证码" not in json.dumps(d)'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","blacklist_phone":[],"blacklist_keywords":[]}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["blacklist_phone_count"] == 0 and d["result"]["blacklist_keywords_count"] == 0'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","nickname":"客厅 U60"}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["nickname_supported"] is True and d["result"]["nickname"] == "客厅 U60" and d["result"]["enabled"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","nickname":""}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["nickname"] == "" and d["result"]["enabled"] is False'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
 status=$(curl -sS -o "$TMP/bad-forward.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"sms.forward.set","params":{"enabled":true,"method":"webhook","webhook_url":"http://127.0.0.1/private"}}' \

@@ -30,7 +30,7 @@ Content-Type: application/json
 | `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
 | `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项；远程 v2 要求 `confirmed=true` |
 | `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
-| `sms.forward.set` | `enabled`、`method=webhook|dingtalk|sms|smtp`，可选 `webhook_url` / `dingtalk_webhook` / `dingtalk_secret` / `sms_to_phone` / `smtp:{host,port,username,password?,to}` / `power_forward_enabled` / `blacklist_phone` / `blacklist_keywords` | 保存受限转发设置；省略目标字段则保留，URL 设为空串、手机号数组设为空或 SMTP 字段全部置空可在关闭该方式时清除；SMTP 只接受证书验证的 TLS 465 或 STARTTLS 587，省略密码表示保留设备上现有密码；有电池且读数可用的设备可单独启用电源状态通知，开启时记录当前基线，总开关关闭时不投递。号码/关键词黑名单是可清空的数组，命中的新短信只登记指纹不投递，规则不影响电源通知；首次启用总开关先强制刷新短信列表并建立基线；远程 v2 要求 `confirmed=true` |
+| `sms.forward.set` | `enabled`、`method=webhook|dingtalk|sms|smtp`，可选 `webhook_url` / `dingtalk_webhook` / `dingtalk_secret` / `sms_to_phone` / `smtp:{host,port,username,password?,to}` / `power_forward_enabled` / `blacklist_phone` / `blacklist_keywords` / `nickname` | 保存受限转发设置；省略目标字段则保留，URL 设为空串、手机号数组设为空或 SMTP 字段全部置空可在关闭该方式时清除；SMTP 只接受证书验证的 TLS 465 或 STARTTLS 587，省略密码表示保留设备上现有密码；有电池且读数可用的设备可单独启用电源状态通知，开启时记录当前基线，总开关关闭时不投递。号码/关键词黑名单是可清空的数组，命中的新短信只登记指纹不投递，规则不影响电源通知。设备别名最多 255 字节，空串清除，省略则保留；首次启用总开关先强制刷新短信列表并建立基线；远程 v2 要求 `confirmed=true` |
 | `sms.forward.test` | 无 | 向当前已配置目的地发送固定测试消息，不含真实收到的短信；短信方式会使用本机 SIM 向目标号码发短信并可能产生费用，SMTP 方式会发送一封测试邮件；远程 v2 要求 `confirmed=true` |
 | `device.poweroff` | 无 | 关闭设备 |
 
