@@ -19,39 +19,6 @@ const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/downl
 const PUBLIC_KEY: &str = include_str!("../ota_public.pem");
 const IDLE_FOR: Duration = Duration::from_secs(120);
 
-/// Platform-specific update behaviour. The ZWRT ARM64 devices keep the defaults;
-/// the ARM32 U50S has its own signed manifest, no curl/wget, a tiny data
-/// volume and a systemd-managed service.
-#[derive(Clone, Copy, Debug)]
-pub struct Profile {
-    /// Signed manifest file name (its signature is `<name>.sig`).
-    pub manifest: &'static str,
-    /// Minimum free bytes on the data volume before an install may start.
-    pub min_free_bytes: f64,
-    /// The daemon downloads and verifies the binary itself and hands the
-    /// installer a local file (`DATAD_BINARY_FILE`) instead of a URL.
-    pub download_in_process: bool,
-    /// Start the installer as a transient systemd unit so it survives the
-    /// restart of the service that spawned it.
-    pub detached_systemd: bool,
-}
-
-impl Profile {
-    pub const ZWRT: Profile = Profile {
-        manifest: "update.json",
-        min_free_bytes: 64.0 * 1024.0 * 1024.0,
-        download_in_process: false,
-        detached_systemd: false,
-    };
-    pub const U50: Profile = Profile {
-        manifest: "update-armv7.json",
-        // A 4.6 MB binary is staged next to the running one on a ~15 MB volume.
-        min_free_bytes: 7.0 * 1024.0 * 1024.0,
-        download_in_process: true,
-        detached_systemd: true,
-    };
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -147,7 +114,6 @@ pub struct Candidate {
 }
 
 pub struct Ota {
-    profile: Profile,
     dir: PathBuf,
     config: Config,
     status: Status,
@@ -161,10 +127,6 @@ pub struct Ota {
 
 impl Ota {
     pub fn load(dir: &Path) -> Result<Self, String> {
-        Self::load_with(dir, Profile::ZWRT)
-    }
-
-    pub fn load_with(dir: &Path, profile: Profile) -> Result<Self, String> {
         let key = parse_public_key(PUBLIC_KEY)?;
         let config = read_json::<Config>(&dir.join("ota.json"))
             .filter(|value| validate_config(value).is_ok())
@@ -177,7 +139,6 @@ impl Ota {
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            profile,
             dir: dir.to_owned(),
             config,
             status,
@@ -253,8 +214,7 @@ impl Ota {
         let mut errors = Vec::new();
         let mut valid_but_current = None;
         for base in self.servers() {
-            let manifest_name = self.profile.manifest;
-            let raw = match self.fetch(&source_url(&base, manifest_name), 1 << 20).await {
+            let raw = match self.fetch(&source_url(&base, "update.json"), 1 << 20).await {
                 Ok(value) => value,
                 Err(error) => {
                     errors.push(format!("{base}: {error}"));
@@ -262,7 +222,7 @@ impl Ota {
                 }
             };
             let encoded = match self
-                .fetch(&source_url(&base, &format!("{manifest_name}.sig")), 4096)
+                .fetch(&source_url(&base, "update.json.sig"), 4096)
                 .await
             {
                 Ok(value) => value,
@@ -335,56 +295,6 @@ impl Ota {
         snapshot: &Value,
         manual: bool,
     ) -> Result<(), String> {
-        let wrapper = self.prepare_install(candidate, snapshot, manual).await?;
-        self.status.state = "installing".into();
-        self.status.progress = 100;
-        self.save_status();
-        let spawned = if self.profile.detached_systemd {
-            // The installer restarts this very service; a child in the
-            // service's cgroup would be killed with it, so run it as its own
-            // transient unit.
-            Command::new("systemd-run")
-                .args([
-                    "--no-block",
-                    "--collect",
-                    "--quiet",
-                    "--unit=zwrt-datad-ota",
-                    "/bin/sh",
-                ])
-                .arg(&wrapper)
-                .kill_on_drop(false)
-                .status()
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|status| {
-                    status
-                        .success()
-                        .then_some(())
-                        .ok_or_else(|| format!("systemd-run exited with {status}"))
-                })
-        } else {
-            Command::new("/bin/sh")
-                .arg(&wrapper)
-                .kill_on_drop(false)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        if spawned.is_err() {
-            let _ = fs::remove_file(self.dir.join("zwrt-datad.new"));
-        }
-        spawned
-    }
-
-    /// Everything before launching the installer: safety gates, pinned
-    /// installer download, and (for in-process profiles) the verified binary.
-    /// Returns the wrapper script that runs the installer.
-    async fn prepare_install(
-        &mut self,
-        candidate: &Candidate,
-        snapshot: &Value,
-        manual: bool,
-    ) -> Result<PathBuf, String> {
         let reasons = self.safety(snapshot, manual);
         if !reasons.is_empty() {
             self.status.state = "waiting_idle".into();
@@ -397,11 +307,6 @@ impl Ota {
             .artifacts
             .get("installer")
             .ok_or("缺少安装器")?;
-        let binary = candidate
-            .manifest
-            .artifacts
-            .get("binary")
-            .ok_or("缺少二进制")?;
         self.status.state = "downloading".into();
         self.status.progress = 5;
         self.status.wait_reasons.clear();
@@ -414,31 +319,18 @@ impl Ota {
         }
         let installer_path = self.dir.join("ota-installer.sh");
         atomic_write(&installer_path, &raw, 0o700)?;
-        let binary_url = source_url(&candidate.base_url, &binary.name);
-        let input = if self.profile.download_in_process {
-            // Stage next to the running binary (same volume) so the installer's
-            // final step is an atomic rename.
-            self.status.progress = 30;
-            self.save_status();
-            let data = self.fetch(&binary_url, 16 << 20).await?;
-            if i64::try_from(data.len()).ok() != Some(binary.size)
-                || hex_sha256(&data) != binary.sha256
-            {
-                return Err("二进制大小或 SHA-256 校验失败".into());
-            }
-            let staged = self.dir.join("zwrt-datad.new");
-            atomic_write(&staged, &data, 0o700)?;
-            format!("DATAD_BINARY_FILE={}", shell_quote(&staged))
-        } else {
-            format!("DATAD_DOWNLOAD_URL={}", shell_quote(binary_url))
-        };
+        let binary = candidate
+            .manifest
+            .artifacts
+            .get("binary")
+            .ok_or("缺少二进制")?;
         let wrapper = self.dir.join("ota-run.sh");
         let result = self.dir.join("ota-result.log");
         let marker = self.dir.join("ota-install-result");
         let script = format!(
-            "#!/bin/sh\nsleep 2\nrm -f {}\nif {} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
+            "#!/bin/sh\nsleep 2\nrm -f {}\nif DATAD_DOWNLOAD_URL={} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
             shell_quote(&marker),
-            input,
+            shell_quote(source_url(&candidate.base_url, &binary.name)),
             shell_quote(&installer_path),
             shell_quote(&result),
             shell_quote(&marker),
@@ -446,7 +338,15 @@ impl Ota {
             shell_quote(&marker),
         );
         atomic_write(&wrapper, script.as_bytes(), 0o700)?;
-        Ok(wrapper)
+        self.status.state = "installing".into();
+        self.status.progress = 100;
+        self.save_status();
+        Command::new("/bin/sh")
+            .arg(&wrapper)
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn fail(&mut self, candidate: Option<&Candidate>, error: String) {
@@ -527,14 +427,10 @@ impl Ota {
         if battery.is_some_and(|value| value <= 10.0) {
             reasons.push("电量必须高于 10%".into());
         }
-        let min_free = self.profile.min_free_bytes;
         if number_at(snapshot, &["runtime", "storage", "available"])
-            .is_some_and(|value| value < min_free)
+            .is_some_and(|value| value < 64.0 * 1024.0 * 1024.0)
         {
-            reasons.push(format!(
-                "可用存储不足 {} MiB",
-                (min_free / (1024.0 * 1024.0)).ceil() as u64
-            ));
+            reasons.push("可用存储不足 64 MiB".into());
         }
         if manual {
             return reasons;
@@ -929,161 +825,6 @@ mod tests {
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");
         assert!(ota.status.signature_verified);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn u50_profile_uses_its_manifest_and_stages_a_verified_binary() {
-        let signing = SigningKey::from_bytes(&[11; 32]);
-        let binary = b"pretend armv7 binary".to_vec();
-        let installer = b"#!/bin/sh\nexit 0\n".to_vec();
-        let manifest = Manifest {
-            schema: 1,
-            version: "99.0.0".into(),
-            tag: "v99.0.0".into(),
-            published_at: "2026-09-30T00:00:00Z".into(),
-            artifacts: BTreeMap::from([
-                (
-                    "installer".into(),
-                    Artifact {
-                        name: "install-datad-armv7.sh".into(),
-                        size: installer.len() as i64,
-                        sha256: hex_sha256(&installer),
-                    },
-                ),
-                (
-                    "binary".into(),
-                    Artifact {
-                        name: "zwrt-datad-armv7".into(),
-                        size: binary.len() as i64,
-                        sha256: hex_sha256(&binary),
-                    },
-                ),
-            ]),
-        };
-        let raw = serde_json::to_vec(&manifest).unwrap();
-        let signature = STANDARD.encode(signing.sign(&raw).to_bytes());
-        let (served_binary, served_installer) = (binary.clone(), installer.clone());
-        let router = Router::new()
-            // The ARM64 manifest must never be read by the U50 profile.
-            .route("/x/update.json", get(|| async { "wrong manifest" }))
-            .route(
-                "/x/update-armv7.json",
-                get(move || {
-                    let v = raw.clone();
-                    async move { v }
-                }),
-            )
-            .route(
-                "/x/update-armv7.json.sig",
-                get(move || {
-                    let v = signature.clone();
-                    async move { v }
-                }),
-            )
-            .route(
-                "/x/install-datad-armv7.sh",
-                get(move || {
-                    let v = served_installer.clone();
-                    async move { v }
-                }),
-            )
-            .route(
-                "/x/zwrt-datad-armv7",
-                get(move || {
-                    let v = served_binary.clone();
-                    async move { v }
-                }),
-            )
-            .route(
-                "/tampered/update-armv7.json",
-                get({
-                    let v = serde_json::to_vec(&manifest).unwrap();
-                    move || {
-                        let v = v.clone();
-                        async move { v }
-                    }
-                }),
-            )
-            .route(
-                "/tampered/update-armv7.json.sig",
-                get({
-                    let v = STANDARD.encode(
-                        signing
-                            .sign(&serde_json::to_vec(&manifest).unwrap())
-                            .to_bytes(),
-                    );
-                    move || {
-                        let v = v.clone();
-                        async move { v }
-                    }
-                }),
-            )
-            .route(
-                "/tampered/install-datad-armv7.sh",
-                get({
-                    let v = installer.clone();
-                    move || {
-                        let v = v.clone();
-                        async move { v }
-                    }
-                }),
-            )
-            .route(
-                "/tampered/zwrt-datad-armv7",
-                get(|| async { "pretend armv7 binarY" }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let dir =
-            std::env::temp_dir().join(format!("zwrt-datad-ota-u50-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mut ota = Ota::load_with(&dir, Profile::U50).unwrap();
-        ota.key = signing.verifying_key();
-        ota.config.sources = vec!["custom".into()];
-        let roomy = json!({"runtime":{"storage":{"available":1.0e9}}});
-
-        ota.config.servers = vec![format!("http://{address}/x")];
-        let candidate = ota.check().await.unwrap();
-        assert_eq!(candidate.manifest.version, "99.0.0");
-
-        let tight = json!({"runtime":{"storage":{"available":1.0e6}}});
-        let error = ota
-            .prepare_install(&candidate, &tight, true)
-            .await
-            .unwrap_err();
-        assert!(error.contains("可用存储不足 7 MiB"), "{error}");
-        assert!(!dir.join("zwrt-datad.new").exists());
-
-        let wrapper = ota.prepare_install(&candidate, &roomy, true).await.unwrap();
-        assert_eq!(fs::read(dir.join("zwrt-datad.new")).unwrap(), binary);
-        assert_eq!(
-            fs::metadata(dir.join("zwrt-datad.new"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(fs::read(dir.join("ota-installer.sh")).unwrap(), installer);
-        let script = fs::read_to_string(wrapper).unwrap();
-        assert!(
-            script.contains("DATAD_BINARY_FILE=") && !script.contains("DATAD_DOWNLOAD_URL"),
-            "{script}"
-        );
-        let _ = fs::remove_file(dir.join("zwrt-datad.new"));
-
-        // A binary that does not match the signed manifest is refused and not staged.
-        ota.config.servers = vec![format!("http://{address}/tampered")];
-        let candidate = ota.check().await.unwrap();
-        let error = ota
-            .prepare_install(&candidate, &roomy, true)
-            .await
-            .unwrap_err();
-        assert!(error.contains("校验失败"), "{error}");
-        assert!(!dir.join("zwrt-datad.new").exists());
         let _ = fs::remove_dir_all(dir);
     }
 }
