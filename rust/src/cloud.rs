@@ -1,4 +1,4 @@
-use crate::{model::Snapshot, webshell::WebShell};
+use crate::model::Snapshot;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use rumqttc::{
@@ -18,7 +18,7 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Once, OnceLock},
+    sync::{Arc, Mutex, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -222,50 +222,7 @@ impl Cloud {
     pub fn start(&self, state: watch::Receiver<Snapshot>, app: crate::server::App) {
         let config = self.tx.subscribe();
         let status = self.status.clone();
-        tokio::spawn(async move { supervisor(config, state, status, Some(app), false).await });
-    }
-
-    /// U50 runs its own collector and only permits the NMS read-only panel.
-    /// The config is supplied explicitly and never written by this runtime.
-    ///
-    /// `webshell` is the process-level opt-in for the NMS remote terminal
-    /// (`--u50-enable-webshell`). It only takes effect together with
-    /// `remote_webshell_enabled: true` in the private config, so a shell needs
-    /// two independent owner decisions.
-    pub fn start_panel_only(
-        file: &Path,
-        state: watch::Receiver<Snapshot>,
-        webshell: bool,
-    ) -> Result<(), String> {
-        let metadata = fs::metadata(file).map_err(|_| "U50 panel config unavailable")?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err("U50 panel config must be a private regular file".into());
-        }
-        let raw = fs::read(file).map_err(|_| "U50 panel config unreadable")?;
-        let mut config: Config =
-            serde_json::from_slice(&raw).map_err(|_| "U50 panel config invalid")?;
-        if !config.enabled || !config.remote_enabled || config.platform_url.is_empty() {
-            return Err("U50 panel requires enabled cloud and remote access".into());
-        }
-        // The generic validator requires a proxy service for remote access.
-        // U50 has no proxy services: validate every other field, then discard
-        // any configured service before the MQTT session can advertise it.
-        let mut validated = config.clone();
-        validated.remote_enabled = false;
-        validate(&validated)?;
-        config.services.clear();
-        config.remote_panel_control_enabled = false;
-        config.remote_webshell_enabled = webshell && config.remote_webshell_enabled;
-        if config.remote_webshell_enabled {
-            PANEL_SHELL.get_or_init(|| WebShell::new(true));
-        }
-        let (tx, rx) = watch::channel(Some(config));
-        let status = Arc::new(Mutex::new(Status::default()));
-        tokio::spawn(async move {
-            let _keep_config = tx;
-            supervisor(rx, state, status, None, true).await
-        });
-        Ok(())
+        tokio::spawn(async move { supervisor(config, state, status, Some(app)).await });
     }
 
     pub fn public_config(&self) -> Value {
@@ -474,7 +431,6 @@ async fn supervisor(
     state_rx: watch::Receiver<Snapshot>,
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
-    panel_only: bool,
 ) {
     loop {
         let config = config_rx.borrow_and_update().clone();
@@ -500,7 +456,6 @@ async fn supervisor(
                 config_rx.clone(),
                 status.clone(),
                 app.clone(),
-                panel_only,
             )
             .await
             {
@@ -589,7 +544,6 @@ async fn session(
     mut config_rx: watch::Receiver<Option<Config>>,
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
-    panel_only: bool,
 ) -> SessionEnd {
     let pending = pending_username(&config.username);
     let enrollment_root = format!("onboard/{}", config.username);
@@ -623,17 +577,10 @@ async fn session(
     {
         return SessionEnd::Failed;
     }
-    let bridge = BridgeManager::new(
-        config.clone(),
-        app.clone(),
-        panel_only.then(|| state_rx.clone()),
-    );
+    let bridge = BridgeManager::new(config.clone(), app.clone());
     let webshell_available = app
         .as_ref()
-        .is_some_and(|app| app.cloud_webshell_available())
-        || (panel_only
-            && config.remote_webshell_enabled
-            && PANEL_SHELL.get().is_some_and(WebShell::enabled));
+        .is_some_and(|app| app.cloud_webshell_available());
     let mut updates = JoinSet::new();
     let mut connected = false;
     let mut enrolled = !pending;
@@ -682,7 +629,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some() || panel_only, panel_only).await.is_err() {
+                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -704,7 +651,7 @@ async fn session(
                             }
                             set_status(&status,"connected","");
                             let snapshot=state_rx.borrow().clone();
-                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some() || panel_only,panel_only).await.is_err() {
+                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some()).await.is_err() {
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
                             }
                         } else {
@@ -747,7 +694,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &snapshot, &status, webshell_available, app.is_some() || panel_only, panel_only).await.is_err() {
+                if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -788,20 +735,15 @@ async fn report(
     status: &Arc<Mutex<Status>>,
     webshell_available: bool,
     panel_available: bool,
-    panel_only: bool,
 ) -> Result<(), String> {
     let state = serde_json::to_value(snapshot).unwrap_or(Value::Null);
-    let mut capabilities = if panel_only {
-        Vec::new()
-    } else {
-        vec!["datad.update", "datad.remote", "datad.remote_origins"]
-    };
+    let mut capabilities = vec!["datad.update", "datad.remote", "datad.remote_origins"];
     if webshell_available {
         capabilities.push("datad.webshell");
     }
     if panel_available {
         capabilities.push("datad.panel");
-        if !panel_only && config.remote_enabled && config.remote_panel_control_enabled {
+        if config.remote_enabled && config.remote_panel_control_enabled {
             capabilities.push("datad.panel.control");
         }
     }
@@ -814,9 +756,9 @@ async fn report(
         "vendor":config.vendor,"model":config.model,"device_id":config.identity,
         "id_type":config.identity_type,"platform":config.platform,
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
-        "capabilities":capabilities,"remote_services":if panel_only { &[][..] } else { &config.services },"remote_enabled":config.remote_enabled,
+        "capabilities":capabilities,"remote_services":config.services,"remote_enabled":config.remote_enabled,
         "remote_origins":reported_remote_origins(config),
-        "remote_panel_control_enabled":!panel_only && config.remote_enabled && config.remote_panel_control_enabled && panel_available,
+        "remote_panel_control_enabled":config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     })).await?;
     publish(
@@ -971,63 +913,31 @@ struct BridgeState {
     seen: HashMap<String, i64>,
 }
 
-/// Terminal used by the U50 panel-only runtime, which has no full `App`.
-/// Set once at startup and only when the U50 WebShell opt-in is active.
-static PANEL_SHELL: OnceLock<WebShell> = OnceLock::new();
-
 #[derive(Clone)]
 struct BridgeManager {
     config: Config,
     app: Option<crate::server::App>,
-    panel_shell: Option<WebShell>,
-    panel_state: Option<watch::Receiver<Snapshot>>,
     state: Arc<AsyncMutex<BridgeState>>,
     shutdown: watch::Sender<bool>,
 }
 
 impl BridgeManager {
-    fn new(
-        config: Config,
-        app: Option<crate::server::App>,
-        panel_state: Option<watch::Receiver<Snapshot>>,
-    ) -> Self {
+    fn new(config: Config, app: Option<crate::server::App>) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             config,
             app,
-            panel_shell: panel_state
-                .as_ref()
-                .and_then(|_| PANEL_SHELL.get().cloned()),
-            panel_state,
             state: Arc::new(AsyncMutex::new(BridgeState::default())),
             shutdown,
         }
-    }
-
-    #[cfg(test)]
-    fn with_panel_shell(mut self, shell: Option<WebShell>) -> Self {
-        self.panel_shell = shell;
-        self
     }
 
     fn shutdown(&self) {
         self.shutdown.send_replace(true);
     }
 
-    fn shell(&self) -> Option<WebShell> {
-        self.app
-            .as_ref()
-            .map(crate::server::App::cloud_webshell)
-            .or_else(|| self.panel_shell.clone())
-    }
-
     async fn receive(&self, command: RemoteCommand) -> Option<Value> {
         let reject = |code: String| json!({"request_id":command.request_id,"status":"rejected","error":{"code":code}});
-        let panel_terminal = command.target_service == "webshell" && self.panel_shell.is_some();
-        if self.panel_state.is_some() && command.target_service != "datad_panel" && !panel_terminal
-        {
-            return Some(reject("panel_only".into()));
-        }
         if let Err(error) = validate_remote(&self.config, &command) {
             return Some(reject(error));
         }
@@ -1040,14 +950,10 @@ impl BridgeManager {
             return Some(reject("session_limit".into()));
         }
         let shell_permit = if command.target_service == "webshell" {
-            let slot = match (&self.app, &self.panel_shell) {
-                (Some(app), _) => app.cloud_webshell_slot(),
-                (None, Some(shell)) if shell.enabled() => {
-                    shell.try_acquire().ok_or("webshell_session_limit")
-                }
-                _ => Err("webshell_disabled"),
+            let Some(app) = &self.app else {
+                return Some(reject("webshell_disabled".into()));
             };
-            match slot {
+            match app.cloud_webshell_slot() {
                 Ok(permit) => Some(permit),
                 Err(error) => return Some(reject(error.into())),
             }
@@ -1058,7 +964,6 @@ impl BridgeManager {
             command.target_service.as_str(),
             "datad_panel" | "datad_panel_control"
         ) && self.app.is_none()
-            && self.panel_state.is_none()
         {
             return Some(reject("panel_unavailable".into()));
         }
@@ -1078,9 +983,9 @@ impl BridgeManager {
         shell_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         if let Some(permit) = shell_permit {
-            if let Some(shell) = self.shell() {
+            if let Some(app) = &self.app {
                 crate::cloud_shell::run(
-                    shell,
+                    app.cloud_webshell(),
                     &self.config,
                     &command.remote_url,
                     &command.token,
@@ -1097,30 +1002,16 @@ impl BridgeManager {
             command.target_service.as_str(),
             "datad_panel" | "datad_panel_control"
         ) {
-            let feeds = if let Some(app) = &self.app {
-                Some(crate::cloud_panel::PanelFeeds {
-                    state: app.cloud_panel_state(),
-                    history: app.cloud_panel_history(),
-                    schedule: Some(app.cloud_panel_schedule()),
-                    speedtest: Some(app.cloud_panel_speedtest()),
-                    cloud_app: Some(app.clone()),
-                })
-            } else {
-                self.panel_state.clone().map(|state| {
-                    let (_, history) = watch::channel(Vec::new());
-                    crate::cloud_panel::PanelFeeds {
-                        state,
-                        history,
-                        schedule: None,
-                        speedtest: None,
-                        cloud_app: None,
-                    }
-                })
-            };
-            if let Some(feeds) = feeds {
+            if let Some(app) = &self.app {
                 crate::cloud_panel::run(
-                    feeds,
-                    command.target_service == "datad_panel_control" && self.app.is_some(),
+                    crate::cloud_panel::PanelFeeds {
+                        state: app.cloud_panel_state(),
+                        history: app.cloud_panel_history(),
+                        schedule: Some(app.cloud_panel_schedule()),
+                        speedtest: Some(app.cloud_panel_speedtest()),
+                        cloud_app: Some(app.clone()),
+                    },
+                    command.target_service == "datad_panel_control",
                     &self.config,
                     &command.remote_url,
                     &command.token,
@@ -1872,7 +1763,7 @@ mod tests {
             fields: serde_json::Map::new(),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None, false));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None));
         let topic = tokio::time::timeout(Duration::from_secs(10), reports_rx.recv())
             .await
             .unwrap()
@@ -1969,7 +1860,7 @@ mod tests {
             fields: serde_json::Map::from_iter([("password".into(), json!("do-not-upload"))]),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None, false));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None));
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut connections = HashSet::new();
             while connections.len() < 2 {
@@ -2030,7 +1921,6 @@ mod tests {
                     config_rx,
                     Arc::new(Mutex::new(Status::default())),
                     None,
-                    false,
                 ),
             )
             .await
@@ -2512,7 +2402,7 @@ mod tests {
         command.remote_url = "wss://other.example.com/api/remote/device/native-session".into();
         assert!(validate_remote(&config, &command).is_err());
         command.remote_url = "wss://nms.example.com/api/remote/device/native-session".into();
-        let manager = BridgeManager::new(config, None, None);
+        let manager = BridgeManager::new(config, None);
         assert_eq!(
             manager.receive(command).await.unwrap()["error"]["code"],
             "webshell_disabled"
@@ -2521,99 +2411,6 @@ mod tests {
         assert!(
             *manager.shutdown.subscribe().borrow(),
             "shutdown lost before subscription"
-        );
-    }
-
-    #[tokio::test]
-    async fn u50_panel_terminal_needs_both_process_and_config_opt_in() {
-        let (_tx, state) = watch::channel(Snapshot {
-            ts: 1,
-            datad: Default::default(),
-            fields: Default::default(),
-        });
-        let mut config = Config {
-            enabled: true,
-            remote_enabled: true,
-            platform_url: "https://nms.example.com".into(),
-            services: Vec::new(),
-            ..Default::default()
-        };
-        let command = RemoteCommand {
-            protocol_version: 1,
-            request_id: "u50-shell".into(),
-            action: "remote.open".into(),
-            remote_url: "wss://nms.example.com/api/remote/device/u50-shell".into(),
-            token: "a".repeat(64),
-            target_service: "webshell".into(),
-            target_port: 0,
-            target_ports: Vec::new(),
-            ttl_seconds: 60,
-        };
-        let code = |reply: Option<Value>| reply.unwrap()["error"]["code"].clone();
-        // No process-level opt-in: the U50 runtime stays panel-only.
-        let manager =
-            BridgeManager::new(config.clone(), None, Some(state.clone())).with_panel_shell(None);
-        assert_eq!(code(manager.receive(command.clone()).await), "panel_only");
-        // Process opt-in but the owner's cloud.json does not allow a shell.
-        let manager = BridgeManager::new(config.clone(), None, Some(state.clone()))
-            .with_panel_shell(Some(WebShell::new(true)));
-        assert_eq!(
-            code(manager.receive(command.clone()).await),
-            "webshell_disabled"
-        );
-        // Both enabled: the request reaches the ordinary terminal validation
-        // (over-long sessions are refused), and proxies stay rejected.
-        config.remote_webshell_enabled = true;
-        let manager = BridgeManager::new(config, None, Some(state))
-            .with_panel_shell(Some(WebShell::new(true)));
-        let mut long = command.clone();
-        long.ttl_seconds = 3600;
-        assert_eq!(
-            code(manager.receive(long).await),
-            "invalid_webshell_request"
-        );
-        let mut proxy = command;
-        proxy.target_service = "router_web".into();
-        proxy.target_port = 80;
-        assert_eq!(code(manager.receive(proxy).await), "panel_only");
-    }
-
-    #[tokio::test]
-    async fn u50_panel_runtime_rejects_all_management_proxies() {
-        let config = Config {
-            enabled: true,
-            remote_enabled: true,
-            remote_panel_control_enabled: true,
-            platform_url: "https://nms.example.com".into(),
-            services: Vec::new(),
-            ..Default::default()
-        };
-        let (_tx, state) = watch::channel(Snapshot {
-            ts: 1,
-            datad: Default::default(),
-            fields: Default::default(),
-        });
-        let manager = BridgeManager::new(config, None, Some(state));
-        let mut command = RemoteCommand {
-            protocol_version: 1,
-            request_id: "u50-proxy-denied".into(),
-            action: "remote.open".into(),
-            remote_url: "wss://nms.example.com/api/remote/device/u50-proxy-denied".into(),
-            token: "a".repeat(64),
-            target_service: "router_web".into(),
-            target_port: 80,
-            target_ports: Vec::new(),
-            ttl_seconds: 60,
-        };
-        assert_eq!(
-            manager.receive(command.clone()).await.unwrap()["error"]["code"],
-            "panel_only"
-        );
-        command.target_service = "datad_panel_control".into();
-        command.target_port = 0;
-        assert_eq!(
-            manager.receive(command).await.unwrap()["error"]["code"],
-            "panel_only"
         );
     }
 
@@ -2694,7 +2491,7 @@ mod tests {
             fields: Default::default(),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status.clone(), None, false));
+        let task = tokio::spawn(supervisor(config_rx, state_rx, status.clone(), None));
         tokio::task::yield_now().await;
         config_tx
             .send(Some(Config {
@@ -2785,7 +2582,7 @@ mod tests {
         let status = Arc::new(Mutex::new(Status::default()));
         let session_task = tokio::spawn({
             let status = status.clone();
-            async move { session(&config, state_rx, config_rx, status, None, false).await }
+            async move { session(&config, state_rx, config_rx, status, None).await }
         });
         let mut found = HashSet::new();
         while found.len() < 3 {

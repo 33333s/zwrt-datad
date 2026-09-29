@@ -33,41 +33,9 @@ python3 scripts/render-installer.py "$asset" build/install-datad.sh
 sh -n build/install-datad.sh
 : "${DATAD_OTA_SIGNING_KEY_FILE:?Set DATAD_OTA_SIGNING_KEY_FILE to the protected Ed25519 private key}"
 python3 scripts/sign-update.py --key "$DATAD_OTA_SIGNING_KEY_FILE" --binary "$asset"
-# Optional ARM32 (U50S) asset, built by scripts/build-arm32-candidate.sh from
-# this same commit. It is uploaded next to the ARM64 assets and is not part of
-# the signed OTA manifest (U50 has no OTA).
-extra_assets=()
-if [[ -n "${DATAD_ARMV7_BINARY:-}" ]]; then
-    armv7_provenance=${DATAD_ARMV7_PROVENANCE:-build/rust-release-provenance-armv7.json}
-    file "$DATAD_ARMV7_BINARY" | grep -q 'ELF 32-bit.*ARM.*statically linked.*stripped' || { echo 'Expected a stripped static ARMv7 binary' >&2; exit 1; }
-    python3 - "$DATAD_ARMV7_BINARY" "$version" "$(git rev-parse HEAD)" "$armv7_provenance" <<'PY'
-import hashlib
-import json
-import sys
-
-binary, version, commit, provenance_path = sys.argv[1:]
-with open(provenance_path, encoding="utf-8") as handle:
-    provenance = json.load(handle)
-with open(binary, "rb") as handle:
-    digest = hashlib.sha256(handle.read()).hexdigest()
-expected = {
-    "implementation": "rust",
-    "target": "armv7-unknown-linux-musleabihf",
-    "version": version,
-    "commit": commit,
-    "asset": "zwrt-datad-armv7",
-    "sha256": digest,
-}
-if provenance != expected:
-    raise SystemExit(f"ARMv7 release provenance mismatch: {provenance!r} != {expected!r}")
-PY
-    cp "$DATAD_ARMV7_BINARY" build/zwrt-datad-armv7
-    (cd build && sha256sum zwrt-datad-armv7 > zwrt-datad-armv7.sha256)
-    extra_assets=(build/zwrt-datad-armv7 build/zwrt-datad-armv7.sha256)
-fi
 for required in "$asset" version.json scripts/service.sh build/install-datad.sh build/update.json build/update.json.sig; do
     [[ -s "$required" ]] || { echo "Missing required asset: $required" >&2; exit 1; }
 done
 gh release create "v$version" "$asset" version.json \
-    scripts/service.sh build/install-datad.sh build/update.json build/update.json.sig ${extra_assets[@]+"${extra_assets[@]}"} --repo 33333s/zwrt-datad \
+    scripts/service.sh build/install-datad.sh build/update.json build/update.json.sig --repo 33333s/zwrt-datad \
     --target "$(git rev-parse HEAD)" --title "zwrt-datad v$version" --notes-file "$notes_file"

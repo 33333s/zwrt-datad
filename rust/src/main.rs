@@ -23,10 +23,6 @@ mod speedtest;
 mod state;
 mod task_schedule;
 mod traffic_history;
-mod u50;
-mod u50_oem;
-mod u50_oem_ids;
-mod u50_sys;
 mod usb;
 mod webshell;
 mod wifi;
@@ -50,24 +46,6 @@ fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()
 struct Args {
     #[arg(long)]
     once: bool,
-    /// Explicit read-only candidate for original-firmware U50 devices.
-    #[arg(long, value_parser = ["u50pro", "u50s"])]
-    u50_model: Option<String>,
-    /// Enable authenticated OEM write compatibility on the loopback U50S server.
-    #[arg(long)]
-    u50_enable_writes: bool,
-    /// Optional private cloud.json for NMS read-only panel sessions on U50.
-    #[arg(long)]
-    u50_panel_config: Option<PathBuf>,
-    /// Allow the NMS remote terminal on the U50 panel runtime. Also needs
-    /// `remote_webshell_enabled: true` in the private cloud.json.
-    #[arg(long)]
-    u50_enable_webshell: bool,
-    /// Save one-time NMS enrollment credentials from stdin into private cloud.json.
-    #[arg(long)]
-    u50_enroll_dir: Option<PathBuf>,
-    #[arg(long, default_value = "http://127.0.0.1/goform/goform_get_cmd_process")]
-    u50_goform_url: String,
     /// Print USB sysfs link status without starting services or changing device state.
     #[arg(long)]
     usb_status: bool,
@@ -114,64 +92,6 @@ async fn main() -> Result<()> {
         }
     }
     let args = Args::parse();
-    anyhow::ensure!(
-        args.u50_model.is_some() || !args.u50_enable_writes,
-        "--u50-enable-writes requires --u50-model u50s"
-    );
-    anyhow::ensure!(
-        !args.u50_enable_webshell || args.u50_panel_config.is_some(),
-        "--u50-enable-webshell requires --u50-panel-config"
-    );
-    anyhow::ensure!(
-        args.u50_model.is_some()
-            || (args.u50_panel_config.is_none()
-                && args.u50_enroll_dir.is_none()
-                && !args.u50_enable_webshell),
-        "U50 panel and enrollment options require --u50-model"
-    );
-    #[cfg(target_arch = "arm")]
-    anyhow::ensure!(
-        args.u50_model.is_some(),
-        "ARM32 candidate requires --u50-model u50pro|u50s"
-    );
-    if let Some(model) = &args.u50_model {
-        anyhow::ensure!(
-            args.u50_enroll_dir.is_none()
-                || (args.u50_panel_config.is_none() && !args.once && !args.u50_enable_writes),
-            "--u50-enroll-dir cannot be combined with server, write, or --once options"
-        );
-        anyhow::ensure!(
-            !args.once || args.u50_panel_config.is_none(),
-            "--u50-panel-config requires a running U50 server"
-        );
-        anyhow::ensure!(
-            args.lan_bind.is_none() && !args.neighbor && !args.webshell && args.identity.is_none(),
-            "U50 candidate mode supports read-only loopback state only"
-        );
-        let model = u50::Model::parse(model)?;
-        if let Some(dir) = &args.u50_enroll_dir {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::io::stdin().take(513).read_to_end(&mut bytes)?;
-            anyhow::ensure!(bytes.len() <= 512, "U50 enrollment input too large");
-            let input: cloud::QuickConnect = serde_json::from_slice(&bytes)?;
-            return u50::enroll(model, dir, input).await;
-        }
-        let bind: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
-        return u50::run(
-            model,
-            &args.u50_goform_url,
-            bind,
-            args.once,
-            Duration::from_millis(args.interval.clamp(500, 5000)),
-            u50::RunOptions {
-                enable_writes: args.u50_enable_writes,
-                enable_webshell: args.u50_enable_webshell,
-            },
-            args.u50_panel_config.as_deref(),
-        )
-        .await;
-    }
     if args.usb_status {
         println!("{}", serde_json::to_string(&usb::snapshot())?);
         return Ok(());
