@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.35",
+    "version": "0.10.36",
     "asset": "zwrt-datad-aarch64",
-    "notes": "为 NMS 原版远程面板增加短信转发黑名单规则"
+    "notes": "修复 MU5252 液冷常开驱动使能与实际播放状态读回"
   }
 }
