@@ -1,6 +1,6 @@
-//! Opt-in SMS forwarding over fixed HTTPS POST or the device's own SIM.
+//! Opt-in SMS forwarding over fixed HTTPS POST, authenticated SMTP or the device's own SIM.
 //! This does not execute UFI's legacy curl_text or copy its local database.
-use crate::{reboot_schedule, sms};
+use crate::{reboot_schedule, sms, smtp_forward};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, header::DATE, redirect::Policy};
 use ring::hmac;
@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 const FILE_NAME: &str = "sms-forward.json";
 const MAX_FILE_BYTES: u64 = 128 * 1024;
@@ -24,7 +25,7 @@ const MAX_SMS_TARGETS: usize = 3;
 const MAX_SMS_DAILY_SENDS: u16 = 60;
 const MAX_SMS_UNITS: usize = 280;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     schema: u8,
@@ -39,6 +40,8 @@ struct Config {
     sms_quota_date: String,
     #[serde(default)]
     sms_quota_used: u16,
+    #[serde(default)]
+    smtp: smtp_forward::Settings,
     seen: Vec<String>,
 }
 
@@ -54,12 +57,13 @@ impl Default for Config {
             sms_to_phone: Vec::new(),
             sms_quota_date: String::new(),
             sms_quota_used: 0,
+            smtp: smtp_forward::Settings::default(),
             seen: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Update {
     pub enabled: bool,
@@ -68,6 +72,7 @@ pub struct Update {
     pub dingtalk_webhook: Option<String>,
     pub dingtalk_secret: Option<String>,
     pub sms_to_phone: Option<Vec<String>>,
+    pub smtp: Option<smtp_forward::Update>,
 }
 
 #[derive(Clone)]
@@ -83,6 +88,7 @@ pub struct Destination {
     dingtalk_webhook: String,
     dingtalk_secret: String,
     sms_to_phone: Vec<String>,
+    smtp: smtp_forward::Settings,
 }
 
 impl Message {
@@ -101,7 +107,7 @@ pub struct Forwarder {
     last_result: &'static str,
 }
 
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();
@@ -160,7 +166,10 @@ fn phone_matches(a: &str, b: &str) -> bool {
 
 fn valid_config(config: &Config) -> bool {
     config.schema == 1
-        && matches!(config.method.as_str(), "webhook" | "dingtalk" | "sms")
+        && matches!(
+            config.method.as_str(),
+            "webhook" | "dingtalk" | "sms" | "smtp"
+        )
         && config.dingtalk_secret.len() <= 256
         && !config.dingtalk_secret.chars().any(char::is_control)
         && config.seen.len() <= MAX_SEEN
@@ -174,6 +183,7 @@ fn valid_config(config: &Config) -> bool {
             .len()
             == config.sms_to_phone.len()
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
+        && config.smtp.safe()
         && (config.sms_quota_date.is_empty() || reboot_schedule::valid_date(&config.sms_quota_date))
         && config
             .seen
@@ -187,6 +197,7 @@ fn valid_config(config: &Config) -> bool {
                 "webhook" => !config.webhook_url.is_empty(),
                 "dingtalk" => !config.dingtalk_webhook.is_empty(),
                 "sms" => !config.sms_to_phone.is_empty(),
+                "smtp" => config.smtp.configured(),
                 _ => false,
             })
 }
@@ -256,7 +267,10 @@ impl Forwarder {
                 .ok()
                 .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_FILE_BYTES)
                 .and_then(|_| fs::read(&path).ok())
-                .and_then(|raw| serde_json::from_slice::<Config>(&raw).ok())
+                .and_then(|raw| {
+                    let raw = Zeroizing::new(raw);
+                    serde_json::from_slice::<Config>(&raw).ok()
+                })
                 .filter(valid_config)
         } else {
             Some(Config::default())
@@ -282,6 +296,8 @@ impl Forwarder {
             "dingtalk_secret_configured":!self.config.dingtalk_secret.is_empty(),
             "sms_configured":!self.config.sms_to_phone.is_empty(),
             "sms_daily_remaining":remaining,
+            "smtp_configured":self.config.smtp.configured(),
+            "smtp_supported":true,
             "last_result":self.last_result})
     }
 
@@ -311,7 +327,8 @@ impl Forwarder {
                 .mode(0o600)
                 .open(&temporary)
                 .map_err(|_| "forward_storage_failed")?;
-            let mut raw = serde_json::to_vec(next).map_err(|_| "forward_storage_failed")?;
+            let mut raw =
+                Zeroizing::new(serde_json::to_vec(next).map_err(|_| "forward_storage_failed")?);
             raw.push(b'\n');
             if raw.len() as u64 > MAX_FILE_BYTES {
                 return Err("forward_storage_failed");
@@ -343,6 +360,9 @@ impl Forwarder {
         }
         if let Some(phones) = input.sms_to_phone {
             next.sms_to_phone = phones;
+        }
+        if let Some(smtp) = input.smtp {
+            next.smtp.apply(smtp);
         }
         if !valid_config(&next) {
             return Err("invalid_forward_config".into());
@@ -399,6 +419,7 @@ impl Forwarder {
             Err(error) if error == "rate_limited" => "rate_limited",
             Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
             Err(error) if error == "message_too_long" => "message_too_long",
+            Err(error) if error == "smtp_auth_failed" => "smtp_auth_failed",
             Err(error) if error == "forward_storage_failed" => "storage_failed",
             Err(_) => "delivery_failed",
         };
@@ -421,6 +442,7 @@ impl Forwarder {
             dingtalk_webhook: self.config.dingtalk_webhook.clone(),
             dingtalk_secret: self.config.dingtalk_secret.clone(),
             sms_to_phone: self.config.sms_to_phone.clone(),
+            smtp: self.config.smtp.clone(),
         }
     }
 
@@ -520,6 +542,9 @@ pub async fn deliver(
 ) -> Result<(), String> {
     if destination_config.method == "sms" {
         return deliver_sms(destination_config, message).await;
+    }
+    if destination_config.method == "smtp" {
+        return smtp_forward::send(&destination_config.smtp, &message.from, &message.text).await;
     }
     let method = destination_config.method.as_str();
     let mut url = destination(
@@ -708,6 +733,7 @@ mod tests {
                     dingtalk_webhook: None,
                     dingtalk_secret: None,
                     sms_to_phone: Some(vec!["+10086".into(), "10010".into()]),
+                    smtp: None,
                 },
                 Some(&old),
             )
@@ -757,7 +783,72 @@ mod tests {
         let manager = Forwarder::load(&dir);
         assert_eq!(manager.status()["enabled"], false);
         assert_eq!(manager.status()["sms_configured"], false);
+        assert_eq!(manager.status()["smtp_configured"], false);
         assert_eq!(manager.status()["last_result"], "idle");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn smtp_credentials_stay_in_private_config_and_never_enter_panel_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-smtp-forward-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        let update = |smtp| Update {
+            enabled: false,
+            method: "smtp".into(),
+            webhook_url: None,
+            dingtalk_webhook: None,
+            dingtalk_secret: None,
+            sms_to_phone: None,
+            smtp: Some(smtp),
+        };
+        let status = manager
+            .update(
+                update(smtp_forward::Update {
+                    host: "smtp.example.com".into(),
+                    port: 465,
+                    username: "sender@example.com".into(),
+                    password: Some("fixture-app-password".into()),
+                    to: "recipient@example.net".into(),
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["smtp_configured"], true);
+        for secret in [
+            "fixture-app-password",
+            "sender@example.com",
+            "recipient@example.net",
+        ] {
+            assert!(!status.to_string().contains(secret));
+        }
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let mut reloaded = Forwarder::load(&dir);
+        assert_eq!(reloaded.status()["smtp_configured"], true);
+        reloaded
+            .update(
+                update(smtp_forward::Update {
+                    host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    password: Some(String::new()),
+                    to: String::new(),
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(reloaded.status()["smtp_configured"], false);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -778,7 +869,8 @@ mod tests {
                         webhook_url: Some("https://example.com/hook".into()),
                         dingtalk_webhook: None,
                         dingtalk_secret: None,
-                        sms_to_phone: None
+                        sms_to_phone: None,
+                        smtp: None
                     },
                     Some(&old)
                 )

@@ -18,6 +18,7 @@ mod reboot_schedule;
 mod server;
 mod sms;
 mod sms_forward;
+mod smtp_forward;
 mod speedtest;
 mod state;
 mod task_schedule;

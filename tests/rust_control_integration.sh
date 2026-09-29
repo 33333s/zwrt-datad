@@ -263,6 +263,11 @@ post '{"action":"sms.forward.test","params":{}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_daily_remaining"] == 59'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"sms","sms_to_phone":[]}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_configured"] is False and d["result"]["sms_daily_remaining"] == 59'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smtp":{"host":"smtp.example.com","port":465,"username":"sender@example.com","password":"fixture-app-password","to":"recipient@example.net"}}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["smtp_configured"] is True and d["result"]["enabled"] is False; assert "fixture-app-password" not in json.dumps(d) and "recipient@example.net" not in json.dumps(d)'
+[ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smtp":{"host":"","port":0,"username":"","password":"","to":""}}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["smtp_configured"] is False'
 status=$(curl -sS -o "$TMP/bad-forward.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"sms.forward.set","params":{"enabled":true,"method":"webhook","webhook_url":"http://127.0.0.1/private"}}' \
     "http://127.0.0.1:$PORT/control")
