@@ -3,18 +3,26 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # Fork PRs stay on disposable GitHub-hosted machines.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "datad-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 4
+      RUST_CONTROL_PORT: 29460
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy,rustfmt
@@ -24,6 +32,10 @@ jobs:
       - run: python3 ../tests/u50_candidate_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_oem_auth_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_installer_test.py
+      - name: Prepare isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/datad-python"
+          echo "$RUNNER_TEMP/datad-python/bin" >> "$GITHUB_PATH"
       - run: python3 -m pip install 'cryptography>=43,<49'
       - run: python3 ../tests/rust_sms_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_usb_test.py target/debug/zwrt-datad
