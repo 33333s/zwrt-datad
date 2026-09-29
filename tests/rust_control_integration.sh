@@ -281,6 +281,14 @@ post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","nic
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["nickname_supported"] is True and d["result"]["nickname"] == "客厅 U60" and d["result"]["enabled"] is False'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","nickname":""}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["nickname"] == "" and d["result"]["enabled"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smtp_forward_device_info":true}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["device_info_supported"] is True and d["result"]["smtp_forward_device_info"] is True and d["result"]["enabled"] is False; assert "device_info" not in d["result"]'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"dingtalk","dingtalk_forward_device_info":true}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["dingtalk_forward_device_info"] is True and d["result"]["smtp_forward_device_info"] is True and d["result"]["enabled"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"sms","sms_forward_device_info":true}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["sms_forward_device_info"] is True and d["result"]["enabled"] is False'
+post '{"action":"sms.forward.set","params":{"enabled":false,"method":"sms","sms_forward_device_info":false,"smtp_forward_device_info":false,"dingtalk_forward_device_info":false}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and all(d["result"][key] is False for key in ("sms_forward_device_info","smtp_forward_device_info","dingtalk_forward_device_info"))'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
 status=$(curl -sS -o "$TMP/bad-forward.json" -w '%{http_code}' -H 'content-type: application/json' \
     --data-binary '{"action":"sms.forward.set","params":{"enabled":true,"method":"webhook","webhook_url":"http://127.0.0.1/private"}}' \

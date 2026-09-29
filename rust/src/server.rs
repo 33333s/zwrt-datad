@@ -159,20 +159,15 @@ impl App {
     }
 
     pub(crate) async fn panel_sms_forward_test(&self) -> Result<Value, String> {
-        let battery = self
-            .inner
-            .snapshot
-            .read()
-            .await
-            .fields
-            .get("battery")
-            .cloned();
+        let device_snapshot = self.inner.snapshot.read().await.clone();
+        let battery = device_snapshot.fields.get("battery").cloned();
         let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
         let mut manager = self.inner.sms_forward.lock().await;
-        let details = manager.delivery();
+        let mut details = manager.delivery();
+        details.attach_device_info(&device_snapshot);
         let test_message = sms_forward::Message::test();
         if let Err(error) = manager.reserve_sms(&test_message) {
             manager.mark_delivery(&Err(error.clone()));
@@ -188,6 +183,28 @@ impl App {
             );
         }
         result.map(|()| status)
+    }
+
+    async fn scheduled_device_info_forward(&self) -> Result<(), String> {
+        let device_snapshot = self.inner.snapshot.read().await.clone();
+        let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let mut manager = self.inner.sms_forward.lock().await;
+        if !manager.device_info_enabled() {
+            return Err("forward_disabled".into());
+        }
+        let mut details = manager.delivery();
+        details.force_device_info(&device_snapshot);
+        let message = sms_forward::Message::device_info();
+        if let Err(error) = manager.reserve_sms(&message) {
+            manager.mark_delivery(&Err(error.clone()));
+            return Err(error);
+        }
+        let result = sms_forward::deliver(&details, &time_origin, &message).await;
+        manager.mark_delivery(&result);
+        result
     }
 
     pub(crate) async fn cloud_panel_config(&self) -> Value {
@@ -370,12 +387,25 @@ impl App {
                         continue;
                     }
                 }
-                let result = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    crate::control::execute(&task.action, &task.params),
-                )
-                .await;
-                let success = matches!(result, Ok(crate::control::Outcome::Ok(_)));
+                let success = if task.action == "sms.forward.device_info" {
+                    matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(50),
+                            app.scheduled_device_info_forward(),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    )
+                } else {
+                    matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(20),
+                            crate::control::execute(&task.action, &task.params),
+                        )
+                        .await,
+                        Ok(crate::control::Outcome::Ok(_))
+                    )
+                };
                 app.inner
                     .tasks
                     .lock()
@@ -393,14 +423,8 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
-                let battery = app
-                    .inner
-                    .snapshot
-                    .read()
-                    .await
-                    .fields
-                    .get("battery")
-                    .cloned();
+                let device_snapshot = app.inner.snapshot.read().await.clone();
+                let battery = device_snapshot.fields.get("battery").cloned();
                 let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
                     .as_str()
                     .unwrap_or_default()
@@ -409,7 +433,8 @@ impl App {
                     let mut manager = app.inner.sms_forward.lock().await;
                     match manager.observe_power(battery.as_ref()) {
                         Ok(Some(message)) => {
-                            let details = manager.delivery();
+                            let mut details = manager.delivery();
+                            details.attach_device_info(&device_snapshot);
                             let result = match manager.reserve_sms(&message) {
                                 Ok(()) => {
                                     sms_forward::deliver(&details, &time_origin, &message).await
@@ -433,6 +458,7 @@ impl App {
                     }
                 };
                 for _ in 0..4 {
+                    let device_snapshot = app.inner.snapshot.read().await.clone();
                     let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
                         .as_str()
                         .unwrap_or_default()
@@ -450,7 +476,8 @@ impl App {
                             break;
                         }
                     };
-                    let details = manager.delivery();
+                    let mut details = manager.delivery();
+                    details.attach_device_info(&device_snapshot);
                     if let Err(error) = manager.reserve_sms(&message) {
                         manager.mark_delivery(&Err(error));
                         break;
