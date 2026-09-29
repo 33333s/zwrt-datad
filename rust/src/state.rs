@@ -1194,6 +1194,9 @@ pub(crate) fn runtime_with(runtime_zones: Value, storage_mount: &str) -> (i64, V
 }
 
 pub async fn collect(sample_interval_ms: u64) -> Snapshot {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.collect().await;
+    }
     // Vendor ubus implementations on these devices lose replies under a large
     // burst of concurrent clients, so state collection is deliberately serial.
     let common = ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;

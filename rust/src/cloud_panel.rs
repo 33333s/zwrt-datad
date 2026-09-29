@@ -721,20 +721,14 @@ pub(crate) async fn run(
     }
     // Extra configuration is fetched only while a remote panel is open. It
     // contains reviewed UI fields, never Wi-Fi keys or raw vendor responses.
-    let (mut wifi_config, mut apn_config, mut cooling_config) = if cloud_app.is_some() {
-        let (wifi_result, apn_result, cooling_result) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()),
-            tokio::time::timeout(Duration::from_secs(6), apn_panel_config()),
-            tokio::time::timeout(Duration::from_secs(6), cooling::panel_config())
-        );
-        (
-            wifi_result.ok().flatten(),
-            apn_result.ok().flatten(),
-            cooling_result.ok().flatten(),
-        )
-    } else {
-        (None, None, None)
-    };
+    let (wifi_result, apn_result, cooling_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()),
+        tokio::time::timeout(Duration::from_secs(6), apn_panel_config()),
+        tokio::time::timeout(Duration::from_secs(6), cooling::panel_config())
+    );
+    let mut wifi_config = wifi_result.ok().flatten();
+    let mut apn_config = apn_result.ok().flatten();
+    let mut cooling_config = cooling_result.ok().flatten();
     let mut config_pending =
         wifi_config.is_some() || apn_config.is_some() || cooling_config.is_some();
     let mut sample = tokio::time::interval(Duration::from_secs(1));

@@ -1,5 +1,5 @@
 // OEM GoAhead action IDs exposed by the current U50S WebUI.
-// Requests still require an explicit write opt-in and authenticated session.
+// Requests are only sent by the daemon's own mapped actions with a local OEM session.
 pub const IDS: &[&str] = &[
     "ADD_DEVICE",
     "ADD_WHITE_SITE",
@@ -97,4 +97,11 @@ pub const IDS: &[&str] = &[
     "setWiFiChipAdvancedInfo24G_5G",
     "setWiFiCoverage",
     "switchWiFiModule",
+    "BAND_SELECT",
+    "DHCP_SETTING",
+    "REBOOT_DEVICE",
+    "SET_BEARER_PREFERENCE",
+    "SET_DEVICE_MTU",
+    "SHUTDOWN_DEVICE",
+    "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
 ];

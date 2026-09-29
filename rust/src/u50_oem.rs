@@ -1,4 +1,5 @@
-//! Authenticated U50S OEM GoAhead bridge. No credentials are persisted.
+//! Authenticated U50S OEM GoAhead bridge. No credentials are persisted; the
+//! daemon's own local session is derived from the device's stored admin hash.
 use crate::u50_oem_ids;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
@@ -147,6 +148,15 @@ impl Bridge {
         cookie: &str,
         params: &BTreeMap<String, String>,
     ) -> Result<(Value, String), String> {
+        self.get_query(keys, cookie, params, true).await
+    }
+    async fn get_query(
+        &self,
+        keys: &str,
+        cookie: &str,
+        params: &BTreeMap<String, String>,
+        multi_data: bool,
+    ) -> Result<(Value, String), String> {
         if keys.len() > 1024 || keys.split(',').count() > 32 || !keys.split(',').all(valid_key) {
             return Err("invalid OEM read keys".into());
         }
@@ -170,9 +180,10 @@ impl Bridge {
         let mut url = self.inner.get_url.clone();
         {
             let mut query = url.query_pairs_mut();
-            query
-                .append_pair("cmd", keys)
-                .append_pair("multi_data", "1");
+            query.append_pair("cmd", keys);
+            if multi_data {
+                query.append_pair("multi_data", "1");
+            }
             for (key, value) in params {
                 query.append_pair(key, value);
             }
@@ -196,11 +207,11 @@ impl Bridge {
         let response = request.send().await.map_err(|_| "OEM write failed")?;
         self.response(response).await
     }
-    pub async fn login(&self, password: String) -> Result<Value, String> {
-        let password = Zeroizing::new(password);
-        if password.is_empty() || password.len() > 256 || password.chars().any(char::is_control) {
-            return Err("invalid password".into());
-        }
+    /// The WebUI proves knowledge of `sha256(password)` (upper-case hex) with
+    /// `sha256(first + LD)`. The firmware stores exactly that first hash as
+    /// `admin_Password`, so the daemon (root, same device) can open its own
+    /// session without ever seeing the password.
+    async fn login_with_first_hash(&self, first: Zeroizing<String>) -> Result<Value, String> {
         {
             let mut last = self.inner.last_login.lock().await;
             if last.is_some_and(|at| at.elapsed() < LOGIN_INTERVAL) {
@@ -216,9 +227,7 @@ impl Bridge {
         else {
             return Err("OEM login challenge unavailable".into());
         };
-        // Current U50S WebUI WEB_ATTR_IF_SUPPORT_SHA256=2.
-        let first = sha256_hex(&password);
-        let proof = sha256_hex(&format!("{first}{ld}"));
+        let proof = sha256_hex(&format!("{}{ld}", first.as_str()));
         let form = vec![
             ("goformId".into(), "LOGIN".into()),
             ("isTest".into(), "false".into()),
@@ -387,10 +396,100 @@ impl Bridge {
         };
         Ok(json!({"ok":true,"action":goform_id,"vendor_result":"success","verified":verified}))
     }
-    pub async fn logout(&self, token: &str) -> Result<Value, String> {
-        let _ = self.authorized_cookie(token).await?;
+    /// Token of the daemon's own OEM session, logging in from the stored admin
+    /// hash when there is none or it is about to expire.
+    pub async fn local_token(&self) -> Result<String, String> {
+        {
+            let guard = self.inner.session.lock().await;
+            if let Some(session) = guard.as_ref()
+                && Instant::now() + Duration::from_secs(30) < session.expires
+            {
+                return Ok(session.token.clone());
+            }
+        }
+        let program =
+            std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into());
+        let raw = crate::command::run(&program, ["get", "admin_Password"], Duration::from_secs(2))
+            .await
+            .map_err(|_| "admin credential unavailable".to_string())?;
+        let stored = Zeroizing::new(String::from_utf8_lossy(&raw).trim().to_owned());
+        if stored.len() != 64
+            || !stored
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        {
+            return Err("admin credential has an unexpected format".into());
+        }
+        let reply = self.login_with_first_hash(stored).await?;
+        reply
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "OEM login failed".into())
+    }
+
+    /// Read OEM fields with the local session; one transparent re-login when
+    /// the firmware expired it.
+    pub async fn local_read(
+        &self,
+        keys: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<Value, String> {
+        for attempt in 0..2 {
+            let token = self.local_token().await?;
+            match self.read(&token, keys, params).await {
+                Ok(value) => return Ok(value.get("fields").cloned().unwrap_or(Value::Null)),
+                Err(error) if attempt == 0 => {
+                    self.drop_session().await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("OEM read failed".into())
+    }
+
+    /// Single-command read (no `multi_data`), as the WebUI does for paged
+    /// resources such as `sms_data_total`; returns the reply object as is.
+    pub async fn local_read_single(
+        &self,
+        cmd: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<Value, String> {
+        for attempt in 0..2 {
+            let token = self.local_token().await?;
+            let cookie = self.authorized_cookie(&token).await?;
+            match self.get_query(cmd, &cookie, params, false).await {
+                Ok((value, _)) => return Ok(value),
+                Err(error) if attempt == 0 => {
+                    self.drop_session().await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("OEM read failed".into())
+    }
+
+    /// Perform an allow-listed OEM action with the local session.
+    pub async fn local_write(
+        &self,
+        goform_id: &str,
+        params: &Map<String, Value>,
+    ) -> Result<Value, String> {
+        let token = self.local_token().await?;
+        match self.write(&token, goform_id, params, true).await {
+            Err(error) if error.contains("session") || error.contains("login") => {
+                self.drop_session().await;
+                let token = self.local_token().await?;
+                self.write(&token, goform_id, params, true).await
+            }
+            other => other,
+        }
+    }
+
+    async fn drop_session(&self) {
         *self.inner.session.lock().await = None;
-        Ok(json!({"ok":true}))
     }
 }
 fn cookies_from_two(first: &str, second: &str) -> String {
