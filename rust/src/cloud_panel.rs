@@ -6,6 +6,7 @@ use crate::{
     cooling,
     model::Snapshot,
     reboot_schedule::{self, Schedule},
+    speedtest::SpeedTest,
     state,
     traffic_history::Usage,
     wifi,
@@ -28,6 +29,7 @@ pub(crate) struct PanelFeeds {
     pub state: watch::Receiver<Snapshot>,
     pub history: watch::Receiver<Vec<Usage>>,
     pub schedule: Option<Arc<Mutex<Schedule>>>,
+    pub speedtest: Option<Arc<Mutex<SpeedTest>>>,
 }
 const MAX_STATE_BYTES: usize = 192 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024;
@@ -53,6 +55,7 @@ const EXPOSED_BLOCKS: &[&str] = &[
     "usb",
     "runtime",
     "qos",
+    "speedtest",
     "reboot_schedule",
     "clients",
     "sample_interval_ms",
@@ -354,6 +357,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "client.unblock"
             | "qos.clear"
             | "schedule.reboot.set"
+            | "speedtest.start"
     )
 }
 
@@ -383,49 +387,72 @@ fn valid_remote_band_list(action: &str, params: &Value) -> bool {
 async fn control_result(
     request: ControlRequest,
     schedule: Option<&Arc<Mutex<Schedule>>>,
+    speedtest: Option<&Arc<Mutex<SpeedTest>>>,
 ) -> Message {
-    let code =
-        if request.action == "usb.set" || !control::ACTIONS.contains(&request.action.as_str()) {
-            Some("unsupported_action")
-        } else if needs_confirmation(&request.action) && !request.confirmed {
-            Some("confirmation_required")
-        } else if !valid_remote_band_list(&request.action, &request.params) {
-            Some("invalid_parameter")
-        } else if request.action == "schedule.reboot.set" {
-            let params = request
-                .params
-                .as_object()
-                .filter(|params| params.len() == 2);
-            let enabled = params
-                .and_then(|params| params.get("enabled"))
-                .and_then(Value::as_bool);
-            let time = params
-                .and_then(|params| params.get("time"))
-                .and_then(Value::as_str);
-            match (schedule, enabled, time) {
-                (Some(schedule), Some(enabled), Some(time)) => {
-                    let conflict = reboot_schedule::oem_conflict().await;
-                    match schedule.lock().await.set(enabled, time, conflict) {
-                        Ok(_) => None,
-                        Err(_) => Some("invalid_parameter"),
-                    }
+    let code = if request.action == "usb.set"
+        || !control::ACTIONS.contains(&request.action.as_str())
+    {
+        Some("unsupported_action")
+    } else if needs_confirmation(&request.action) && !request.confirmed {
+        Some("confirmation_required")
+    } else if !valid_remote_band_list(&request.action, &request.params) {
+        Some("invalid_parameter")
+    } else if request.action == "schedule.reboot.set" {
+        let params = request
+            .params
+            .as_object()
+            .filter(|params| params.len() == 2);
+        let enabled = params
+            .and_then(|params| params.get("enabled"))
+            .and_then(Value::as_bool);
+        let time = params
+            .and_then(|params| params.get("time"))
+            .and_then(Value::as_str);
+        match (schedule, enabled, time) {
+            (Some(schedule), Some(enabled), Some(time)) => {
+                let conflict = reboot_schedule::oem_conflict().await;
+                match schedule.lock().await.set(enabled, time, conflict) {
+                    Ok(_) => None,
+                    Err(_) => Some("invalid_parameter"),
                 }
-                _ => Some("invalid_parameter"),
             }
+            _ => Some("invalid_parameter"),
+        }
+    } else if request.action == "speedtest.start" {
+        match speedtest {
+            Some(speedtest) => match SpeedTest::start(speedtest.clone(), &request.params).await {
+                Ok(_) => None,
+                Err(_) => Some("invalid_parameter"),
+            },
+            None => Some("unsupported_action"),
+        }
+    } else if request.action == "speedtest.stop" {
+        if !request
+            .params
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            Some("invalid_parameter")
+        } else if let Some(speedtest) = speedtest {
+            SpeedTest::stop(speedtest.clone()).await;
+            None
         } else {
-            match tokio::time::timeout(
-                Duration::from_secs(20),
-                control::execute(&request.action, &request.params),
-            )
-            .await
-            {
-                Ok(Outcome::Ok(_)) => None,
-                Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
-                Ok(Outcome::Failed(_)) => Some("device_call_failed"),
-                Ok(Outcome::NotHandled) => Some("unsupported_action"),
-                Err(_) => Some("device_call_timeout"),
-            }
-        };
+            Some("unsupported_action")
+        }
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            control::execute(&request.action, &request.params),
+        )
+        .await
+        {
+            Ok(Outcome::Ok(_)) => None,
+            Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
+            Ok(Outcome::Failed(_)) => Some("device_call_failed"),
+            Ok(Outcome::NotHandled) => Some("unsupported_action"),
+            Err(_) => Some("device_call_timeout"),
+        }
+    };
     Message::Text(
         json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code})
             .to_string()
@@ -446,6 +473,7 @@ pub(crate) async fn run(
         state: state_rx,
         history: mut history_rx,
         schedule,
+        speedtest,
     } = feeds;
     if *shutdown.borrow() || ttl.is_zero() {
         return;
@@ -576,7 +604,7 @@ pub(crate) async fn run(
                     let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
-                    if socket.send(control_result(request, schedule.as_ref()).await).await.is_err() { return; }
+                    if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref()).await).await.is_err() { return; }
                     if refresh_wifi || refresh_apn || refresh_cooling {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
@@ -604,6 +632,10 @@ mod tests {
         fields.insert(
             "reboot_schedule".into(),
             json!({"supported":true,"enabled":false,"time":"02:03"}),
+        );
+        fields.insert(
+            "speedtest".into(),
+            json!({"supported":true,"state":"idle","provider":"cloudflare"}),
         );
         fields.insert("future_secret".into(), json!({"token":"must-not-leak"}));
         fields.insert(
@@ -633,6 +665,7 @@ mod tests {
             "02:03"
         );
         let parsed: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["snapshot"]["speedtest"]["provider"], "cloudflare");
         assert_eq!(parsed["snapshot"]["net"]["type"], "SA");
         assert!(parsed["snapshot"].get("future_secret").is_none());
         assert_eq!(
@@ -741,6 +774,8 @@ mod tests {
         assert!(needs_confirmation("cellular.set"));
         assert!(needs_confirmation("cooling.fan.set_curve"));
         assert!(needs_confirmation("cooling.liquid.set_mode"));
+        assert!(needs_confirmation("speedtest.start"));
+        assert!(!needs_confirmation("speedtest.stop"));
         for action in [
             "wifi.set_dual_band",
             "wifi.interface.delete",
@@ -769,7 +804,7 @@ mod tests {
             "band.set_nr_sa",
             &json!({"bands":"28,78"})
         ));
-        let Message::Text(reply) = control_result(request, None).await else {
+        let Message::Text(reply) = control_result(request, None, None).await else {
             panic!("expected a text result")
         };
         let reply: Value = serde_json::from_str(&reply).unwrap();
@@ -787,7 +822,8 @@ mod tests {
             assert!(parse_control(&invalid).is_none());
         }
         let unsupported = allowed.replace("device.reboot", "ubus.call");
-        let Message::Text(reply) = control_result(parse_control(&unsupported).unwrap(), None).await
+        let Message::Text(reply) =
+            control_result(parse_control(&unsupported).unwrap(), None, None).await
         else {
             panic!("expected an unsupported-action result")
         };
@@ -796,7 +832,8 @@ mod tests {
             "unsupported_action"
         );
         let skipped_adb = allowed.replace("device.reboot", "usb.set");
-        let Message::Text(reply) = control_result(parse_control(&skipped_adb).unwrap(), None).await
+        let Message::Text(reply) =
+            control_result(parse_control(&skipped_adb).unwrap(), None, None).await
         else {
             panic!("expected USB mode to be excluded from the remote panel")
         };
@@ -816,7 +853,7 @@ mod tests {
         let manager = Arc::new(Mutex::new(Schedule::load(&dir)));
         let raw = json!({"type":"control","protocol_version":2,"request_id":"a".repeat(32),
             "action":"schedule.reboot.set","params":{"enabled":false,"time":"02:03"},"confirmed":false}).to_string();
-        let rejected = control_result(parse_control(&raw).unwrap(), Some(&manager)).await;
+        let rejected = control_result(parse_control(&raw).unwrap(), Some(&manager), None).await;
         let Message::Text(rejected) = rejected else {
             panic!("expected a text result")
         };
@@ -828,6 +865,7 @@ mod tests {
         let accepted = control_result(
             parse_control(&raw.replace("\"confirmed\":false", "\"confirmed\":true")).unwrap(),
             Some(&manager),
+            None,
         )
         .await;
         let Message::Text(accepted) = accepted else {
@@ -887,6 +925,7 @@ mod tests {
                     state: receiver,
                     history: history_receiver,
                     schedule: None,
+                    speedtest: None,
                 },
                 false,
                 &config,
@@ -974,6 +1013,7 @@ mod tests {
                     state: receiver,
                     history: history_receiver,
                     schedule: None,
+                    speedtest: None,
                 },
                 true,
                 &config,

@@ -61,6 +61,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 从 0.10.27 起，`reboot_schedule` 状态块只随本地 `/state`/SSE 与已授权的按需面板会话发送，不进入常规 MQTT。`schedule.reboot.set` 在 v2 面板要求 `confirmed=true`，每日时间按设备本地时钟和时区解释；datad 将当天的触发日期以 0600 文件持久化后才调用已有 `device.reboot`，同一天至多触发一次。默认关闭；检测到原厂周/间隔日计划重启已启用时，拒绝启用 datad 的每日计划，避免两套计划重复重启。无效配置或设备时间不可用时不触发。
 
+从 0.10.28 起，`speedtest.start` 由设备默认 IPv4 出口向 [Cloudflare 官方测速组件](https://github.com/cloudflare/speedtest#api-reference)使用的固定 `https://speed.cloudflare.com/__down` 发起 HTTPS 下载，沿用证书与主机名校验、不跟随重定向、不读取浏览器提供的 URL。一次操作的总下载量限制为 1–50 MiB、1–5 线程、1 或 3 轮，每轮最长约 18 秒；同一时刻只允许一个测试，可用 `speedtest.stop` 取消。NMS v2 控制通道启动时要求 `confirmed=true`；网页只收到 `speedtest` 状态与平均速率，不传输下载内容，也不把测速结果加入普通 MQTT 遥测。该值只描述设备到 Cloudflare 边缘的单次测试，不代表设备蜂窝链路峰值或聚合吞吐。
+
 云端连接且 `remote_enabled` 开启时，datad 报告 `datad.panel` 能力。NMS 可用现有 `remote.open` 命令建立 `target_service: "datad_panel"`、`target_port: 0` 的独立 WSS 会话，最长一小时，不占用 9460/9461 TCP 管理端口，也不需要设备本地 UFI 进程。设备必须验证配置的平台/备用 HTTPS 来源、TLS 主机名、一次性会话票据和 `nms-datad-panel-v1` WebSocket 子协议。
 
 连接后设备先发送 `ready`，再以最多每秒一次的 `state` 文本帧发送当前 datad 快照。只允许本模块显式列出的状态块；每帧至多 192 KiB，不上传 datad Bearer Token、云配置或未来新增的未知块。状态只在远程面板会话期间传输，不加入常规 MQTT 遥测或设备历史记录。会话到期、远程开关关闭、配置变化或 WSS 中断即停止。此协议第一阶段只读，设备拒绝浏览器/平台发来的数据帧；后续控制需另行逐项授权和审计。

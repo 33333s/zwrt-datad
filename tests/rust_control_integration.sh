@@ -253,7 +253,15 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==80; assert "schedule.reboot.set" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==82; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+post '{"action":"speedtest.stop","params":{}}' |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["provider"]=="cloudflare"'
+status=$(curl -sS -o "$TMP/bad-speedtest.json" -w '%{http_code}' -H 'content-type: application/json' \
+    --data-binary '{"action":"speedtest.start","params":{"bytes":52428801,"threads":1,"runs":1,"url":"http://127.0.0.1"}}' \
+    "http://127.0.0.1:$PORT/control")
+[ "$status" = 400 ]
+curl -fsS "http://127.0.0.1:$PORT/state" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["speedtest"]["provider"]=="cloudflare" and d["speedtest"]["requested_bytes"]==0'
 post '{"action":"schedule.reboot.set","params":{"enabled":false,"time":"02:03"}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["enabled"] is False and d["result"]["time"]=="02:03"'
 [ "$(file_mode "$TMP/data/reboot-schedule.json")" = 600 ]

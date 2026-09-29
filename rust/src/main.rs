@@ -17,6 +17,7 @@ mod qtrace_mask;
 mod reboot_schedule;
 mod server;
 mod sms;
+mod speedtest;
 mod state;
 mod traffic_history;
 mod usb;

@@ -5,6 +5,7 @@ use crate::{
     neighbor_manager::Manager as NeighborManager,
     ota::{self, Config as OtaConfig, Ota},
     reboot_schedule::{self, Schedule},
+    speedtest::SpeedTest,
     state,
     traffic_history::{History, Usage},
     webshell::WebShell,
@@ -61,6 +62,7 @@ pub(crate) struct Inner {
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
     schedule: Arc<Mutex<Schedule>>,
+    speedtest: Arc<Mutex<SpeedTest>>,
 }
 
 struct DeviceSession {
@@ -79,6 +81,10 @@ impl App {
 
     pub(crate) fn cloud_panel_schedule(&self) -> Arc<Mutex<Schedule>> {
         self.inner.schedule.clone()
+    }
+
+    pub(crate) fn cloud_panel_speedtest(&self) -> Arc<Mutex<SpeedTest>> {
+        self.inner.speedtest.clone()
     }
 
     pub(crate) fn cloud_webshell_available(&self) -> bool {
@@ -123,6 +129,10 @@ impl App {
         initial
             .fields
             .insert("reboot_schedule".into(), schedule.status());
+        let speedtest = SpeedTest::new();
+        initial
+            .fields
+            .insert("speedtest".into(), speedtest.status());
         let mut history = History::load(&data_dir);
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
@@ -145,6 +155,7 @@ impl App {
                 history: Mutex::new(history),
                 history_tx,
                 schedule: Arc::new(Mutex::new(schedule)),
+                speedtest: Arc::new(Mutex::new(speedtest)),
             }),
         };
         app.inner
@@ -232,6 +243,10 @@ impl App {
             "reboot_schedule".into(),
             self.inner.schedule.lock().await.status(),
         );
+        let mut speedtest = self.inner.speedtest.lock().await;
+        speedtest.refresh_availability();
+        next.fields.insert("speedtest".into(), speedtest.status());
+        drop(speedtest);
         let mut history = self.inner.history.lock().await;
         if history.record(&next) {
             self.inner.history_tx.send_replace(history.days());
@@ -888,6 +903,30 @@ async fn control(
             Err(error) => invalid_parameter(action, &error),
         };
     }
+    if action == "speedtest.start" {
+        let params = body.get("params").unwrap_or(&Value::Null);
+        return match SpeedTest::start(app.inner.speedtest.clone(), params).await {
+            Ok(value) => {
+                let refresh = app.clone();
+                tokio::spawn(async move { refresh.refresh_snapshot().await });
+                control_ok(action, value)
+            }
+            Err(error) => invalid_parameter(action, error),
+        };
+    }
+    if action == "speedtest.stop" {
+        if !body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            return invalid_parameter(action, "stop accepts no params");
+        }
+        let value = SpeedTest::stop(app.inner.speedtest.clone()).await;
+        let refresh = app.clone();
+        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        return control_ok(action, value);
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1329,8 +1368,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 80);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 80);
+        assert_eq!(controls.len(), 82);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 82);
     }
 
     #[test]

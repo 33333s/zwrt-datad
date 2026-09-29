@@ -12,6 +12,8 @@ pub enum Outcome {
 pub const ACTIONS: &[&str] = &[
     "device.reboot",
     "schedule.reboot.set",
+    "speedtest.start",
+    "speedtest.stop",
     "device.poweroff",
     "cellular.connect",
     "cellular.disconnect",
