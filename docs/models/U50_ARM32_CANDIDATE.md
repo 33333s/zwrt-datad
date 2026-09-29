@@ -75,3 +75,33 @@ The U50S `/state` now carries the same blocks as the ZWRT collector wherever the
 
 Band capabilities use the factory lists (`lte_band_1_64_factory` bitmask, `nr5g_*_band_factory`); `complete=false` and no supported-band strings when any list is missing. Unreadable fields are omitted rather than reported as 0.
 
+
+## Boot autostart on the U50S (systemd)
+
+The U50S root filesystem is read-only, has no `/etc/rc.local`, and no firmware script executes anything from the writable `/etc_rw`, `/data` or `/systemrw` volumes. Init is systemd (239), so autostart is a unit added to the root filesystem:
+
+```sh
+mount -o remount,rw /
+cat > /etc/systemd/system/zwrt-datad.service <<'EOF'
+[Unit]
+Description=zwrt-datad (U50S read-only state and NMS panel)
+ConditionPathExists=/etc_rw/zwrt-datad/zwrt-datad
+ConditionPathExists=/etc_rw/zwrt-datad/cloud.json
+After=rcS-zte-server.service
+
+[Service]
+Type=simple
+ExecStart=/etc_rw/zwrt-datad/zwrt-datad --u50-model u50s --u50-panel-config /etc_rw/zwrt-datad/cloud.json --bind 127.0.0.1 --port 9460
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -s ../zwrt-datad.service /etc/systemd/system/multi-user.target.wants/zwrt-datad.service
+sync; mount -o remount,ro /; systemctl daemon-reload
+```
+
+`Restart=on-failure` also covers the first seconds after boot when the OEM `cfg` store is not ready yet (datad exits until `cfg get model_name` works). The binary stays in `/etc_rw/zwrt-datad/`, so datad updates never touch the root filesystem again. `/etc_rw/zwrt-datad/service.sh` now only drives the unit (`start|stop|restart|status`). A firmware upgrade rewrites the root filesystem and removes the unit; repeat the steps above afterwards. Removal: remount read-write, delete the unit and the symlink, remount read-only.
