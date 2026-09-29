@@ -172,6 +172,7 @@ pub struct Ota {
 }
 
 impl Ota {
+    #[cfg(test)]
     pub fn load(dir: &Path) -> Result<Self, String> {
         Self::load_with(dir, Profile::ZWRT)
     }

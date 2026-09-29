@@ -164,15 +164,31 @@ async fn ensure_crypto_session() -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+/// Vendor SMS counters (unread badge and change detection).
+async fn fetch_capacity() -> Result<Value, String> {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.sms_capacity().await;
+    }
+    state::ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await
+}
+
+/// One page of the vendor message store.
+async fn fetch_page(page: usize, store: i64) -> Result<Value, String> {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.sms_page(page, PAGE_SIZE, store).await;
+    }
+    state::ubus("zwrt_wms", "zte_libwms_get_sms_data", json!({
+        "page":page,"data_per_page":PAGE_SIZE,"mem_store":store,"tags":10,"order_by":"order by id desc"
+    })).await
+}
+
 async fn read_pages() -> Result<(Vec<Value>, bool), String> {
     let mut replies = Vec::new();
     let mut truncated = false;
     for store in [1, 0] {
         let mut seen = std::collections::HashSet::new();
         for page in 0..MAX_PAGES {
-            let reply = state::ubus("zwrt_wms", "zte_libwms_get_sms_data", json!({
-                "page":page,"data_per_page":PAGE_SIZE,"mem_store":store,"tags":10,"order_by":"order by id desc"
-            })).await?;
+            let reply = fetch_page(page, store).await?;
             let rows = reply
                 .get("list")
                 .or_else(|| reply.get("messages"))
@@ -201,6 +217,11 @@ async fn read_pages() -> Result<(Vec<Value>, bool), String> {
 }
 
 async fn load_messages() -> Result<(Vec<Value>, bool), String> {
+    if crate::u50_ctl::get().is_some() {
+        // The U50S GoAhead API returns plain messages: no crypto session.
+        let (replies, truncated) = read_pages().await?;
+        return normalize_lists(&replies, None).map(|list| (list, truncated));
+    }
     // Unencrypted models remain readable even when the web crypto service is
     // unavailable. An encrypted response, however, must authenticate.
     let mut key = ensure_crypto_session().await.ok();
@@ -238,7 +259,7 @@ pub async fn snapshot() -> Option<Value> {
         return cache.value();
     }
     cache.checked = Some(Instant::now());
-    let capacity = match state::ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await {
+    let capacity = match fetch_capacity().await {
         Ok(value) => value,
         Err(_) => {
             cache.error = Some("vendor SMS capacity unavailable".into());
@@ -530,6 +551,11 @@ pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
     };
     if !valid(number, message, sms_time) {
         return Err((true, "invalid SMS parameters".into()));
+    }
+    if let Some(ctl) = crate::u50_ctl::get() {
+        let result = ctl.sms_send(sender, number, message, sms_time).await;
+        invalidate();
+        return result;
     }
     let result = match sender {
         "v3e1" | "v3e2" => send_external(sender, number, message, sms_time).await,

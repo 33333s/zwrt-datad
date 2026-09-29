@@ -163,7 +163,9 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
                 raise AssertionError("candidate server did not start")
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/capabilities", timeout=2) as response:
                 capabilities = json.load(response)
-                assert capabilities["controls"] == []
+                # The U50S offers the mainline control API for what it implements.
+                assert "cellular.set" in capabilities["controls"] and "sms.send_raw" in capabilities["controls"]
+                assert not any(name.startswith("speedtest") for name in capabilities["controls"])
                 assert capabilities["events"] == ["state"]
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/events", timeout=2) as response:
                 event_lines = [response.readline().decode().strip() for _ in range(3)]
@@ -184,32 +186,20 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
                 assert error.code == 400, error.code
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/control", timeout=2)
-                raise AssertionError("control route was exposed")
+                raise AssertionError("control accepted a GET")
             except urllib.error.HTTPError as error:
-                assert error.code == 404
+                assert error.code == 405, error.code
         finally:
             process.terminate()
             process.wait(timeout=5)
-        panel_file = Path(tmp) / "cloud.json"
-        panel_file.write_text(json.dumps({
-            "enabled": True,
-            "remote_enabled": True,
-            "broker": "wss://127.0.0.1:1/mqtt",
-            "platform_url": "https://nms.example.com",
-            "username": "fixture-user",
-            "password": "fixture-password",
-            "model": "U50Pro",
-            "identity": "fixture-device",
-            "services": [],
-        }))
-        panel_cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url,
-                     "--u50-panel-config", str(panel_file), "--port", str(port)]
-        panel_file.chmod(0o644)
-        denied = subprocess.run(panel_cmd, env=env, capture_output=True, text=True, timeout=15)
-        assert denied.returncode != 0 and "private regular file" in denied.stderr
-        panel_file.chmod(0o600)
-        panel_process = subprocess.Popen(panel_cmd, env=env, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE, text=True)
+        # Existing service definitions pass --u50-panel-config; the directory of
+        # that file is then the data directory (same cloud.json as before).
+        legacy_dir = Path(tmp) / "legacy"
+        legacy_dir.mkdir()
+        legacy_cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--u50-enable-writes",
+                      "--u50-panel-config", str(legacy_dir / "cloud.json"), "--port", str(port)]
+        legacy = subprocess.Popen(legacy_cmd, env=server_env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, text=True)
         try:
             for _ in range(40):
                 try:
@@ -219,10 +209,16 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
                 except urllib.error.URLError:
                     time.sleep(0.1)
             else:
-                raise AssertionError("panel-enabled candidate server did not start")
+                raise AssertionError("legacy service arguments no longer start the server")
+            save = urllib.request.Request(f"http://127.0.0.1:{port}/ota/config",
+                                          data=b'{"enabled":true,"servers":[],"sources":["github"]}',
+                                          headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(save, timeout=2) as response:
+                assert json.load(response)["success"] is True
+            assert (legacy_dir / "ota.json").exists(), "state must live next to cloud.json"
         finally:
-            panel_process.terminate()
-            panel_process.wait(timeout=5)
+            legacy.terminate()
+            legacy.wait(timeout=5)
         Handler.reply = b"<html>login required</html>"
         fallback = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
         partial = json.loads(fallback.stdout)

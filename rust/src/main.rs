@@ -24,6 +24,7 @@ mod state;
 mod task_schedule;
 mod traffic_history;
 mod u50;
+mod u50_ctl;
 mod u50_oem;
 mod u50_oem_ids;
 mod u50_sys;
@@ -53,13 +54,15 @@ struct Args {
     /// Explicit read-only candidate for original-firmware U50 devices.
     #[arg(long, value_parser = ["u50pro", "u50s"])]
     u50_model: Option<String>,
-    /// Enable authenticated OEM write compatibility on the loopback U50S server.
-    #[arg(long)]
+    /// Ignored since v0.10.46: the U50 runtime now uses the same App and
+    /// control API as ARM64. Kept so existing service definitions still start.
+    #[arg(long, hide = true)]
     u50_enable_writes: bool,
-    /// Optional private cloud.json for NMS read-only panel sessions on U50.
-    #[arg(long)]
+    /// The directory of this cloud.json is used as the data directory when
+    /// `--u50-data-dir` is not given (existing service definitions).
+    #[arg(long, hide = true)]
     u50_panel_config: Option<PathBuf>,
-    /// Allow the NMS remote terminal on the U50 panel runtime. Also needs
+    /// Allow the NMS remote terminal on the U50. Also needs
     /// `remote_webshell_enabled: true` in the private cloud.json.
     #[arg(long)]
     u50_enable_webshell: bool,
@@ -119,19 +122,8 @@ async fn main() -> Result<()> {
     }
     let args = Args::parse();
     anyhow::ensure!(
-        args.u50_model.is_some() || !args.u50_enable_writes,
-        "--u50-enable-writes requires --u50-model u50s"
-    );
-    anyhow::ensure!(
-        !args.u50_enable_webshell || args.u50_panel_config.is_some(),
-        "--u50-enable-webshell requires --u50-panel-config"
-    );
-    anyhow::ensure!(
-        args.u50_model.is_some()
-            || (args.u50_panel_config.is_none()
-                && args.u50_enroll_dir.is_none()
-                && !args.u50_enable_webshell),
-        "U50 panel and enrollment options require --u50-model"
+        args.u50_model.is_some() || (args.u50_enroll_dir.is_none() && !args.u50_enable_webshell),
+        "U50 options require --u50-model"
     );
     #[cfg(target_arch = "arm")]
     anyhow::ensure!(
@@ -140,17 +132,12 @@ async fn main() -> Result<()> {
     );
     if let Some(model) = &args.u50_model {
         anyhow::ensure!(
-            args.u50_enroll_dir.is_none()
-                || (args.u50_panel_config.is_none() && !args.once && !args.u50_enable_writes),
-            "--u50-enroll-dir cannot be combined with server, write, or --once options"
-        );
-        anyhow::ensure!(
-            !args.once || args.u50_panel_config.is_none(),
-            "--u50-panel-config requires a running U50 server"
+            args.u50_enroll_dir.is_none() || !args.once,
+            "--u50-enroll-dir cannot be combined with --once"
         );
         anyhow::ensure!(
             args.lan_bind.is_none() && !args.neighbor && !args.webshell && args.identity.is_none(),
-            "U50 candidate mode supports read-only loopback state only"
+            "U50 mode listens on loopback only; use --u50-enable-webshell for the terminal"
         );
         let model = u50::Model::parse(model)?;
         if let Some(dir) = &args.u50_enroll_dir {
@@ -169,11 +156,15 @@ async fn main() -> Result<()> {
             args.once,
             Duration::from_millis(args.interval.clamp(500, 5000)),
             u50::RunOptions {
-                enable_writes: args.u50_enable_writes,
                 enable_webshell: args.u50_enable_webshell,
-                data_dir: args.u50_data_dir.clone(),
+                data_dir: args
+                    .u50_panel_config
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+                    .map(std::path::Path::to_path_buf)
+                    .filter(|_| args.u50_data_dir.as_os_str() == "/etc_rw/zwrt-datad")
+                    .unwrap_or_else(|| args.u50_data_dir.clone()),
             },
-            args.u50_panel_config.as_deref(),
         )
         .await;
     }

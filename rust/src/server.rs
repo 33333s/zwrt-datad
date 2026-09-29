@@ -305,7 +305,10 @@ impl App {
                 tx,
                 interval_ms: AtomicU64::new(interval.as_millis() as u64),
                 cloud: RwLock::new(Cloud::load(&data_dir)),
-                ota: Mutex::new(Ota::load(&data_dir).map_err(anyhow::Error::msg)?),
+                ota: Mutex::new(
+                    Ota::load_with(&data_dir, crate::u50_ctl::ota_profile())
+                        .map_err(anyhow::Error::msg)?,
+                ),
                 neighbor: Mutex::new(neighbor),
                 identity: crate::identity::Identity::new(&data_dir),
                 _data_dir: data_dir,
@@ -1148,6 +1151,9 @@ async fn usb_status(State(app): State<App>) -> Json<Value> {
     )
 }
 fn capability_controls() -> Vec<&'static str> {
+    if crate::u50_ctl::get().is_some() {
+        return crate::u50_ctl::CONTROLS.to_vec();
+    }
     let mut controls = vec![
         "device.login_info",
         "device.login",

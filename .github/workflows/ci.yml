@@ -30,7 +30,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 ../tests/u50_candidate_test.py target/debug/zwrt-datad
-      - run: python3 ../tests/u50_oem_auth_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/u50_platform_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_installer_test.py
       - name: Prepare isolated Python environment
         run: |

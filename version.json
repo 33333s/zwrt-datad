@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.45",
+    "version": "0.10.46",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 独立发布线：自更新改用 arm32-latest 更新通道，ARM32 Release 不占用 Latest"
+    "notes": "ARM32 U50S 改为运行与 ARM64 相同的 App：短信收发/转发、漫游/网络模式/SIM 控制、定时与 OTA/NMS 等主线能力（无测速）"
   }
 }

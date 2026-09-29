@@ -125,6 +125,10 @@ pub fn local_clock() -> Option<Clock> {
 }
 
 pub async fn oem_conflict() -> bool {
+    if crate::u50_ctl::get().is_some() {
+        // The U50S firmware has no ZWRT reboot-schedule setting to collide with.
+        return false;
+    }
     crate::state::uci_read("zwrt_zte_mc.reboot_schedule.reboot_schedule_enable").await == "1"
 }
 

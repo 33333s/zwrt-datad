@@ -4,34 +4,20 @@
 //! The firmware proves names and code paths, not successful device responses.
 use crate::{
     cloud::{Cloud, QuickConnect},
-    cloud_update::PanelUpdater,
     command,
     model::{DatadVersion, Snapshot},
-    ota::{self, Ota, Profile},
+    server::App,
     u50_oem::Bridge,
     u50_sys,
 };
 use anyhow::{Context, Result, ensure};
-use axum::{
-    Json, Router,
-    extract::{Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
-};
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
-    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, RwLock, Semaphore, watch};
-use tokio_stream::{StreamExt, wrappers::WatchStream};
-use tower_http::limit::RequestBodyLimitLayer;
 
 const CMD: &str = "model_name,wa_inner_version,network_type,network_provider_fullname,network_provider,battery_value,battery_temp,battery_status,battery_vol_percent,battery_charging,signalbar,simcard_status,realtime_tx_thrpt,realtime_rx_thrpt,realtime_tx_bytes,realtime_rx_bytes,monthly_tx_bytes,monthly_rx_bytes,wifi_onoff_state,wifi_access_sta_num,modem_main_state,pin_status,simcard_active_slot,lte_rsrp,lte_rsrq,lte_snr";
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -883,163 +869,6 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
     );
 }
 
-#[derive(Clone)]
-struct App {
-    snapshot: Arc<RwLock<Snapshot>>,
-    tx: watch::Sender<Snapshot>,
-    sse_slots: Arc<Semaphore>,
-    last_ok: Arc<RwLock<Instant>>,
-    max_stale: Duration,
-    oem: Option<Bridge>,
-    ota: Option<Arc<Mutex<Ota>>>,
-}
-async fn health(State(app): State<App>) -> (StatusCode, &'static str) {
-    if app.last_ok.read().await.elapsed() > app.max_stale {
-        (StatusCode::SERVICE_UNAVAILABLE, "probe stale\n")
-    } else {
-        (StatusCode::OK, "ok\n")
-    }
-}
-async fn version() -> Json<DatadVersion> {
-    Json(Default::default())
-}
-async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
-    Json(app.snapshot.read().await.clone())
-}
-async fn capabilities(State(app): State<App>) -> Json<Value> {
-    let controls: Vec<&str> = if app.oem.is_some() {
-        vec!["u50.oem.goform"]
-    } else {
-        vec![]
-    };
-    Json(json!({
-        "schema_version":1,
-        "protocol":1,
-        "events":["state"],
-        "transport":["http","sse"],
-        "control":controls,
-        "controls":controls,
-        "oem_actions":if app.oem.is_some() {crate::u50_oem_ids::IDS} else {&[]},
-        "discovery":[],
-        "passthrough":[],
-        "template_status":"firmware_candidate"
-    }))
-}
-#[derive(Deserialize)]
-struct LoginRequest {
-    password: String,
-}
-#[derive(Deserialize)]
-struct ControlRequest {
-    action: String,
-    goform_id: String,
-    #[serde(default)]
-    params: Map<String, Value>,
-    #[serde(default)]
-    confirm: bool,
-}
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-}
-fn api_error(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"ok":false,"error":message}))).into_response()
-}
-async fn oem_login(State(app): State<App>, Json(body): Json<LoginRequest>) -> Response {
-    let Some(oem) = app.oem.as_ref() else {
-        return api_error(StatusCode::NOT_FOUND, "OEM writes disabled");
-    };
-    match oem.login(body.password).await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) if error == "login rate limited" => {
-            api_error(StatusCode::TOO_MANY_REQUESTS, &error)
-        }
-        Err(error) if error == "invalid password" => api_error(StatusCode::BAD_REQUEST, &error),
-        Err(error) if error == "OEM login rejected" => api_error(StatusCode::UNAUTHORIZED, &error),
-        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error),
-    }
-}
-async fn oem_read(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Query(mut query): Query<BTreeMap<String, String>>,
-) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return api_error(StatusCode::UNAUTHORIZED, "Bearer token required");
-    };
-    let Some(oem) = app.oem.as_ref() else {
-        return api_error(StatusCode::NOT_FOUND, "OEM writes disabled");
-    };
-    let Some(cmd) = query.remove("cmd") else {
-        return api_error(StatusCode::BAD_REQUEST, "missing cmd");
-    };
-    match oem.read(token, &cmd, &query).await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) if error.contains("session") || error.contains("login required") => {
-            api_error(StatusCode::UNAUTHORIZED, &error)
-        }
-        Err(error) if error.starts_with("OEM ") => api_error(StatusCode::BAD_GATEWAY, &error),
-        Err(error) => api_error(StatusCode::BAD_REQUEST, &error),
-    }
-}
-async fn oem_control(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(body): Json<ControlRequest>,
-) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return api_error(StatusCode::UNAUTHORIZED, "Bearer token required");
-    };
-    let Some(oem) = app.oem.as_ref() else {
-        return api_error(StatusCode::NOT_FOUND, "OEM writes disabled");
-    };
-    if body.action != "u50.oem.goform" {
-        return api_error(StatusCode::BAD_REQUEST, "unsupported action");
-    }
-    match oem
-        .write(token, &body.goform_id, &body.params, body.confirm)
-        .await
-    {
-        Ok(value) => Json(value).into_response(),
-        Err(error) if error.contains("session") || error.contains("login required") => {
-            api_error(StatusCode::UNAUTHORIZED, &error)
-        }
-        Err(error) if error.starts_with("OEM ") => api_error(StatusCode::BAD_GATEWAY, &error),
-        Err(error) => api_error(StatusCode::BAD_REQUEST, &error),
-    }
-}
-async fn oem_logout(State(app): State<App>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return api_error(StatusCode::UNAUTHORIZED, "Bearer token required");
-    };
-    let Some(oem) = app.oem.as_ref() else {
-        return api_error(StatusCode::NOT_FOUND, "OEM writes disabled");
-    };
-    match oem.logout(token).await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => api_error(StatusCode::UNAUTHORIZED, &error),
-    }
-}
-
-async fn events(State(app): State<App>) -> Response {
-    let Ok(permit) = app.sse_slots.clone().try_acquire_owned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok":false,"error":"sse_client_limit"})),
-        )
-            .into_response();
-    };
-    let stream = WatchStream::new(app.tx.subscribe()).map(move |snapshot| {
-        let _keep_permit_alive = &permit;
-        Ok::<_, Infallible>(Event::default().event("state").json_data(snapshot).unwrap())
-    });
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new())
-        .into_response()
-}
 async fn fetch_goform(
     client: &reqwest::Client,
     url: &reqwest::Url,
@@ -1152,6 +981,21 @@ async fn enrich(
     );
 }
 
+/// Everything needed to sample the device; cloneable, cheap.
+#[derive(Clone)]
+pub struct Collector {
+    client: reqwest::Client,
+    url: reqwest::Url,
+    model: Model,
+    interval: Duration,
+}
+
+impl Collector {
+    pub async fn snapshot(&self) -> Result<Snapshot> {
+        collect(&self.client, &self.url, self.model, self.interval).await
+    }
+}
+
 async fn collect(
     client: &reqwest::Client,
     url: &reqwest::Url,
@@ -1165,142 +1009,18 @@ async fn collect(
     Ok(snapshot)
 }
 
-async fn current_snapshot(app: &App) -> Value {
-    serde_json::to_value(&*app.snapshot.read().await).unwrap_or(Value::Null)
-}
-
-/// Mainline auto-update policy: first check after 90 s, then a check every six
-/// hours and an install when the device has been idle for two minutes.
-/// `ZWRT_DATAD_OTA_DISABLE_AUTO=1` turns the background task off.
-fn spawn_ota(app: &App) {
-    let Some(ota) = app.ota.clone() else {
-        return;
-    };
-    if std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").as_deref() == Ok("1") {
-        return;
-    }
-    let app = app.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(90)).await;
-        loop {
-            let snapshot = current_snapshot(&app).await;
-            let mut manager = ota.lock().await;
-            manager.reconcile_install_result();
-            if manager.should_auto_check() && manager.begin_update().is_ok() {
-                manager.mark_auto_check();
-                let _ = manager.check().await;
-                manager.finish_update();
-            }
-            if let Some(candidate) = manager.auto_candidate()
-                && manager.begin_update().is_ok()
-            {
-                if let Err(error) = manager.install(&candidate, &snapshot, false).await
-                    && !error.starts_with("等待安装条件:")
-                {
-                    manager.fail(Some(&candidate), error);
-                }
-                manager.finish_update();
-            }
-            drop(manager);
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    });
-}
-
-async fn ota_config_get(State(app): State<App>) -> Response {
-    match &app.ota {
-        Some(ota) => Json(ota.lock().await.config_json()).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-async fn ota_status(State(app): State<App>) -> Response {
-    match &app.ota {
-        Some(ota) => Json(ota.lock().await.status_json()).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-async fn ota_config_post(
-    State(app): State<App>,
-    payload: Result<Json<ota::Config>, JsonRejection>,
-) -> Response {
-    let (Some(ota), Ok(Json(config))) = (&app.ota, payload) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"success":false,"error":"配置格式无效"})),
-        )
-            .into_response();
-    };
-    match ota.lock().await.update_config(config) {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"success":false,"error":error})),
-        )
-            .into_response(),
-    }
-}
-async fn ota_check(State(app): State<App>) -> Response {
-    let Some(ota) = &app.ota else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let mut manager = ota.lock().await;
-    match manager.check().await {
-        Ok(candidate) => (
-            StatusCode::OK,
-            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":ota::source_name(&candidate.base_url)})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"success":false,"error":error})),
-        )
-            .into_response(),
-    }
-}
-async fn ota_update(State(app): State<App>) -> Response {
-    let Some(ota) = app.ota.clone() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if let Err(error) = ota.lock().await.begin_update() {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"success":false,"error":error})),
-        )
-            .into_response();
-    }
-    tokio::spawn(async move {
-        let snapshot = current_snapshot(&app).await;
-        let mut manager = ota.lock().await;
-        match manager.check().await {
-            Ok(candidate) if !ota::has_update(&candidate) => {
-                manager.fail(Some(&candidate), "当前已是最新版本".into());
-            }
-            Ok(candidate) => {
-                if let Err(error) = manager.install(&candidate, &snapshot, true).await {
-                    manager.fail(Some(&candidate), error);
-                }
-            }
-            Err(error) => manager.fail(None, error),
-        }
-        manager.finish_update();
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"success":true,"status":"started"})),
-    )
-        .into_response()
-}
-
-/// Explicit owner opt-ins for the U50 runtime; both default to off.
+/// Explicit owner opt-ins for the U50 runtime; all default to off.
 #[derive(Clone, Default)]
 pub struct RunOptions {
-    pub enable_writes: bool,
     pub enable_webshell: bool,
-    /// Directory for OTA state and the staged binary; must be on the same
-    /// volume as the running executable.
+    /// Directory for datad's own state (cloud.json, OTA, schedules, SMS
+    /// forwarding); must be on the same volume as the running executable.
     pub data_dir: PathBuf,
 }
 
+/// Run the mainline runtime on the U50S: the same `App` as on ARM64 (cloud, OTA,
+/// WebShell, schedules, SMS forwarding, panel) with the platform seams served by
+/// `u50_ctl`.
 pub async fn run(
     model: Model,
     goform_url: &str,
@@ -1308,20 +1028,18 @@ pub async fn run(
     once: bool,
     interval: Duration,
     options: RunOptions,
-    panel_config: Option<&Path>,
 ) -> Result<()> {
     let RunOptions {
-        enable_writes,
         enable_webshell,
         data_dir,
     } = options;
     ensure!(
         bind.ip().is_loopback(),
-        "U50 candidate server is loopback-only"
+        "U50 datad only listens on the loopback interface"
     );
     let url = validate_goform_url(goform_url)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(4))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let initial = collect(&client, &url, model, interval).await?;
@@ -1329,91 +1047,28 @@ pub async fn run(
         println!("{}", serde_json::to_string(&initial)?);
         return Ok(());
     }
-    ensure!(
-        !enable_writes || model == Model::U50S,
-        "OEM writes are only mapped for U50S"
+    let host = initial
+        .fields
+        .get("u50_cfg")
+        .and_then(|v| v.get("lan_ipaddr"))
+        .and_then(Value::as_str)
+        .context("U50 LAN address unavailable")?
+        .to_owned();
+    let bridge = Bridge::new(client.clone(), url.clone(), host).map_err(anyhow::Error::msg)?;
+    crate::u50_ctl::install(
+        Collector {
+            client,
+            url,
+            model,
+            interval,
+        },
+        bridge,
     );
-    let oem = if enable_writes {
-        let host = initial
-            .fields
-            .get("u50_cfg")
-            .and_then(|v| v.get("lan_ipaddr"))
-            .and_then(Value::as_str)
-            .context("U50S LAN address unavailable for OEM writes")?;
-        Some(Bridge::new(client.clone(), url.clone(), host.into()).map_err(anyhow::Error::msg)?)
-    } else {
-        None
-    };
-    let (tx, _) = watch::channel(initial.clone());
-    let ota = match Ota::load_with(&data_dir, Profile::U50) {
-        Ok(manager) => Some(Arc::new(Mutex::new(manager))),
-        Err(error) => {
-            eprintln!("U50 OTA unavailable: {error}");
-            None
-        }
-    };
-    if let Some(file) = panel_config {
-        let updater = ota.as_ref().map(|ota| PanelUpdater {
-            ota: ota.clone(),
-            data_dir: data_dir.clone(),
-            snapshot: tx.subscribe(),
-        });
-        crate::cloud::Cloud::start_panel_only(file, tx.subscribe(), enable_webshell, updater)
-            .map_err(anyhow::Error::msg)?;
-    }
-    let app = App {
-        snapshot: Arc::new(RwLock::new(initial)),
-        tx,
-        sse_slots: Arc::new(Semaphore::new(16)),
-        last_ok: Arc::new(RwLock::new(Instant::now())),
-        max_stale: interval.saturating_mul(3),
-        oem,
-        ota,
-    };
-    spawn_ota(&app);
-    let state = app.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            if let Ok(next) = collect(&client, &url, model, interval).await {
-                let mut current = state.snapshot.write().await;
-                let mut comparable = next.clone();
-                comparable.ts = current.ts;
-                if comparable != *current {
-                    *current = next.clone();
-                    let _ = state.tx.send(next);
-                } else {
-                    current.ts = next.ts;
-                }
-                *state.last_ok.write().await = Instant::now();
-            }
-        }
-    });
-    let mut router = Router::new()
-        .route("/healthz", get(health))
-        .route("/version", get(version))
-        .route("/state", get(snapshot))
-        .route("/events", get(events))
-        .route("/capabilities", get(capabilities));
-    if app.ota.is_some() {
-        router = router
-            .route("/ota/config", get(ota_config_get).post(ota_config_post))
-            .route("/ota/status", get(ota_status))
-            .route("/ota/check", post(ota_check))
-            .route("/ota/update", post(ota_update));
-    }
-    if app.oem.is_some() {
-        router = router
-            .route("/auth/login", post(oem_login))
-            .route("/auth/logout", post(oem_logout))
-            .route("/oem/read", get(oem_read))
-            .route("/control", post(oem_control));
-    }
-    let router = router
-        .layer(RequestBodyLimitLayer::new(16 * 1024))
-        .with_state(app);
-    axum::serve(tokio::net::TcpListener::bind(bind).await?, router).await?;
-    Ok(())
+    let app = App::new(data_dir, interval, None, false, enable_webshell).await?;
+    app.spawn_reboot_schedule();
+    app.spawn_task_schedule();
+    app.spawn_sms_forward();
+    app.serve(bind, false, false).await
 }
 
 #[cfg(test)]

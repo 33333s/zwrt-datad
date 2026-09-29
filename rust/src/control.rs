@@ -154,6 +154,9 @@ async fn mapped_call(
 }
 
 pub async fn execute(action: &str, params: &Value) -> Outcome {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.execute(action, params).await;
+    }
     match action {
         "device.reboot" => {
             call(
