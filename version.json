@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.39",
+    "version": "0.10.40",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：同步主线 v0.10.38，并补齐系统/温度/电池/接口/客户端/基站与频段等完整只读状态"
+    "notes": "ARM32 U50S 候选版：无数据源时不再上报固定 HSR=false，避免 NMS 显示误导性的高铁模式未开启"
   }
 }

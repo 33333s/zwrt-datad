@@ -460,7 +460,8 @@ fn from_sources(
     {
         net.insert("nr_snr".into(), json!(value));
     }
-    net.insert("HSR".into(), json!(false));
+    // The firmware has no high-speed-rail source, so `HSR` is omitted (unknown)
+    // rather than reported as a constant "off" that the NMS panel would display.
     fields.insert("net".into(), Value::Object(net));
 
     let mut battery = Map::new();
@@ -1286,7 +1287,7 @@ mod tests {
         assert_eq!(value.fields["net"]["type"], "LTE");
         assert_eq!(value.fields["net"]["bars"], 5);
         assert_eq!(value.fields["net"]["lte_rsrp"], -83);
-        assert_eq!(value.fields["net"]["HSR"], false);
+        assert!(value.fields["net"].get("HSR").is_none());
         assert_eq!(value.fields["battery"]["percent"], 66);
         assert_eq!(value.fields["battery"]["temp"], 34);
         assert_eq!(value.fields["traffic"]["rx_speed"], 1814);
