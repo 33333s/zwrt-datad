@@ -65,6 +65,7 @@ fn action_valid(action: &str, params: &Value) -> bool {
     match action {
         "device.reboot"
         | "device.poweroff"
+        | "sms.forward.device_info"
         | "cellular.connect"
         | "cellular.disconnect"
         | "cell.unlock_all" => params.as_object().is_some_and(Map::is_empty),
@@ -333,6 +334,7 @@ mod tests {
     fn only_reviewed_actions_are_accepted() {
         for (action, params) in [
             ("device.reboot", json!({})),
+            ("sms.forward.device_info", json!({})),
             ("cellular.set", json!({"roaming":0})),
             ("network.set_mode", json!({"mode":"Only_LTE"})),
             ("nfc.set", json!({"enabled":false})),
@@ -346,6 +348,10 @@ mod tests {
             ("ubus.call", json!({"service":"zwrt_web"})),
             ("sms.send_raw", json!({})),
             ("device.reboot", json!({"shell":"reboot"})),
+            (
+                "sms.forward.device_info",
+                json!({"target":"https://example.com"}),
+            ),
             ("network.set_mode", json!({"mode":"anything"})),
             ("wifi.set_module", json!({"enabled":2})),
         ] {

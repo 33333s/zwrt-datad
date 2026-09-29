@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.38",
+    "version": "0.10.39",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 候选版：同步主线 v0.10.37 与 NMS 设备自报接入"
+    "notes": "ARM32 U50S 候选版：同步主线 v0.10.38，并补齐系统/温度/电池/接口/客户端/基站与频段等完整只读状态"
   }
 }
