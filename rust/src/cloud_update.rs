@@ -2,7 +2,11 @@
 use crate::{cloud::Config, ota, server::App};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,85 +81,123 @@ fn write_record(path: &Path, value: &Value) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())?;
     fs::rename(temp, path).map_err(|e| e.to_string())
 }
+pub async fn update_result(data_dir: &Path) -> Option<Value> {
+    let path = data_dir.join("cloud-update.json");
+    let mut result: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if result["status"] == "installing" {
+        let version = env!("DATAD_VERSION");
+        if result["data"]["target_version"] == version {
+            let expected = result["data"]["binary_sha256"].as_str()?;
+            use sha2::{Digest, Sha256};
+            let bytes = fs::read(std::env::current_exe().ok()?).ok()?;
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            result["status"] = json!(if actual == expected {
+                "succeeded"
+            } else {
+                "failed"
+            });
+            result["data"]["current_version"] = json!(version);
+            result["data"]["installed_sha256"] = json!(actual);
+            let _ = write_record(&path, &result);
+        } else if let Ok(marker) = fs::read_to_string(data_dir.join("ota-install-result"))
+            && matches!(marker.trim(), "failed" | "success")
+        {
+            result["status"] = json!("failed");
+            result["error"] = json!({"code":if marker.trim()=="success" {"installed_version_mismatch"} else {"installer_failed"}});
+            let _ = write_record(&path, &result);
+        }
+    }
+    Some(result)
+}
+
+pub async fn run_update(
+    ota: &tokio::sync::Mutex<ota::Ota>,
+    data_dir: &Path,
+    snapshot: Value,
+    command: Command,
+    config: Config,
+) -> Value {
+    let mut result =
+        json!({"request_id":command.request_id,"action":command.action,"status":"failed"});
+    let mut persist = false;
+    let run = async {
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+        validate(&command, &config, boot.trim(), uptime())?;
+        let path = data_dir.join("cloud-update.json");
+        if let Some(previous) = update_result(data_dir).await {
+            if previous["request_id"] == command.request_id { return Ok(previous); }
+            if previous["status"] == "installing" { return Err("update_in_progress".into()); }
+        }
+        let mut manager = ota.try_lock().map_err(|_| "update_in_progress".to_string())?;
+        manager.begin_update()?;
+        persist = true;
+        let operation: Result<Value, String> = async {
+            let candidate = manager.check().await?;
+            let binary = candidate.manifest.artifacts.get("binary").ok_or("missing_binary")?;
+            let data = json!({"current_version":env!("DATAD_VERSION"),"target_version":candidate.manifest.version,
+                "binary_sha256":binary.sha256,"size":binary.size,"has_update":ota::has_update(&candidate),"signature_verified":true});
+            if command.action == "datad.update.check" {
+                return Ok(json!({"request_id":command.request_id,"action":command.action,"status":"checked","data":data}));
+            }
+            if command.target_version != candidate.manifest.version || command.binary_sha256 != binary.sha256 {
+                return Err("candidate_changed_check_again".into());
+            }
+            if !ota::has_update(&candidate) { return Err("already_current".into()); }
+            let installing = json!({"request_id":command.request_id,"action":command.action,"status":"installing","data":data});
+            // Persist before starting the installer, which restarts this process.
+            let _ = fs::remove_file(data_dir.join("ota-install-result"));
+            write_record(&path, &installing)?;
+            manager.install(&candidate, &snapshot, true).await?;
+            Ok(installing)
+        }.await;
+        if let Err(error) = &operation { manager.fail(None, error.clone()); }
+        manager.finish_update();
+        operation
+    }.await;
+    match run {
+        Ok(value) => result = value,
+        Err(error) => result["error"] = json!({"code":error}),
+    }
+    // A rejected concurrent command must not overwrite an active installation record.
+    if persist {
+        let _ = write_record(&data_dir.join("cloud-update.json"), &result);
+    }
+    result
+}
+
+/// Update state for runtimes without a full `App` (the ARM32 U50 collector).
+#[derive(Clone)]
+pub struct PanelUpdater {
+    pub ota: Arc<tokio::sync::Mutex<ota::Ota>>,
+    pub data_dir: PathBuf,
+    pub snapshot: tokio::sync::watch::Receiver<crate::model::Snapshot>,
+}
+
+impl PanelUpdater {
+    pub async fn result(&self) -> Option<Value> {
+        update_result(&self.data_dir).await
+    }
+    pub async fn run(&self, command: Command, config: Config) -> Value {
+        let snapshot = serde_json::to_value(&*self.snapshot.borrow()).unwrap_or(Value::Null);
+        run_update(&self.ota, &self.data_dir, snapshot, command, config).await
+    }
+}
+
 impl App {
     pub async fn cloud_update_result(&self) -> Option<Value> {
-        let path = self.inner._data_dir.join("cloud-update.json");
-        let mut result: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-        if result["status"] == "installing" {
-            let version = env!("DATAD_VERSION");
-            if result["data"]["target_version"] == version {
-                let expected = result["data"]["binary_sha256"].as_str()?;
-                use sha2::{Digest, Sha256};
-                let bytes = fs::read(std::env::current_exe().ok()?).ok()?;
-                let actual = format!("{:x}", Sha256::digest(&bytes));
-                result["status"] = json!(if actual == expected {
-                    "succeeded"
-                } else {
-                    "failed"
-                });
-                result["data"]["current_version"] = json!(version);
-                result["data"]["installed_sha256"] = json!(actual);
-                let _ = write_record(&path, &result);
-            } else if let Ok(marker) =
-                fs::read_to_string(self.inner._data_dir.join("ota-install-result"))
-                && matches!(marker.trim(), "failed" | "success")
-            {
-                result["status"] = json!("failed");
-                result["error"] = json!({"code":if marker.trim()=="success" {"installed_version_mismatch"} else {"installer_failed"}});
-                let _ = write_record(&path, &result);
-            }
-        }
-        Some(result)
+        update_result(&self.inner._data_dir).await
     }
 
     pub async fn cloud_update(&self, command: Command, config: Config) -> Value {
-        let mut result =
-            json!({"request_id":command.request_id,"action":command.action,"status":"failed"});
-        let mut persist = false;
-        let run = async {
-            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-            validate(&command, &config, boot.trim(), uptime())?;
-            let path = self.inner._data_dir.join("cloud-update.json");
-            if let Some(previous) = self.cloud_update_result().await {
-                if previous["request_id"] == command.request_id { return Ok(previous); }
-                if previous["status"] == "installing" { return Err("update_in_progress".into()); }
-            }
-            let mut manager = self.inner.ota.try_lock().map_err(|_| "update_in_progress".to_string())?;
-            manager.begin_update()?;
-            persist = true;
-            let operation: Result<Value, String> = async {
-                let candidate = manager.check().await?;
-                let binary = candidate.manifest.artifacts.get("binary").ok_or("missing_binary")?;
-                let data = json!({"current_version":env!("DATAD_VERSION"),"target_version":candidate.manifest.version,
-                    "binary_sha256":binary.sha256,"size":binary.size,"has_update":ota::has_update(&candidate),"signature_verified":true});
-                if command.action == "datad.update.check" {
-                    return Ok(json!({"request_id":command.request_id,"action":command.action,"status":"checked","data":data}));
-                }
-                if command.target_version != candidate.manifest.version || command.binary_sha256 != binary.sha256 {
-                    return Err("candidate_changed_check_again".into());
-                }
-                if !ota::has_update(&candidate) { return Err("already_current".into()); }
-                let installing = json!({"request_id":command.request_id,"action":command.action,"status":"installing","data":data});
-                // Persist before starting the installer, which restarts this process.
-                let _ = fs::remove_file(self.inner._data_dir.join("ota-install-result"));
-                write_record(&path, &installing)?;
-                let snapshot = serde_json::to_value(self.snapshot().await).unwrap_or(Value::Null);
-                manager.install(&candidate, &snapshot, true).await?;
-                Ok(installing)
-            }.await;
-            if let Err(error) = &operation { manager.fail(None, error.clone()); }
-            manager.finish_update();
-            operation
-        }.await;
-        match run {
-            Ok(value) => result = value,
-            Err(error) => result["error"] = json!({"code":error}),
-        }
-        // A rejected concurrent command must not overwrite an active installation record.
-        if persist {
-            let _ = write_record(&self.inner._data_dir.join("cloud-update.json"), &result);
-        }
-        result
+        let snapshot = serde_json::to_value(self.snapshot().await).unwrap_or(Value::Null);
+        run_update(
+            &self.inner.ota,
+            &self.inner._data_dir,
+            snapshot,
+            command,
+            config,
+        )
+        .await
     }
 }
 

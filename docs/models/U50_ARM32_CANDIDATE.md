@@ -114,3 +114,16 @@ The mainline WebShell (PTY-backed, 4 sessions, 15 min idle, 1800 s cap) is avail
 2. set `"remote_webshell_enabled": true` in the private `cloud.json` (with `remote_enabled: true`).
 
 Without both, a `webshell` request is answered `panel_only` / `webshell_disabled`. Proxies, remote control and updates remain rejected in this runtime. When enabled the device advertises `datad.webshell`, and NMS accepts the terminal only for the bound owner as for mainline devices. To enable on the device, add the flag to `ExecStart` in `/etc/systemd/system/zwrt-datad.service` (remount `/` read-write for the edit, then read-only again), edit `cloud.json`, and `systemctl daemon-reload && sh /etc_rw/zwrt-datad/service.sh restart`.
+
+## Self-update (OTA), same as mainline (v0.10.44)
+
+The U50 runtime now has the mainline update stack: the loopback `/ota/config`, `/ota/status`, `/ota/check`, `/ota/update` routes, the background auto-update (first check after 90 s, then every 6 h, installs after two idle minutes; `ZWRT_DATAD_OTA_DISABLE_AUTO=1` disables the background task), and the NMS `datad.update.check` / `datad.update.install` commands (advertised as `datad.update` when the panel config is active). Sources, Ed25519 verification against the embedded public key and the version/SHA pinning are the same code as ARM64.
+
+Differences that come from the device:
+
+- **Own signed manifest.** Releases publish `update-armv7.json` / `update-armv7.json.sig` and the pinned installer `install-datad-armv7.sh` next to the binary `zwrt-datad-armv7`. The ARM64 `update.json` and every deployed ARM64 datad are untouched. **Every release must be published with `DATAD_ARMV7_BINARY`** (see `scripts/publish-release.sh`); a release without these assets makes U50 update checks fail until the next one that has them.
+- **The daemon downloads the binary itself.** The firmware has no curl/wget, so datad fetches `zwrt-datad-armv7`, checks size and SHA-256 against the signed manifest, and stages it as `<data-dir>/zwrt-datad.new` (`--u50-data-dir`, default `/etc_rw/zwrt-datad`, same volume as the executable). The installer only verifies the pinned hash and `--version`, swaps atomically and restarts.
+- **systemd.** The installer runs as the transient unit `zwrt-datad-ota` (`systemd-run`), so restarting `zwrt-datad.service` does not kill it. It waits until the service runs the new file and stays up, and otherwise restores the previous binary.
+- **Storage gate.** The ~15 MB `/etc_rw` volume needs 7 MiB free (instead of 64 MiB) before an install starts.
+
+The first move to an OTA-capable build must be manual; later versions update themselves.

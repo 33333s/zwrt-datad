@@ -1,4 +1,4 @@
-use crate::{model::Snapshot, webshell::WebShell};
+use crate::{cloud_update::PanelUpdater, model::Snapshot, webshell::WebShell};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use rumqttc::{
@@ -236,6 +236,7 @@ impl Cloud {
         file: &Path,
         state: watch::Receiver<Snapshot>,
         webshell: bool,
+        updater: Option<PanelUpdater>,
     ) -> Result<(), String> {
         let metadata = fs::metadata(file).map_err(|_| "U50 panel config unavailable")?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
@@ -258,6 +259,9 @@ impl Cloud {
         config.remote_webshell_enabled = webshell && config.remote_webshell_enabled;
         if config.remote_webshell_enabled {
             PANEL_SHELL.get_or_init(|| WebShell::new(true));
+        }
+        if let Some(updater) = updater {
+            let _ = PANEL_UPDATER.set(updater);
         }
         let (tx, rx) = watch::channel(Some(config));
         let status = Arc::new(Mutex::new(Status::default()));
@@ -678,9 +682,8 @@ async fn session(
                         continue;
                     }
                     let snapshot = state_rx.borrow().clone();
-                    if let Some(app) = &app
-                        && let Some(result) = app.cloud_update_result().await {
-                            let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                    if let Some(result) = pending_update_result(&app, panel_only).await {
+                        let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
                     if report(&client, config, &snapshot, &status, webshell_available, app.is_some() || panel_only, panel_only).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
@@ -716,11 +719,13 @@ async fn session(
                     if !enrolled { continue; }
                     if message.topic != format!("{}/command/request", root(config)) || message.retain || message.payload.len() > 8192 { continue; }
                     if let Ok(command) = serde_json::from_slice::<crate::cloud_update::Command>(&message.payload) {
-                        if let Some(app) = &app {
-                            let app = app.clone();
+                        if updates.is_empty() {
                             let config = config.clone();
-                            if updates.is_empty() {
+                            if let Some(app) = &app {
+                                let app = app.clone();
                                 updates.spawn(async move { app.cloud_update(command, config).await });
+                            } else if panel_only && let Some(updater) = PANEL_UPDATER.get().cloned() {
+                                updates.spawn(async move { updater.run(command, config).await });
                             }
                         }
                         continue;
@@ -742,9 +747,8 @@ async fn session(
                 }
             },
             _ = ticker.tick(), if connected && enrolled => {
-                if let Some(app) = &app
-                    && let Some(result) = app.cloud_update_result().await {
-                        let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                if let Some(result) = pending_update_result(&app, panel_only).await {
+                    let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
                 if report(&client, config, &snapshot, &status, webshell_available, app.is_some() || panel_only, panel_only).await.is_err() {
@@ -796,6 +800,9 @@ async fn report(
     } else {
         vec!["datad.update", "datad.remote", "datad.remote_origins"]
     };
+    if panel_only && PANEL_UPDATER.get().is_some() {
+        capabilities.push("datad.update");
+    }
     if webshell_available {
         capabilities.push("datad.webshell");
     }
@@ -974,6 +981,24 @@ struct BridgeState {
 /// Terminal used by the U50 panel-only runtime, which has no full `App`.
 /// Set once at startup and only when the U50 WebShell opt-in is active.
 static PANEL_SHELL: OnceLock<WebShell> = OnceLock::new();
+
+/// Signed self-update handler for the same runtime (NMS `datad.update.*`).
+static PANEL_UPDATER: OnceLock<PanelUpdater> = OnceLock::new();
+
+/// Update result to re-publish (after a restart the installer's outcome is
+/// read back from disk), from the full `App` or the U50 panel runtime.
+async fn pending_update_result(
+    app: &Option<crate::server::App>,
+    panel_only: bool,
+) -> Option<Value> {
+    if let Some(app) = app {
+        return app.cloud_update_result().await;
+    }
+    if panel_only {
+        return PANEL_UPDATER.get()?.result().await;
+    }
+    None
+}
 
 #[derive(Clone)]
 struct BridgeManager {

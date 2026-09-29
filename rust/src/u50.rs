@@ -4,15 +4,17 @@
 //! The firmware proves names and code paths, not successful device responses.
 use crate::{
     cloud::{Cloud, QuickConnect},
+    cloud_update::PanelUpdater,
     command,
     model::{DatadVersion, Snapshot},
+    ota::{self, Ota, Profile},
     u50_oem::Bridge,
     u50_sys,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
@@ -23,11 +25,11 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{RwLock, Semaphore, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tokio_stream::{StreamExt, wrappers::WatchStream};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -889,6 +891,7 @@ struct App {
     last_ok: Arc<RwLock<Instant>>,
     max_stale: Duration,
     oem: Option<Bridge>,
+    ota: Option<Arc<Mutex<Ota>>>,
 }
 async fn health(State(app): State<App>) -> (StatusCode, &'static str) {
     if app.last_ok.read().await.elapsed() > app.max_stale {
@@ -1162,11 +1165,140 @@ async fn collect(
     Ok(snapshot)
 }
 
+async fn current_snapshot(app: &App) -> Value {
+    serde_json::to_value(&*app.snapshot.read().await).unwrap_or(Value::Null)
+}
+
+/// Mainline auto-update policy: first check after 90 s, then a check every six
+/// hours and an install when the device has been idle for two minutes.
+/// `ZWRT_DATAD_OTA_DISABLE_AUTO=1` turns the background task off.
+fn spawn_ota(app: &App) {
+    let Some(ota) = app.ota.clone() else {
+        return;
+    };
+    if std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").as_deref() == Ok("1") {
+        return;
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            let snapshot = current_snapshot(&app).await;
+            let mut manager = ota.lock().await;
+            manager.reconcile_install_result();
+            if manager.should_auto_check() && manager.begin_update().is_ok() {
+                manager.mark_auto_check();
+                let _ = manager.check().await;
+                manager.finish_update();
+            }
+            if let Some(candidate) = manager.auto_candidate()
+                && manager.begin_update().is_ok()
+            {
+                if let Err(error) = manager.install(&candidate, &snapshot, false).await
+                    && !error.starts_with("等待安装条件:")
+                {
+                    manager.fail(Some(&candidate), error);
+                }
+                manager.finish_update();
+            }
+            drop(manager);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
+async fn ota_config_get(State(app): State<App>) -> Response {
+    match &app.ota {
+        Some(ota) => Json(ota.lock().await.config_json()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn ota_status(State(app): State<App>) -> Response {
+    match &app.ota {
+        Some(ota) => Json(ota.lock().await.status_json()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn ota_config_post(
+    State(app): State<App>,
+    payload: Result<Json<ota::Config>, JsonRejection>,
+) -> Response {
+    let (Some(ota), Ok(Json(config))) = (&app.ota, payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"success":false,"error":"配置格式无效"})),
+        )
+            .into_response();
+    };
+    match ota.lock().await.update_config(config) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"success":false,"error":error})),
+        )
+            .into_response(),
+    }
+}
+async fn ota_check(State(app): State<App>) -> Response {
+    let Some(ota) = &app.ota else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut manager = ota.lock().await;
+    match manager.check().await {
+        Ok(candidate) => (
+            StatusCode::OK,
+            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":ota::source_name(&candidate.base_url)})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"success":false,"error":error})),
+        )
+            .into_response(),
+    }
+}
+async fn ota_update(State(app): State<App>) -> Response {
+    let Some(ota) = app.ota.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Err(error) = ota.lock().await.begin_update() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"success":false,"error":error})),
+        )
+            .into_response();
+    }
+    tokio::spawn(async move {
+        let snapshot = current_snapshot(&app).await;
+        let mut manager = ota.lock().await;
+        match manager.check().await {
+            Ok(candidate) if !ota::has_update(&candidate) => {
+                manager.fail(Some(&candidate), "当前已是最新版本".into());
+            }
+            Ok(candidate) => {
+                if let Err(error) = manager.install(&candidate, &snapshot, true).await {
+                    manager.fail(Some(&candidate), error);
+                }
+            }
+            Err(error) => manager.fail(None, error),
+        }
+        manager.finish_update();
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"success":true,"status":"started"})),
+    )
+        .into_response()
+}
+
 /// Explicit owner opt-ins for the U50 runtime; both default to off.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     pub enable_writes: bool,
     pub enable_webshell: bool,
+    /// Directory for OTA state and the staged binary; must be on the same
+    /// volume as the running executable.
+    pub data_dir: PathBuf,
 }
 
 pub async fn run(
@@ -1181,6 +1313,7 @@ pub async fn run(
     let RunOptions {
         enable_writes,
         enable_webshell,
+        data_dir,
     } = options;
     ensure!(
         bind.ip().is_loopback(),
@@ -1212,8 +1345,20 @@ pub async fn run(
         None
     };
     let (tx, _) = watch::channel(initial.clone());
+    let ota = match Ota::load_with(&data_dir, Profile::U50) {
+        Ok(manager) => Some(Arc::new(Mutex::new(manager))),
+        Err(error) => {
+            eprintln!("U50 OTA unavailable: {error}");
+            None
+        }
+    };
     if let Some(file) = panel_config {
-        crate::cloud::Cloud::start_panel_only(file, tx.subscribe(), enable_webshell)
+        let updater = ota.as_ref().map(|ota| PanelUpdater {
+            ota: ota.clone(),
+            data_dir: data_dir.clone(),
+            snapshot: tx.subscribe(),
+        });
+        crate::cloud::Cloud::start_panel_only(file, tx.subscribe(), enable_webshell, updater)
             .map_err(anyhow::Error::msg)?;
     }
     let app = App {
@@ -1223,7 +1368,9 @@ pub async fn run(
         last_ok: Arc::new(RwLock::new(Instant::now())),
         max_stale: interval.saturating_mul(3),
         oem,
+        ota,
     };
+    spawn_ota(&app);
     let state = app.clone();
     tokio::spawn(async move {
         loop {
@@ -1248,6 +1395,13 @@ pub async fn run(
         .route("/state", get(snapshot))
         .route("/events", get(events))
         .route("/capabilities", get(capabilities));
+    if app.ota.is_some() {
+        router = router
+            .route("/ota/config", get(ota_config_get).post(ota_config_post))
+            .route("/ota/status", get(ota_status))
+            .route("/ota/check", post(ota_check))
+            .route("/ota/update", post(ota_update));
+    }
     if app.oem.is_some() {
         router = router
             .route("/auth/login", post(oem_login))
