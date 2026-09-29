@@ -960,6 +960,31 @@ impl Forwarder {
         }))
     }
 
+    fn reserve_sim_quota(&mut self, count: u16) -> Result<(), String> {
+        let date = reboot_schedule::local_clock()
+            .ok_or("clock_unavailable")?
+            .date;
+        let mut next = self.config.clone();
+        if next.sms_quota_date != date {
+            next.sms_quota_date = date;
+            next.sms_quota_used = 0;
+        }
+        if next.sms_quota_used + count > MAX_SMS_DAILY_SENDS {
+            return Err("rate_limited".into());
+        }
+        next.sms_quota_used += count;
+        self.save(&next)?;
+        self.config = next;
+        Ok(())
+    }
+
+    pub fn reserve_scheduled_sms(&mut self) -> Result<(), String> {
+        if self.last_result == "invalid_config" {
+            return Err("invalid_config".into());
+        }
+        self.reserve_sim_quota(1)
+    }
+
     pub fn reserve_sms(&mut self, message: &Message) -> Result<(), String> {
         if self.config.method != "sms" {
             return Ok(());
@@ -973,21 +998,7 @@ impl Forwarder {
         if count == 0 {
             return Err("self_forward_blocked".into());
         }
-        let date = reboot_schedule::local_clock()
-            .ok_or("clock_unavailable")?
-            .date;
-        let mut next = self.config.clone();
-        if next.sms_quota_date != date {
-            next.sms_quota_date = date;
-            next.sms_quota_used = 0;
-        }
-        if usize::from(next.sms_quota_used) + count > usize::from(MAX_SMS_DAILY_SENDS) {
-            return Err("rate_limited".into());
-        }
-        next.sms_quota_used += count as u16;
-        self.save(&next)?;
-        self.config = next;
-        Ok(())
+        self.reserve_sim_quota(count as u16)
     }
 }
 
@@ -1827,6 +1838,36 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_sms_reserves_the_shared_sim_quota_before_delivery() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-scheduled-sms-quota-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.sms_quota_date = reboot_schedule::local_clock().unwrap().date;
+        manager.config.sms_quota_used = MAX_SMS_DAILY_SENDS - 1;
+        manager.save(&manager.config).unwrap();
+        assert!(!manager.config.enabled);
+        assert_eq!(manager.config.method, "webhook");
+        manager.reserve_scheduled_sms().unwrap();
+        assert_eq!(manager.status()["sms_daily_remaining"], 0);
+        assert_eq!(manager.reserve_scheduled_sms(), Err("rate_limited".into()));
+        let mut reloaded = Forwarder::load(&dir);
+        assert_eq!(reloaded.status()["sms_daily_remaining"], 0);
+        assert_eq!(reloaded.reserve_scheduled_sms(), Err("rate_limited".into()));
+        assert_eq!(
+            fs::metadata(dir.join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn device_info_uses_bounded_status_without_leaking_identifiers_to_mail_or_dingtalk() {
         let fields = json!({
             "device":{"market_name":"U60 Pro"},
@@ -1906,6 +1947,12 @@ mod tests {
         assert_eq!(manager.status()["enabled"], false);
         assert_eq!(manager.status()["last_result"], "invalid_config");
         assert!(!manager.status().to_string().contains("must-not-leak"));
+        let original = fs::read(dir.join(FILE_NAME)).unwrap();
+        assert_eq!(
+            manager.reserve_scheduled_sms(),
+            Err("invalid_config".into())
+        );
+        assert_eq!(fs::read(dir.join(FILE_NAME)).unwrap(), original);
         assert!(
             manager
                 .next(&json!({"stale":false,"truncated":false,"list":[]}))
