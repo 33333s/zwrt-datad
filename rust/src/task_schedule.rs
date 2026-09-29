@@ -270,7 +270,7 @@ impl TaskSchedule {
         let index = self.stored.tasks.iter().position(|task| {
             task.input.time == clock.time
                 && task.last_attempt_date != clock.date
-                && !(task.has_triggered && !task.input.repeat_daily)
+                && (task.input.repeat_daily || !task.has_triggered)
         })?;
         let mut next = self.stored.clone();
         let task = &mut next.tasks[index];
