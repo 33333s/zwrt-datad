@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pinned zwrt-datad installer for the ARMv7 ZTE U50S (version and SHA-256 below).
+# zwrt-datad @@VERSION@@ pinned installer for the ARMv7 ZTE U50S.
 #
 # It installs only the binary whose SHA-256 is pinned below. The running daemon
 # downloads and verifies the binary itself (this firmware has no curl/wget) and
