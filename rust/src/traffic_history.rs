@@ -30,6 +30,8 @@ struct Stored {
     schema: u8,
     last_sample_at: i64,
     days: BTreeMap<String, Day>,
+    #[serde(default)]
+    active_day: Option<String>,
 }
 
 impl Default for Stored {
@@ -38,6 +40,7 @@ impl Default for Stored {
             schema: 1,
             last_sample_at: 0,
             days: BTreeMap::new(),
+            active_day: None,
         }
     }
 }
@@ -51,6 +54,9 @@ pub struct Usage {
 pub struct History {
     path: PathBuf,
     stored: Stored,
+    last_sample_elapsed: Option<std::time::Duration>,
+    clock_generation: u64,
+    allow_relabel: bool,
 }
 
 fn valid_date(value: &str) -> bool {
@@ -114,6 +120,10 @@ impl History {
             .and_then(|raw| serde_json::from_slice::<Stored>(&raw).ok())
             .filter(|value| {
                 value.schema == 1
+                    && value
+                        .active_day
+                        .as_ref()
+                        .is_none_or(|date| valid_date(date) && value.days.contains_key(date))
                     && value.days.len() <= MAX_DAYS
                     && value.days.keys().all(|date| valid_date(date))
                     && value.days.values().all(|day| {
@@ -121,7 +131,13 @@ impl History {
                     })
             })
             .unwrap_or_default();
-        Self { path, stored }
+        Self {
+            path,
+            stored,
+            last_sample_elapsed: None,
+            clock_generation: crate::time_control::clock_generation(),
+            allow_relabel: false,
+        }
     }
 
     pub fn days(&self) -> Vec<Usage> {
@@ -136,6 +152,24 @@ impl History {
     }
 
     pub fn record(&mut self, snapshot: &Snapshot) -> bool {
+        let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
+            return false;
+        };
+        if crate::time_control::clock_change_in_progress() {
+            return false;
+        }
+        let generation = crate::time_control::clock_generation();
+        if generation != self.clock_generation {
+            self.clock_generation = generation;
+            self.stored.last_sample_at = 0;
+            self.allow_relabel = true;
+        }
+        let elapsed = crate::elapsed::now();
+        if self.last_sample_elapsed.is_some_and(|previous| {
+            elapsed.saturating_sub(previous).as_secs() < SAMPLE_SECONDS as u64
+        }) {
+            return false;
+        }
         let Some(traffic) = snapshot.fields.get("traffic") else {
             return false;
         };
@@ -154,16 +188,17 @@ impl History {
         let Ok(now) = i64::try_from(now.as_secs()) else {
             return false;
         };
-        if self.stored.last_sample_at != 0
-            && (now < self.stored.last_sample_at
-                || now - self.stored.last_sample_at < SAMPLE_SECONDS)
-        {
-            return false;
+        // Real-time correction must not stall sampling until the old epoch
+        // catches up. The sampling interval uses elapsed boot time instead.
+        if now < self.stored.last_sample_at {
+            self.stored.last_sample_at = 0;
+            self.allow_relabel = true;
         }
         let Some(date) = local_date() else {
             return false;
         };
         let changed = self.apply_sample(&date, now, counter);
+        self.last_sample_elapsed = Some(elapsed);
         if changed && let Err(error) = self.persist() {
             eprintln!("traffic history save failed: {error}");
         }
@@ -175,50 +210,52 @@ impl History {
             || !valid_date(date)
             || counter > MAX_DAILY_BYTES
             || now < self.stored.last_sample_at
-            || self
-                .stored
-                .days
-                .last_key_value()
-                .is_some_and(|(last, _)| date < last.as_str())
+            || (!self.allow_relabel
+                && self
+                    .stored
+                    .active_day
+                    .as_deref()
+                    .or_else(|| {
+                        self.stored
+                            .days
+                            .last_key_value()
+                            .map(|(last, _)| last.as_str())
+                    })
+                    .is_some_and(|last| date < last))
             || (self.stored.days.contains_key(date)
                 && now - self.stored.last_sample_at < SAMPLE_SECONDS)
         {
             return false;
         }
-        if self
-            .stored
-            .days
-            .get(date)
-            .is_some_and(|day| day.last_counter == counter)
+        if self.stored.active_day.as_deref() == Some(date)
+            && self
+                .stored
+                .days
+                .get(date)
+                .is_some_and(|day| day.last_counter == counter)
         {
             return false;
         }
-        let is_new_day = !self.stored.days.contains_key(date);
-        let previous_counter = if is_new_day {
-            self.stored
-                .days
-                .last_key_value()
-                .map(|(_, day)| day.last_counter)
-        } else {
-            None
-        };
+        // Counters belong to the latest observation, not whichever date is
+        // lexically greatest. A corrected calendar can revisit an older day.
+        let previous_counter = self
+            .stored
+            .active_day
+            .as_ref()
+            .and_then(|active| self.stored.days.get(active))
+            .or_else(|| self.stored.days.last_key_value().map(|(_, day)| day))
+            .map(|day| day.last_counter);
         let day = self.stored.days.entry(date.to_owned()).or_insert(Day {
             bytes: 0,
             last_counter: 0,
         });
-        let increment = if is_new_day {
-            previous_counter.map_or(counter, |previous| {
-                if counter >= previous {
-                    counter - previous
-                } else {
-                    counter
-                }
-            })
-        } else if counter >= day.last_counter {
-            counter - day.last_counter
-        } else {
-            counter // Counter reset during the day.
-        };
+        let increment = previous_counter.map_or(counter, |previous| {
+            if counter >= previous {
+                counter - previous
+            } else {
+                counter
+            }
+        });
         let next = day.bytes.saturating_add(increment);
         if next > MAX_DAILY_BYTES {
             return false;
@@ -226,6 +263,8 @@ impl History {
         day.bytes = next;
         day.last_counter = counter;
         self.stored.last_sample_at = now;
+        self.stored.active_day = Some(date.to_owned());
+        self.allow_relabel = false;
         while self.stored.days.len() > MAX_DAYS {
             self.stored.days.pop_first();
         }
@@ -255,6 +294,32 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrected_calendar_keeps_delta_without_recounting_later_days() {
+        let dir = std::env::temp_dir().join(format!("datad-history-clock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut history = History::load(&dir);
+        let start = MIN_CLOCK_SECONDS + 86_400;
+        assert!(history.apply_sample("2026-10-02", start + 28_800, 100));
+        assert!(history.apply_sample("2026-10-02", start + 29_100, 200));
+        // Authorized correction establishes a new epoch/calendar generation.
+        history.stored.last_sample_at = 0;
+        history.allow_relabel = true;
+        assert!(history.apply_sample("2026-10-01", start + 600, 250));
+        assert_eq!(history.days()[0].bytes, 50);
+        assert_eq!(history.days()[1].bytes, 200);
+        assert!(history.apply_sample("2026-10-01", start + 900, 300));
+        assert_eq!(history.days()[0].bytes, 100);
+        history.persist().unwrap();
+        let mut reopened = History::load(&dir);
+        assert_eq!(reopened.stored.active_day.as_deref(), Some("2026-10-01"));
+        reopened.stored.last_sample_at = 0;
+        reopened.allow_relabel = true;
+        assert!(reopened.apply_sample("2026-10-02", start + 1200, 350));
+        assert_eq!(reopened.days()[1].bytes, 250);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn daily_samples_survive_restarts_and_count_counter_resets() {

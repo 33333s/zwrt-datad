@@ -341,13 +341,16 @@ impl TaskSchedule {
     /// Record an attempt before a device action. A reboot or crash cannot
     /// cause the same one-shot task to run again on daemon restart.
     pub fn observe(&mut self, clock: Option<&Clock>) -> Option<TaskInput> {
+        if crate::time_control::clock_change_in_progress() {
+            return None;
+        }
         let clock = clock?;
         if self.error.is_some() {
             return None;
         }
         let index = self.stored.tasks.iter().position(|task| {
             task.input.time == clock.time
-                && task.last_attempt_date != clock.date
+                && (task.last_attempt_date.is_empty() || task.last_attempt_date < clock.date)
                 && (task.input.repeat_daily || !task.has_triggered)
         })?;
         let mut next = self.stored.clone();
@@ -542,6 +545,21 @@ mod tests {
         assert!(schedule.observe(Some(&clock)).is_some());
         assert!(schedule.observe(Some(&clock)).is_none());
         clock.date = "2026-09-30".into();
+        crate::time_control::with_clock_state(true, 1, || {
+            assert!(
+                schedule.observe(Some(&clock)).is_none(),
+                "clock transition consumed a task"
+            );
+        });
+        assert!(schedule.observe(Some(&clock)).is_some());
+        clock.date = "2026-09-29".into();
+        assert!(
+            schedule.observe(Some(&clock)).is_none(),
+            "clock rollback repeated a daily action"
+        );
+        clock.date = "2026-09-30".into();
+        assert!(schedule.observe(Some(&clock)).is_none());
+        clock.date = "2026-10-01".into();
         assert!(schedule.observe(Some(&clock)).is_some());
         fs::remove_dir_all(dir).unwrap();
     }
