@@ -85,8 +85,8 @@ pub(crate) fn boot_id() -> Option<String> {
     {
         let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
         let value = value.trim();
-        return (value.len() == 36 && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
-            .then(|| value.to_owned());
+        (value.len() == 36 && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+            .then(|| value.to_owned())
     }
     #[cfg(not(target_os = "linux"))]
     None
