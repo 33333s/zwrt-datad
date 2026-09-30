@@ -1194,7 +1194,12 @@ impl Ctl {
             return Outcome::Failed(error);
         }
         let readback = self.field("net_select").await;
-        Outcome::Ok(json!({"mode":mode,"verified":readback.as_deref() == Some(mode)}))
+        // The U50 Pro firmware stores the 4G+5G preference as `WL_AND_5G`.
+        let verified = match mode {
+            "4G_AND_5G" => matches!(readback.as_deref(), Some("4G_AND_5G" | "WL_AND_5G")),
+            other => readback.as_deref() == Some(other),
+        };
+        Outcome::Ok(json!({"mode":mode,"verified":verified}))
     }
 
     async fn sim_set_slot(&self, params: &Value) -> Outcome {

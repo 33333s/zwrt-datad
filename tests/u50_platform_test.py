@@ -120,7 +120,9 @@ class Vendor(BaseHTTPRequestHandler):
         if action == "SET_CONNECTION_MODE":
             STORE["dial_mode"], STORE["roam_setting_option"] = one["ConnectionMode"], one["roam_setting_option"]
         elif action == "SET_BEARER_PREFERENCE":
-            STORE["net_select"] = one["BearerPreference"]
+            # The U50 Pro firmware reports the 4G+5G preference as WL_AND_5G.
+            STORE["net_select"] = ("WL_AND_5G" if one["BearerPreference"] == "4G_AND_5G"
+                                   else one["BearerPreference"])
         elif action == "SWITCH_SIMCARD_SLOT":
             STORE["simcard_active_slot"] = one["simcard_active_slot"]
         elif action == "BAND_SELECT":
@@ -281,6 +283,10 @@ esac
         status, result = control(port, "network.set_mode", {"mode": "Only_5G"})
         assert status == 200 and result["result"] == {"mode": "Only_5G", "verified": True}, result
         assert control(port, "network.set_mode", {"mode": "rm -rf"})[0] == 400
+        # U50 Pro: the input alias maps to 4G_AND_5G and the WL_AND_5G readback
+        # still counts as verified.
+        status, result = control(port, "network.set_mode", {"mode": "WL_AND_5G"})
+        assert status == 200 and result["result"] == {"mode": "4G_AND_5G", "verified": True}, result
         status, result = control(port, "sim.set_slot", {"slot": 2})
         assert status == 200 and result["result"]["verified"] is True
         assert control(port, "sim.set_slot", {"slot": 3})[0] == 400

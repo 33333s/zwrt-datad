@@ -59,7 +59,16 @@ pub fn thermal_zones() -> Vec<(String, i64)> {
         let Some(kind) = read(&format!("{base}/type")) else {
             continue;
         };
-        if kind.contains("-lvl") || kind.ends_with("-lowf") || kind == "battery_zte" {
+        // `vbat` reports battery voltage in mV, `socd` a shutdown counter in
+        // impossible milli-degrees, and the mmWave beamer floats high on
+        // sub-6-only hardware (sdxlemur/U50 Pro); none are temperatures.
+        if kind.contains("-lvl")
+            || kind.ends_with("-lowf")
+            || matches!(
+                kind.as_str(),
+                "battery_zte" | "vbat" | "socd" | "modem-beamer-usr"
+            )
+        {
             continue;
         }
         let Some(milli) = read_i64(&format!("{base}/temp"))
@@ -76,10 +85,18 @@ pub fn thermal_zones() -> Vec<(String, i64)> {
 }
 
 pub fn cpu_celsius(zones: &[(String, i64)]) -> Option<i64> {
-    ["cpu0-0-usr", "mdm-core-0-usr", "mdm-q6-usr"]
-        .iter()
-        .find_map(|wanted| zones.iter().find(|(name, _)| name == wanted))
-        .map(|(_, milli)| (milli + 500) / 1000)
+    // sdxlemur (U50 Pro) exposes the AP core as `cpuss-0-usr` and the modem
+    // DSP as `mdmq6-0-usr` instead of the sdxprairie (U50S) `cpu0-0-usr`.
+    [
+        "cpu0-0-usr",
+        "cpuss-0-usr",
+        "mdmq6-0-usr",
+        "mdm-core-0-usr",
+        "mdm-q6-usr",
+    ]
+    .iter()
+    .find_map(|wanted| zones.iter().find(|(name, _)| name == wanted))
+    .map(|(_, milli)| (milli + 500) / 1000)
 }
 
 pub fn thermal_block(zones: &[(String, i64)]) -> Value {
@@ -212,6 +229,7 @@ fn battery_extra_with(ps: impl Fn(&str, &str) -> Option<String>) -> Map<String, 
                 .as_ref()
                 .and_then(|status| charging_status(status).map(|value| (status, value)))
         });
+    let charging_code = recognized.as_ref().map(|(_, code)| *code);
     if let Some((status, value)) = recognized {
         out.insert("charging".into(), json!(value));
         out.insert("status".into(), json!(status));
@@ -242,17 +260,27 @@ fn battery_extra_with(ps: impl Fn(&str, &str) -> Option<String>) -> Map<String, 
         out.insert("bat_uv".into(), json!(value));
     }
     // Same sign convention as the ZWRT collector: positive while charging.
-    // The fuel-gauge node already follows it; the charger-side `battery` node
-    // reports the opposite sign.
-    if let Some(value) =
-        ps_i64("bms", "current_now").or_else(|| ps_i64("battery", "current_now").map(|v| -v))
-    {
+    // The fuel-gauge node already follows it. The sign of the `battery` node
+    // varies by firmware (negative while charging on sdxprairie/U50S, positive
+    // on sdxlemur/U50 Pro), so it is normalised against the recognized state
+    // (1 = charging, 2 = discharging).
+    let bat_current = ps_i64("bms", "current_now").or_else(|| {
+        let value = ps_i64("battery", "current_now")?;
+        match charging_code {
+            Some(1) => Some(value.abs()),
+            Some(2) => Some(-value.abs()),
+            _ => Some(value),
+        }
+    });
+    if let Some(value) = bat_current {
         out.insert("bat_ua".into(), json!(value));
     }
     if let Some(value) = ps_i64("battery", "cycle_count") {
         out.insert("cycle_count".into(), json!(value));
     }
-    if let Some(value) = ps_i64("battery_zte", "nominal_capacity_mah_mbb") {
+    if let Some(value) = ps_i64("battery_zte", "nominal_capacity_mah_mbb")
+        .or_else(|| ps_i64("battery", "charge_full").map(|v| v / 1000))
+    {
         out.insert("capacity_mah".into(), json!(value));
     }
     out
@@ -620,6 +648,12 @@ mod tests {
             ("pm8150b-vbat-lvl0", "4334"),
             ("battery_zte", "3400"),
             ("battery", "34700"),
+            // sdxlemur (U50 Pro) pseudo-zones and sensor names.
+            ("vbat", "4185"),
+            ("socd", "22"),
+            ("modem-beamer-usr", "85854"),
+            ("cpuss-0-usr", "39900"),
+            ("mdmq6-0-usr", "40200"),
         ]
         .into_iter()
         .enumerate()
@@ -630,23 +664,87 @@ mod tests {
             fs::write(zone.join("temp"), format!("{temp}\n")).unwrap();
         }
         // A zone whose temp cannot be read (EINVAL on the device) is skipped.
-        let broken = dir.join("sys/class/thermal/thermal_zone9");
+        let broken = dir.join("sys/class/thermal/thermal_zone12");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("type"), "soc\n").unwrap();
         // SAFETY: tests in this module are the only users of the variable.
         unsafe { std::env::set_var("ZWRT_DATAD_U50_ROOT", &dir) };
         let zones = thermal_zones();
-        unsafe { std::env::remove_var("ZWRT_DATAD_U50_ROOT") };
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(
             zones,
             vec![
                 ("cpu0-0-usr".to_owned(), 42800),
-                ("battery".to_owned(), 34700)
+                ("battery".to_owned(), 34700),
+                ("cpuss-0-usr".to_owned(), 39900),
+                ("mdmq6-0-usr".to_owned(), 40200)
             ]
         );
         assert_eq!(cpu_celsius(&zones), Some(43));
         assert_eq!(thermal_block(&zones)["cpu_celsius"], 43);
+        // The U50 Pro zone names alone also select a CPU temperature.
+        assert_eq!(cpu_celsius(&[("cpuss-0-usr".to_owned(), 39900)]), Some(40));
+        assert_eq!(cpu_celsius(&[("mdmq6-0-usr".to_owned(), 40200)]), Some(40));
+        assert_eq!(cpu_celsius(&[("mdmss-0-usr".to_owned(), 40200)]), None);
+        unsafe { std::env::remove_var("ZWRT_DATAD_U50_ROOT") };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn battery_sign_and_capacity_follow_the_recognized_state() {
+        // sdxlemur (U50 Pro): positive current while charging, capacity from
+        // the learned full charge, charger presence from the USB node.
+        let extra = battery_fixture(
+            "sdxlemur",
+            &[
+                ("battery", "status", "Charging"),
+                ("battery", "current_now", "899353"),
+                ("battery", "voltage_now", "4220314"),
+                ("battery", "cycle_count", "232"),
+                ("battery", "charge_full", "9532000"),
+                ("battery", "health", "Good"),
+                ("usb", "present", "1"),
+                ("usb", "voltage_now", "4460544"),
+            ],
+        );
+        assert_eq!(extra["bat_ua"], json!(899353));
+        assert_eq!(extra["capacity_mah"], json!(9532));
+        assert_eq!(extra["charger_connect"], json!(1));
+        assert_eq!(extra["bat_uv"], json!(4220314));
+        assert_eq!(extra["chg_uv"], json!(4460544));
+        assert_eq!(extra["health"], json!(1));
+        assert_eq!(extra["cycle_count"], json!(232));
+        assert_eq!(extra["charging"], json!(1));
+
+        // sdxprairie (U50S): negative current while charging is flipped, both
+        // with the status on the `battery` node and on `battery_zte`.
+        for (name, status_supply) in [("sdxprairie", "battery"), ("sdxprairie-zte", "battery_zte")]
+        {
+            let extra = battery_fixture(
+                name,
+                &[
+                    (status_supply, "status", "Charging"),
+                    ("battery", "current_now", "-114000"),
+                ],
+            );
+            assert_eq!(extra["bat_ua"], json!(114000), "{name}");
+            assert_eq!(extra["charging"], json!(1), "{name}");
+        }
+
+        // Discharging keeps the collector convention: negative while draining.
+        let extra = battery_fixture(
+            "discharging",
+            &[
+                ("battery", "status", "Discharging"),
+                ("battery", "current_now", "300000"),
+            ],
+        );
+        assert_eq!(extra["bat_ua"], json!(-300000));
+        assert_eq!(extra["charging"], json!(2));
+
+        // Without a recognized status the raw sign is preserved untouched.
+        let extra = battery_fixture("unrecognized", &[("battery", "current_now", "250000")]);
+        assert_eq!(extra["bat_ua"], json!(250000));
+        assert!(!extra.contains_key("charging"));
     }
 
     #[test]

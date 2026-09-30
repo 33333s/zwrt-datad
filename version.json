@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.50",
+    "version": "0.10.51",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 补齐充电状态、SINR 小数与 QoS 来源适配"
+    "notes": "ARM32 U50 Pro 真机适配：CPU 温度、电池电流符号与容量、温控噪声过滤与 WL_AND_5G 回读"
   }
 }
