@@ -1088,7 +1088,7 @@ mod tests {
             fs::write(root.join("tmp/TZ"), b"UTC0\n").unwrap();
             let script = root.join("etc/init.d/zte_topsw_ntp");
             let text = format!(
-                "#!/bin/sh\nbase='{}'\ncase \"$1\" in\nenabled) test -f \"$base/enabled\";;\nstatus) test -f \"$base/running\";;\nenable) touch \"$base/enabled\";;\ndisable) rm -f \"$base/enabled\";;\nstart) touch \"$base/running\";;\nstop) rm -f \"$base/running\";;\n*) exit 2;;\nesac\n",
+                "#!/bin/sh\nbase='{}'\ncase \"$1\" in\nenabled) test -f \"$base/enabled\";;\nstatus) if test -f \"$base/running\"; then exit 0; else exit 3; fi;;\nenable) touch \"$base/enabled\";;\ndisable) rm -f \"$base/enabled\";;\nstart) touch \"$base/running\";;\nstop) rm -f \"$base/running\";;\n*) exit 2;;\nesac\n",
                 root.display()
             );
             fs::write(&script, text).unwrap();
