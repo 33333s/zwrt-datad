@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.54",
+    "version": "0.10.55",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50 Pro 真机适配：CPU 温度、电池电流符号与容量、温控噪声过滤与 WL_AND_5G 回读"
+    "notes": "ARM32 U50 机内 QRTR DIAG 通道：modem 构建信息入 state.u50_diag"
   }
 }

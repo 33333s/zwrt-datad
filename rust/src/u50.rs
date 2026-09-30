@@ -1006,6 +1006,7 @@ async fn enrich(
         }),
     );
     fields.insert("interfaces".into(), u50_sys::interfaces(cfg).await);
+    fields.insert("u50_diag".into(), crate::u50_diag::block());
     if let Some(clients) = u50_sys::clients().await {
         // The OEM per-chip counters stay when they are present.
         if let Some(Value::Object(old)) = fields.get("clients") {
