@@ -1267,6 +1267,21 @@ async fn control(
         )
             .into_response();
     }
+    if let Some(ctl) = crate::u50_ctl::get()
+        && crate::u50_ctl::READ_ACTIONS.contains(&action)
+    {
+        return match ctl
+            .read_model(action, body.get("params").unwrap_or(&json!({})))
+            .await
+        {
+            crate::control::Outcome::Ok(value) => control_ok(action, value),
+            crate::control::Outcome::Invalid(error) => invalid_parameter(action, &error),
+            crate::control::Outcome::Failed(error) => control_failed(action, error),
+            crate::control::Outcome::NotHandled => {
+                control_failed(action, "read action unavailable".into())
+            }
+        };
+    }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
     }

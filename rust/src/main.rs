@@ -27,6 +27,7 @@ mod u50;
 mod u50_ctl;
 mod u50_oem;
 mod u50_oem_ids;
+mod u50_panel;
 mod u50_sys;
 mod usb;
 mod webshell;

@@ -49,6 +49,18 @@ STORE = {
 }
 MESSAGES = [{"id": "7", "number": "10086", "content": "6D4B8BD5", "tag": "1",
              "date": "26,08,27,04,00,00,+,0"}]
+APN_RECORD = "Fixture($)fixture.apn($)unused($)unused($)PAP($)apn-account-secret($)apn-password-secret($)IP($)0($)0($)auto($)($)"
+STORE.update({"apn_mode": "manual", "apn_interface_version": "2", "profile_name_ui": "Fixture",
+              "wan_apn_ui": "fixture.apn", "APN_config0": APN_RECORD, "apn_auto_config": APN_RECORD,
+              "wifi_lbd_enable": "0"})
+WIFI_POINTS = {"ResponseList": [
+    {"ChipIndex": "0", "AccessPointIndex": "0", "Band": "b", "SSID": "fixture-24", "AuthMode": "WPA2PSK",
+     "Password": "wifi-password-secret", "ApBroadcastDisabled": "0", "Pmf_switch": "1",
+     "AccessPointSwitchStatus": "1", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "11", "BandWidth": "1"},
+    {"ChipIndex": "1", "AccessPointIndex": "0", "Band": "a", "SSID": "fixture-5", "AuthMode": "WPA3PSK",
+     "Password": "wifi-password-secret", "ApBroadcastDisabled": "1", "Pmf_switch": "2",
+     "AccessPointSwitchStatus": "1", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "149", "BandWidth": "4"},
+]}
 LOG = []
 
 
@@ -97,6 +109,16 @@ class Vendor(BaseHTTPRequestHandler):
             else:
                 Vendor.current_rd = current = RD
             return self.send_json({"RD": current})
+        if keys in (["queryAccessPointInfo"], ["queryWiFiModuleSwitch"]):
+            assert "multi_data" not in query, "Wi-Fi resources must use the WebUI single-command reads"
+            assert "sid=two" in self.headers.get("Cookie", ""), "configuration must use the local OEM session"
+            LOG.append(("configuration_read", keys[0]))
+            return self.send_json(WIFI_POINTS if keys == ["queryAccessPointInfo"] else {"WiFiModuleSwitch": "1"})
+        if any(key.startswith("APN_config") or key.startswith("ipv6_APN_config") for key in keys):
+            assert query.get("multi_data") == ["1"] and len(keys) <= 32
+            assert "sid=two" in self.headers.get("Cookie", "")
+            LOG.append(("configuration_read", "apn_profiles"))
+
         if keys == ["sms_data_total"]:
             assert "multi_data" not in query, "the WebUI reads sms_data_total as a single command"
             assert query["order_by"] == ["order by id desc"] and query["tags"] == ["10"]
@@ -203,6 +225,7 @@ case "$1:$2" in
   get:data_volume_limit_switch) echo 0 ;;
   get:wan_auto_clear_flow_data_switch) echo on ;;
   get:traffic_clear_date) echo 1 ;;
+  get:dhcpLease_hour) echo 24 ;;
   get:admin_Password) echo {ADMIN_HASH} ;;
   *) exit 1 ;;
 esac
@@ -273,6 +296,34 @@ esac
         _, caps = call(port, "/capabilities")
         assert "cellular.set" in caps["controls"] and "sms.send_raw" in caps["controls"]
         assert not any(name.startswith("speedtest") for name in caps["controls"])
+        for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access"):
+            assert action in caps["controls"]
+        assert "wifi.configure" not in caps["controls"] and "apn.add" not in caps["controls"]
+
+        # Local reads use OEM resources, make no setting writes, and exclude
+        # keys embedded in the firmware's Wi-Fi and APN response objects.
+        before = len(writes())
+        status, wifi = control(port, "wifi.status", {})
+        assert status == 200, wifi
+        assert wifi["result"]["main_2g"]["ssid"] == "fixture-24"
+        assert wifi["result"]["main_5g"]["encryption"] == "sae"
+        assert wifi["result"]["main_2g"]["writable"] is False
+        status, dual = control(port, "wifi.dual_band_status", {})
+        assert status == 200 and dual["result"]["enabled"] is False and dual["result"]["writable"] is False
+        status, apn = control(port, "apn.list", {})
+        assert status == 200, apn
+        assert apn["result"]["mode"] == {"apn_mode": 1} and apn["result"]["writable"] is False
+        assert apn["result"]["enabled"] == {"profileId": "manual-0"}
+        assert apn["result"]["manual"]["apnListArray"][0]["wanapn"] == "fixture.apn"
+        status, clients_read = control(port, "client.access", {})
+        assert status == 200 and clients_read["result"]["total"] == 2
+        for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access"):
+            assert control(port, action, {"arbitrary": "value"})[0] == 400
+        assert len(writes()) == before, "read actions must not modify the device"
+        for secret in ("wifi-password-secret", "apn-account-secret", "apn-password-secret", ADMIN_HASH):
+            assert secret not in json.dumps([wifi, dual, apn, clients_read])
+        assert control(port, "apn.add", {"name": "fixture"})[0] == 404
+        assert len(writes()) == before
 
         _, cloud = call(port, "/cloud/config")
         assert cloud["config"]["enabled"] is True and cloud["config"]["remote_enabled"] is True, cloud
@@ -289,6 +340,7 @@ esac
         assert sms["list"][0]["text"] == "测试" and sms["list"][0]["num"] == "10086" and sms["list"][0]["unread"] == 1
         assert ("login",) in LOG, "the daemon must open its own OEM session from the stored hash"
         assert state["net"]["roaming_allowed"] == 0
+        assert state["dhcp"]["leasetime"] == "24h"
 
         # Roaming: the current dial mode is preserved, the result is read back.
         status, result = control(port, "cellular.set", {"roaming": 1})
