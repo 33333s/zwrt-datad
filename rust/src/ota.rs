@@ -328,8 +328,9 @@ impl Ota {
         let result = self.dir.join("ota-result.log");
         let marker = self.dir.join("ota-install-result");
         let script = format!(
-            "#!/bin/sh\nsleep 2\nrm -f {}\nif DATAD_DOWNLOAD_URL={} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
+            "#!/bin/sh\nsleep 2\nrm -f {}\nif {}DATAD_DOWNLOAD_URL={} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
             shell_quote(&marker),
+            install_dir_env(),
             shell_quote(source_url(&candidate.base_url, &binary.name)),
             shell_quote(&installer_path),
             shell_quote(&result),
@@ -636,6 +637,23 @@ fn hex_sha256(data: &[u8]) -> String {
         .iter()
         .map(|value| format!("{value:02x}"))
         .collect()
+}
+
+/// Tell the installer to update the directory this daemon runs from, so an
+/// install outside `/data/zwrt-datad` is upgraded in place. Empty for the
+/// standard location (the installer's default).
+fn install_dir_env() -> String {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok())
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let standard = fs::canonicalize("/data/zwrt-datad").ok();
+    match dir {
+        Some(dir) if Some(&dir) != standard.as_ref() => {
+            format!("DATAD_INSTALL_DIR={} ", shell_quote(dir))
+        }
+        _ => String::new(),
+    }
 }
 
 fn shell_quote(value: impl AsRef<Path>) -> String {

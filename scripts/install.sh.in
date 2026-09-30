@@ -6,8 +6,10 @@ export PATH
 VERSION='@@VERSION@@'
 EXPECTED_SHA='@@SHA256@@'
 DOWNLOAD_URL=${DATAD_DOWNLOAD_URL:-'@@DOWNLOAD_URL@@'}
-DIR=/data/zwrt-datad
-BIN=$DIR/zwrt-datad
+STANDARD_DIR=/data/zwrt-datad
+DIR=${DATAD_INSTALL_DIR:-}
+BIN=
+CUSTOM=0
 RC=/etc/rc.local
 WORK=
 BACKUP=
@@ -31,6 +33,7 @@ wait_health() {
     return 1
 }
 known_binary() {
+    [ -z "$DIR" ] || [ "$1" != "$DIR/zwrt-datad" ] || return 0
     case "$1" in
         /data/zwrt-datad/zwrt-datad|/data/plugins/zwrt-datad/zwrt-datad|/data/data/zwrt-datad/zwrt-datad|/data/plugins/u60-datad/u60-datad|/data/u60-datad/u60-datad) return 0 ;;
         *) return 1 ;;
@@ -113,6 +116,29 @@ cleanup() {
     exit "$status"
 }
 
+# Install where the running datad lives (explicit DATAD_INSTALL_DIR from the OTA
+# wrapper, else the one running datad whose directory has service.sh), so a
+# non-standard location is updated in place. The default stays /data/zwrt-datad.
+if [ -z "$DIR" ]; then
+    found=
+    count=0
+    for proc in /proc/[0-9]*; do
+        actual=$(readlink "$proc/exe" 2>/dev/null || true)
+        actual=${actual% (deleted)}
+        case "${actual##*/}" in zwrt-datad) ;; *) continue ;; esac
+        candidate=${actual%/*}
+        case "$candidate" in /tmp/*|"") continue ;; esac
+        [ -f "$candidate/service.sh" ] || continue
+        [ "$candidate" = "$found" ] || { found=$candidate; count=$((count+1)); }
+    done
+    if [ "$count" = 1 ]; then DIR=$found; else DIR=$STANDARD_DIR; fi
+fi
+case "$DIR" in /*) ;; *) fail "安装目录必须是绝对路径：$DIR" ;; esac
+case "$DIR" in *[!A-Za-z0-9_./-]*|*..*) fail "安装目录含不允许的字符：$DIR" ;; esac
+BIN=$DIR/zwrt-datad
+if [ "$(readlink -f "$DIR" 2>/dev/null || printf '%s' "$DIR")" != "$(readlink -f "$STANDARD_DIR" 2>/dev/null || printf '%s' "$STANDARD_DIR")" ]; then CUSTOM=1; fi
+[ "$CUSTOM" = 0 ] || say "沿用已安装目录：$DIR（不改写 rc.local）"
+
 [ "$(id -u)" = 0 ] || fail "请使用 root 执行"
 case "$(uname -m)" in aarch64|arm64) ;; *) fail "仅支持 ARM64/aarch64" ;; esac
 for cmd in curl sha256sum awk cmp stat flock mktemp readlink od; do
@@ -137,8 +163,12 @@ cat > "$WORK/rc.awk" <<'DATAD_RC_AWK_EOF'
 @@RC_AWK@@
 DATAD_RC_AWK_EOF
 
-# Validate boot changes before touching the running service.
-if [ -e "$RC" ]; then
+# Validate boot changes before touching the running service. A datad kept in a
+# non-standard directory keeps the operator's own boot entry untouched.
+if [ "$CUSTOM" = 1 ]; then
+    : > "$WORK/rc.before"
+    : > "$WORK/rc.after"
+elif [ -e "$RC" ]; then
     [ -f "$RC" ] && [ ! -L "$RC" ] || fail "rc.local 必须是普通文件"
     cp -p "$RC" "$WORK/rc.before"
 else
@@ -147,12 +177,13 @@ fi
 awk -f "$WORK/rc.awk" "$WORK/rc.before" > "$WORK/rc.after" || fail "无法安全整理 rc.local"
 sh -n "$WORK/rc.after" || fail "整理后的 rc.local 语法错误"
 RC_CHANGED=1
-if [ -f "$RC" ] && cmp -s "$RC" "$WORK/rc.after"; then RC_CHANGED=0; fi
+if [ "$CUSTOM" = 1 ] || { [ -f "$RC" ] && cmp -s "$RC" "$WORK/rc.after"; }; then RC_CHANGED=0; fi
 
 # An enabled legacy init script would start a duplicate before rc.local.
 # Keep the script itself; remove only its boot symlinks after success.
 : > "$WORK/legacy-links"
 for link in /etc/rc.d/*; do
+    [ "$CUSTOM" = 0 ] || break
     [ -L "$link" ] || continue
     target=$(readlink -f "$link" 2>/dev/null || true)
     case "$target" in
@@ -210,6 +241,11 @@ if [ "$FILES_CHANGED" = 0 ] && [ "$RC_CHANGED" = 0 ] && [ ! -s "$WORK/legacy-lin
     exit 0
 fi
 
+# The new binary is copied beside the old one and the old one is backed up
+# while installing: require room for both on the filesystem holding $DIR.
+need_kb=$(( $(stat -c %s "$WORK/zwrt-datad") / 1024 * 3 + 1024 ))
+have_kb=$(df -Pk "$DIR" 2>/dev/null | awk 'NR==2{print $4}')
+case "$have_kb" in ''|*[!0-9]*) ;; *) [ "$have_kb" -ge "$need_kb" ] || fail "$DIR 所在分区可用空间不足：需要约 ${need_kb} KiB，仅有 ${have_kb} KiB" ;; esac
 BACKUP="$DIR/backups/install-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
@@ -283,5 +319,5 @@ rm -rf "$BACKUP"
 [ ! -e "$BACKUP" ] || fail "安装成功，但临时回滚备份清理失败：$BACKUP"
 BACKUP=
 say "安装完成：v$VERSION，$BIN"
-say "自启：sh /data/zwrt-datad/service.sh start"
+say "自启：sh $DIR/service.sh start"
 say "临时回滚备份已删除"

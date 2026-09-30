@@ -1,6 +1,10 @@
 #!/system/bin/sh
 
-SERVICE_DIR="${ZWRT_DATAD_DIR:-/data/zwrt-datad}"
+# Default to the directory this script lives in, so an install kept outside
+# /data/zwrt-datad keeps working; fall back to the standard path.
+SERVICE_DIR="${ZWRT_DATAD_DIR:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}"
+SERVICE_DIR="${SERVICE_DIR:-/data/zwrt-datad}"
+export ZWRT_DATAD_DIR="$SERVICE_DIR"
 BIN="${ZWRT_DATAD_BIN:-$SERVICE_DIR/zwrt-datad}"
 PID_FILE="${ZWRT_DATAD_PID_FILE:-$SERVICE_DIR/zwrt-datad.pid}"
 LOG_FILE="${ZWRT_DATAD_LOG_FILE:-$SERVICE_DIR/zwrt-datad.log}"
