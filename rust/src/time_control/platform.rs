@@ -620,8 +620,7 @@ impl Platform {
                     return Some(false);
                 };
                 let mut actual = wanted;
-                if unsafe { libc::ioctl(file.as_raw_fd(), get as _, &mut actual) } != 0
-                {
+                if unsafe { libc::ioctl(file.as_raw_fd(), get as _, &mut actual) } != 0 {
                     return Some(false);
                 };
                 let mut tm = t;
