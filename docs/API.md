@@ -327,3 +327,11 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 curl -H 'Authorization: Bearer <token>' http://<device-lan-ip>:9461/state
 curl -N 'http://<device-lan-ip>:9461/events?access_token=<token>'
 ```
+
+### U50S ARM32 状态字段
+
+确认型号为 U50S 时，`device.api_template_supported=1`；U50Pro 保持未实机验证的候选标志。支持模板不代表每个可选原厂测量都有数据，具体应检查字段存在性和 `qos.available`。
+
+- `battery.charging` 使用与主线一致的内核状态码：`0` 未知、`1` 正在充电、`2` 放电、`3` 未在充电、`4` 已充满；已充满且仍插着电源时，不能把 `4` 当作未插电。`battery.charger_connect` 单独表示电源连接。
+- `net.lte_snr`、`net.nr_snr` 为 dB 数值字符串，保留小数与有效的 `0`；缺失或无效的原厂测量不伪造为零。
+- `qos.qci` 为整数，`qos.ambr_dl` / `qos.ambr_ul` 为 Mbps 数值字符串；读取原厂 `/logfs/key.log` 及轮转文件。原厂未提供 QoS 样本时，`qos.available=false`、`reason=no_oem_qos_sample`，QCI 为 `0`、AMBR 为空（与主线未知值兼容），客户端应显示未知。

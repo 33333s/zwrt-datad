@@ -63,6 +63,9 @@ case "$1:$2" in
   get:wifi_onoff_state) printf '%s\\n' '1' ;;
   get:wifi_access_sta_num) printf '%s\\n' '2' ;;
   get:lte_rsrp) printf '%s\\n' '-83' ;;
+  get:lte_snr) printf '%s\\n' '4.4' ;;
+  get:rmcc) printf '%s\\n' '460' ;;
+  get:rmnc) printf '%s\\n' '1' ;;
   get:simcard_active_slot) printf '%s\\n' '1' ;;
   *) exit 1 ;;
 esac
@@ -106,7 +109,9 @@ esac
 printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wlan0)\\n'
 ''')
         iw.chmod(0o700)
-        env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_U50_ROOT": str(root),
+        qos_log = Path(tmp) / "key.log"
+        qos_log.write_text("[DATA] cid1 LTE default bearer qci = 9\n[DATA] eps_bearer_id=5 access_point=INTERNET.MNC001.MCC460.GPRS apn_ambr_dl_ext=64.000Mbps apn_ambr_ul_ext=32.000Mbps\n")
+        env = {**os.environ, "ZWRT_DATAD_QOS_LOG": str(qos_log), "ZWRT_DATAD_QOS_LOG_ROTATED": str(Path(tmp) / "no-rotated.log"), "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_U50_ROOT": str(root),
                "ZWRT_DATAD_U50_IP_BIN": str(ip), "ZWRT_DATAD_U50_IW_BIN": str(iw)}
         cmd = [BINARY, "--u50-model", "u50pro", "--u50-loopback-only", "--u50-goform-url", url, "--once"]
         result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
@@ -118,6 +123,10 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         assert state["u50_cfg"]["wan_ipaddr"] == "10.0.0.2"
         assert state["net"]["type"] == "NR5G"
         assert state["net"]["bars"] == 5
+        assert state["net"]["lte_snr"] == "4.4"
+        assert state["qos"]["qci"] == 9
+        assert state["qos"]["ambr_dl"] == "64.000" and state["qos"]["ambr_ul"] == "32.000"
+        assert state["qos"]["available"] is True
         assert state["battery"]["percent"] == 66
         assert state["traffic"]["tx_speed"] == 4980
         assert state["wlan"]["enabled"] == 1
@@ -223,6 +232,12 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         fallback = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
         partial = json.loads(fallback.stdout)
         assert partial["u50_sources"]["goform"] == "unavailable"
+        missing_qos = subprocess.run(cmd, env={**env, "ZWRT_DATAD_QOS_LOG": str(Path(tmp) / "absent")},
+                                     capture_output=True, text=True, timeout=15, check=True)
+        unknown = json.loads(missing_qos.stdout)["qos"]
+        assert unknown["available"] is False and unknown["qci"] == 0
+        assert unknown["ambr_dl"] == "" and unknown["ambr_ul"] == ""
+        assert unknown["reason"] == "no_oem_qos_sample"
         assert partial["device"]["model_name"] == "U50Pro"
         assert partial["net"]["type"] == "LTE"
         assert partial["net"]["operator"] == "TestCfg"

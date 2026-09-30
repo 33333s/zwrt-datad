@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.49",
+    "version": "0.10.50",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 修复 LAN 9461 监听与原厂密码登录"
+    "notes": "ARM32 U50S 补齐充电状态、SINR 小数与 QoS 来源适配"
   }
 }

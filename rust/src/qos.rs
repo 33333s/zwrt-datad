@@ -75,17 +75,36 @@ struct Cache {
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 pub fn read_for_plmn(mcc: i64, mnc: i64) -> Values {
-    let current = std::env::var("ZWRT_DATAD_QOS_LOG")
-        .or_else(|_| std::env::var("ZWRT_DATAD_KEY_LOG"))
-        .unwrap_or_else(|_| "/data/logfs/key.log".into());
-    let rotated = std::env::var("ZWRT_DATAD_QOS_LOG_ROTATED")
-        .or_else(|_| std::env::var("ZWRT_DATAD_KEY_LOG_ROTATED"))
-        .unwrap_or_else(|_| "/data/logfs/key.log.0".into());
+    read_with_defaults(mcc, mnc, "/data/logfs/key.log", "/data/logfs/key.log.0")
+}
+
+/// U50 firmware's key-log scripts use `/logfs`, rather than ZWRT's `/data/logfs`.
+/// Keep explicit environment overrides available for installations and fixtures.
+pub fn read_u50_for_plmn(mcc: i64, mnc: i64) -> Values {
+    read_with_defaults(mcc, mnc, "/logfs/key.log", "/logfs/key.log.0")
+}
+
+fn log_paths(
+    default_current: &str,
+    default_rotated: &str,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> (PathBuf, PathBuf) {
+    let current = read_env("ZWRT_DATAD_QOS_LOG")
+        .or_else(|| read_env("ZWRT_DATAD_KEY_LOG"))
+        .unwrap_or_else(|| default_current.into());
+    let rotated = read_env("ZWRT_DATAD_QOS_LOG_ROTATED")
+        .or_else(|| read_env("ZWRT_DATAD_KEY_LOG_ROTATED"))
+        .unwrap_or_else(|| default_rotated.into());
+    (current.into(), rotated.into())
+}
+
+fn read_with_defaults(mcc: i64, mnc: i64, current: &str, rotated: &str) -> Values {
+    let (current, rotated) = log_paths(current, rotated, |key| std::env::var(key).ok());
     let cache = CACHE.get_or_init(|| Mutex::new(Cache::default()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.refresh(Path::new(&rotated), Path::new(&current));
+    cache.refresh(&rotated, &current);
     parse_texts(
         &[
             (cache.rotated.data_lines.as_str(), false),
@@ -492,6 +511,101 @@ mod tests {
                 ambr_ul: "75.000".into()
             })
         );
+    }
+
+    #[test]
+    fn platform_paths_preserve_explicit_log_overrides() {
+        let defaults = |current, rotated| log_paths(current, rotated, |_| None);
+        assert_eq!(
+            defaults("/data/logfs/key.log", "/data/logfs/key.log.0"),
+            (
+                PathBuf::from("/data/logfs/key.log"),
+                PathBuf::from("/data/logfs/key.log.0")
+            )
+        );
+        assert_eq!(
+            defaults("/logfs/key.log", "/logfs/key.log.0"),
+            (
+                PathBuf::from("/logfs/key.log"),
+                PathBuf::from("/logfs/key.log.0")
+            )
+        );
+        let override_paths = |key: &str| match key {
+            "ZWRT_DATAD_QOS_LOG" => Some("/fixture/current".into()),
+            "ZWRT_DATAD_KEY_LOG" => Some("/ignored/current".into()),
+            "ZWRT_DATAD_QOS_LOG_ROTATED" => Some("/fixture/rotated".into()),
+            "ZWRT_DATAD_KEY_LOG_ROTATED" => Some("/ignored/rotated".into()),
+            _ => None,
+        };
+        assert_eq!(
+            log_paths("/logfs/key.log", "/logfs/key.log.0", override_paths),
+            (
+                PathBuf::from("/fixture/current"),
+                PathBuf::from("/fixture/rotated")
+            )
+        );
+        assert_eq!(
+            log_paths("/logfs/key.log", "/logfs/key.log.0", |key| match key {
+                "ZWRT_DATAD_KEY_LOG" => Some("/legacy/current".into()),
+                "ZWRT_DATAD_KEY_LOG_ROTATED" => Some("/legacy/rotated".into()),
+                _ => None,
+            }),
+            (
+                PathBuf::from("/legacy/current"),
+                PathBuf::from("/legacy/rotated")
+            )
+        );
+    }
+
+    #[test]
+    fn cache_does_not_reuse_values_from_another_platform_path() {
+        let dir = temp_dir("platform-paths");
+        let zwrt_dir = dir.join("data-logfs");
+        let u50_dir = dir.join("logfs");
+        fs::create_dir_all(&zwrt_dir).unwrap();
+        fs::create_dir_all(&u50_dir).unwrap();
+        fs::write(
+            zwrt_dir.join("key.log"),
+            "[DATA] cid1 LTE default bearer qci = 9\n[DATA] dnn=internet session_ambr_dl=2 session_ambr_dl_unit=1(100Mbps) session_ambr_ul=1 session_ambr_ul_unit=1(100Mbps)\n",
+        )
+        .unwrap();
+        fs::write(
+            u50_dir.join("key.log.0"),
+            "[DATA] cid1 LTE default bearer qci = 8\n[DATA] eps_bearer_id=5 access_point=CMHK.MNC012.MCC454.GPRS apn_ambr_dl_ext=64.000Mbps apn_ambr_ul_ext=32.000Mbps\n",
+        )
+        .unwrap();
+        let mut cache = Cache::default();
+        cache.refresh(&zwrt_dir.join("key.log.0"), &zwrt_dir.join("key.log"));
+        assert_eq!(
+            parse_texts(&[(&cache.current.data_lines, true)], 454, 12).qci,
+            9
+        );
+        cache.refresh(&u50_dir.join("key.log.0"), &u50_dir.join("key.log"));
+        let u50 = parse_texts(
+            &[
+                (&cache.rotated.data_lines, false),
+                (&cache.current.data_lines, true),
+            ],
+            454,
+            12,
+        );
+        assert_eq!(u50.qci, 8);
+        assert_eq!(u50.ambr_dl, "64.000");
+        assert_eq!(u50.ambr_ul, "32.000");
+        fs::remove_file(u50_dir.join("key.log.0")).unwrap();
+        cache.refresh(&u50_dir.join("key.log.0"), &u50_dir.join("key.log"));
+        assert_eq!(
+            parse_texts(
+                &[
+                    (&cache.rotated.data_lines, false),
+                    (&cache.current.data_lines, true),
+                ],
+                454,
+                12,
+            ),
+            Values::default()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
