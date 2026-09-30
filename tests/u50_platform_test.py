@@ -41,6 +41,8 @@ STORE = {
     "data_volume_limit_switch": "0", "data_volume_limit_unit": "", "data_volume_limit_size": "",
     "data_volume_alert_percent": "", "wan_auto_clear_flow_data_switch": "on", "traffic_clear_date": "1",
     "flux_limited_disconnect": "off",
+    "lan_ipaddr": "192.168.0.1", "lan_netmask": "255.255.255.0", "dhcpEnabled": "1", "dhcpStart": "192.168.0.2",
+    "dhcpEnd": "192.168.0.253", "dhcpLease_hour": "24", "mtu": "1500", "tcp_mss": "1460", "wifi_onoff_state": "1",
 }
 MESSAGES = [{"id": "7", "number": "10086", "content": "6D4B8BD5", "tag": "1",
              "date": "26,08,27,04,00,00,+,0"}]
@@ -125,6 +127,15 @@ class Vendor(BaseHTTPRequestHandler):
             STORE["nr5g_nsa_band_lock" if one["type"] == "1" else "nr5g_sa_band_lock"] = one["nr5g_band_mask"]
         elif action == "setDeviceAccessControlList":
             STORE["AclMode"], STORE["BlackMacList"], STORE["BlackNameList"] = one["AclMode"], one["BlackMacList"], one["BlackNameList"]
+        elif action == "DHCP_SETTING":
+            STORE["dhcpEnabled"] = "1" if one["lanDhcpType"] == "SERVER" else "0"
+            for src, dst in (("dhcpStart", "dhcpStart"), ("dhcpEnd", "dhcpEnd"), ("dhcpLease", "dhcpLease_hour")):
+                if src in one:
+                    STORE[dst] = one[src]
+        elif action == "SET_DEVICE_MTU":
+            STORE["mtu"], STORE["tcp_mss"] = one["mtu"], one["tcp_mss"]
+        elif action == "SET_WIFI_INFO":
+            STORE["wifi_onoff_state"] = one["wifiEnabled"]
         elif action == "DATA_LIMIT_SETTING":
             for key in ("data_volume_limit_switch", "data_volume_limit_unit", "data_volume_limit_size",
                         "data_volume_alert_percent", "wan_auto_clear_flow_data_switch", "traffic_clear_date"):
@@ -206,7 +217,7 @@ esac
         # Mainline API surface, restricted to what the U50S implements.
         _, caps = call(port, "/capabilities")
         assert "cellular.set" in caps["controls"] and "sms.send_raw" in caps["controls"]
-        assert not any(name.startswith("speedtest") or name.startswith("wifi") for name in caps["controls"])
+        assert not any(name.startswith("speedtest") for name in caps["controls"])
 
         _, cloud = call(port, "/cloud/config")
         assert cloud["config"]["enabled"] is True and cloud["config"]["remote_enabled"] is True, cloud
@@ -334,9 +345,29 @@ esac
                             ("client.rename", {"mac": "aa:bb:cc:00:00:01", "hostname": "a;b"})):
             assert control(port, action, bad)[0] == 400, (action, bad)
 
+        # LAN / MTU / Wi-Fi switch.
+        status, result = control(port, "lan.set", {"dhcp_start": "192.168.0.50", "dhcp_end": "192.168.0.200", "lease_seconds": 7200})
+        assert status == 200 and result["result"]["verified"], result
+        assert writes()[-1][2] == {"goformId": "DHCP_SETTING", "lanIp": "192.168.0.1", "lanNetmask": "255.255.255.0",
+                                   "lanDhcpType": "SERVER", "dhcpStart": "192.168.0.50", "dhcpEnd": "192.168.0.200",
+                                   "dhcpLease": "2", "dhcp_reboot_flag": "1", "mac_ip_reset": "0"}
+        status, result = control(port, "lan.set", {"dhcp_disabled": 1})
+        assert status == 200 and STORE["dhcpEnabled"] == "0" and "dhcpStart" not in writes()[-1][2]
+        assert control(port, "lan.set", {"dhcp_disabled": 0})[0] == 200
+        for bad in ({"ip": "10.0.0.1"}, {"dhcp_start": "10.0.0.5"}, {"dhcp_start": "192.168.0.250", "dhcp_end": "192.168.0.10"},
+                    {"dhcp_start": "192.168.0.1"}, {"lease_seconds": 100}, {"dhcp_disabled": 2}):
+            assert control(port, "lan.set", bad)[0] == 400, bad
+        status, result = control(port, "lan.set_mtu", {"mtu": 1400})
+        assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "SET_DEVICE_MTU", "mtu": "1400", "tcp_mss": "1360"}
+        assert control(port, "lan.set_mtu", {"mtu": 100})[0] == 400
+        status, result = control(port, "wifi.set_module", {"enabled": 0})
+        assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "SET_WIFI_INFO", "wifiEnabled": "0"}
+        assert control(port, "wifi.set_module", {"enabled": 1})[0] == 200
+        assert control(port, "wifi.set_module", {"enabled": 5})[0] == 400
+
         # Device actions and unmapped actions.
         assert control(port, "device.reboot", {})[0] == 200 and writes()[-1][1] == "REBOOT_DEVICE"
-        assert control(port, "wifi.configure", {"section": "main_2g"})[0] == 404
+        assert control(port, "wifi.configure", {"section": "main_2g"})[0] == 404, "wifi.configure is not mapped yet"
         assert control(port, "cooling.fan.set_mode", {"mode": "custom"})[0] == 404
 
         # The credential never appears in any reply.
