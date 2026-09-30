@@ -75,6 +75,9 @@ pub const CONTROLS: &[&str] = &[
     "client.unblock",
     "client.kick",
     "client.rename",
+    "lan.set",
+    "lan.set_mtu",
+    "wifi.set_module",
 ];
 
 pub fn ota_profile() -> Profile {
@@ -444,6 +447,9 @@ impl Ctl {
             "client.unblock" => self.client_access(params, false).await,
             "client.kick" => self.client_kick(params).await,
             "client.rename" => self.client_rename(params).await,
+            "lan.set" => self.lan_set(params).await,
+            "lan.set_mtu" => self.lan_set_mtu(params).await,
+            "wifi.set_module" => self.wifi_set_module(params).await,
             _ => Outcome::NotHandled,
         }
     }
@@ -918,6 +924,151 @@ impl Ctl {
                 && after.get("wan_auto_clear_flow_data_switch").and_then(Value::as_str) == Some(wanted)})),
             Err(error) => Outcome::Failed(error),
         }
+    }
+
+    /// DHCP server settings. The LAN address and netmask are fixed: the
+    /// firmware's local GoAhead only answers to `192.168.0.1`, which is also
+    /// how this daemon reaches its OEM channel.
+    async fn lan_set(&self, params: &Value) -> Outcome {
+        let current = |key: &'static str| async move { self.field(key).await.unwrap_or_default() };
+        let ip = current("lan_ipaddr").await;
+        let netmask = current("lan_netmask").await;
+        if ip.is_empty() || netmask.is_empty() {
+            return Outcome::Failed("current LAN settings unavailable".into());
+        }
+        if text(params, "ip").is_some_and(|v| v != ip)
+            || text(params, "netmask").is_some_and(|v| v != netmask)
+        {
+            return Outcome::Invalid("the U50S LAN address and netmask cannot be changed".into());
+        }
+        let disabled = match integer(params, "dhcp_disabled") {
+            Ok(Some(v @ (0 | 1))) => Some(v),
+            Ok(None) => None,
+            _ => return Outcome::Invalid("dhcp_disabled must be 0 or 1".into()),
+        };
+        let server = match disabled {
+            Some(v) => v == 0,
+            None => current("dhcpEnabled").await == "1",
+        };
+        let addr = |key: &str, fallback: String| -> Result<String, String> {
+            let value = text(params, key).map(str::to_owned).unwrap_or(fallback);
+            let parsed: std::net::Ipv4Addr = value
+                .parse()
+                .map_err(|_| format!("{key} must be an IPv4 address"))?;
+            let (a, n, m) = (
+                u32::from(parsed),
+                u32::from(
+                    ip.parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "bad LAN address")?,
+                ),
+                u32::from(
+                    netmask
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "bad LAN netmask")?,
+                ),
+            );
+            if a & m != n & m || a == n {
+                return Err(format!("{key} must be another address in the LAN subnet"));
+            }
+            Ok(value)
+        };
+        let mut pairs = vec![
+            ("lanIp", ip.clone()),
+            ("lanNetmask", netmask.clone()),
+            (
+                "lanDhcpType",
+                if server { "SERVER" } else { "DISABLE" }.to_owned(),
+            ),
+        ];
+        if server {
+            let start = match addr("dhcp_start", current("dhcpStart").await) {
+                Ok(v) => v,
+                Err(e) => return Outcome::Invalid(e),
+            };
+            let end = match addr("dhcp_end", current("dhcpEnd").await) {
+                Ok(v) => v,
+                Err(e) => return Outcome::Invalid(e),
+            };
+            if u32::from(
+                start
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            ) > u32::from(
+                end.parse::<std::net::Ipv4Addr>()
+                    .unwrap_or(std::net::Ipv4Addr::BROADCAST),
+            ) {
+                return Outcome::Invalid("dhcp_start must not be above dhcp_end".into());
+            }
+            let hours = match integer(params, "lease_seconds") {
+                Ok(Some(seconds))
+                    if seconds >= 3600 && seconds % 3600 == 0 && seconds / 3600 <= 720 =>
+                {
+                    seconds / 3600
+                }
+                Ok(Some(_)) => {
+                    return Outcome::Invalid(
+                        "lease_seconds must be whole hours, 3600 to 2592000".into(),
+                    );
+                }
+                Ok(None) => current("dhcpLease_hour").await.parse().unwrap_or(24),
+                Err(e) => return Outcome::Invalid(e),
+            };
+            pairs.push(("dhcpStart", start));
+            pairs.push(("dhcpEnd", end));
+            pairs.push(("dhcpLease", hours.to_string()));
+        }
+        pairs.push(("dhcp_reboot_flag", "1".into()));
+        pairs.push(("mac_ip_reset", "0".into()));
+        let wanted_start = pairs
+            .iter()
+            .find(|(k, _)| *k == "dhcpStart")
+            .map(|(_, v)| v.clone());
+        if let Err(error) = self.write("DHCP_SETTING", &pairs).await {
+            return Outcome::Failed(error);
+        }
+        let enabled_now = self.field("dhcpEnabled").await;
+        let start_now = self.field("dhcpStart").await;
+        let verified = enabled_now.as_deref() == Some(if server { "1" } else { "0" })
+            && wanted_start.is_none_or(|w| start_now.as_deref() == Some(w.as_str()));
+        Outcome::Ok(json!({"dhcp_enabled":server,"verified":verified}))
+    }
+
+    async fn lan_set_mtu(&self, params: &Value) -> Outcome {
+        let mtu = match integer(params, "mtu") {
+            Ok(Some(v)) if (576..=1500).contains(&v) => v,
+            _ => return Outcome::Invalid("mtu must be 576 through 1500".into()),
+        };
+        let mss = mtu - 40;
+        if let Err(error) = self
+            .write(
+                "SET_DEVICE_MTU",
+                &[("mtu", mtu.to_string()), ("tcp_mss", mss.to_string())],
+            )
+            .await
+        {
+            return Outcome::Failed(error);
+        }
+        let verified = self.field("mtu").await.as_deref() == Some(mtu.to_string().as_str());
+        Outcome::Ok(json!({"mtu":mtu,"tcp_mss":mss,"verified":verified}))
+    }
+
+    /// Master Wi-Fi switch (`SET_WIFI_INFO`); the state is read back from
+    /// `wifi_onoff_state`.
+    async fn wifi_set_module(&self, params: &Value) -> Outcome {
+        let enabled = match integer(params, "enabled") {
+            Ok(Some(v @ (0 | 1))) => v,
+            _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
+        };
+        if let Err(error) = self
+            .write("SET_WIFI_INFO", &[("wifiEnabled", enabled.to_string())])
+            .await
+        {
+            return Outcome::Failed(error);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let verified =
+            self.field("wifi_onoff_state").await.as_deref() == Some(enabled.to_string().as_str());
+        Outcome::Ok(json!({"enabled":enabled,"verified":verified}))
     }
 
     /// `roaming` maps to the OEM connection mode; `enabled` to connect/disconnect.

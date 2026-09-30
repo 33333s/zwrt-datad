@@ -116,3 +116,12 @@ Mapped onto OEM goform actions (same request shapes as the firmware WebUI):
 - `client.block` / `client.unblock` — OEM blacklist (`setDeviceAccessControlList`, `AclMode` 2); refused while the firmware is in whitelist mode. `client.kick` blocks the station briefly and re-allows it (the firmware has no plain disassociate call). `client.rename` — `EDIT_HOSTNAME`. State `clients` (`total/wifi/lan/list/blocked`) comes from `station_list`, `lan_station_list` and `queryDeviceAccessControlList`.
 
 Verified against a fake GoAhead in `tests/u50_platform_test.py`. Not yet exercised with a write on a real device: band/cell locks and traffic limits (they change live radio/billing behaviour).
+
+## Controls added in v0.10.48
+
+- `lan.set` — `DHCP_SETTING`: DHCP on/off, range and lease (whole hours). The LAN address/netmask cannot be changed: the firmware GoAhead only answers to `192.168.0.1`, which the daemon's own OEM channel needs. `dhcp_reboot_flag=1` is sent as the WebUI does.
+- `lan.set_mtu` — `SET_DEVICE_MTU` (`tcp_mss` = mtu − 40).
+- `wifi.set_module` — `SET_WIFI_INFO` master switch, read back from `wifi_onoff_state`.
+- Not mapped: `dns.set` (the OEM has no LAN DNS call; DNS lives inside APN profiles), `wifi.configure` and the other Wi-Fi actions (the firmware is dual-chip and its per-chip SSID/security protocol is not verified yet).
+
+Only exercised against the fake GoAhead so far.
