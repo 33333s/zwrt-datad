@@ -266,7 +266,17 @@ impl History {
         self.stored.active_day = Some(date.to_owned());
         self.allow_relabel = false;
         while self.stored.days.len() > MAX_DAYS {
-            self.stored.days.pop_first();
+            let oldest = self
+                .stored
+                .days
+                .keys()
+                .find(|date| Some(date.as_str()) != self.stored.active_day.as_deref())
+                .cloned();
+            if let Some(oldest) = oldest {
+                self.stored.days.remove(&oldest);
+            } else {
+                break;
+            }
         }
         true
     }
@@ -294,6 +304,46 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_history_keeps_the_corrected_active_day_on_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-history-full-clock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut history = History::load(&dir);
+        for year in 2027..2040 {
+            for month in 1..=12 {
+                for day in 1..=28 {
+                    if history.stored.days.len() == MAX_DAYS {
+                        break;
+                    }
+                    history.stored.days.insert(
+                        format!("{year:04}-{month:02}-{day:02}"),
+                        Day {
+                            bytes: 1,
+                            last_counter: 100,
+                        },
+                    );
+                }
+            }
+        }
+        assert_eq!(history.stored.days.len(), MAX_DAYS);
+        history.stored.active_day = history
+            .stored
+            .days
+            .last_key_value()
+            .map(|(date, _)| date.clone());
+        history.allow_relabel = true;
+        assert!(history.apply_sample("2026-10-01", MIN_CLOCK_SECONDS + 300, 150));
+        assert_eq!(history.stored.days.len(), MAX_DAYS);
+        assert_eq!(history.stored.active_day.as_deref(), Some("2026-10-01"));
+        history.persist().unwrap();
+        let loaded = History::load(&dir);
+        assert_eq!(loaded.stored.days.len(), MAX_DAYS);
+        assert_eq!(loaded.days()[0].date, "2026-10-01");
+        assert_eq!(loaded.days()[0].bytes, 50);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn corrected_calendar_keeps_delta_without_recounting_later_days() {
