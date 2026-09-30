@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.52",
+    "version": "0.10.53",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 修复 LTE 锁频入口、网络模式兼容与并发写入回读"
+    "notes": "ARM32 U50S 原厂 APN 接口为空时，只读回报本地当前 APN，不回传凭据"
   }
 }

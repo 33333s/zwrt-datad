@@ -93,6 +93,8 @@ class Vendor(BaseHTTPRequestHandler):
         if not self.trusted():
             return self.send_json({"network_type": ""})
         keys = query.get("cmd", [""])[0].split(",")
+        if getattr(Vendor, "empty_apn", False) and ("apn_mode" in keys or any("APN_config" in key for key in keys)):
+            return self.send_json({key: "" for key in keys})
         if Vendor.pending_mode and time.monotonic() >= Vendor.pending_mode[1]:
             STORE["net_select"] = Vendor.pending_mode[0]
             Vendor.pending_mode = None
@@ -215,7 +217,13 @@ def writes():
 with tempfile.TemporaryDirectory(prefix="u50-platform-test-") as tmp:
     folder = Path(tmp)
     cfg = folder / "cfg"
+    cfg_mode = folder / "cfg-apn-mode"
+    cfg_apn = folder / "cfg-apn-name"
+    cfg_keys = folder / "cfg-keys"
+    cfg_mode.write_text("auto\n")
+    cfg_apn.write_text("cfg.fixture.apn\n")
     cfg.write_text(f'''#!/bin/sh
+printf '%s\\n' "$1:$2" >> "{cfg_keys}"
 case "$1:$2" in
   get:model_name) echo U50S ;;
   get:lan_ipaddr) echo 192.168.0.1 ;;
@@ -227,6 +235,12 @@ case "$1:$2" in
   get:traffic_clear_date) echo 1 ;;
   get:dhcpLease_hour) echo 24 ;;
   get:admin_Password) echo {ADMIN_HASH} ;;
+  get:apn_mode) cat "{cfg_mode}" ;;
+  get:apn_interface_version) echo 2 ;;
+  get:profile_name_ui) echo CfgFixture ;;
+  get:wan_apn_ui) cat "{cfg_apn}" ;;
+  get:ppp_auth_mode_ui) echo NONE ;;
+  get:pdp_type_ui) echo IPv4v6 ;;
   *) exit 1 ;;
 esac
 ''')
@@ -315,13 +329,31 @@ esac
         assert apn["result"]["mode"] == {"apn_mode": 1} and apn["result"]["writable"] is False
         assert apn["result"]["enabled"] == {"profileId": "manual-0"}
         assert apn["result"]["manual"]["apnListArray"][0]["wanapn"] == "fixture.apn"
+        # The real original image can return empty APN metadata. Fall back
+        # only to reviewed cfg scalars, never raw profiles or credentials.
+        Vendor.empty_apn = True
+        status, cfg_view = control(port, "apn.list", {})
+        assert status == 200, cfg_view
+        assert cfg_view["result"]["mode"] == {"apn_mode": 0}
+        assert cfg_view["result"]["enabled"] == {"profileId": "current"}
+        assert cfg_view["result"]["writable"] is False
+        assert cfg_view["result"]["automatic"]["apnListArray"][0]["wanapn"] == "cfg.fixture.apn"
+        assert cfg_view["result"]["manual"]["apnListArray"] == []
+        assert "get:APN_config" not in cfg_keys.read_text() and "get:ppp_passwd" not in cfg_keys.read_text()
+        cfg_mode.write_text("invalid\n")
+        assert control(port, "apn.list", {})[0] == 502
+        cfg_mode.write_text("auto\n")
+        cfg_apn.write_text("a" * 300)
+        assert control(port, "apn.list", {})[0] == 502
+        cfg_apn.write_text("cfg.fixture.apn\n")
+        Vendor.empty_apn = False
         status, clients_read = control(port, "client.access", {})
         assert status == 200 and clients_read["result"]["total"] == 2
         for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access"):
             assert control(port, action, {"arbitrary": "value"})[0] == 400
         assert len(writes()) == before, "read actions must not modify the device"
         for secret in ("wifi-password-secret", "apn-account-secret", "apn-password-secret", ADMIN_HASH):
-            assert secret not in json.dumps([wifi, dual, apn, clients_read])
+            assert secret not in json.dumps([wifi, dual, apn, cfg_view, clients_read])
         assert control(port, "apn.add", {"name": "fixture"})[0] == 404
         assert len(writes()) == before
 

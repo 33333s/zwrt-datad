@@ -284,6 +284,7 @@ the device firmware provides. Both actions use the existing token authentication
 
 ## U50S ARM32 兼容说明
 
+- `apn.list` 与按需云端面板优先读取原厂 HTTP 配置；接口不可用时只读本地 `cfg` 的白名单标量。兜底仅报告当前 APN（`current`）、模式、名称和认证/PDP 类型，不报告完整配置目录，不读取 APN 账号、密码或原始序列化配置，保持 `writable:false`。模式未知、字段过长或读取超时明确失败。
 - `network.set_mode` 支持 `4G_AND_5G`（也接受 `auto`）、`Only_LTE`（`4G` / `LTE`）、`Only_5G`（`5G` / `NR`）。模式偏好与实际驻留网络是不同字段，选择 5G 不保证当地有 5G 覆盖。
 - 频段 `bands` 可以是逗号分隔的数字字符串或整数数组；空字符串 / 空数组恢复该设备实际出厂频段，缺少出厂数据时明确失败。
 - U50S 使用已验证的 `SET_NETWORK_BAND_LOCK` LTE 接口；U50Pro 候选保留旧协议。
