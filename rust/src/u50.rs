@@ -1020,10 +1020,12 @@ async fn collect(
     Ok(snapshot)
 }
 
-/// Explicit owner opt-ins for the U50 runtime; all default to off.
+/// U50 runtime listener and feature options.
 #[derive(Clone, Default)]
 pub struct RunOptions {
     pub enable_webshell: bool,
+    pub lan_addr: Option<SocketAddr>,
+    pub auth_token: Option<String>,
     /// Directory for datad's own state (cloud.json, OTA, schedules, SMS
     /// forwarding); must be on the same volume as the running executable.
     pub data_dir: PathBuf,
@@ -1042,6 +1044,8 @@ pub async fn run(
 ) -> Result<()> {
     let RunOptions {
         enable_webshell,
+        lan_addr,
+        auth_token,
         data_dir,
     } = options;
     ensure!(
@@ -1075,11 +1079,20 @@ pub async fn run(
         },
         bridge,
     );
-    let app = App::new(data_dir, interval, None, false, enable_webshell).await?;
+    let local_requires_auth = lan_addr.is_none() && auth_token.is_some();
+    let app = App::new(data_dir, interval, auth_token, false, enable_webshell).await?;
     app.spawn_reboot_schedule();
     app.spawn_task_schedule();
     app.spawn_sms_forward();
-    app.serve(bind, false, false).await
+    if let Some(lan_addr) = lan_addr {
+        tokio::try_join!(
+            app.clone().serve(bind, false, false),
+            app.serve(lan_addr, true, true)
+        )?;
+        Ok(())
+    } else {
+        app.serve(bind, local_requires_auth, false).await
+    }
 }
 
 #[cfg(test)]

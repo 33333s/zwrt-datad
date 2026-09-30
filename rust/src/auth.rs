@@ -59,6 +59,9 @@ pub async fn verify_password(username: &str, password: &str) -> bool {
     if username.is_empty() || username.len() > 256 || password.len() > 256 {
         return false;
     }
+    if crate::u50_ctl::get().is_some() {
+        return crate::u50_ctl::verify_password(username, password).await;
+    }
     let Ok(info) = state::ubus("zwrt_web", "web_login_info", json!({})).await else {
         return false;
     };
@@ -149,7 +152,7 @@ fn success_text(value: &str) -> bool {
         "success" | "ok" | "true" | "pass" | "passed" | "logged" | "logined" | "done"
     )
 }
-fn secure_eq(a: &str, b: &str) -> bool {
+pub(crate) fn secure_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())

@@ -6,6 +6,8 @@ the per-write AD challenge, SMS paging and the connection/bearer/SIM actions.
 The daemon must derive its own session from the stored admin hash, expose the
 mainline control API for the mapped actions, and never leak the credential.
 """
+import base64
+import http.client
 import hashlib
 import json
 import os
@@ -147,10 +149,10 @@ class Vendor(BaseHTTPRequestHandler):
         pass
 
 
-def call(port, path, body=None):
+def call(port, path, body=None, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
             return response.status, json.load(response)
@@ -189,6 +191,9 @@ esac
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        lan_port = probe.getsockname()[1]
     (folder / "data").mkdir()
     # An enrolled U50S: remote access on, no proxied back-ends (the mainline
     # validator used to reject this combination).
@@ -203,7 +208,7 @@ esac
     env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_OTA_DISABLE_AUTO": "1"}
     process = subprocess.Popen(
         [BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--u50-data-dir", str(folder / "data"),
-         "--port", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+         "--port", str(port), "--lan-port", str(lan_port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         for _ in range(60):
             try:
@@ -213,6 +218,34 @@ esac
                 time.sleep(0.1)
         else:
             raise AssertionError("U50 runtime did not start")
+
+        # The U50 LAN listener uses original WebUI credentials, never ubus.
+        origin = "http://192.168.0.2:2333"
+        connection = http.client.HTTPConnection("127.0.0.1", lan_port, timeout=8)
+        connection.request("OPTIONS", "/auth/login", headers={"Origin": origin,
+            "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization",
+            "Access-Control-Request-Private-Network": "true"})
+        response = connection.getresponse()
+        assert response.status == 204
+        assert response.getheader("Access-Control-Allow-Origin") == origin
+        assert response.getheader("Access-Control-Allow-Private-Network") == "true"
+        response.read()
+        connection.close()
+        assert call(lan_port, "/state")[0] == 401
+        for user, password in [("admin", "wrong"), ("other", "device-admin-password")]:
+            basic = base64.b64encode(f"{user}:{password}".encode()).decode()
+            assert call(lan_port, "/auth/login", {}, {"Authorization": f"Basic {basic}"})[0] == 401
+        basic = base64.b64encode(b"admin:device-admin-password").decode()
+        status, login = call(lan_port, "/auth/login", {}, {"Authorization": f"Basic {basic}"})
+        assert status == 200 and login["access_token"], login
+        token = login["access_token"]
+        assert call(lan_port, "/state", headers={"Authorization": f"Bearer {token}"})[0] == 200
+        connection = http.client.HTTPConnection("127.0.0.1", lan_port, timeout=8)
+        connection.request("GET", f"/events?access_token={token}", headers={"Origin": origin})
+        response = connection.getresponse()
+        assert response.status == 200 and response.getheader("Access-Control-Allow-Origin") == origin
+        assert response.readline().startswith(b"event: state")
+        connection.close()
 
         # Mainline API surface, restricted to what the U50S implements.
         _, caps = call(port, "/capabilities")

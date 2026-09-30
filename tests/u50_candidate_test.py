@@ -108,7 +108,7 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         iw.chmod(0o700)
         env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_U50_ROOT": str(root),
                "ZWRT_DATAD_U50_IP_BIN": str(ip), "ZWRT_DATAD_U50_IW_BIN": str(iw)}
-        cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--once"]
+        cmd = [BINARY, "--u50-model", "u50pro", "--u50-loopback-only", "--u50-goform-url", url, "--once"]
         result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
         state = json.loads(result.stdout)
         assert state["device"]["api_template"] == "U50PRO"
@@ -149,7 +149,7 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         ota_dir = Path(tmp) / "otadata"
         ota_dir.mkdir()
         server_env = {**env, "ZWRT_DATAD_OTA_DISABLE_AUTO": "1"}
-        process = subprocess.Popen([BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--port", str(port),
+        process = subprocess.Popen([BINARY, "--u50-model", "u50pro", "--u50-loopback-only", "--u50-goform-url", url, "--port", str(port),
                                     "--u50-data-dir", str(ota_dir)], env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
             for _ in range(40):
@@ -196,7 +196,7 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         # that file is then the data directory (same cloud.json as before).
         legacy_dir = Path(tmp) / "legacy"
         legacy_dir.mkdir()
-        legacy_cmd = [BINARY, "--u50-model", "u50pro", "--u50-goform-url", url, "--u50-enable-writes",
+        legacy_cmd = [BINARY, "--u50-model", "u50pro", "--u50-loopback-only", "--u50-goform-url", url, "--u50-enable-writes",
                       "--u50-panel-config", str(legacy_dir / "cloud.json"), "--port", str(port)]
         legacy = subprocess.Popen(legacy_cmd, env=server_env, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, text=True)
@@ -227,11 +227,11 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         assert partial["net"]["type"] == "LTE"
         assert partial["net"]["operator"] == "TestCfg"
         u50s_env = {**env, "MOCK_U50_MODEL": "U50S"}
-        u50s = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--once"], env=u50s_env, capture_output=True, text=True, timeout=15, check=True)
+        u50s = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-loopback-only", "--u50-goform-url", url, "--once"], env=u50s_env, capture_output=True, text=True, timeout=15, check=True)
         assert json.loads(u50s.stdout)["device"]["api_template"] == "U50S"
         enroll_dir = Path(tmp) / "enroll"
         enrollment = json.dumps({"username": "enr_" + "a" * 32, "password": "fixture-secret"})
-        enroll_cmd = [BINARY, "--u50-model", "u50s", "--u50-enroll-dir", str(enroll_dir)]
+        enroll_cmd = [BINARY, "--u50-model", "u50s", "--u50-loopback-only", "--u50-enroll-dir", str(enroll_dir)]
         enrolled = subprocess.run(enroll_cmd, input=enrollment, env=u50s_env,
                                   capture_output=True, text=True, timeout=15, check=True)
         assert json.loads(enrolled.stdout) == {"configured": True, "model": "U50S", "password_configured": True}
@@ -249,12 +249,12 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         duplicate = subprocess.run(enroll_cmd, input=enrollment, env=u50s_env,
                                    capture_output=True, text=True, timeout=15)
         assert duplicate.returncode != 0 and cloud_file.read_bytes() == saved_bytes
-        no_identity = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-enroll-dir", str(Path(tmp) / "no-id")],
+        no_identity = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-loopback-only", "--u50-enroll-dir", str(Path(tmp) / "no-id")],
                                      input=enrollment, env={**u50s_env, "MOCK_U50_NO_ID": "1"},
                                      capture_output=True, text=True, timeout=15)
         assert no_identity.returncode != 0
         assert "fixture-secret" not in no_identity.stderr
-        wrong = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--once"], env=env, capture_output=True, text=True, timeout=15)
+        wrong = subprocess.run([BINARY, "--u50-model", "u50s", "--u50-loopback-only", "--u50-goform-url", url, "--once"], env=env, capture_output=True, text=True, timeout=15)
         assert wrong.returncode != 0
         print("U50 firmware cfg and optional GoAhead probe OK")
 finally:
