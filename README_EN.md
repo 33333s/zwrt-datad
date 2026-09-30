@@ -101,3 +101,5 @@ Port 9460 is the loopback API. The LAN API on port 9461 requires a Bearer Token 
 ## License and contributors
 
 Licensed under the [MIT License](LICENSE). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for project credits.
+
+U50S ARM32 listens on loopback port 9460 and authenticated LAN port 9461 by default. Log in through `/auth/login` using `admin` and the original WebUI password. Override the LAN listener with `--lan-bind` / `--lan-port`, or disable it with `--u50-loopback-only`. ZWRT `/auth/exchange` is not supported on U50S.

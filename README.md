@@ -101,3 +101,5 @@ curl -N http://127.0.0.1:9460/events
 ## 许可与贡献者
 
 项目使用 [MIT License](LICENSE)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
+
+U50S ARM32 默认同时监听本机 9460 与内网 9461；9461 使用 `admin` 和原厂后台密码通过 `/auth/login` 获取 Bearer Token。`--lan-bind` / `--lan-port` 可调整内网监听；`--u50-loopback-only` 可关闭内网接口。U50S 不支持 ZWRT 的 `/auth/exchange`。

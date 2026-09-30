@@ -51,7 +51,7 @@ fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()
 struct Args {
     #[arg(long)]
     once: bool,
-    /// Explicit read-only candidate for original-firmware U50 devices.
+    /// Original-firmware U50 platform backend.
     #[arg(long, value_parser = ["u50pro", "u50s"])]
     u50_model: Option<String>,
     /// Ignored since v0.10.46: the U50 runtime now uses the same App and
@@ -66,6 +66,9 @@ struct Args {
     /// `remote_webshell_enabled: true` in the private cloud.json.
     #[arg(long)]
     u50_enable_webshell: bool,
+    /// Disable the authenticated U50 LAN API (enabled by default on port 9461).
+    #[arg(long, conflicts_with = "lan_bind")]
+    u50_loopback_only: bool,
     /// Directory for U50 OTA state and the staged update binary (same volume
     /// as the executable).
     #[arg(long, default_value = "/etc_rw/zwrt-datad")]
@@ -122,7 +125,10 @@ async fn main() -> Result<()> {
     }
     let args = Args::parse();
     anyhow::ensure!(
-        args.u50_model.is_some() || (args.u50_enroll_dir.is_none() && !args.u50_enable_webshell),
+        args.u50_model.is_some()
+            || (args.u50_enroll_dir.is_none()
+                && !args.u50_enable_webshell
+                && !args.u50_loopback_only),
         "U50 options require --u50-model"
     );
     #[cfg(target_arch = "arm")]
@@ -136,8 +142,8 @@ async fn main() -> Result<()> {
             "--u50-enroll-dir cannot be combined with --once"
         );
         anyhow::ensure!(
-            args.lan_bind.is_none() && !args.neighbor && !args.webshell && args.identity.is_none(),
-            "U50 mode listens on loopback only; use --u50-enable-webshell for the terminal"
+            !args.neighbor && !args.webshell && args.identity.is_none(),
+            "U50 does not support --neighbor or --identity; use --u50-enable-webshell for the terminal"
         );
         let model = u50::Model::parse(model)?;
         if let Some(dir) = &args.u50_enroll_dir {
@@ -157,6 +163,25 @@ async fn main() -> Result<()> {
             Duration::from_millis(args.interval.clamp(500, 5000)),
             u50::RunOptions {
                 enable_webshell: args.u50_enable_webshell,
+                lan_addr: if args.u50_loopback_only {
+                    None
+                } else {
+                    Some(
+                        format!(
+                            "{}:{}",
+                            args.lan_bind.as_deref().unwrap_or("0.0.0.0"),
+                            args.lan_port
+                        )
+                        .parse()?,
+                    )
+                },
+                auth_token: args
+                    .auth_token_file
+                    .as_ref()
+                    .map(std::fs::read_to_string)
+                    .transpose()?
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty()),
                 data_dir: args
                     .u50_panel_config
                     .as_deref()

@@ -80,6 +80,34 @@ pub const CONTROLS: &[&str] = &[
     "wifi.set_module",
 ];
 
+/// Verify the original WebUI admin password without creating or replacing
+/// the daemon's OEM cookie session. The root-only cfg value is the same
+/// uppercase SHA-256 used by the firmware's login challenge.
+pub async fn verify_password(username: &str, password: &str) -> bool {
+    if username != "admin" {
+        return false;
+    }
+    let program = std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into());
+    let Ok(raw) =
+        crate::command::run(&program, ["get", "admin_Password"], Duration::from_secs(2)).await
+    else {
+        return false;
+    };
+    let raw = zeroize::Zeroizing::new(raw);
+    let stored = String::from_utf8_lossy(&raw);
+    let stored = stored.trim();
+    if stored.len() != 64
+        || !stored
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+    {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+    let first = zeroize::Zeroizing::new(format!("{:X}", Sha256::digest(password.as_bytes())));
+    crate::auth::secure_eq(stored, first.as_str())
+}
+
 pub fn ota_profile() -> Profile {
     if CTL.get().is_some() {
         Profile::U50
