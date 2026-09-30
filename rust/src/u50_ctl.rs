@@ -699,6 +699,7 @@ impl Ctl {
             bands
         };
         let mask = lte_mask(&bands);
+        let saved_mode = self.ensure_band_write_mode().await;
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
                 .await
@@ -714,6 +715,7 @@ impl Ctl {
             )
             .await
         };
+        self.restore_mode(saved_mode).await;
         if let Err(error) = result {
             return Outcome::Failed(error);
         }
@@ -728,6 +730,36 @@ impl Ctl {
             );
         }
         Outcome::Ok(json!({"result":"success","bands":bands,"mask":mask,"verified":true}))
+    }
+
+    /// The U50 Pro firmware rejects band-lock writes unless the modem is in
+    /// 5G-only mode (`Only_5G`). The official WebUI enforces the same rule on
+    /// its network-settings page. Temporarily switch, write, and restore.
+    async fn ensure_band_write_mode(&self) -> Option<String> {
+        let current = self.field("net_select").await.unwrap_or_default();
+        if current == "Only_5G" {
+            return None; // already in the right mode
+        }
+        if self
+            .write(
+                "SET_BEARER_PREFERENCE",
+                &[("BearerPreference", "Only_5G".into())],
+            )
+            .await
+            .is_err()
+        {
+            return None; // cannot switch; let the band write fail with its own error
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Some(current) // return the original mode for restore
+    }
+
+    async fn restore_mode(&self, original: Option<String>) {
+        if let Some(mode) = original {
+            let _ = self
+                .write("SET_BEARER_PREFERENCE", &[("BearerPreference", mode)])
+                .await;
+        }
     }
 
     async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
@@ -758,7 +790,8 @@ impl Ctl {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        if let Err(error) = self
+        let saved_mode = self.ensure_band_write_mode().await;
+        let write_result = self
             .write(
                 "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
                 &[
@@ -766,8 +799,9 @@ impl Ctl {
                     ("type", if nsa { "1" } else { "0" }.into()),
                 ],
             )
-            .await
-        {
+            .await;
+        self.restore_mode(saved_mode).await;
+        if let Err(error) = write_result {
             return Outcome::Failed(error);
         }
         let key = if nsa {
@@ -1333,8 +1367,10 @@ impl Ctl {
             Ok(Some(v @ (0 | 1))) => v,
             _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
         };
+        // The U50 Pro firmware has `switchWiFiModule` (not `SET_WIFI_INFO`)
+        // and takes `SwitchOption` (not `wifiEnabled`), matching the WebUI.
         if let Err(error) = self
-            .write("SET_WIFI_INFO", &[("wifiEnabled", enabled.to_string())])
+            .write("switchWiFiModule", &[("SwitchOption", enabled.to_string())])
             .await
         {
             return Outcome::Failed(error);

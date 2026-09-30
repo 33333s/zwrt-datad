@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.56",
+    "version": "0.10.58",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50 机内信令采集 worker（libdiag DCI 客户端，NR/LTE RRC OTA 订阅，state.u50_signaling）"
+    "notes": "U50 Pro 控制修复：WiFi开关goform、频段锁定模式前置、5QI/AMBR实时提取"
   }
 }

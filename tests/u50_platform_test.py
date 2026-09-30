@@ -185,8 +185,8 @@ class Vendor(BaseHTTPRequestHandler):
                     STORE[dst] = one[src]
         elif action == "SET_DEVICE_MTU":
             STORE["mtu"], STORE["tcp_mss"] = one["mtu"], one["tcp_mss"]
-        elif action == "SET_WIFI_INFO":
-            STORE["wifi_onoff_state"] = one["wifiEnabled"]
+        elif action == "SET_WIFI_INFO" or action == "switchWiFiModule":
+            STORE["wifi_onoff_state"] = one.get("wifiEnabled", one.get("SwitchOption", "1"))
         elif action == "DATA_LIMIT_SETTING":
             for key in ("data_volume_limit_switch", "data_volume_limit_unit", "data_volume_limit_size",
                         "data_volume_alert_percent", "wan_auto_clear_flow_data_switch", "traffic_clear_date"):
@@ -418,15 +418,18 @@ esac
         # Band locks: WebUI mask format, read back, invalid input refused.
         status, result = control(port, "band.set_lte", {"bands": "1,3,41"})
         assert status == 200 and result["result"]["mask"] == "0x10000000005" and result["result"]["verified"], result
-        assert writes()[-1] == ("write", "SET_NETWORK_BAND_LOCK", {
-            "goformId": "SET_NETWORK_BAND_LOCK", "lte_band_lock": "0x10000000005"})
+        band_writes = [w for w in writes() if w[1] == "SET_NETWORK_BAND_LOCK"]
+        assert band_writes and band_writes[-1][2] == {
+            "goformId": "SET_NETWORK_BAND_LOCK", "lte_band_lock": "0x10000000005"}
         for bad in ({"bands": "1,x"}, {"bands": "0"}, {"bands": "65"}, {}):
             assert control(port, "band.set_lte", bad)[0] == 400, bad
         status, result = control(port, "band.set_nr_nsa", {"bands": "78,41,78"})
         assert status == 200 and result["result"] == {"result":"success", "bands": [41, 78], "verified": True}, result
-        assert writes()[-1][2] == {"goformId": "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "nr5g_band_mask": "41,78", "type": "1"}
+        nr_writes = [w for w in writes() if w[1] == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK"]
+        assert nr_writes and nr_writes[-1][2] == {"goformId": "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "nr5g_band_mask": "41,78", "type": "1"}
         status, result = control(port, "band.set_nr_sa", {"bands": "78"})
-        assert status == 200 and writes()[-1][2]["type"] == "0"
+        nr_writes = [w for w in writes() if w[1] == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK"]
+        assert status == 200 and nr_writes[-1][2]["type"] == "0"
 
         # CSV/array parity, auto restoration and common mode names.
         assert control(port, "band.set_lte", {"bands": [1,3,41]})[0] == 200
@@ -534,7 +537,7 @@ esac
         assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "SET_DEVICE_MTU", "mtu": "1400", "tcp_mss": "1360"}
         assert control(port, "lan.set_mtu", {"mtu": 100})[0] == 400
         status, result = control(port, "wifi.set_module", {"enabled": 0})
-        assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "SET_WIFI_INFO", "wifiEnabled": "0"}
+        assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "switchWiFiModule", "SwitchOption": "0"}
         assert control(port, "wifi.set_module", {"enabled": 1})[0] == 200
         assert control(port, "wifi.set_module", {"enabled": 5})[0] == 400
 
