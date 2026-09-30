@@ -66,6 +66,7 @@ LOG = []
 
 class Vendor(BaseHTTPRequestHandler):
     logged_in = False
+    developer = False
     skip_mode_write = False
     delay_mode_write = False
     pending_mode = None
@@ -111,6 +112,8 @@ class Vendor(BaseHTTPRequestHandler):
             else:
                 Vendor.current_rd = current = RD
             return self.send_json({"RD": current})
+        if keys == ["developer_option_loginfo"]:
+            return self.send_json({"developer_option_loginfo": "ok" if Vendor.developer else ""})
         if keys in (["queryAccessPointInfo"], ["queryWiFiModuleSwitch"]):
             assert "multi_data" not in query, "Wi-Fi resources must use the WebUI single-command reads"
             assert "sid=two" in self.headers.get("Cookie", ""), "configuration must use the local OEM session"
@@ -156,6 +159,19 @@ class Vendor(BaseHTTPRequestHandler):
                       and form.get("AD", [""])[0] == digest(digest(VERSION + "") + Vendor.current_rd))
         if not authorized:
             return self.send_json({"result": "failure"})
+        if action == "DEVELOPER_OPTION_LOGIN":
+            # The firmware gates hidden-page goforms behind this second login;
+            # it reuses the stored admin hash with a fresh LD challenge and
+            # answers "0" (not "success") when the proof is accepted.
+            if form.get("password", [""])[0] != digest(ADMIN_HASH + LD):
+                return self.send_json({"result": "failure"})
+            Vendor.developer = True
+            LOG.append(("write", action, {k: v for k, v in {key: values[0] for key, values in form.items()}.items()
+                                          if k not in ("AD", "isTest")}))
+            return self.send_json({"result": "0"})
+        if action in ("BAND_SELECT", "WAN_PERFORM_NR5G_BAND_LOCK",
+                      "WAN_PERFORM_NR5G_SANSA_BAND_LOCK") and not Vendor.developer:
+            return self.send_json({"result": "failure"})
         one = {key: values[0] for key, values in form.items()}
         LOG.append(("write", action, {k: v for k, v in one.items() if k not in ("AD", "isTest")}))
         if action == "SET_CONNECTION_MODE":
@@ -171,7 +187,7 @@ class Vendor(BaseHTTPRequestHandler):
         elif action == "SWITCH_SIMCARD_SLOT":
             STORE["simcard_active_slot"] = one["simcard_active_slot"]
         elif action == "BAND_SELECT":
-            return self.send_json({"result":"failure"})
+            STORE["lte_band_lock"] = one["lte_band_mask"]
         elif action == "SET_NETWORK_BAND_LOCK":
             STORE["lte_band_lock"] = one["lte_band_lock"]
         elif action == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK":
@@ -417,25 +433,30 @@ esac
 
         # Band locks: WebUI mask format, read back, invalid input refused.
         status, result = control(port, "band.set_lte", {"bands": "1,3,41"})
-        assert status == 200 and result["result"]["mask"] == "0x10000000005" and result["result"]["verified"], result
+        assert status == 200 and result["result"]["mask"] == "0x0000010000000005" and result["result"]["verified"], result
         band_writes = [w for w in writes() if w[1] == "SET_NETWORK_BAND_LOCK"]
         assert band_writes and band_writes[-1][2] == {
-            "goformId": "SET_NETWORK_BAND_LOCK", "lte_band_lock": "0x10000000005"}
+            "goformId": "SET_NETWORK_BAND_LOCK", "lte_band_lock": "0x0000010000000005"}
         for bad in ({"bands": "1,x"}, {"bands": "0"}, {"bands": "65"}, {}):
             assert control(port, "band.set_lte", bad)[0] == 400, bad
         status, result = control(port, "band.set_nr_nsa", {"bands": "78,41,78"})
         assert status == 200 and result["result"] == {"result":"success", "bands": [41, 78], "verified": True}, result
         nr_writes = [w for w in writes() if w[1] == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK"]
         assert nr_writes and nr_writes[-1][2] == {"goformId": "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "nr5g_band_mask": "41,78", "type": "1"}
+        # The NR lock is developer-gated: the bridge must have elevated the
+        # session (password proof from the stored admin hash) exactly once.
+        dev_logins = [w for w in writes() if w[1] == "DEVELOPER_OPTION_LOGIN"]
+        assert len(dev_logins) == 1, dev_logins
         status, result = control(port, "band.set_nr_sa", {"bands": "78"})
         nr_writes = [w for w in writes() if w[1] == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK"]
         assert status == 200 and nr_writes[-1][2]["type"] == "0"
+        assert len([w for w in writes() if w[1] == "DEVELOPER_OPTION_LOGIN"]) == 1
 
         # CSV/array parity, auto restoration and common mode names.
         assert control(port, "band.set_lte", {"bands": [1,3,41]})[0] == 200
         status, automatic = control(port, "band.set_lte", {"bands": ""})
         assert status == 200 and automatic["result"]["verified"] is True, automatic
-        assert STORE["lte_band_lock"] == "0x1c200000095"
+        assert STORE["lte_band_lock"] == "0x000001c200000095"
         assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
         assert STORE["nr5g_sa_band_lock"] == "5,7,78"
         assert control(port, "network.set_mode", {"mode": "4G"})[1]["result"]["mode"] == "Only_LTE"

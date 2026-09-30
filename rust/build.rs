@@ -45,7 +45,11 @@ fn main() {
                 bytes.len() > 64 && bytes.len() < 2 * 1024 * 1024,
                 "diag worker size out of range"
             );
-            assert_eq!(&bytes[..6], b"\x7fELF\x01\x01", "diag worker must be ELF32 LE");
+            assert_eq!(
+                &bytes[..6],
+                b"\x7fELF\x01\x01",
+                "diag worker must be ELF32 LE"
+            );
             assert_eq!(&bytes[18..20], &[40, 0], "diag worker must be ARM EABI5");
             bytes
         }

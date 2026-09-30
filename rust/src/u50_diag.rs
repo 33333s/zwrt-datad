@@ -131,7 +131,11 @@ fn probe(io: &mut dyn DiagIo) -> Map<String, Value> {
     // Hello makes every node re-announce its services; the wildcard lookup
     // then brings the whole table back to this socket.
     if io
-        .send_to(&ctrl_packet(QRTR_TYPE_HELLO, 0, 0, 0, 0)[..4], QRTR_NS_NODE, QRTR_NS_PORT)
+        .send_to(
+            &ctrl_packet(QRTR_TYPE_HELLO, 0, 0, 0, 0)[..4],
+            QRTR_NS_NODE,
+            QRTR_NS_PORT,
+        )
         .is_err()
     {
         return unavailable("qrtr_hello_failed");
@@ -365,9 +369,18 @@ mod tests {
     fn nhdlc_unwrap_is_strict() {
         let frame = [0x7e, 0x01, 0x02, 0x00, 0xaa, 0xbb, 0x7e];
         assert_eq!(unwrap_nhdlc(&frame), Some(&[0xaa, 0xbb][..]));
-        assert_eq!(unwrap_nhdlc(&[0x7e, 0x02, 0x02, 0x00, 0xaa, 0xbb, 0x7e]), None);
-        assert_eq!(unwrap_nhdlc(&[0x7e, 0x01, 0x03, 0x00, 0xaa, 0xbb, 0x7e]), None);
-        assert_eq!(unwrap_nhdlc(&[0x7e, 0x01, 0x02, 0x00, 0xaa, 0xbb, 0x00]), None);
+        assert_eq!(
+            unwrap_nhdlc(&[0x7e, 0x02, 0x02, 0x00, 0xaa, 0xbb, 0x7e]),
+            None
+        );
+        assert_eq!(
+            unwrap_nhdlc(&[0x7e, 0x01, 0x03, 0x00, 0xaa, 0xbb, 0x7e]),
+            None
+        );
+        assert_eq!(
+            unwrap_nhdlc(&[0x7e, 0x01, 0x02, 0x00, 0xaa, 0xbb, 0x00]),
+            None
+        );
         assert_eq!(unwrap_nhdlc(&[0x7e, 0x01]), None);
     }
 
@@ -396,10 +409,18 @@ mod tests {
         let mut io = FakeIo {
             sent: Vec::new(),
             replies: vec![
-                Ok((server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 0, 0), 2, 16406)),
+                Ok((
+                    server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 0, 0),
+                    2,
+                    16406,
+                )),
                 Ok((server_entry(0x1000, 1, 2, 16391), 2, 16406)),
                 Ok((server_entry(DIAG_SERVICE, 3, 3, 21), 2, 16406)),
-                Ok((server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 3, 17), 2, 16406)),
+                Ok((
+                    server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 3, 17),
+                    2,
+                    16406,
+                )),
                 Ok((ver, 3, 17)),
                 Err(FakeIo::timeout()),
             ],
@@ -425,7 +446,11 @@ mod tests {
         let mut io = FakeIo {
             sent: Vec::new(),
             replies: vec![
-                Ok((server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 3, 17), 2, 16406)),
+                Ok((
+                    server_entry(DIAG_SERVICE, DIAG_INSTANCE_CMD, 3, 17),
+                    2,
+                    16406,
+                )),
                 Ok((frame, 3, 17)),
                 Err(FakeIo::timeout()),
             ],

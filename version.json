@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.58",
+    "version": "0.10.59",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro 控制修复：WiFi开关goform、频段锁定模式前置、5QI/AMBR实时提取"
+    "notes": "U50 Pro 频段锁定修复：developer-option 门禁自动提权，LTE/NR SA/NSA 锁频全通"
   }
 }

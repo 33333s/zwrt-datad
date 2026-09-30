@@ -223,12 +223,14 @@ fn band_list(params: &Value, key: &str, max: u32) -> Result<Vec<u32>, String> {
     Ok(bands)
 }
 
-/// Match the original U50 WebUI's minimal hex mask representation.
+/// Match the original U50 WebUI's hex mask: always full 64-bit width with
+/// leading zeros (`0x000001e2080800d5`), lowercase — the firmware rejects
+/// shorter forms.
 fn lte_mask(bands: &[u32]) -> String {
     let mask = bands
         .iter()
         .fold(0u64, |mask, band| mask | 1u64 << (band - 1));
-    format!("0x{mask:x}")
+    format!("0x{mask:016x}")
 }
 
 fn network_mode(value: &str) -> Option<&'static str> {
@@ -699,7 +701,6 @@ impl Ctl {
             bands
         };
         let mask = lte_mask(&bands);
-        let saved_mode = self.ensure_band_write_mode().await;
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
                 .await
@@ -715,7 +716,6 @@ impl Ctl {
             )
             .await
         };
-        self.restore_mode(saved_mode).await;
         if let Err(error) = result {
             return Outcome::Failed(error);
         }
@@ -732,36 +732,9 @@ impl Ctl {
         Outcome::Ok(json!({"result":"success","bands":bands,"mask":mask,"verified":true}))
     }
 
-    /// The U50 Pro firmware rejects band-lock writes unless the modem is in
-    /// 5G-only mode (`Only_5G`). The official WebUI enforces the same rule on
-    /// its network-settings page. Temporarily switch, write, and restore.
-    async fn ensure_band_write_mode(&self) -> Option<String> {
-        let current = self.field("net_select").await.unwrap_or_default();
-        if current == "Only_5G" {
-            return None; // already in the right mode
-        }
-        if self
-            .write(
-                "SET_BEARER_PREFERENCE",
-                &[("BearerPreference", "Only_5G".into())],
-            )
-            .await
-            .is_err()
-        {
-            return None; // cannot switch; let the band write fail with its own error
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        Some(current) // return the original mode for restore
-    }
-
-    async fn restore_mode(&self, original: Option<String>) {
-        if let Some(mode) = original {
-            let _ = self
-                .write("SET_BEARER_PREFERENCE", &[("BearerPreference", mode)])
-                .await;
-        }
-    }
-
+    /// The U50 Pro firmware gates `BAND_SELECT` and the NR lock goforms behind
+    /// its developer-option login; the OEM bridge elevates the session
+    /// transparently before those writes, so no mode dance is needed here.
     async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
         let bands = match band_list(params, "bands", 512) {
             Ok(bands) => bands,
@@ -790,7 +763,6 @@ impl Ctl {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let saved_mode = self.ensure_band_write_mode().await;
         let write_result = self
             .write(
                 "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
@@ -800,7 +772,6 @@ impl Ctl {
                 ],
             )
             .await;
-        self.restore_mode(saved_mode).await;
         if let Err(error) = write_result {
             return Outcome::Failed(error);
         }
@@ -1574,7 +1545,7 @@ mod band_mode_tests {
             assert!(band_list(&json!({"bands":value}), "bands", 64).is_err());
         }
         assert!(band_list(&json!({}), "bands", 64).is_err());
-        assert_eq!(lte_mask(&[1, 3, 41]), "0x10000000005");
+        assert_eq!(lte_mask(&[1, 3, 41]), "0x0000010000000005");
     }
     #[test]
     fn canonical_network_modes_and_common_aliases() {

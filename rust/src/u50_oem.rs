@@ -20,6 +20,20 @@ use zeroize::{Zeroize, Zeroizing};
 const MAX_REPLY: usize = 64 * 1024;
 const SESSION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const LOGIN_INTERVAL: Duration = Duration::from_secs(3);
+/// GoAhead answers these hidden-page actions only after a second,
+/// developer-option login (same admin password, own LD challenge, plus AD).
+/// Mirrors the checklist table embedded in `zte_topsw_goahead`.
+const DEVELOPER_GATED: &[&str] = &[
+    "BAND_SELECT",
+    "BAND_SELECT_EX",
+    "WAN_PERFORM_NR5G_BAND_LOCK",
+    "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
+    "WAN_OPERATE_MODE_SET",
+    "IF_UPGRADE",
+    "ALG_SETTING",
+    "OFFLINE_DEVICE_REMOVE",
+    "STK_PROCESS",
+];
 
 #[derive(Clone)]
 pub struct Bridge {
@@ -37,6 +51,7 @@ struct Inner {
 struct Session {
     token: String,
     cookie: String,
+    first: Zeroizing<String>,
     expires: Instant,
 }
 
@@ -107,10 +122,16 @@ impl Bridge {
         })
     }
     fn request(&self, request: reqwest::RequestBuilder, cookie: &str) -> reqwest::RequestBuilder {
+        let origin = format!("http://{}", self.inner.host);
         let request = request
             .header(HOST, self.inner.host.as_str())
-            .header(REFERER, format!("http://{}/", self.inner.host))
-            .header("X-Requested-With", "XMLHttpRequest");
+            .header(REFERER, format!("{origin}/"))
+            .header("Origin", &origin)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            );
         if cookie.is_empty() {
             request
         } else {
@@ -244,7 +265,12 @@ impl Bridge {
             return Err("OEM login rejected".into());
         }
         let cookie = cookies_from_two(&first_cookie, &second_cookie);
-        let (status, _) = self.get("loginfo", &cookie).await?;
+        let (status, status_cookie) = self.get("loginfo", &cookie).await?;
+        let cookie = if status_cookie.is_empty() {
+            cookie
+        } else {
+            cookies_from_two(&cookie, &status_cookie)
+        };
         if status.get("loginfo").and_then(Value::as_str) != Some("ok") {
             return Err("OEM login not confirmed".into());
         }
@@ -255,11 +281,17 @@ impl Bridge {
         *self.inner.session.lock().await = Some(Session {
             token: token.clone(),
             cookie,
+            first,
             expires: Instant::now() + SESSION_LIFETIME,
         });
         Ok(json!({"ok":true,"token":token,"expires_in":SESSION_LIFETIME.as_secs()}))
     }
     async fn authorized_cookie(&self, token: &str) -> Result<String, String> {
+        self.authorized_session(token)
+            .await
+            .map(|(cookie, _)| cookie)
+    }
+    async fn authorized_session(&self, token: &str) -> Result<(String, Zeroizing<String>), String> {
         let guard = self.inner.session.lock().await;
         let Some(session) = guard.as_ref() else {
             return Err("OEM login required".into());
@@ -267,7 +299,82 @@ impl Bridge {
         if Instant::now() >= session.expires || !same_token(&session.token, token) {
             return Err("OEM session expired or invalid".into());
         }
-        Ok(session.cookie.clone())
+        Ok((session.cookie.clone(), session.first.clone()))
+    }
+    /// The write challenge digest: `AD = SHA256(SHA256(wa_inner_version +
+    /// cr_version) + RD)` with a fresh RD challenge.
+    async fn access_id(&self, cookie: &str) -> Result<String, String> {
+        let (versions, _) = self.get("wa_inner_version,cr_version", cookie).await?;
+        let version = versions
+            .get("wa_inner_version")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let cr = versions
+            .get("cr_version")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if version.is_empty() {
+            return Err("OEM version challenge unavailable".into());
+        }
+        let (rd, _) = self.get("RD", cookie).await?;
+        let Some(rd) = rd
+            .get("RD")
+            .and_then(Value::as_str)
+            .filter(|v| v.len() == 64)
+        else {
+            return Err("OEM write challenge unavailable".into());
+        };
+        Ok(sha256_hex(&format!(
+            "{}{rd}",
+            sha256_hex(&format!("{version}{cr}"))
+        )))
+    }
+    /// Elevate the session for developer-gated actions. The proof mirrors the
+    /// normal login (`SHA256(stored admin hash + LD)`) but goes to
+    /// `DEVELOPER_OPTION_LOGIN` with its own AD; the elevation is verified
+    /// through the `developer_option_loginfo` status read.
+    async fn ensure_developer(
+        &self,
+        cookie: &str,
+        first: &Zeroizing<String>,
+    ) -> Result<(), String> {
+        let (status, _) = self.get("developer_option_loginfo", cookie).await?;
+        if status
+            .get("developer_option_loginfo")
+            .and_then(Value::as_str)
+            == Some("ok")
+        {
+            return Ok(());
+        }
+        let (challenge, _) = self.get("LD", cookie).await?;
+        let Some(ld) = challenge
+            .get("LD")
+            .and_then(Value::as_str)
+            .filter(|s| s.len() == 64)
+        else {
+            return Err("developer login challenge unavailable".into());
+        };
+        let proof = sha256_hex(&format!("{}{ld}", first.as_str()));
+        let ad = self.access_id(cookie).await?;
+        let form = vec![
+            ("isTest".into(), "false".into()),
+            ("goformId".into(), "DEVELOPER_OPTION_LOGIN".into()),
+            ("password".into(), proof),
+            ("AD".into(), ad),
+        ];
+        let (result, _) = self.post(&form, cookie).await?;
+        if result.get("result").and_then(Value::as_str) != Some("0") {
+            return Err("developer login rejected".into());
+        }
+        let (status, _) = self.get("developer_option_loginfo", cookie).await?;
+        if status
+            .get("developer_option_loginfo")
+            .and_then(Value::as_str)
+            != Some("ok")
+        {
+            return Err("developer login not confirmed".into());
+        }
+        Ok(())
     }
     pub async fn read(
         &self,
@@ -298,37 +405,21 @@ impl Bridge {
         // RD belongs to the OEM session: concurrent writes must not replace
         // each other's challenge between reading it and submitting AD.
         let _write = self.inner.write_gate.lock().await;
-        let cookie = self.authorized_cookie(token).await?;
-        let mut form = vec![
-            ("goformId".into(), goform_id.into()),
-            ("isTest".into(), "false".into()),
-        ];
+        let (cookie, first) = self.authorized_session(token).await?;
+        if DEVELOPER_GATED.contains(&goform_id) {
+            self.ensure_developer(&cookie, &first).await?;
+        }
+        // The OEM WebUI sends `isTest` first and `AD` last; some goahead
+        // builds are sensitive to this order.
+        let mut form: Vec<(String, String)> = vec![("isTest".into(), "false".into())];
         // The OEM WebUI explicitly exempts SET_WEB_LANGUAGE from AD. All
         // other write IDs use a fresh RD challenge tied to firmware versions.
-        if goform_id != "SET_WEB_LANGUAGE" {
-            let (versions, _) = self.get("wa_inner_version,cr_version", &cookie).await?;
-            let version = versions
-                .get("wa_inner_version")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let cr = versions
-                .get("cr_version")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if version.is_empty() {
-                return Err("OEM version challenge unavailable".into());
-            }
-            let (rd, _) = self.get("RD", &cookie).await?;
-            let Some(rd) = rd
-                .get("RD")
-                .and_then(Value::as_str)
-                .filter(|v| v.len() == 64)
-            else {
-                return Err("OEM write challenge unavailable".into());
-            };
-            let ad = sha256_hex(&format!("{}{rd}", sha256_hex(&format!("{version}{cr}"))));
-            form.push(("AD".into(), ad));
-        }
+        let ad = if goform_id != "SET_WEB_LANGUAGE" {
+            self.access_id(&cookie).await?
+        } else {
+            String::new()
+        };
+        form.push(("goformId".into(), goform_id.into()));
         if goform_id == "SET_WEB_LANGUAGE" {
             let Some(language) = params.get("Language").and_then(Value::as_str) else {
                 return Err("missing language".into());
@@ -371,6 +462,10 @@ impl Bridge {
                 return Err("OEM parameters too large".into());
             }
             form.push((key.clone(), value));
+        }
+        // AD goes last, matching the WebUI's form order.
+        if !ad.is_empty() {
+            form.push(("AD".into(), ad));
         }
         let write_cookie = if goform_id == "SET_WEB_LANGUAGE" {
             ""
