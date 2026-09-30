@@ -188,28 +188,56 @@ fn id_list(params: &Value, key: &str) -> Result<String, String> {
 
 /// A comma-separated band list of positive numbers up to `max` (`1,3,78`).
 fn band_list(params: &Value, key: &str, max: u32) -> Result<Vec<u32>, String> {
-    let raw = text(params, key).ok_or_else(|| format!("{key} is required"))?;
-    let mut bands = Vec::new();
-    for part in raw.split(',') {
-        match part.trim().parse::<u32>() {
-            Ok(band) if (1..=max).contains(&band) => bands.push(band),
-            _ => return Err(format!("{key} must be comma-separated band numbers")),
+    let values: Vec<u32> = match params.get(key) {
+        Some(Value::String(raw)) if raw.trim().is_empty() => Vec::new(),
+        Some(Value::String(raw)) => raw
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{key} must contain band numbers"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(Value::Array(raw)) => raw
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| format!("{key} must contain integer band numbers"))
+            })
+            .collect::<Result<_, _>>()?,
+        _ => {
+            return Err(format!(
+                "{key} is required as a comma-separated string or integer array"
+            ));
         }
+    };
+    if values.len() > 64 || values.iter().any(|v| !(1..=max).contains(v)) {
+        return Err(format!(
+            "{key} must list up to 64 bands from 1 through {max}"
+        ));
     }
-    if bands.is_empty() || bands.len() > 64 {
-        return Err(format!("{key} must list 1 to 64 bands"));
-    }
+    let mut bands = values;
     bands.sort_unstable();
     bands.dedup();
     Ok(bands)
 }
 
-/// LTE band bitmask in the WebUI's format: `0x` + 16 hex digits, bit 0 = B1.
+/// Match the original U50 WebUI's minimal hex mask representation.
 fn lte_mask(bands: &[u32]) -> String {
     let mask = bands
         .iter()
         .fold(0u64, |mask, band| mask | 1u64 << (band - 1));
-    format!("0x{mask:016x}")
+    format!("0x{mask:x}")
+}
+
+fn network_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "4G_AND_5G" | "LTE_AND_5G" | "WL_AND_5G" | "AUTO" | "4G/5G" | "4G_5G" => Some("4G_AND_5G"),
+        "ONLY_LTE" | "ONLY_4G" | "4G_ONLY" | "LTE" | "4G" => Some("Only_LTE"),
+        "ONLY_5G" | "5G_ONLY" | "NR" | "5G" => Some("Only_5G"),
+        _ => None,
+    }
 }
 
 fn mask_value(text: &str) -> Option<u64> {
@@ -318,12 +346,36 @@ impl Ctl {
     }
 
     async fn field(&self, key: &str) -> Option<String> {
-        self.read(key)
+        if let Some(value) = self
+            .read(key)
             .await
-            .ok()?
-            .get(key)?
-            .as_str()
-            .map(str::to_owned)
+            .ok()
+            .and_then(|v| v.get(key)?.as_str().map(str::to_owned))
+            .filter(|v| !v.is_empty())
+        {
+            return Some(value);
+        }
+        let program =
+            std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into());
+        let raw = crate::command::run(&program, ["get", key], Duration::from_secs(2))
+            .await
+            .ok()?;
+        let value = String::from_utf8(raw).ok()?.trim().to_owned();
+        (!value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control))
+            .then_some(value)
+    }
+
+    async fn wait_field(&self, key: &str, accept: impl Fn(&str) -> bool + Send + Sync) -> bool {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if self.field(key).await.is_some_and(|value| accept(&value)) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Secretless configuration for the on-demand NMS panel. The complete
@@ -575,9 +627,28 @@ impl Ctl {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
         };
+        let bands = if bands.is_empty() {
+            match self
+                .field("lte_band_1_64_factory")
+                .await
+                .as_deref()
+                .and_then(mask_value)
+                .filter(|v| *v != 0)
+            {
+                Some(mask) => (1..=64)
+                    .filter(|band| mask & (1u64 << (band - 1)) != 0)
+                    .collect(),
+                None => return Outcome::Failed("factory LTE bands unavailable".into()),
+            }
+        } else {
+            bands
+        };
         let mask = lte_mask(&bands);
-        if let Err(error) = self
-            .write(
+        let result = if self.collector.model == crate::u50::Model::U50S {
+            self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
+                .await
+        } else {
+            self.write(
                 "BAND_SELECT",
                 &[
                     ("is_gw_band", "0".into()),
@@ -587,18 +658,45 @@ impl Ctl {
                 ],
             )
             .await
-        {
+        };
+        if let Err(error) = result {
             return Outcome::Failed(error);
         }
-        let readback = self.field("lte_band_lock").await;
-        let verified = readback.as_deref().and_then(mask_value) == mask_value(&mask);
-        Outcome::Ok(json!({"bands":bands,"mask":mask,"verified":verified}))
+        let verified = self
+            .wait_field("lte_band_lock", |value| {
+                mask_value(value) == mask_value(&mask)
+            })
+            .await;
+        if !verified {
+            return Outcome::Failed(
+                "OEM LTE band write was accepted but readback did not match".into(),
+            );
+        }
+        Outcome::Ok(json!({"result":"success","bands":bands,"mask":mask,"verified":true}))
     }
 
     async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
         let bands = match band_list(params, "bands", 512) {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
+        };
+        let bands = if bands.is_empty() {
+            let key = if nsa {
+                "nr5g_nsa_band_factory"
+            } else {
+                "nr5g_sa_band_factory"
+            };
+            match self
+                .field(key)
+                .await
+                .and_then(|value| band_list(&json!({"bands":value}), "bands", 512).ok())
+                .filter(|v| !v.is_empty())
+            {
+                Some(bands) => bands,
+                None => return Outcome::Failed("factory NR bands unavailable".into()),
+            }
+        } else {
+            bands
         };
         let csv = bands
             .iter()
@@ -622,15 +720,20 @@ impl Ctl {
         } else {
             "nr5g_sa_band_lock"
         };
-        let readback = self.field(key).await.map(|value| {
-            let mut list: Vec<u32> = value
-                .split(',')
-                .filter_map(|p| p.trim().parse().ok())
-                .collect();
-            list.sort_unstable();
-            list
-        });
-        Outcome::Ok(json!({"bands":bands,"verified":readback.as_deref() == Some(bands.as_slice())}))
+        let verified = self
+            .wait_field(key, |value| {
+                band_list(&json!({"bands":value}), "bands", 512)
+                    .ok()
+                    .as_deref()
+                    == Some(bands.as_slice())
+            })
+            .await;
+        if !verified {
+            return Outcome::Failed(
+                "OEM NR band write was accepted but readback did not match".into(),
+            );
+        }
+        Outcome::Ok(json!({"result":"success","bands":bands,"verified":true}))
     }
 
     async fn cell_lock_lte(&self, params: &Value) -> Outcome {
@@ -1266,11 +1369,13 @@ impl Ctl {
 
     async fn network_set_mode(&self, params: &Value) -> Outcome {
         // U50S bearer preferences (MU5002 WebUI): 4G+5G, 5G only, 4G only.
-        let mode = match text(params, "mode") {
-            Some("4G_AND_5G" | "LTE_AND_5G" | "WL_AND_5G") => "4G_AND_5G",
-            Some("Only_5G") => "Only_5G",
-            Some("Only_LTE") => "Only_LTE",
-            _ => return Outcome::Invalid("mode must be 4G_AND_5G, Only_5G or Only_LTE".into()),
+        let mode = match text(params, "mode").and_then(network_mode) {
+            Some(mode) => mode,
+            None => {
+                return Outcome::Invalid(
+                    "mode must be 4G_AND_5G/auto, Only_LTE/4G or Only_5G/5G".into(),
+                );
+            }
         };
         if let Err(error) = self
             .write(
@@ -1281,8 +1386,15 @@ impl Ctl {
         {
             return Outcome::Failed(error);
         }
-        let readback = self.field("net_select").await;
-        Outcome::Ok(json!({"mode":mode,"verified":readback.as_deref() == Some(mode)}))
+        let verified = self
+            .wait_field("net_select", |value| network_mode(value) == Some(mode))
+            .await;
+        if !verified {
+            return Outcome::Failed(
+                "OEM network mode write was accepted but readback did not match".into(),
+            );
+        }
+        Outcome::Ok(json!({"result":"success","mode":mode,"verified":true}))
     }
 
     async fn sim_set_slot(&self, params: &Value) -> Outcome {
@@ -1337,5 +1449,55 @@ mod tests {
         assert_eq!(integer(&json!({}), "a").unwrap(), None);
         assert!(integer(&json!({"a":"x"}), "a").is_err());
         assert!(integer(&json!({"a":1.5}), "a").is_err());
+    }
+}
+
+#[cfg(test)]
+mod band_mode_tests {
+    use super::*;
+    #[test]
+    fn band_inputs_accept_csv_arrays_and_auto_but_reject_bad_values() {
+        assert_eq!(
+            band_list(&json!({"bands":"41,1,3,3"}), "bands", 64).unwrap(),
+            vec![1, 3, 41]
+        );
+        assert_eq!(
+            band_list(&json!({"bands":[41,1,3,3]}), "bands", 64).unwrap(),
+            vec![1, 3, 41]
+        );
+        for value in [json!(""), json!([])] {
+            assert!(
+                band_list(&json!({"bands":value}), "bands", 64)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for value in [
+            json!([-1]),
+            json!([0]),
+            json!([65]),
+            json!([1.5]),
+            json!([true]),
+            json!("1;reboot"),
+        ] {
+            assert!(band_list(&json!({"bands":value}), "bands", 64).is_err());
+        }
+        assert!(band_list(&json!({}), "bands", 64).is_err());
+        assert_eq!(lte_mask(&[1, 3, 41]), "0x10000000005");
+    }
+    #[test]
+    fn canonical_network_modes_and_common_aliases() {
+        for value in ["4G_AND_5G", "WL_AND_5G", "auto"] {
+            assert_eq!(network_mode(value), Some("4G_AND_5G"));
+        }
+        for value in ["Only_LTE", "4G", "LTE"] {
+            assert_eq!(network_mode(value), Some("Only_LTE"));
+        }
+        for value in ["Only_5G", "5G", "NR"] {
+            assert_eq!(network_mode(value), Some("Only_5G"));
+        }
+        for value in ["5G_NSA", "garbage", "rm -rf"] {
+            assert_eq!(network_mode(value), None);
+        }
     }
 }

@@ -6,6 +6,7 @@ the per-write AD challenge, SMS paging and the connection/bearer/SIM actions.
 The daemon must derive its own session from the stored admin hash, expose the
 mainline control API for the mapped actions, and never leak the credential.
 """
+import concurrent.futures
 import base64
 import http.client
 import hashlib
@@ -39,7 +40,7 @@ STORE = {
     "dial_mode": "manual_dial", "roam_setting_option": "off", "net_select": "4G_AND_5G",
     "simcard_active_slot": "1", "sms_unread_num": "1", "sms_dev_unread_num": "1",
     "sms_sim_unread_num": "0", "sms_nv_num_total": "1", "sms_sim_num_total": "0",
-    "lte_band_lock": "0x1c200000095", "nr5g_sa_band_lock": "5,7,78", "nr5g_nsa_band_lock": "5,7,78",
+    "lte_band_lock": "0x1c200000095", "lte_band_1_64_factory":"0x1c200000095", "nr5g_sa_band_factory":"5,7,78", "nr5g_nsa_band_factory":"5,7,78", "nr5g_sa_band_lock": "5,7,78", "nr5g_nsa_band_lock": "5,7,78",
     "data_volume_limit_switch": "0", "data_volume_limit_unit": "", "data_volume_limit_size": "",
     "data_volume_alert_percent": "", "wan_auto_clear_flow_data_switch": "on", "traffic_clear_date": "1",
     "flux_limited_disconnect": "off",
@@ -65,6 +66,12 @@ LOG = []
 
 class Vendor(BaseHTTPRequestHandler):
     logged_in = False
+    skip_mode_write = False
+    delay_mode_write = False
+    pending_mode = None
+    rotate_rd = False
+    rd_counter = 0
+    current_rd = RD
 
     def send_json(self, value, cookie=None):
         data = json.dumps(value).encode()
@@ -86,12 +93,22 @@ class Vendor(BaseHTTPRequestHandler):
         if not self.trusted():
             return self.send_json({"network_type": ""})
         keys = query.get("cmd", [""])[0].split(",")
+        if Vendor.pending_mode and time.monotonic() >= Vendor.pending_mode[1]:
+            STORE["net_select"] = Vendor.pending_mode[0]
+            Vendor.pending_mode = None
         if keys == ["LD"]:
             return self.send_json({"LD": LD}, "pre=one; Path=/")
         if keys == ["loginfo"]:
             return self.send_json({"loginfo": "ok" if "sid=two" in self.headers.get("Cookie", "") else ""})
         if keys == ["RD"]:
-            return self.send_json({"RD": RD})
+            if Vendor.rotate_rd:
+                Vendor.rd_counter += 1
+                Vendor.current_rd = digest(f"challenge-{Vendor.rd_counter}")
+                current = Vendor.current_rd
+                time.sleep(0.1)
+            else:
+                Vendor.current_rd = current = RD
+            return self.send_json({"RD": current})
         if keys in (["queryAccessPointInfo"], ["queryWiFiModuleSwitch"]):
             assert "multi_data" not in query, "Wi-Fi resources must use the WebUI single-command reads"
             assert "sid=two" in self.headers.get("Cookie", ""), "configuration must use the local OEM session"
@@ -101,6 +118,7 @@ class Vendor(BaseHTTPRequestHandler):
             assert query.get("multi_data") == ["1"] and len(keys) <= 32
             assert "sid=two" in self.headers.get("Cookie", "")
             LOG.append(("configuration_read", "apn_profiles"))
+
         if keys == ["sms_data_total"]:
             assert "multi_data" not in query, "the WebUI reads sms_data_total as a single command"
             assert query["order_by"] == ["order by id desc"] and query["tags"] == ["10"]
@@ -133,7 +151,7 @@ class Vendor(BaseHTTPRequestHandler):
                 return self.send_json({"result": "0"}, "sid=two; Path=/")
             return self.send_json({"result": "3"})
         authorized = ("sid=two" in self.headers.get("Cookie", "")
-                      and form.get("AD", [""])[0] == digest(digest(VERSION + "") + RD))
+                      and form.get("AD", [""])[0] == digest(digest(VERSION + "") + Vendor.current_rd))
         if not authorized:
             return self.send_json({"result": "failure"})
         one = {key: values[0] for key, values in form.items()}
@@ -141,11 +159,16 @@ class Vendor(BaseHTTPRequestHandler):
         if action == "SET_CONNECTION_MODE":
             STORE["dial_mode"], STORE["roam_setting_option"] = one["ConnectionMode"], one["roam_setting_option"]
         elif action == "SET_BEARER_PREFERENCE":
-            STORE["net_select"] = one["BearerPreference"]
+            if Vendor.delay_mode_write:
+                Vendor.pending_mode = (one["BearerPreference"], time.monotonic() + 0.5)
+            elif not Vendor.skip_mode_write:
+                STORE["net_select"] = one["BearerPreference"]
         elif action == "SWITCH_SIMCARD_SLOT":
             STORE["simcard_active_slot"] = one["simcard_active_slot"]
         elif action == "BAND_SELECT":
-            STORE["lte_band_lock"] = one["lte_band_mask"]
+            return self.send_json({"result":"failure"})
+        elif action == "SET_NETWORK_BAND_LOCK":
+            STORE["lte_band_lock"] = one["lte_band_lock"]
         elif action == "WAN_PERFORM_NR5G_SANSA_BAND_LOCK":
             STORE["nr5g_nsa_band_lock" if one["type"] == "1" else "nr5g_sa_band_lock"] = one["nr5g_band_mask"]
         elif action == "setDeviceAccessControlList":
@@ -330,7 +353,7 @@ esac
         assert control(port, "cellular.set", {"connect_mode": "sometimes"})[0] == 400
 
         status, result = control(port, "network.set_mode", {"mode": "Only_5G"})
-        assert status == 200 and result["result"] == {"mode": "Only_5G", "verified": True}, result
+        assert status == 200 and result["result"] == {"result":"success", "mode": "Only_5G", "verified": True}, result
         assert control(port, "network.set_mode", {"mode": "rm -rf"})[0] == 400
         status, result = control(port, "sim.set_slot", {"slot": 2})
         assert status == 200 and result["result"]["verified"] is True
@@ -355,17 +378,44 @@ esac
 
         # Band locks: WebUI mask format, read back, invalid input refused.
         status, result = control(port, "band.set_lte", {"bands": "1,3,41"})
-        assert status == 200 and result["result"]["mask"] == "0x0000010000000005" and result["result"]["verified"], result
-        assert writes()[-1] == ("write", "BAND_SELECT", {
-            "goformId": "BAND_SELECT", "is_gw_band": "0", "gw_band_mask": "0", "is_lte_band": "1",
-            "lte_band_mask": "0x0000010000000005"})
-        for bad in ({"bands": ""}, {"bands": "1,x"}, {"bands": "0"}, {"bands": "65"}, {}):
+        assert status == 200 and result["result"]["mask"] == "0x10000000005" and result["result"]["verified"], result
+        assert writes()[-1] == ("write", "SET_NETWORK_BAND_LOCK", {
+            "goformId": "SET_NETWORK_BAND_LOCK", "lte_band_lock": "0x10000000005"})
+        for bad in ({"bands": "1,x"}, {"bands": "0"}, {"bands": "65"}, {}):
             assert control(port, "band.set_lte", bad)[0] == 400, bad
         status, result = control(port, "band.set_nr_nsa", {"bands": "78,41,78"})
-        assert status == 200 and result["result"] == {"bands": [41, 78], "verified": True}, result
+        assert status == 200 and result["result"] == {"result":"success", "bands": [41, 78], "verified": True}, result
         assert writes()[-1][2] == {"goformId": "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "nr5g_band_mask": "41,78", "type": "1"}
         status, result = control(port, "band.set_nr_sa", {"bands": "78"})
         assert status == 200 and writes()[-1][2]["type"] == "0"
+
+        # CSV/array parity, auto restoration and common mode names.
+        assert control(port, "band.set_lte", {"bands": [1,3,41]})[0] == 200
+        status, automatic = control(port, "band.set_lte", {"bands": ""})
+        assert status == 200 and automatic["result"]["verified"] is True, automatic
+        assert STORE["lte_band_lock"] == "0x1c200000095"
+        assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
+        assert STORE["nr5g_sa_band_lock"] == "5,7,78"
+        assert control(port, "network.set_mode", {"mode": "4G"})[1]["result"]["mode"] == "Only_LTE"
+        assert control(port, "network.set_mode", {"mode": "auto"})[1]["result"]["mode"] == "4G_AND_5G"
+
+        Vendor.rotate_rd = True
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(control, port, "band.set_lte", {"bands":[1,3,41]}),
+                       pool.submit(control, port, "network.set_mode", {"mode":"4G"})]
+            for future in futures:
+                status, reply = future.result(timeout=10)
+                assert status == 200 and reply["result"]["verified"] is True, reply
+        Vendor.rotate_rd = False
+        assert control(port, "network.set_mode", {"mode":"auto"})[0] == 200
+        Vendor.delay_mode_write = True
+        status, delayed = control(port, "network.set_mode", {"mode":"4G"})
+        assert status == 200 and delayed["result"]["verified"] is True, delayed
+        Vendor.delay_mode_write = False
+        Vendor.skip_mode_write = True
+        status, failed = control(port, "network.set_mode", {"mode":"5G"})
+        assert status == 502 and failed["ok"] is False, failed
+        Vendor.skip_mode_write = False
 
         # Cell locks use the WebUI's formats; unlock zeroes LTE and sends 1,1,1,1 for NR.
         assert control(port, "cell.lock_lte", {"pci": 57, "earfcn": 3725})[0] == 200
