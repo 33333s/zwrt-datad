@@ -115,7 +115,7 @@ const CFG_KEYS: &[&str] = &[
     "dhcpEnabled",
     "dhcpStart",
     "dhcpEnd",
-    "dhcpLease",
+    "dhcpLease_hour",
     "prefer_dns_auto",
     "standby_dns_auto",
     "ipv6_prefer_dns_auto",
@@ -859,14 +859,13 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
             ("lan_netmask", "netmask"),
             ("dhcpStart", "range_start"),
             ("dhcpEnd", "range_end"),
-            ("dhcpLease", "leasetime"),
         ] {
-            if let Some(value) = cfg
-                .get(source)
-                .filter(|v| target == "leasetime" || v.parse::<Ipv4Addr>().is_ok())
-            {
+            if let Some(value) = cfg.get(source).filter(|v| v.parse::<Ipv4Addr>().is_ok()) {
                 dhcp.insert(target.into(), json!(value));
             }
+        }
+        if let Some(hours) = cfg_number(cfg, "dhcpLease_hour", 1, 720) {
+            dhcp.insert("leasetime".into(), json!(format!("{hours}h")));
         }
         if let Some(value) = cfg
             .get("dhcpEnabled")
@@ -1260,7 +1259,7 @@ mod tests {
             ("traffic_total_roam_rx", "5"),
             ("dhcpStart", "192.168.0.2"),
             ("dhcpEnd", "192.168.0.253"),
-            ("dhcpLease", "86400"),
+            ("dhcpLease_hour", "24"),
             ("dhcpEnabled", "1"),
             ("lan_netmask", "255.255.255.0"),
         ]
@@ -1283,6 +1282,7 @@ mod tests {
         assert_eq!(net["nr_rssi"], -71);
         assert_eq!(net["nr_bw"], "100MHz");
         assert_eq!(net["sa_bands"], "5,7,78,257,258");
+        assert_eq!(state["dhcp"]["leasetime"], "24h");
         assert_eq!(net["lte_bands"], "1,3,5,8,34,39,40,41");
         assert_eq!(net["lte_supported_bands"], "1,3,5,8,34,39,40,41");
         assert_eq!(net["nr_sa_supported_bands"], "1,3,5,8,28,41,78");
@@ -1295,6 +1295,26 @@ mod tests {
         assert_eq!(state["thermal"]["protection"]["level"], 0);
         // Secrets and unmapped keys never leak into the snapshot.
         assert!(!Value::Object(state).to_string().contains("password"));
+    }
+
+    #[test]
+    fn dhcp_lease_uses_oem_hours_and_rejects_invalid_or_legacy_keys() {
+        let mut cfg = BTreeMap::from([
+            ("model_name".into(), "U50S".into()),
+            ("integrate_version".into(), "B02".into()),
+            ("lan_ipaddr".into(), "192.168.0.1".into()),
+            ("dhcpLease".into(), "86400".into()),
+        ]);
+        for raw in ["", "0", "721", "24s", "not-a-number"] {
+            cfg.insert("dhcpLease_hour".into(), raw.into());
+            let state = from_sources(Model::U50S, &cfg, None).unwrap();
+            assert!(state.fields["dhcp"].get("leasetime").is_none());
+        }
+        for raw in ["1", "24", "720"] {
+            cfg.insert("dhcpLease_hour".into(), raw.into());
+            let state = from_sources(Model::U50S, &cfg, None).unwrap();
+            assert_eq!(state.fields["dhcp"]["leasetime"], format!("{raw}h"));
+        }
     }
 
     #[test]
