@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.45",
+    "version": "0.10.46",
     "asset": "zwrt-datad-aarch64",
-    "notes": "OTA 安装器沿用已安装目录，存储检查改为 datad 所在分区"
+    "notes": "新增默认关闭的系统时间校准、可核验同步结果和安全恢复；会话、更新与定时任务适应时钟调整"
   }
 }
