@@ -98,6 +98,7 @@ pub const IDS: &[&str] = &[
     "setWiFiCoverage",
     "switchWiFiModule",
     "BAND_SELECT",
+    "SET_NETWORK_BAND_LOCK",
     "DHCP_SETTING",
     "REBOOT_DEVICE",
     "SET_BEARER_PREFERENCE",

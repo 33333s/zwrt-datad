@@ -32,6 +32,7 @@ struct Inner {
     host: String,
     session: Mutex<Option<Session>>,
     last_login: Mutex<Option<Instant>>,
+    write_gate: Mutex<()>,
 }
 struct Session {
     token: String,
@@ -101,6 +102,7 @@ impl Bridge {
                 host,
                 session: Mutex::new(None),
                 last_login: Mutex::new(None),
+                write_gate: Mutex::new(()),
             }),
         })
     }
@@ -293,6 +295,9 @@ impl Bridge {
         if params.len() > 32 {
             return Err("too many OEM parameters".into());
         }
+        // RD belongs to the OEM session: concurrent writes must not replace
+        // each other's challenge between reading it and submitting AD.
+        let _write = self.inner.write_gate.lock().await;
         let cookie = self.authorized_cookie(token).await?;
         let mut form = vec![
             ("goformId".into(), goform_id.into()),

@@ -1030,7 +1030,7 @@ async fn enrich(
 pub struct Collector {
     client: reqwest::Client,
     url: reqwest::Url,
-    model: Model,
+    pub(crate) model: Model,
     interval: Duration,
 }
 

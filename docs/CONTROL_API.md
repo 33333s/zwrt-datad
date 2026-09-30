@@ -281,3 +281,10 @@ State is refreshed after uncertain writes as the hardware may have changed.
 `verified` confirms the firmware setting, not an electrical current measurement.
 No extra datad startup policy rewrites the mode; reboot persistence is whatever
 the device firmware provides. Both actions use the existing token authentication.
+
+## U50S ARM32 兼容说明
+
+- `network.set_mode` 支持 `4G_AND_5G`（也接受 `auto`）、`Only_LTE`（`4G` / `LTE`）、`Only_5G`（`5G` / `NR`）。模式偏好与实际驻留网络是不同字段，选择 5G 不保证当地有 5G 覆盖。
+- 频段 `bands` 可以是逗号分隔的数字字符串或整数数组；空字符串 / 空数组恢复该设备实际出厂频段，缺少出厂数据时明确失败。
+- U50S 使用已验证的 `SET_NETWORK_BAND_LOCK` LTE 接口；U50Pro 候选保留旧协议。
+- 频段和网络模式写入仅在有界回读匹配后返回 `result.result="success"` 与 `verified=true`；原厂拒绝或回读不一致返回失败。
