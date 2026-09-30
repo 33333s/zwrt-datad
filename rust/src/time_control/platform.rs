@@ -254,6 +254,7 @@ impl Platform {
         match status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
+            Some(3) if program == SERVICE && args == ["status"] => Ok(false),
             _ => Err("system_command_failed"),
         }
     }
@@ -647,5 +648,39 @@ impl Platform {
     }
     pub fn journal_present(&self) -> bool {
         self.journal.exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn procd_stopped_status_is_false_but_other_exit_three_is_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "datad-time-exit-status-{}",
+            super::super::new_tag()
+        ));
+        fs::create_dir_all(root.join("etc/init.d")).unwrap();
+        for name in [SERVICE, "etc/init.d/other"] {
+            let path = root.join(name);
+            fs::write(&path, b"#!/bin/sh\nexit 3\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Only isolated status scripts run; this never calls the clock backend.
+        let mut platform = Platform::new(&root);
+        platform.root = root.clone();
+        assert_eq!(platform.run(SERVICE, &["status"]).await, Ok(false));
+        for args in [&["enabled"][..], &["stop"][..], &["status", "extra"][..]] {
+            assert_eq!(
+                platform.run(SERVICE, args).await,
+                Err("system_command_failed")
+            );
+        }
+        assert_eq!(
+            platform.run("etc/init.d/other", &["status"]).await,
+            Err("system_command_failed")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
