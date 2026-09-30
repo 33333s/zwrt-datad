@@ -176,8 +176,24 @@ fn os_release(text: &str) -> String {
 /// Battery details beyond the OEM `cfg` percentage/temperature: measured
 /// voltage/current, charger presence and health from the power-supply class.
 pub fn battery_extra() -> Map<String, Value> {
+    battery_extra_with(|name, file| read(&format!("/sys/class/power_supply/{name}/{file}")))
+}
+
+/// Match the mainline `battery.charging` contract (Linux power-supply status),
+/// rather than turning every state other than charging into discharging.
+fn charging_status(text: &str) -> Option<i64> {
+    match text.trim() {
+        "Unknown" => Some(0),
+        "Charging" => Some(1),
+        "Discharging" => Some(2),
+        "Not charging" => Some(3),
+        "Full" => Some(4),
+        _ => None,
+    }
+}
+
+fn battery_extra_with(ps: impl Fn(&str, &str) -> Option<String>) -> Map<String, Value> {
     let mut out = Map::new();
-    let ps = |name: &str, file: &str| read(&format!("/sys/class/power_supply/{name}/{file}"));
     let ps_i64 = |name: &str, file: &str| ps(name, file)?.parse::<i64>().ok();
     if let Some(online) = ps_i64("battery_zte", "online") {
         out.insert("online".into(), json!(online));
@@ -186,11 +202,31 @@ pub fn battery_extra() -> Map<String, Value> {
         out.insert("health".into(), json!(i64::from(health == "Good")));
         out.insert("health_text".into(), json!(health));
     }
-    if let Some(status) = ps("battery_zte", "status").or_else(|| ps("battery", "status")) {
-        out.insert("charging".into(), json!(i64::from(status == "Charging")));
+    let primary_status = ps("battery_zte", "status");
+    let fallback_status = ps("battery", "status");
+    let recognized = primary_status
+        .as_ref()
+        .and_then(|status| charging_status(status).map(|value| (status, value)))
+        .or_else(|| {
+            fallback_status
+                .as_ref()
+                .and_then(|status| charging_status(status).map(|value| (status, value)))
+        });
+    if let Some((status, value)) = recognized {
+        out.insert("charging".into(), json!(value));
+        out.insert("status".into(), json!(status));
+    } else if let Some(status) = primary_status.or(fallback_status) {
+        // Keep diagnostic text without asserting a known charging state.
         out.insert("status".into(), json!(status));
     }
-    if let Some(present) = ps_i64("charger_zte", "present") {
+    let presence = [
+        ("charger_zte", "present"),
+        ("usb", "present"),
+        ("usb", "online"),
+    ]
+    .iter()
+    .find_map(|(name, file)| ps_i64(name, file).filter(|value| matches!(value, 0 | 1)));
+    if let Some(present) = presence {
         out.insert("charger_connect".into(), json!(present));
     }
     if let Some(kind) = ps("charger_zte", "type") {
@@ -422,6 +458,117 @@ pub async fn clients() -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn battery_fixture(name: &str, values: &[(&str, &str, &str)]) -> Map<String, Value> {
+        let dir =
+            std::env::temp_dir().join(format!("u50-sys-battery-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (supply, file, value) in values {
+            let supply = dir.join(supply);
+            fs::create_dir_all(&supply).unwrap();
+            fs::write(supply.join(file), format!("{value}\n")).unwrap();
+        }
+        // Use a local reader so these fixtures cannot race the process-wide
+        // ZWRT_DATAD_U50_ROOT override used by the thermal test.
+        let out = battery_extra_with(|supply, file| {
+            fs::read_to_string(dir.join(supply).join(file))
+                .ok()
+                .map(|value| value.trim().to_owned())
+        });
+        let _ = fs::remove_dir_all(dir);
+        out
+    }
+
+    #[test]
+    fn battery_status_preserves_full_unplugged_and_unknown_states() {
+        for (status, expected, present) in [
+            ("Charging", 1, "1"),
+            ("Discharging", 2, "0"),
+            ("Not charging", 3, "1"),
+            ("Full", 4, "1"),
+            ("Unknown", 0, "0"),
+        ] {
+            let mut battery = battery_fixture(
+                "states",
+                &[
+                    ("battery_zte", "status", status),
+                    ("charger_zte", "present", present),
+                    ("charger_zte", "type", "Mains"),
+                ],
+            );
+            assert_eq!(battery["charging"], expected, "{status}");
+            assert_eq!(battery["status"], status);
+            assert_eq!(battery["charger_connect"], present.parse::<i64>().unwrap());
+            assert_eq!(battery["charger_type_name"], "Mains");
+            assert!(!battery.contains_key("charger_type"));
+
+            // Full/unplugged states must remain usable by power forwarding,
+            // whose mainline contract accepts known status values 1..=4.
+            battery.insert("percent".into(), json!(100));
+            assert_eq!(
+                crate::sms_forward::power_state(Some(&Value::Object(battery))),
+                (expected > 0).then_some((100, expected))
+            );
+        }
+    }
+
+    #[test]
+    fn battery_status_uses_valid_fallback_without_fabricating_a_state() {
+        let fallback = battery_fixture(
+            "fallback",
+            &[
+                ("battery_zte", "status", "unsupported"),
+                ("battery", "status", "Full"),
+            ],
+        );
+        assert_eq!(fallback["charging"], 4);
+        assert_eq!(fallback["status"], "Full");
+        let absent = battery_fixture("fallback", &[("battery", "status", "Discharging")]);
+        assert_eq!(absent["charging"], 2);
+        let unknown = battery_fixture(
+            "fallback",
+            &[
+                ("battery_zte", "status", "Unknown"),
+                ("battery", "status", "Charging"),
+            ],
+        );
+        assert_eq!(unknown["charging"], 0);
+        let invalid = battery_fixture(
+            "fallback",
+            &[
+                ("battery_zte", "status", "unsupported"),
+                ("battery", "status", "invalid"),
+            ],
+        );
+        assert!(!invalid.contains_key("charging"));
+        assert_eq!(invalid["status"], "unsupported");
+        assert!(battery_fixture("fallback", &[]).is_empty());
+    }
+
+    #[test]
+    fn charger_presence_validates_flags_and_preserves_explicit_disconnect() {
+        let fallback = battery_fixture(
+            "presence",
+            &[("charger_zte", "present", "9"), ("usb", "present", "1")],
+        );
+        assert_eq!(fallback["charger_connect"], 1);
+        let disconnected = battery_fixture(
+            "presence",
+            &[("charger_zte", "present", "0"), ("usb", "online", "1")],
+        );
+        assert_eq!(disconnected["charger_connect"], 0);
+        let online = battery_fixture("presence", &[("usb", "online", "1")]);
+        assert_eq!(online["charger_connect"], 1);
+        let invalid = battery_fixture(
+            "presence",
+            &[
+                ("charger_zte", "present", "-1"),
+                ("usb", "present", "2"),
+                ("usb", "online", "bad"),
+            ],
+        );
+        assert!(!invalid.contains_key("charger_connect"));
+    }
 
     #[test]
     fn parses_ip_output_and_keeps_only_global_addresses_of_the_family() {

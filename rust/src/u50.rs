@@ -1,7 +1,7 @@
-//! Read-only, firmware-derived U50 candidate collector.
+//! Original-firmware U50 state collector and platform runtime.
 //!
-//! This path deliberately does not expose ZWRT UBus/UCI or mutating routes.
-//! The firmware proves names and code paths, not successful device responses.
+//! OEM cfg/GoAhead and kernel sources are mapped into the public state
+//! contract without depending on ZWRT UBus/UCI.
 use crate::{
     cloud::{Cloud, QuickConnect},
     command,
@@ -200,6 +200,28 @@ fn source_number(
         .or_else(|| cfg_number(cfg, key, min, max))
 }
 
+/// Signal-to-noise ratios are fractional dB in the OEM store. Keep the
+/// mainline string contract, preserve zero, and reject unknown/sentinel values.
+fn source_snr(cfg: &BTreeMap<String, String>, goform: Option<&Value>, key: &str) -> Option<String> {
+    let valid = |v: f64| v.is_finite() && (-30.0..=60.0).contains(&v);
+    goform
+        .and_then(|raw| raw.get(key))
+        .and_then(|v| match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        })
+        .filter(|v| valid(*v))
+        .or_else(|| {
+            cfg.get(key)?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| valid(*v))
+        })
+        .map(|v| v.to_string())
+}
+
 fn cfg_bin() -> String {
     std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into())
 }
@@ -327,15 +349,16 @@ fn from_sources(
         !observed.contains(other),
         "U50 cfg model_name conflicts with --u50-model"
     );
+    let supported = model == Model::U50S && observed.contains("U50S");
     let mut fields = Map::new();
     fields.insert(
         "device".into(),
         json!({
             "profile": model.template().to_ascii_lowercase(),
-            "profile_source": "explicit_candidate",
+            "profile_source": if supported { "oem_u50s" } else { "explicit_candidate" },
             "api_template": model.template(),
             "api_template_label": model.template(),
-            "api_template_supported": 0,
+            "api_template_supported": i64::from(supported),
             "full_ubus": 0,
             "model_name": model_name
         }),
@@ -411,11 +434,13 @@ fn from_sources(
         ("signalbar", "bars", 0, 5),
         ("lte_rsrp", "lte_rsrp", -160, -20),
         ("lte_rsrq", "lte_rsrq", -50, 0),
-        ("lte_snr", "lte_snr", -30, 60),
     ] {
         if let Some(value) = source_number(cfg, goform, source, min, max) {
             net.insert(target.into(), json!(value));
         }
+    }
+    if let Some(value) = source_snr(cfg, goform, "lte_snr") {
+        net.insert("lte_snr".into(), json!(value));
     }
     if let Some(value) = cfg.get("ppp_status") {
         net.insert("wan_status".into(), json!(value));
@@ -426,7 +451,7 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "wan_active_channel", 0, 1_000_000) {
         net.insert("lte_channel".into(), json!(value));
     }
-    if let Some(value) = cfg.get("lte_pci").and_then(|v| hex_number(v, 1007)) {
+    if let Some(value) = cfg.get("lte_pci").and_then(|v| hex_number(v, 503)) {
         net.insert("lte_pci".into(), json!(value));
     }
     if let Some(value) = cfg.get("wan_lte_ca") {
@@ -435,7 +460,7 @@ fn from_sources(
     if let Some(value) = cfg.get("nr5g_action_band") {
         net.insert("nr_band".into(), json!(value));
     }
-    if let Some(value) = cfg_number(cfg, "nr5g_action_channel", 0, 1_000_000) {
+    if let Some(value) = cfg_number(cfg, "nr5g_action_channel", 0, 3_279_165) {
         net.insert("nr_channel".into(), json!(value));
     }
     if let Some(value) = cfg.get("nr5g_pci").and_then(|v| hex_number(v, 1007)) {
@@ -444,11 +469,7 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "Z5g_rsrp", -160, -20) {
         net.insert("nr_rsrp".into(), json!(value));
     }
-    if let Some(value) = cfg.get("Z5g_SINR")
-        && value
-            .parse::<f64>()
-            .is_ok_and(|n| (-30.0..=60.0).contains(&n))
-    {
+    if let Some(value) = source_snr(cfg, goform, "Z5g_SINR") {
         net.insert("nr_snr".into(), json!(value));
     }
     // The firmware has no high-speed-rail source, so `HSR` is omitted (unknown)
@@ -973,6 +994,18 @@ async fn enrich(
             battery.entry(key).or_insert(value);
         }
     }
+    let mcc = cfg_number(cfg, "rmcc", 0, 999).unwrap_or_default();
+    let mnc = cfg_number(cfg, "rmnc", 0, 999).unwrap_or_default();
+    let qos = crate::qos::read_u50_for_plmn(mcc, mnc);
+    let available = qos.qci > 0 || !qos.ambr_dl.is_empty() || !qos.ambr_ul.is_empty();
+    fields.insert(
+        "qos".into(),
+        json!({
+            "qci":qos.qci, "ambr_dl":qos.ambr_dl, "ambr_ul":qos.ambr_ul,
+            "available":available, "source":if available {"oem_key_log"} else {"unavailable"},
+            "reason":if available {""} else {"no_oem_qos_sample"}
+        }),
+    );
     fields.insert("interfaces".into(), u50_sys::interfaces(cfg).await);
     if let Some(clients) = u50_sys::clients().await {
         // The OEM per-chip counters stay when they are present.
@@ -1099,6 +1132,54 @@ pub async fn run(
 mod tests {
     use super::*;
     #[test]
+    fn fractional_snr_preserves_zero_and_rejects_sentinels() {
+        let mut cfg = BTreeMap::from([
+            ("model_name".into(), "U50S".into()),
+            ("lte_snr".into(), "4.4".into()),
+        ]);
+        assert_eq!(
+            from_sources(Model::U50S, &cfg, None).unwrap().fields["net"]["lte_snr"],
+            "4.4"
+        );
+        for value in ["0", "-2.5", "13.6"] {
+            cfg.insert("lte_snr".into(), value.into());
+            cfg.insert("Z5g_SINR".into(), value.into());
+            let state = from_sources(Model::U50S, &cfg, None).unwrap();
+            assert_eq!(state.fields["net"]["lte_snr"], value);
+            assert_eq!(state.fields["net"]["nr_snr"], value);
+        }
+        for value in ["NaN", "inf", "255", "-32768", "--", ""] {
+            cfg.insert("lte_snr".into(), value.into());
+            cfg.insert("Z5g_SINR".into(), value.into());
+            let state = from_sources(Model::U50S, &cfg, None).unwrap();
+            assert!(state.fields["net"].get("lte_snr").is_none());
+            assert!(state.fields["net"].get("nr_snr").is_none());
+        }
+        cfg.insert("lte_snr".into(), "6.2".into());
+        assert_eq!(
+            source_snr(&cfg, Some(&json!({"lte_snr":"255"})), "lte_snr"),
+            Some("6.2".into())
+        );
+        assert_eq!(
+            source_snr(&cfg, Some(&json!({"lte_snr":1.25})), "lte_snr"),
+            Some("1.25".into())
+        );
+    }
+
+    #[test]
+    fn radio_identity_bounds_match_lte_and_nr() {
+        let cfg = BTreeMap::from([
+            ("model_name".into(), "U50S".into()),
+            ("lte_pci".into(), "504".into()),
+            ("nr5g_pci".into(), "3EF".into()),
+            ("nr5g_action_channel".into(), "2070833".into()),
+        ]);
+        let state = from_sources(Model::U50S, &cfg, None).unwrap();
+        assert!(state.fields["net"].get("lte_pci").is_none());
+        assert_eq!(state.fields["net"]["nr_pci"], 1007);
+        assert_eq!(state.fields["net"]["nr_channel"], 2070833);
+    }
+    #[test]
     fn maps_firmware_cfg_even_when_goform_requires_login() {
         let cfg = BTreeMap::from([
             ("model_name".into(), "U50Pro".into()),
@@ -1198,6 +1279,7 @@ mod tests {
         assert_eq!(net["nr_pci"], 0x384);
         assert_eq!(net["nr_cell_id"], 0x32343f007_i64);
         assert_eq!(net["nr_tac"], 0x320903);
+        assert_eq!(value.fields["device"]["api_template_supported"], 1);
         assert_eq!(net["nr_rssi"], -71);
         assert_eq!(net["nr_bw"], "100MHz");
         assert_eq!(net["sa_bands"], "5,7,78,257,258");
