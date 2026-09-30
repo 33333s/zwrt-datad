@@ -1,6 +1,6 @@
 //! Opt-in SMS forwarding over fixed HTTPS POST, authenticated SMTP or the device's own SIM.
 //! This does not execute UFI's legacy curl_text or copy its local database.
-use crate::{model::Snapshot, reboot_schedule, sms, smtp_forward};
+use crate::{model::Snapshot, reboot_schedule, sms, smtp_forward, time_control};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, header::DATE, redirect::Policy};
 use ring::hmac;
@@ -518,8 +518,7 @@ fn valid_config(config: &Config) -> bool {
         && valid_nickname(&config.nickname)
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
         && config.power_quota_used <= MAX_POWER_DAILY_SENDS
-        && (config.power_quota_date.is_empty()
-            || reboot_schedule::valid_date(&config.power_quota_date))
+        && valid_quota_state(&config.power_quota_date, config.power_quota_used)
         && match (config.power_last_percent, config.power_last_charging) {
             (None, None) => true,
             (Some(percent), Some(charging)) => {
@@ -528,7 +527,7 @@ fn valid_config(config: &Config) -> bool {
             _ => false,
         }
         && config.smtp.safe()
-        && (config.sms_quota_date.is_empty() || reboot_schedule::valid_date(&config.sms_quota_date))
+        && valid_quota_state(&config.sms_quota_date, config.sms_quota_used)
         && config
             .seen
             .iter()
@@ -544,6 +543,35 @@ fn valid_config(config: &Config) -> bool {
                 "smtp" => config.smtp.configured(),
                 _ => false,
             })
+}
+
+fn valid_quota_state(date: &str, used: u16) -> bool {
+    if date.is_empty() {
+        used == 0
+    } else {
+        reboot_schedule::valid_date(date)
+    }
+}
+
+// Retain the highest observed calendar date. A backward clock/date step must
+// not grant another day's allowance; empty dates are valid only before use.
+fn quota_day(date: &str, used: u16, today: &str) -> Result<(String, u16), String> {
+    if !reboot_schedule::valid_date(today) || !valid_quota_state(date, used) {
+        return Err("clock_unavailable".into());
+    }
+    if date.is_empty() || today > date {
+        Ok((today.into(), 0))
+    } else {
+        Ok((date.into(), used))
+    }
+}
+
+fn quota_remaining(date: &str, used: u16, today: Option<&str>, maximum: u16) -> u16 {
+    let used = today
+        .and_then(|today| quota_day(date, used, today).ok())
+        .map(|(_, used)| used)
+        .unwrap_or(used);
+    maximum.saturating_sub(used)
 }
 
 fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
@@ -644,17 +672,22 @@ impl Forwarder {
     }
 
     pub fn status(&self) -> Value {
-        let today = reboot_schedule::local_clock().map(|clock| clock.date);
-        let remaining = if today.as_deref() == Some(&self.config.sms_quota_date) {
-            MAX_SMS_DAILY_SENDS - self.config.sms_quota_used
-        } else {
-            MAX_SMS_DAILY_SENDS
-        };
-        let power_remaining = if today.as_deref() == Some(&self.config.power_quota_date) {
-            MAX_POWER_DAILY_SENDS - self.config.power_quota_used
-        } else {
-            MAX_POWER_DAILY_SENDS
-        };
+        let today = (!time_control::clock_change_in_progress())
+            .then(reboot_schedule::local_clock)
+            .flatten()
+            .map(|clock| clock.date);
+        let remaining = quota_remaining(
+            &self.config.sms_quota_date,
+            self.config.sms_quota_used,
+            today.as_deref(),
+            MAX_SMS_DAILY_SENDS,
+        );
+        let power_remaining = quota_remaining(
+            &self.config.power_quota_date,
+            self.config.power_quota_used,
+            today.as_deref(),
+            MAX_POWER_DAILY_SENDS,
+        );
         json!({"supported":true,"enabled":self.config.enabled,"method":self.config.method,
             "webhook_configured":!self.config.webhook_url.is_empty(),
             "dingtalk_configured":!self.config.dingtalk_webhook.is_empty(),
@@ -814,6 +847,17 @@ impl Forwarder {
     /// Persist the fingerprint before delivery: a crash after remote success
     /// cannot re-send SMS content on restart. Failed delivery is not retried.
     pub fn next(&mut self, snapshot: &Value) -> Result<Option<Message>, String> {
+        self.next_with_clock_gate(snapshot, time_control::clock_change_in_progress())
+    }
+
+    fn next_with_clock_gate(
+        &mut self,
+        snapshot: &Value,
+        changing: bool,
+    ) -> Result<Option<Message>, String> {
+        if changing {
+            return Ok(None);
+        }
         if !self.config.enabled {
             return Ok(None);
         }
@@ -886,6 +930,22 @@ impl Forwarder {
     /// Store the new battery baseline and the daily quota before any external
     /// delivery. Reboots and failed sends cannot replay an old power event.
     pub fn observe_power(&mut self, battery: Option<&Value>) -> Result<Option<Message>, String> {
+        let changing = time_control::clock_change_in_progress();
+        let clock = (!changing && self.config.enabled && self.config.power_forward_enabled)
+            .then(reboot_schedule::local_clock)
+            .flatten();
+        self.observe_power_with_clock(battery, clock.as_ref(), changing)
+    }
+
+    fn observe_power_with_clock(
+        &mut self,
+        battery: Option<&Value>,
+        clock: Option<&reboot_schedule::Clock>,
+        changing: bool,
+    ) -> Result<Option<Message>, String> {
+        if changing {
+            return Ok(None);
+        }
         let current = power_state(battery);
         let previous = match (
             self.config.power_last_percent,
@@ -922,16 +982,13 @@ impl Forwarder {
             self.power_last_result = "idle";
             return Ok(None);
         }
-        let Some(clock) = reboot_schedule::local_clock() else {
-            self.save(&next)?;
-            self.config = next;
+        let Some(clock) = clock else {
             self.power_last_result = "clock_unavailable";
             return Ok(None);
         };
-        if next.power_quota_date != clock.date {
-            next.power_quota_date = clock.date.clone();
-            next.power_quota_used = 0;
-        }
+        let (date, used) = quota_day(&next.power_quota_date, next.power_quota_used, &clock.date)?;
+        next.power_quota_date = date;
+        next.power_quota_used = used;
         if next.power_quota_used >= MAX_POWER_DAILY_SENDS {
             self.save(&next)?;
             self.config = next;
@@ -961,18 +1018,37 @@ impl Forwarder {
     }
 
     fn reserve_sim_quota(&mut self, count: u16) -> Result<(), String> {
-        let date = reboot_schedule::local_clock()
-            .ok_or("clock_unavailable")?
-            .date;
+        let changing = time_control::clock_change_in_progress();
+        let clock = (!changing).then(reboot_schedule::local_clock).flatten();
+        self.reserve_sim_quota_with_clock(
+            count,
+            clock.as_ref().map(|clock| clock.date.as_str()),
+            changing,
+        )
+    }
+
+    fn reserve_sim_quota_with_clock(
+        &mut self,
+        count: u16,
+        date: Option<&str>,
+        changing: bool,
+    ) -> Result<(), String> {
+        if changing {
+            return Err("clock_unavailable".into());
+        }
+        let date = date.ok_or("clock_unavailable")?;
         let mut next = self.config.clone();
-        if next.sms_quota_date != date {
-            next.sms_quota_date = date;
-            next.sms_quota_used = 0;
-        }
-        if next.sms_quota_used + count > MAX_SMS_DAILY_SENDS {
+        let (date, used) = quota_day(&next.sms_quota_date, next.sms_quota_used, date)?;
+        next.sms_quota_date = date;
+        next.sms_quota_used = used;
+        let Some(used) = next
+            .sms_quota_used
+            .checked_add(count)
+            .filter(|used| *used <= MAX_SMS_DAILY_SENDS)
+        else {
             return Err("rate_limited".into());
-        }
-        next.sms_quota_used += count;
+        };
+        next.sms_quota_used = used;
         self.save(&next)?;
         self.config = next;
         Ok(())
@@ -986,6 +1062,9 @@ impl Forwarder {
     }
 
     pub fn reserve_sms(&mut self, message: &Message) -> Result<(), String> {
+        if time_control::clock_change_in_progress() {
+            return Err("clock_unavailable".into());
+        }
         if self.config.method != "sms" {
             return Ok(());
         }
@@ -1104,6 +1183,24 @@ pub async fn deliver(
     time_origin: &str,
     message: &Message,
 ) -> Result<(), String> {
+    deliver_with_clock_gate(
+        destination_config,
+        time_origin,
+        message,
+        time_control::clock_change_in_progress(),
+    )
+    .await
+}
+
+async fn deliver_with_clock_gate(
+    destination_config: &Destination,
+    time_origin: &str,
+    message: &Message,
+    changing: bool,
+) -> Result<(), String> {
+    if changing {
+        return Err("clock_unavailable".into());
+    }
     if destination_config.method == "sms" {
         return deliver_sms(destination_config, message).await;
     }
@@ -1252,6 +1349,230 @@ pub async fn fresh_baseline() -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_calendar_highwater_preserves_use_on_backward_dates() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-forward-clock-quota-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        for invalid in ["", "2026-02-31", "2026-13-01", "1970-01-01"] {
+            assert_eq!(
+                manager
+                    .reserve_sim_quota_with_clock(1, Some(invalid), false)
+                    .unwrap_err(),
+                "clock_unavailable"
+            );
+            assert_eq!(manager.config.sms_quota_used, 0);
+        }
+        manager
+            .reserve_sim_quota_with_clock(60, Some("2026-10-01"), false)
+            .unwrap();
+        for date in ["2026-09-30", "2026-10-01", "2026-09-30"] {
+            assert_eq!(
+                manager
+                    .reserve_sim_quota_with_clock(1, Some(date), false)
+                    .unwrap_err(),
+                "rate_limited"
+            );
+            assert_eq!(manager.config.sms_quota_used, 60);
+            assert_eq!(manager.config.sms_quota_date, "2026-10-01");
+            assert_eq!(
+                quota_remaining(
+                    &manager.config.sms_quota_date,
+                    manager.config.sms_quota_used,
+                    Some(date),
+                    MAX_SMS_DAILY_SENDS
+                ),
+                0
+            );
+        }
+        manager
+            .reserve_sim_quota_with_clock(1, Some("2026-10-02"), false)
+            .unwrap();
+        assert_eq!(manager.config.sms_quota_used, 1);
+        assert_eq!(manager.config.sms_quota_date, "2026-10-02");
+        let reloaded = Forwarder::load(&dir);
+        assert_eq!(reloaded.config.sms_quota_used, 1);
+        assert_eq!(reloaded.config.sms_quota_date, "2026-10-02");
+        assert!(!valid_quota_state("", 1));
+        let invalid = Config {
+            sms_quota_used: 1,
+            ..Default::default()
+        };
+        assert!(!valid_config(&invalid));
+        let invalid = Config {
+            power_quota_used: 1,
+            ..Default::default()
+        };
+        assert!(!valid_config(&invalid));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clock_transition_keeps_sms_and_power_pending_across_midnight() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-forward-clock-pending-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.power_forward_enabled = true;
+        manager.config.power_last_percent = Some(50);
+        manager.config.power_last_charging = Some(1);
+        manager.config.power_quota_date = "2026-09-30".into();
+        manager.config.power_quota_used = 60;
+        manager.config.sms_quota_date = "2026-09-30".into();
+        manager.config.sms_quota_used = 60;
+        manager.save(&manager.config).unwrap();
+        let before = fs::read(&manager.path).unwrap();
+        let new_sms = json!({"stale":false,"truncated":false,"list":[{"id":1,"num":"10001","date":"10-01 00:00","tag":1,"text":"fixture"}]});
+        let midnight = reboot_schedule::Clock {
+            date: "2026-10-01".into(),
+            time: "00:00".into(),
+            offset: "+0800".into(),
+        };
+        let power = json!({"percent":51,"charging":1});
+        assert!(
+            manager
+                .next_with_clock_gate(&new_sms, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(manager.config.seen.is_empty());
+        assert!(
+            manager
+                .observe_power_with_clock(Some(&power), Some(&midnight), true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.config.power_last_percent, Some(50));
+        assert_eq!(
+            manager
+                .reserve_sim_quota_with_clock(1, Some("2026-10-01"), true)
+                .unwrap_err(),
+            "clock_unavailable"
+        );
+        assert_eq!(
+            fs::read(&manager.path).unwrap(),
+            before,
+            "time transition consumed/reset pending state"
+        );
+        assert_eq!(
+            quota_remaining(
+                &manager.config.sms_quota_date,
+                manager.config.sms_quota_used,
+                None,
+                MAX_SMS_DAILY_SENDS
+            ),
+            0
+        );
+        assert!(
+            manager
+                .next_with_clock_gate(&new_sms, false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(manager.config.seen.len(), 1);
+        assert!(
+            manager
+                .next_with_clock_gate(&new_sms, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .observe_power_with_clock(Some(&power), Some(&midnight), false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(manager.config.power_quota_date, "2026-10-01");
+        assert_eq!(manager.config.power_quota_used, 1);
+        assert!(
+            manager
+                .observe_power_with_clock(Some(&power), Some(&midnight), false)
+                .unwrap()
+                .is_none()
+        );
+        manager
+            .reserve_sim_quota_with_clock(1, Some("2026-10-01"), false)
+            .unwrap();
+        assert_eq!(manager.config.sms_quota_used, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn power_quota_also_retains_the_highest_day_after_reboot() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-power-clock-quota-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.power_forward_enabled = true;
+        manager.config.power_last_percent = Some(50);
+        manager.config.power_last_charging = Some(1);
+        manager.config.power_quota_date = "2026-10-01".into();
+        manager.config.power_quota_used = 60;
+        manager.save(&manager.config).unwrap();
+        let mut manager = Forwarder::load(&dir);
+        let previous = reboot_schedule::Clock {
+            date: "2026-09-30".into(),
+            time: "23:59".into(),
+            offset: "+0800".into(),
+        };
+        let power = json!({"percent":51,"charging":1});
+        assert!(
+            manager
+                .observe_power_with_clock(Some(&power), Some(&previous), false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.config.power_quota_used, 60);
+        assert_eq!(manager.config.power_quota_date, "2026-10-01");
+        let tomorrow = reboot_schedule::Clock {
+            date: "2026-10-02".into(),
+            time: "00:00".into(),
+            offset: "+0800".into(),
+        };
+        assert!(
+            manager
+                .observe_power_with_clock(
+                    Some(&json!({"percent":52,"charging":1})),
+                    Some(&tomorrow),
+                    false
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(manager.config.power_quota_used, 1);
+        assert_eq!(manager.config.power_quota_date, "2026-10-02");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn time_gate_rejects_delivery_before_destination_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-clock-no-delivery-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let destination = Forwarder::load(&dir).delivery();
+        // No configured target means this test cannot send a real message even
+        // if the regression moves the gate behind destination validation.
+        assert_eq!(
+            deliver_with_clock_gate(&destination, "", &Message::test(), true)
+                .await
+                .unwrap_err(),
+            "clock_unavailable"
+        );
+    }
     use axum::{Json, Router, routing::post};
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
