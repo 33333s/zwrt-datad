@@ -1,6 +1,6 @@
 # U50 Pro / U50S ARM32
 
-This branch runs the mainline datad on the original ARM32 firmware of the ZTE U50S (U50 Pro shares the code path but has not been exercised). `device.api_template_supported` stays `0`: the model has no mainline template yet, and only the features listed below are implemented.
+This branch runs the mainline datad on the original ARM32 firmware of the ZTE U50S and U50 Pro. `device.api_template_supported` stays `0`: the model has no mainline template yet, and only the features listed below are implemented. The U50 Pro (MU5120, firmware `EN_CN_MU5120AV1.0.0B17`, GoAhead `BD_FLYMODEMMU5120V1.0.1B12`, kernel `sdxlemur 5.4.226`) was verified read-only on a real device; see the section at the end.
 
 ## Static firmware evidence
 
@@ -159,3 +159,19 @@ panel instead of being presented as an empty successful configuration.
 The mappings and credential filtering are covered by synthetic OEM HTTP and
 unit fixtures. They still require independent U50S readback and NMS-page
 verification on the deployed firmware; U50 Pro remains unverified.
+
+## U50 Pro (MU5120) on-device verification, 2026-09 (read-only)
+
+The v0.10.49 armv7 binary was run from `/tmp` on a U50 Pro with `--u50-model u50pro` (one-shot and a short daemon on a loopback port, data dir under `/tmp`, auto-update disabled; no firmware configuration was changed). Everything the U50S runtime needs is present and answers:
+
+- `cfg` (`/usr/bin/cfg`) serves `cfg show` with every mapped key of the state snapshot populated (`model_name=MU5120`, `net_select`, NR SA n78 registration, factory band lists, DHCP, traffic, `modem_msn` for enrollment identity). `admin_Password` is the same 64-hex-digit SHA-256 the OEM login needs.
+- GoAhead (`zte_topsw_goahead`, ports 80/443) answers unauthenticated `goform_get_cmd_process` reads (`network_provider_fullname` empty, `network_provider=UNICOM` — the cfg fallback already covers it), serves the `LD` login challenge, and the daemon's own session login succeeded, so `state.sms` returns the real message list. The binary contains every mapped write ID, including `SET_BEARER_PREFERENCE`, `BAND_SELECT`, `WAN_PERFORM_NR5G_SANSA_BAND_LOCK`, `DHCP_SETTING` and `setDeviceAccessControlList`.
+- Kernel paths match: `bridge0`/`rmnet_data0`/`rndis0`/`wlan0`, `/etc_rw/ztembb/configs/dnsmasq.leases`, `/sbin/ip`, `/usr/sbin/iw`, systemd 244 (the U50S unit file works unchanged), `battery`/`usb`/`charger_zte`/`statistics_zte` power-supply nodes. CPU usage appears from the second sample in daemon mode as on the U50S.
+
+Firmware differences found on the device and fixed for it:
+
+- **Thermal zones.** sdxlemur names its sensors `cpuss-0-usr`/`mdmq6-0-usr` instead of `cpu0-0-usr`, so `thermal.cpu_celsius`/`system.cpu_temp` were absent; both names are now candidates. `vbat` (battery voltage in mV), `socd` (a counter reading 0.02 °C) and `modem-beamer-usr` (a floating mmWave sensor reading ~86 °C on this sub-6-only device) are dropped like the other pseudo-zones.
+- **Battery.** The `battery` node reports current **positive while charging** (the U50S node was negative), so `bat_ua` is normalised against the recognized charging state instead of unconditionally negated. `capacity_mah` falls back to `battery/charge_full` (9532 mAh here) because the U50 Pro has no `battery_zte/nominal_capacity_mah_mbb`; its `charger_connect` is served by the `usb` fallback.
+- **Network mode readback.** The firmware stores the 4G+5G preference as `net_select=WL_AND_5G` while `SET_BEARER_PREFERENCE` still takes `4G_AND_5G`; `network.set_mode` now treats that readback as verified.
+
+**Storage constraint (unresolved).** The U50 Pro `/etc_rw` is only ~5.5 MiB total (the U50S has ~15 MiB) and `/data` is a 2 MiB OEM volume. With the ~4.6 MiB binary installed, the 7 MiB OTA free-space gate can never pass and the staged `zwrt-datad.new` does not fit either, so self-update cannot install on the U50 Pro as provisioned. Deployment needs a maintainer decision (different volume, lower gate with `/tmp` staging, or manual-only updates); the checks in this verification all ran from `/tmp`.
