@@ -186,3 +186,39 @@ Transport facts, all verified on the device and cross-checked against the open-s
 - **Commands.** A bare diag command (no HDLC, no wrapper) sent as one QRTR DATA packet to that port; replies come NHDLC-wrapped as `7e 01 <len:le16> <payload> <7e>`. Framed or wrapped requests are answered `[0x13 bad-command][request echoed]`.
 - **Read-only by design.** Only `DIAG_VER_F` is sent; log masks, streams and diag-id registration are deliberately untouched until stream handling is designed, so the modem's diag state is never modified. Heavy exploratory probing (repeated `HELLO` broadcasts, a fake CNTL publication) was once observed to drop the modem's qrtr service registrations until the next reboot, while cellular data stayed up; the shipped probe sends one `HELLO`+one lookup per minute.
 - Safety note: an early exploratory port sweep across live QMI services on the modem crashed the device once. All probing must go through the name service and target only the discovered DIAG CMD address.
+- Safety note: an early exploratory port sweep across live QMI services on the modem crashed the device once. All probing must go through the name service and target only the discovered DIAG CMD address.
+
+## On-device signaling capture (v0.10.56)
+
+`--u50-signaling` (opt-in) starts the read-only signaling capture: a small
+glibc ARM worker built from `rust/u50_diag_worker.c`, embedded into the main
+binary at build time (`DATAD_DIAG_WORKER`, same mechanism as the Keymaster
+worker) and extracted to the data directory when the flag is present. The
+worker `dlopen`s the vendor `libdiag.so.1`, registers a DCI client and
+subscribes to the NR/LTE RRC OTA log codes (`0xB821`, `0xB0C0`, LTE NAS
+in/out). It never writes modem state: masks are per-DCI-client, and the worker
+releases its client and deinitializes the library on shutdown.
+
+`state.u50_signaling` reports `{enabled, available, reason, total, dropped,
+rate, cell{pci,arfcn}, codes{}, pdu_types{}, restarts}` with a five-second
+status freshness bound; every failure degrades to an explicit reason
+(`worker_not_built` when the binary was built without `DATAD_DIAG_WORKER`,
+`status_stale`, `libdiag_missing`, …). Safety properties, all verified on a
+U50 Pro:
+
+- **Crash isolation and backoff.** The worker runs as a child process; the
+  supervisor respawns with exponential backoff (1–60 s) and reports `restarts`.
+- **No orphans.** The worker watches a supervisor heartbeat file and exits on
+  its own if the daemon disappears for ten seconds; the daemon sends SIGTERM
+  (clean DCI deregistration) before reaping on shutdown.
+- **Bounded state.** Status fields are copied with depth/size bounds and a
+  500 logs/s in-worker rate limit; the status file is written atomically.
+- **OEM coexistence.** During capture the OEM `diag-router` stays healthy and
+  `key.log` keeps updating (verified over repeated start/stop cycles).
+
+One libdiag caveat is baked into the worker: `diag_register_dci_client`'s
+documented-as-unused fourth parameter is dereferenced by the library, so an
+`int` must be passed. The captured stream is the standard RRC OTA log
+(`[len][code][timestamp][payload]`); decoding RRC reconfigurations into QoS
+identifiers (5QI) is the next milestone — the messages are already captured,
+with the serving cell verified from the log header (PCI/ARFCN).

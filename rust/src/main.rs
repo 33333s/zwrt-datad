@@ -26,6 +26,7 @@ mod traffic_history;
 mod u50;
 mod u50_ctl;
 mod u50_diag;
+mod u50_signal;
 mod u50_oem;
 mod u50_oem_ids;
 mod u50_panel;
@@ -68,6 +69,10 @@ struct Args {
     /// `remote_webshell_enabled: true` in the private cloud.json.
     #[arg(long)]
     u50_enable_webshell: bool,
+    /// Enable the on-device signaling capture worker (U50 only, read-only
+    /// diag DCI client; see docs/models/U50_ARM32_CANDIDATE.md).
+    #[arg(long)]
+    u50_signaling: bool,
     /// Disable the authenticated U50 LAN API (enabled by default on port 9461).
     #[arg(long, conflicts_with = "lan_bind")]
     u50_loopback_only: bool,
@@ -130,7 +135,8 @@ async fn main() -> Result<()> {
         args.u50_model.is_some()
             || (args.u50_enroll_dir.is_none()
                 && !args.u50_enable_webshell
-                && !args.u50_loopback_only),
+                && !args.u50_loopback_only
+                && !args.u50_signaling),
         "U50 options require --u50-model"
     );
     #[cfg(target_arch = "arm")]
@@ -165,6 +171,7 @@ async fn main() -> Result<()> {
             Duration::from_millis(args.interval.clamp(500, 5000)),
             u50::RunOptions {
                 enable_webshell: args.u50_enable_webshell,
+                signaling: args.u50_signaling,
                 lan_addr: if args.u50_loopback_only {
                     None
                 } else {
