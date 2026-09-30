@@ -394,6 +394,61 @@ impl Ctl {
     /// catalog in batches allowed by the bridge, then discard those secrets
     /// while mapping onto the NMS's reviewed profile fields.
     pub async fn apn_panel_config(&self) -> Result<Value, String> {
+        // Some original images return empty APN values from GoAhead even
+        // though cfg has the active profile. Keep both reads bounded by the
+        // panel's six-second configuration deadline.
+        if let Ok(Ok(config)) =
+            tokio::time::timeout(Duration::from_secs(2), self.apn_oem_panel_config()).await
+        {
+            return Ok(config);
+        }
+        tokio::time::timeout(Duration::from_secs(3), self.apn_cfg_panel_config())
+            .await
+            .map_err(|_| "OEM APN configuration read timed out".to_owned())?
+    }
+
+    async fn apn_cfg_panel_config(&self) -> Result<Value, String> {
+        let program =
+            std::env::var("ZWRT_DATAD_U50_CFG_BIN").unwrap_or_else(|_| "/usr/bin/cfg".into());
+        let mut reply = Map::new();
+        // Exact scalar allowlist: do not read serialized APN profiles, account
+        // usernames/passwords, or the complete cfg store into this fallback.
+        for key in [
+            "apn_mode",
+            "apn_interface_version",
+            "profile_name_ui",
+            "wan_apn_ui",
+            "ppp_auth_mode_ui",
+            "pdp_type_ui",
+            "m_profile_name",
+            "profile_name",
+            "wan_apn",
+            "ppp_auth_mode",
+            "pdp_type",
+        ] {
+            let Ok(raw) =
+                crate::command::run(&program, ["get", key], Duration::from_millis(500)).await
+            else {
+                continue;
+            };
+            if raw.len() > 256 {
+                continue;
+            }
+            let Ok(value) = std::str::from_utf8(&raw) else {
+                continue;
+            };
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.chars().any(char::is_control) {
+                continue;
+            }
+            reply.insert(key.into(), json!(value));
+        }
+        // This view describes the active profile only. It does not invent an
+        // editable catalog, and apn_config retains writable:false.
+        crate::u50_panel::apn_config(&Value::Object(reply))
+    }
+
+    async fn apn_oem_panel_config(&self) -> Result<Value, String> {
         let mut raw = Map::new();
         for prefix in ["APN_config", "ipv6_APN_config"] {
             let keys = (0..20)
