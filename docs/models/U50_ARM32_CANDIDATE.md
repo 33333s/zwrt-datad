@@ -125,3 +125,37 @@ Verified against a fake GoAhead in `tests/u50_platform_test.py`. Not yet exercis
 - Not mapped: `dns.set` (the OEM has no LAN DNS call; DNS lives inside APN profiles), `wifi.configure` and the other Wi-Fi actions (the firmware is dual-chip and its per-chip SSID/security protocol is not verified yet).
 
 Only exercised against the fake GoAhead so far.
+
+## Reviewed panel read models (v0.10.51)
+
+The on-demand NMS panel now obtains Wi-Fi and APN views from the OEM backend
+instead of attempting ZWRT `uci`/`ubus` calls. Both views carry `writable: false`;
+this change does not implement Wi-Fi configuration or APN writes. Unknown or
+unavailable data stays unknown, and an invalid resource is omitted from the
+panel instead of being presented as an empty successful configuration.
+
+- Wi-Fi uses the original WebUI's single-command `queryAccessPointInfo`
+  (`ResponseList`) read. The module switch remains in `state.wlan.enabled`.
+  Main SSIDs are selected by
+  `AccessPointIndex=0` and the OEM `Band` value (`b`/`a`), independently of chip
+  ordering. Only SSID, authentication mode, enabled/hidden/PMF state, station
+  limit, current country/channel and configured bandwidth policy are exposed.
+  The country/channel lists contain only observed settings; they are not a
+  complete hardware or regulatory capability catalog. Wi-Fi keys and raw OEM
+  replies are never included.
+- APN uses bounded `APN_config0..19`/`ipv6_APN_config0..19` batches and automatic
+  profile/current-mode fields. The adapter parses the OEM serialized profiles
+  into the same reviewed `id/name/apn/auth_mode/pdp_type/enabled` fields as the
+  NMS panel. Embedded account names/passwords, raw profile strings and the OEM
+  session are discarded. IDs identify read views and cannot be used for writes.
+- The local read actions `wifi.status`, `wifi.dual_band_status`, `apn.list` and
+  `client.access` are listed in `/capabilities`; they accept no parameters.
+  `client.access` returns the same reviewed list/blocked/counts view as
+  `state.clients`. Local Wi-Fi and APN reads also exclude credentials.
+- DHCP leases use the OEM read key `dhcpLease_hour`, in hours. `state.dhcp`
+  represents it as an explicit duration such as `24h`, so clients do not
+  interpret the raw number as seconds. Missing/invalid hours are omitted.
+
+The mappings and credential filtering are covered by synthetic OEM HTTP and
+unit fixtures. They still require independent U50S readback and NMS-page
+verification on the deployed firmware; U50 Pro remains unverified.

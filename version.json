@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.50",
+    "version": "0.10.51",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50S 补齐充电状态、SINR 小数与 QoS 来源适配"
+    "notes": "ARM32 U50S 新增无凭据 Wi-Fi/APN 面板读模型并明确 DHCP 租期单位"
   }
 }

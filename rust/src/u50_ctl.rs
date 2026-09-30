@@ -45,6 +45,10 @@ pub fn get() -> Option<&'static Ctl> {
 /// forwarding, cloud features, state sampling) plus the OEM-backed actions
 /// mapped in `Ctl::execute`. Speed tests are intentionally not offered.
 pub const CONTROLS: &[&str] = &[
+    "wifi.status",
+    "wifi.dual_band_status",
+    "apn.list",
+    "client.access",
     "state.refresh",
     "state.set_interval",
     "schedule.reboot.set",
@@ -78,6 +82,13 @@ pub const CONTROLS: &[&str] = &[
     "lan.set",
     "lan.set_mtu",
     "wifi.set_module",
+];
+
+pub const READ_ACTIONS: &[&str] = &[
+    "wifi.status",
+    "wifi.dual_band_status",
+    "apn.list",
+    "client.access",
 ];
 
 /// Verify the original WebUI admin password without creating or replacing
@@ -313,6 +324,83 @@ impl Ctl {
             .get(key)?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Secretless configuration for the on-demand NMS panel. The complete
+    /// AccessPoint reply includes a Wi-Fi key; only the reviewed view leaves
+    /// this call, and no OEM write is made.
+    pub async fn wifi_panel_config(&self) -> Result<Value, String> {
+        let points = self
+            .oem
+            .local_read_single("queryAccessPointInfo", &BTreeMap::new())
+            .await?;
+        let steering = self.read("wifi_lbd_enable").await.unwrap_or(Value::Null);
+        crate::u50_panel::wifi_config(&points, &steering)
+    }
+
+    /// OEM APN records contain username/password fields. Fetch a bounded
+    /// catalog in batches allowed by the bridge, then discard those secrets
+    /// while mapping onto the NMS's reviewed profile fields.
+    pub async fn apn_panel_config(&self) -> Result<Value, String> {
+        let mut raw = Map::new();
+        for prefix in ["APN_config", "ipv6_APN_config"] {
+            let keys = (0..20)
+                .map(|n| format!("{prefix}{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let reply = self.read(&keys).await?;
+            raw.extend(reply.as_object().ok_or("invalid OEM APN reply")?.clone());
+        }
+        let reply = self.read("apn_interface_version,apn_mode,apn_auto_config,ipv6_apn_auto_config,m_profile_name,profile_name,profile_name_ui,wan_apn,wan_apn_ui,ppp_auth_mode,ppp_auth_mode_ui,pdp_type,pdp_type_ui").await?;
+        raw.extend(reply.as_object().ok_or("invalid OEM APN reply")?.clone());
+        crate::u50_panel::apn_config(&Value::Object(raw))
+    }
+
+    /// Original-firmware counterparts of the mainline local read actions.
+    /// Wi-Fi keys and APN credentials remain absent even on the local API.
+    pub async fn read_model(&self, action: &str, params: &Value) -> Outcome {
+        if !params.as_object().is_some_and(Map::is_empty) {
+            return Outcome::Invalid("this read action accepts no parameters".into());
+        }
+        let result = match action {
+            "wifi.status" => self.wifi_panel_config().await.map(|config| {
+                let mut sections = Map::new();
+                for (band, section) in [("2g", "main_2g"), ("5g", "main_5g")] {
+                    let row = &config["bands"][band];
+                    if row["supported"] == true {
+                        sections.insert(section.into(), json!({
+                            "ssid":row["ssid"],"encryption":row["encryption"],
+                            "disabled":row["enabled"].as_bool().map(|v|if v {"0"} else {"1"}),
+                            "hidden":row["hidden"].as_bool().map(|v|if v {"1"} else {"0"}),
+                            "pmf":row["pmf"],"maxassoc":row["maxassoc"],"writable":false
+                        }));
+                    }
+                }
+                Value::Object(sections)
+            }),
+            "wifi.dual_band_status" => self.read("wifi_lbd_enable").await.and_then(|raw| {
+                let enabled = match raw.get("wifi_lbd_enable").and_then(Value::as_str) {
+                    Some("0") => false,Some("1") => true,_ => return Err("OEM band steering state unavailable".into()),
+                };
+                Ok(json!({"supported":true,"enabled":enabled,"writable":false,
+                    "WiFiDualBandSupported":"1","WiFiDualBandEnabled":if enabled {"1"} else {"0"},
+                    "BandSteeringSwitch":if enabled {"1"} else {"0"}}))
+            }),
+            "apn.list" => self.apn_panel_config().await.map(|config| {
+                let profiles = |key: &str| {
+                    let items = config[key].as_array().into_iter().flatten().map(|row|json!({
+                        "profileId":row["id"],"profilename":row["name"],"wanapn":row["apn"],
+                        "pdpType":row["pdp_type"],"pppAuthMode":row["auth_mode"],"isEnable":row["enabled"]
+                    })).collect::<Vec<_>>();
+                    json!({"apnListArray":items})
+                };
+                json!({"mode":{"apn_mode":config["mode"]},"automatic":profiles("automatic"),
+                    "manual":profiles("manual"),"enabled":{"profileId":config["enabled_id"]},"writable":false})
+            }),
+            "client.access" => self.clients_block().await.ok_or_else(||"OEM client list unavailable".into()),
+            _ => return Outcome::NotHandled,
+        };
+        outcome_from(result)
     }
 
     // ---- SMS source for `crate::sms` -------------------------------------

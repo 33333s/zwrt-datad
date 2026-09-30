@@ -201,6 +201,9 @@ fn state_message_with_config(
 }
 
 async fn wifi_panel_config() -> Option<Value> {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.wifi_panel_config().await.ok();
+    }
     let status = wifi::wireless_config_status().await.ok()?;
     let countries: Vec<String> = status
         .get("countries")?
@@ -277,6 +280,9 @@ fn panel_apn_profiles(reply: &Value) -> Vec<Value> {
 }
 
 async fn apn_panel_config() -> Option<Value> {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        return ctl.apn_panel_config().await.ok();
+    }
     let (mode, automatic, manual, enabled) = tokio::join!(
         state::ubus("zwrt_apn_object", "get_apn_mode", json!({})),
         state::ubus("zwrt_apn_object", "getAutoApnList", json!({})),
