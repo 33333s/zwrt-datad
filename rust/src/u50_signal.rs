@@ -27,9 +27,8 @@ const RESPAWN_MIN: Duration = Duration::from_secs(1);
 const RESPAWN_MAX: Duration = Duration::from_secs(60);
 
 fn worker_blob() -> Option<&'static [u8]> {
-    (option_env!("DATAD_DIAG_WORKER_EMBEDDED").unwrap_or("0") == "1").then(|| {
-        include_bytes!(concat!(env!("OUT_DIR"), "/diag-worker")).as_slice()
-    })
+    (option_env!("DATAD_DIAG_WORKER_EMBEDDED").unwrap_or("0") == "1")
+        .then(|| include_bytes!(concat!(env!("OUT_DIR"), "/diag-worker")).as_slice())
 }
 
 struct Supervisor {
@@ -107,14 +106,8 @@ pub fn block() -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_owned();
-            let reason = status
-                .get("reason")
-                .cloned()
-                .unwrap_or_else(|| json!(""));
-            out.insert(
-                "available".into(),
-                json!(worker_state == "running"),
-            );
+            let reason = status.get("reason").cloned().unwrap_or_else(|| json!(""));
+            out.insert("available".into(), json!(worker_state == "running"));
             out.insert("worker".into(), json!(worker_state));
             out.insert("reason".into(), reason);
             out.insert("restarts".into(), json!(run.restarts));
@@ -151,12 +144,7 @@ fn materialize_worker(path: &Path, blob: &[u8]) -> Result<(), &'static str> {
     fs::rename(&tmp, path).map_err(|_| "worker_rename_failed")
 }
 
-fn ensure_running(
-    run: &mut Supervisor,
-    worker: &Path,
-    status: &Path,
-    heartbeat: &Path,
-) {
+fn ensure_running(run: &mut Supervisor, worker: &Path, status: &Path, heartbeat: &Path) {
     if let Some(child) = run.child.as_mut()
         && child.try_wait().map(|w| w.is_none()).unwrap_or(false)
     {
@@ -245,7 +233,11 @@ fn bounded(value: &Value, depth: usize) -> Value {
             Value::Object(out)
         }
         Value::Array(items) if depth < 4 => Value::Array(
-            items.iter().take(64).map(|v| bounded(v, depth + 1)).collect(),
+            items
+                .iter()
+                .take(64)
+                .map(|v| bounded(v, depth + 1))
+                .collect(),
         ),
         Value::String(s) if s.len() <= 128 => value.clone(),
         Value::String(_) => Value::String(String::new()),
