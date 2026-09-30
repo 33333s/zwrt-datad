@@ -910,7 +910,22 @@ struct RemoteCommand {
 #[derive(Default)]
 struct BridgeState {
     active: HashSet<String>,
-    seen: HashMap<String, i64>,
+    seen: HashMap<String, Duration>,
+}
+
+impl BridgeState {
+    fn already_seen(&mut self, request: &str) -> bool {
+        let now = crate::elapsed::now();
+        self.seen.retain(|_, expires| *expires > now);
+        self.seen.contains_key(request)
+    }
+
+    fn remember(&mut self, request: String) {
+        self.seen.insert(
+            request,
+            crate::elapsed::now().saturating_add(Duration::from_secs(12 * 3600)),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -942,8 +957,7 @@ impl BridgeManager {
             return Some(reject(error));
         }
         let mut state = self.state.lock().await;
-        state.seen.retain(|_, expires| *expires > now());
-        if state.seen.contains_key(&command.request_id) {
+        if state.already_seen(&command.request_id) {
             return None;
         }
         if state.active.len() >= 4 || state.seen.len() >= 128 {
@@ -968,9 +982,7 @@ impl BridgeManager {
             return Some(reject("panel_unavailable".into()));
         }
         state.active.insert(command.request_id.clone());
-        state
-            .seen
-            .insert(command.request_id.clone(), now() + 12 * 3600);
+        state.remember(command.request_id.clone());
         drop(state);
         let manager = self.clone();
         tokio::spawn(async move { manager.run_bridge(command, shell_permit).await });
@@ -1451,6 +1463,23 @@ mod tests {
     };
     use tokio_rustls::TlsAcceptor;
     use tokio_tungstenite::accept_hdr_async;
+
+    #[test]
+    fn tunnel_dedup_uses_boot_elapsed_ttl_across_wall_steps_and_suspend() {
+        for wall_step in [-8 * 3600, 8 * 3600] {
+            crate::elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+                let mut state = BridgeState::default();
+                state.remember("request".into());
+                crate::elapsed::advance(Duration::ZERO, wall_step);
+                assert!(state.already_seen("request"));
+                crate::elapsed::advance(Duration::from_secs(12 * 3600 - 1), 0);
+                assert!(state.already_seen("request"));
+                crate::elapsed::advance(Duration::from_secs(1), 0);
+                assert!(!state.already_seen("request"));
+                assert!(state.seen.is_empty());
+            });
+        }
+    }
 
     #[test]
     fn pending_credentials_derive_stable_device_identity_and_proof() {

@@ -1,3 +1,4 @@
+use crate::{elapsed, time_control};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::{Client, Url};
@@ -10,7 +11,7 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::process::Command;
 
@@ -18,6 +19,8 @@ const NETDISK: &str = "https://pan.ericsfj.com/sd/wN2PJUK8";
 const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/download";
 const PUBLIC_KEY: &str = include_str!("../ota_public.pem");
 const IDLE_FOR: Duration = Duration::from_secs(120);
+const AUTO_CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+const MAX_IDLE_OBSERVATION_GAP: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -118,11 +121,37 @@ pub struct Ota {
     config: Config,
     status: Status,
     candidate: Option<Candidate>,
-    idle_since: Option<i64>,
+    idle_since: Option<Duration>,
+    idle_observed_at: Option<Duration>,
+    clock_generation: u64,
     pub busy: bool,
     client: Client,
     key: VerifyingKey,
-    last_auto_check: i64,
+    last_auto_check: Option<Duration>,
+    retry_deadline: Option<Duration>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredStatus {
+    #[serde(flatten)]
+    status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryTimer>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RetryTimer {
+    boot_id: String,
+    deadline_ms: u64,
+}
+
+fn retry_delay(failures: u8) -> Duration {
+    Duration::from_secs(match failures {
+        1 => 3600,
+        2 => 6 * 3600,
+        3 => 24 * 3600,
+        _ => 0,
+    })
 }
 
 impl Ota {
@@ -131,24 +160,47 @@ impl Ota {
         let config = read_json::<Config>(&dir.join("ota.json"))
             .filter(|value| validate_config(value).is_ok())
             .unwrap_or_default();
-        let mut status = read_json::<Status>(&dir.join("ota-state.json")).unwrap_or_default();
+        let stored = read_json::<StoredStatus>(&dir.join("ota-state.json")).unwrap_or_default();
+        let mut status = stored.status;
         status.current_version = env!("DATAD_VERSION").into();
         status.source = source_name(&status.source).into();
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self {
+        let delay = retry_delay(status.failure_count);
+        let retry_deadline = if delay.is_zero() || status.state == "succeeded" {
+            None
+        } else if let Some(timer) = stored.retry
+            && elapsed::boot_id().as_deref() == Some(timer.boot_id.as_str())
+            && Duration::from_millis(timer.deadline_ms)
+                <= elapsed::now().saturating_add(Duration::from_secs(24 * 3600))
+        {
+            // Daemon restarts in the same boot preserve even an expired deadline.
+            Some(Duration::from_millis(timer.deadline_ms))
+        } else {
+            // An old release/another boot has no trustworthy elapsed deadline.
+            // Rearm the bounded cooldown; never infer elapsed age from RTC/wall time.
+            Some(elapsed::now().saturating_add(delay))
+        };
+        let manager = Self {
             dir: dir.to_owned(),
             config,
             status,
             candidate: None,
             idle_since: None,
+            idle_observed_at: None,
+            clock_generation: time_control::clock_generation(),
             busy: false,
             client,
             key,
-            last_auto_check: 0,
-        })
+            last_auto_check: None,
+            retry_deadline,
+        };
+        if manager.retry_deadline.is_some() {
+            manager.save_status();
+        }
+        Ok(manager)
     }
 
     pub fn config_json(&self) -> Value {
@@ -156,10 +208,37 @@ impl Ota {
     }
 
     pub fn status_json(&self) -> Value {
-        json!({"success":true,"status":self.status,"enabled":self.config.enabled})
+        json!({"success":true,"status":self.display_status(),"enabled":self.config.enabled})
+    }
+
+    fn display_status(&self) -> Status {
+        let mut status = self.status.clone();
+        let remaining = self
+            .retry_deadline
+            .map(|deadline| deadline.saturating_sub(elapsed::now()))
+            .unwrap_or_default();
+        status.next_retry_at = if remaining.is_zero() {
+            0
+        } else {
+            now().saturating_add(
+                remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+                    .min(i64::MAX as u64) as i64,
+            )
+        };
+        status
+    }
+
+    fn retry_ready(&self) -> bool {
+        self.retry_deadline
+            .is_none_or(|deadline| elapsed::now() >= deadline)
     }
 
     pub fn begin_update(&mut self) -> Result<(), String> {
+        if time_control::clock_change_in_progress() {
+            return Err("系统时间正在切换，请稍后重试".into());
+        }
         if self.busy {
             return Err("更新任务正在运行".into());
         }
@@ -206,6 +285,9 @@ impl Ota {
     }
 
     pub async fn check(&mut self) -> Result<Candidate, String> {
+        if time_control::clock_change_in_progress() {
+            return Err("系统时间正在切换，请稍后重试".into());
+        }
         self.status.state = "checking".into();
         self.status.error.clear();
         self.status.last_check_at = now();
@@ -354,16 +436,12 @@ impl Ota {
         self.status.state = "error".into();
         self.status.error = error;
         self.status.failure_count = self.status.failure_count.saturating_add(1);
-        let delay = match self.status.failure_count {
-            1 => 3600,
-            2 => 6 * 3600,
-            3 => 24 * 3600,
-            _ => {
-                self.status.state = "blocked".into();
-                0
-            }
-        };
-        self.status.next_retry_at = if delay == 0 { 0 } else { now() + delay };
+        let delay = retry_delay(self.status.failure_count);
+        if delay.is_zero() {
+            self.status.state = "blocked".into();
+        }
+        self.retry_deadline = (!delay.is_zero()).then(|| elapsed::now().saturating_add(delay));
+        self.status.next_retry_at = self.display_status().next_retry_at;
         if let Some(candidate) = candidate {
             self.status.latest_version = candidate.manifest.version.clone();
             self.status.source = source_name(&candidate.base_url).into();
@@ -385,6 +463,7 @@ impl Ota {
             self.status.wait_reasons.clear();
             self.status.failure_count = 0;
             self.status.next_retry_at = 0;
+            self.retry_deadline = None;
         } else {
             self.status.state = "error".into();
             self.status.error = "安装器执行失败，已由安装器回滚".into();
@@ -394,7 +473,11 @@ impl Ota {
     }
 
     pub fn auto_candidate(&mut self) -> Option<Candidate> {
-        if !self.config.enabled || self.busy || self.status.next_retry_at > now() {
+        if !self.config.enabled
+            || self.busy
+            || !self.retry_ready()
+            || time_control::clock_change_in_progress()
+        {
             return None;
         }
         if self.status.state == "blocked"
@@ -413,16 +496,26 @@ impl Ota {
     pub fn should_auto_check(&self) -> bool {
         self.config.enabled
             && !self.busy
-            && self.status.next_retry_at <= now()
-            && (self.candidate.is_none() || now() - self.last_auto_check >= 6 * 3600)
+            && self.retry_ready()
+            && !time_control::clock_change_in_progress()
+            && (self.candidate.is_none()
+                || self
+                    .last_auto_check
+                    .is_none_or(|last| elapsed::now().saturating_sub(last) >= AUTO_CHECK_EVERY))
     }
 
     pub fn mark_auto_check(&mut self) {
-        self.last_auto_check = now();
+        self.last_auto_check = Some(elapsed::now());
     }
 
     fn safety(&mut self, snapshot: &Value, manual: bool) -> Vec<String> {
         let mut reasons = Vec::new();
+        self.observe_clock_generation(time_control::clock_generation());
+        if time_control::clock_change_in_progress() {
+            self.idle_since = None;
+            self.idle_observed_at = None;
+            reasons.push("系统时间正在切换".into());
+        }
         let battery = number_at(snapshot, &["battery", "percent"])
             .or_else(|| number_at(snapshot, &["system", "battery_percent"]));
         if battery.is_some_and(|value| value <= 10.0) {
@@ -453,14 +546,32 @@ impl Ota {
             reasons.push("上下行需低于 1 MiB/s".into());
         }
         if reasons.is_empty() {
-            let first = *self.idle_since.get_or_insert_with(now);
-            if now() - first < IDLE_FOR.as_secs() as i64 {
+            let observed = elapsed::now();
+            if self
+                .idle_observed_at
+                .is_some_and(|last| observed.saturating_sub(last) > MAX_IDLE_OBSERVATION_GAP)
+            {
+                // No samples during suspend/process stalls: they cannot prove idle.
+                self.idle_since = None;
+            }
+            self.idle_observed_at = Some(observed);
+            let first = *self.idle_since.get_or_insert(observed);
+            if observed.saturating_sub(first) < IDLE_FOR {
                 reasons.push("设备需连续空闲 2 分钟".into());
             }
         } else {
             self.idle_since = None;
+            self.idle_observed_at = None;
         }
         reasons
+    }
+
+    fn observe_clock_generation(&mut self, generation: u64) {
+        if self.clock_generation != generation {
+            self.clock_generation = generation;
+            self.idle_since = None;
+            self.idle_observed_at = None;
+        }
     }
 
     async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
@@ -487,7 +598,20 @@ impl Ota {
     }
 
     fn save_status(&self) {
-        let _ = atomic_json(&self.dir.join("ota-state.json"), &self.status, 0o600);
+        let retry = self.retry_deadline.and_then(|deadline| {
+            Some(RetryTimer {
+                boot_id: elapsed::boot_id()?,
+                deadline_ms: u64::try_from(deadline.as_millis()).ok()?,
+            })
+        });
+        let _ = atomic_json(
+            &self.dir.join("ota-state.json"),
+            &StoredStatus {
+                status: self.display_status(),
+                retry,
+            },
+            0o600,
+        );
     }
 }
 
@@ -613,10 +737,7 @@ fn newer(left: &str, right: &str) -> bool {
 }
 
 fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    elapsed::wall_epoch()
 }
 
 fn number_at(value: &Value, path: &[&str]) -> Option<f64> {
@@ -740,6 +861,137 @@ mod tests {
         let mut ota = Ota::load(&dir).unwrap();
         let reasons = ota.safety(&json!({"battery":{"percent":10},"runtime":{"storage":{"available":1},"cpu_usage_tenths":900,"throughput":{"rx_bps":9999999,"tx_bps":0}},"neighbor":{"enabled":true}}), true);
         assert_eq!(reasons, ["电量必须高于 10%", "可用存储不足 64 MiB"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn timer_candidate() -> Candidate {
+        Candidate {
+            manifest: Manifest {
+                schema: 1,
+                version: "99.0.0".into(),
+                tag: "v99.0.0".into(),
+                published_at: String::new(),
+                artifacts: BTreeMap::new(),
+            },
+            base_url: "https://updates.example".into(),
+        }
+    }
+
+    #[test]
+    fn ota_period_and_retry_do_not_follow_eight_hour_wall_steps() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-ota-elapsed-period-{}", std::process::id()));
+        for step in [-8 * 3600, 8 * 3600] {
+            let _ = fs::remove_dir_all(&dir);
+            elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+                let mut ota = Ota::load(&dir).unwrap();
+                ota.candidate = Some(timer_candidate());
+                ota.mark_auto_check();
+                ota.fail(None, "fixture".into());
+                elapsed::advance(Duration::ZERO, step);
+                assert!(ota.auto_candidate().is_none());
+                assert!(!ota.should_auto_check());
+                assert_eq!(
+                    ota.status_json()["status"]["next_retry_at"],
+                    1_780_000_000 + step + 3600
+                );
+                elapsed::advance(Duration::from_secs(3600 - 1), 0);
+                assert!(ota.auto_candidate().is_none());
+                elapsed::advance(Duration::from_secs(1), 0);
+                assert!(ota.auto_candidate().is_some());
+                assert!(!ota.should_auto_check());
+                elapsed::advance(Duration::from_secs(5 * 3600), 0);
+                assert!(ota.should_auto_check());
+            });
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ota_idle_requires_observations_not_wall_steps_or_suspend() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-ota-elapsed-idle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+            let mut ota = Ota::load(&dir).unwrap();
+            let snapshot = json!({"battery":{"percent":80},"runtime":{"storage":{"available":134217728},"cpu_usage_tenths":0,"throughput":{"rx_bps":0,"tx_bps":0}},"neighbor":{"enabled":false}});
+            assert!(!ota.safety(&snapshot, false).is_empty());
+            elapsed::advance(Duration::ZERO, 8 * 3600);
+            assert!(!ota.safety(&snapshot, false).is_empty());
+            elapsed::advance(Duration::from_secs(60), -8 * 3600);
+            assert!(!ota.safety(&snapshot, false).is_empty());
+            elapsed::advance(Duration::from_secs(60), 0);
+            assert!(ota.safety(&snapshot, false).is_empty());
+            // A sleeping/stalled system has not supplied fresh idle observations.
+            elapsed::advance(Duration::from_secs(8 * 3600), 0);
+            assert!(!ota.safety(&snapshot, false).is_empty());
+            elapsed::advance(Duration::from_secs(60), 0);
+            assert!(!ota.safety(&snapshot, false).is_empty());
+            elapsed::advance(Duration::from_secs(60), 0);
+            assert!(ota.safety(&snapshot, false).is_empty());
+            ota.observe_clock_generation(ota.clock_generation + 1);
+            assert!(ota.idle_since.is_none());
+            assert!(ota.idle_observed_at.is_none());
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retry_restores_same_boot_deadline_without_trusting_rtc() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-ota-elapsed-restart-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+            let mut ota = Ota::load(&dir).unwrap();
+            ota.fail(None, "fixture".into());
+            elapsed::advance(Duration::from_secs(900), -8 * 3600);
+            drop(ota);
+            let ota = Ota::load(&dir).unwrap();
+            assert!(!ota.retry_ready());
+            assert_eq!(
+                ota.status_json()["status"]["next_retry_at"],
+                elapsed::wall_epoch() + 2700
+            );
+            assert!(ota.status_json()["status"].get("retry").is_none());
+            elapsed::advance(Duration::from_secs(2700), 8 * 3600);
+            drop(ota);
+            assert!(Ota::load(&dir).unwrap().retry_ready());
+        });
+        // A reboot resets BOOTTIME. A bounded fresh cooldown is safer than
+        // interpreting the previous kernel's deadline or an arbitrary RTC value.
+        elapsed::with_clock(Duration::ZERO, 1_780_000_000 + 8 * 3600, || {
+            elapsed::set_boot_id("another-test-boot");
+            let ota = Ota::load(&dir).unwrap();
+            assert!(!ota.retry_ready());
+            elapsed::advance(Duration::from_secs(3600), -8 * 3600);
+            assert!(ota.retry_ready());
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_retry_state_rearms_a_bounded_elapsed_cooldown() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-ota-elapsed-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Status {
+            state: "error".into(),
+            failure_count: 1,
+            next_retry_at: 1_780_000_000 + 8 * 3600,
+            ..Default::default()
+        };
+        fs::write(
+            dir.join("ota-state.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        elapsed::with_clock(Duration::ZERO, 1_780_000_000, || {
+            let ota = Ota::load(&dir).unwrap();
+            assert!(!ota.retry_ready());
+            elapsed::advance(Duration::from_secs(3600), -8 * 3600);
+            assert!(ota.retry_ready());
+        });
         let _ = fs::remove_dir_all(dir);
     }
 

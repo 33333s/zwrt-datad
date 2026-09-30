@@ -39,6 +39,7 @@ const MAX_STATE_BYTES: usize = 192 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024;
 const MAX_CONTROLS_PER_SESSION: usize = 128;
 const EXPOSED_BLOCKS: &[&str] = &[
+    "time",
     "net",
     "neighbor",
     "battery",
@@ -334,6 +335,8 @@ fn needs_confirmation(action: &str) -> bool {
     matches!(
         action,
         "device.reboot"
+            | "time.config.set"
+            | "time.sync"
             | "device.poweroff"
             | "cellular.disconnect"
             | "cellular.set"
@@ -446,6 +449,22 @@ async fn control_result(
         Some("confirmation_required")
     } else if !valid_remote_band_list(&request.action, &request.params) {
         Some("invalid_parameter")
+    } else if matches!(request.action.as_str(), "time.config.set" | "time.sync") {
+        match cloud_app {
+            Some(app) => match app.panel_time_action(&request.action, request.params.clone()) {
+                Ok(_) => None,
+                Err(error)
+                    if matches!(
+                        error.as_str(),
+                        "config_storage_failed" | "clock_permission_denied" | "operation_busy"
+                    ) =>
+                {
+                    Some("device_call_failed")
+                }
+                Err(_) => Some("invalid_parameter"),
+            },
+            None => Some("unsupported_action"),
+        }
     } else if request.action == "neighbor.set" {
         match (cloud_app, remote_neighbor_enabled(&request.params)) {
             (Some(app), Some(enabled)) => {
@@ -1029,6 +1048,12 @@ mod tests {
         );
         assert!(filtered[0].get("username").is_none());
         assert!(filtered[0].get("password").is_none());
+    }
+    #[test]
+    fn time_read_is_not_a_confirmed_mutation_but_both_writes_are() {
+        assert!(!needs_confirmation("time.status"));
+        assert!(needs_confirmation("time.config.set"));
+        assert!(needs_confirmation("time.sync"));
     }
 
     #[test]

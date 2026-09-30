@@ -1,11 +1,7 @@
-use crate::state;
+use crate::{elapsed, state};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    fs::File,
-    io::Read,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs::File, io::Read, time::Duration};
 
 const SESSION_TTL: u64 = 12 * 60 * 60;
 const SESSION_LIMIT: usize = 16;
@@ -13,7 +9,7 @@ const SESSION_LIMIT: usize = 16;
 #[derive(Clone)]
 struct Session {
     token: String,
-    expires_at: u64,
+    deadline: Duration,
 }
 
 #[derive(Default)]
@@ -21,10 +17,10 @@ pub struct Sessions(Vec<Session>);
 
 impl Sessions {
     pub fn validate(&mut self, token: &str) -> bool {
-        let now = now();
-        self.0.retain(|s| s.expires_at > now);
+        let now = elapsed::now();
+        self.0.retain(|s| s.deadline > now);
         if let Some(session) = self.0.iter_mut().find(|s| secure_eq(&s.token, token)) {
-            session.expires_at = now + SESSION_TTL;
+            session.deadline = now.saturating_add(Duration::from_secs(SESSION_TTL));
             true
         } else {
             false
@@ -35,21 +31,23 @@ impl Sessions {
         let mut bytes = [0u8; 24];
         File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let expires_at = now() + SESSION_TTL;
-        self.0.retain(|s| s.expires_at > now());
+        let now = elapsed::now();
+        let deadline = now.saturating_add(Duration::from_secs(SESSION_TTL));
+        let expires_at = (elapsed::wall_epoch().max(0) as u64).saturating_add(SESSION_TTL);
+        self.0.retain(|s| s.deadline > now);
         if self.0.len() >= SESSION_LIMIT {
             let oldest = self
                 .0
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, s)| s.expires_at)
+                .min_by_key(|(_, s)| s.deadline)
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             self.0.remove(oldest);
         }
         self.0.push(Session {
             token: token.clone(),
-            expires_at,
+            deadline,
         });
         Ok((token, expires_at))
     }
@@ -156,13 +154,6 @@ fn secure_eq(a: &str, b: &str) -> bool {
             .fold(0u8, |diff, (x, y)| diff | (x ^ y))
             == 0
 }
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 pub fn token_reply(token: String, expires_at: u64) -> Value {
     json!({"ok":true,"token_type":"Bearer","access_token":token,"expires_in":SESSION_TTL,"expires_at":expires_at})
 }
@@ -178,5 +169,36 @@ mod tests {
         let (token, _) = sessions.issue().unwrap();
         assert_eq!(token.len(), 48);
         assert!(sessions.validate(&token));
+    }
+
+    #[test]
+    fn session_ttl_ignores_eight_hour_wall_steps_and_includes_suspend() {
+        for step in [-8 * 3600, 8 * 3600] {
+            elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+                let mut sessions = Sessions::default();
+                let (token, expires_at) = sessions.issue().unwrap();
+                assert_eq!(expires_at, 1_780_000_000 + SESSION_TTL);
+                elapsed::advance(Duration::ZERO, step);
+                assert_eq!(
+                    sessions.0[0].deadline,
+                    Duration::from_secs(100 + SESSION_TTL)
+                );
+                // BOOTTIME advances during suspend even without request activity.
+                elapsed::advance(Duration::from_secs(SESSION_TTL), 0);
+                assert!(!sessions.validate(&token));
+            });
+        }
+    }
+
+    #[test]
+    fn active_session_refresh_is_twelve_elapsed_hours_not_wall_hours() {
+        elapsed::with_clock(Duration::ZERO, 1_780_000_000, || {
+            let mut sessions = Sessions::default();
+            let (token, _) = sessions.issue().unwrap();
+            elapsed::advance(Duration::from_secs(60), -8 * 3600);
+            assert!(sessions.validate(&token));
+            elapsed::advance(Duration::from_secs(SESSION_TTL), 8 * 3600);
+            assert!(!sessions.validate(&token));
+        });
     }
 }

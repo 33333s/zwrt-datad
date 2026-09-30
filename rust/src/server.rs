@@ -67,6 +67,7 @@ pub(crate) struct Inner {
     tasks: Arc<Mutex<TaskSchedule>>,
     speedtest: Arc<Mutex<SpeedTest>>,
     sms_forward: Arc<Mutex<Forwarder>>,
+    time_control: crate::time_control::Manager,
 }
 
 struct DeviceSession {
@@ -134,6 +135,8 @@ impl App {
         &self,
         input: SmsForwardUpdate,
     ) -> Result<Value, String> {
+        let _clock_lease = crate::time_control::clock_sensitive_operation()
+            .ok_or_else(|| "clock_change_in_progress".to_owned())?;
         let battery = self
             .inner
             .snapshot
@@ -159,6 +162,8 @@ impl App {
     }
 
     pub(crate) async fn panel_sms_forward_test(&self) -> Result<Value, String> {
+        let _clock_lease = crate::time_control::clock_sensitive_operation()
+            .ok_or_else(|| "clock_change_in_progress".to_owned())?;
         let device_snapshot = self.inner.snapshot.read().await.clone();
         let battery = device_snapshot.fields.get("battery").cloned();
         let time_origin = self.inner.cloud.read().await.panel_config()["platform_url"]
@@ -273,9 +278,11 @@ impl App {
         neighbor_enabled: bool,
         webshell_enabled: bool,
     ) -> Result<Self> {
+        let time_control = crate::time_control::Manager::new(&data_dir);
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut initial = state::collect(interval.as_millis() as u64).await;
+        initial.fields.insert("time".into(), time_control.status());
         let mut neighbor = NeighborManager::new(neighbor_enabled);
         neighbor
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
@@ -320,6 +327,7 @@ impl App {
                 tasks: Arc::new(Mutex::new(tasks)),
                 speedtest: Arc::new(Mutex::new(speedtest)),
                 sms_forward: Arc::new(Mutex::new(sms_forward)),
+                time_control,
             }),
         };
         app.inner
@@ -333,6 +341,15 @@ impl App {
     }
     pub async fn snapshot(&self) -> Snapshot {
         self.inner.snapshot.read().await.clone()
+    }
+    pub fn spawn_time_control(&self) {
+        self.inner.time_control.start();
+    }
+    pub(crate) fn panel_time_action(&self, action: &str, params: Value) -> Result<Value, String> {
+        self.inner
+            .time_control
+            .submit(action, params)
+            .map_err(str::to_owned)
     }
     fn spawn_sampler(&self) {
         let app = self.clone();
@@ -354,6 +371,9 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
+                    continue;
+                };
                 let clock = reboot_schedule::local_clock();
                 let conflict = reboot_schedule::oem_conflict().await;
                 let due = app.inner.schedule.lock().await.observe(clock, conflict);
@@ -377,6 +397,9 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
+                    continue;
+                };
                 let clock = reboot_schedule::local_clock();
                 let due = app.inner.tasks.lock().await.observe(clock.as_ref());
                 let (Some(task), Some(clock)) = (due, clock) else {
@@ -454,6 +477,10 @@ impl App {
                     .unwrap_or_default()
                     .to_owned();
                 {
+                    let Some(_clock_lease) = crate::time_control::clock_sensitive_operation()
+                    else {
+                        continue;
+                    };
                     let mut manager = app.inner.sms_forward.lock().await;
                     match manager.observe_power(battery.as_ref()) {
                         Ok(Some(message)) => {
@@ -482,6 +509,10 @@ impl App {
                     }
                 };
                 for _ in 0..4 {
+                    let Some(_clock_lease) = crate::time_control::clock_sensitive_operation()
+                    else {
+                        break;
+                    };
                     let device_snapshot = app.inner.snapshot.read().await.clone();
                     let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
                         .as_str()
@@ -547,6 +578,8 @@ impl App {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        next.fields
+            .insert("time".into(), self.inner.time_control.status());
         next.fields.insert(
             "reboot_schedule".into(),
             self.inner.schedule.lock().await.status(),
@@ -1080,6 +1113,7 @@ fn capability_controls() -> Vec<&'static str> {
         "state.refresh",
         "state.set_interval",
         "qos.reload",
+        "time.status",
     ];
     controls.extend_from_slice(crate::control::ACTIONS);
     controls
@@ -1172,6 +1206,33 @@ async fn control(
             Json(json!({"ok":false,"action":action,"error":{"code":"invalid_request","message":"params must be a JSON object"}})),
         )
             .into_response();
+    }
+    if action == "time.status" {
+        if body
+            .get("params")
+            .is_some_and(|v| !v.as_object().is_some_and(Map::is_empty))
+        {
+            return invalid_parameter(action, "time.status accepts no parameters");
+        }
+        return control_ok(action, app.inner.time_control.status());
+    }
+    if matches!(action, "time.config.set" | "time.sync") {
+        if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
+            return invalid_parameter(action, "time actions require confirmed=true");
+        }
+        return match app.panel_time_action(action, body.get("params").cloned().unwrap_or(json!({})))
+        {
+            Ok(value) => control_ok(action, value),
+            Err(error)
+                if matches!(
+                    error.as_str(),
+                    "config_storage_failed" | "clock_permission_denied" | "operation_busy"
+                ) =>
+            {
+                control_failed(action, error)
+            }
+            Err(error) => invalid_parameter(action, &error),
+        };
     }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
@@ -1740,8 +1801,14 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 87);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 87);
+        assert_eq!(controls.len(), 87 + 3);
+        for action in ["time.status", "time.config.set", "time.sync"] {
+            assert!(controls.contains(&action));
+        }
+        assert_eq!(
+            controls.iter().copied().collect::<HashSet<_>>().len(),
+            87 + 3
+        );
     }
 
     #[test]

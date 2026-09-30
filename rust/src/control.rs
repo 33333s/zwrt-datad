@@ -10,6 +10,8 @@ pub enum Outcome {
 }
 
 pub const ACTIONS: &[&str] = &[
+    "time.config.set",
+    "time.sync",
     "device.reboot",
     "schedule.reboot.set",
     "schedule.task.put",

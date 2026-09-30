@@ -243,6 +243,9 @@ impl Schedule {
     /// Persist the date before returning a reboot request, so a daemon restart
     /// in the same minute cannot schedule another reboot.
     pub fn observe(&mut self, clock: Option<Clock>, conflict: bool) -> bool {
+        if crate::time_control::clock_change_in_progress() {
+            return false;
+        }
         self.set_environment(clock, conflict);
         let Some(clock) = &self.clock else {
             return false;
@@ -251,7 +254,8 @@ impl Schedule {
             || conflict
             || self.error.is_some()
             || clock.time != self.stored.time
-            || self.stored.last_attempt_date == clock.date
+            || (!self.stored.last_attempt_date.is_empty()
+                && self.stored.last_attempt_date >= clock.date)
         {
             return false;
         }
@@ -306,7 +310,19 @@ mod tests {
         assert!(!schedule.observe(parse_clock("2026-09-29 02:03 +0000"), false));
         let mut loaded = Schedule::load(&dir);
         assert!(!loaded.observe(parse_clock("2026-09-29 02:03 +0000"), false));
+        crate::time_control::with_clock_state(true, 1, || {
+            assert!(
+                !loaded.observe(parse_clock("2026-09-30 02:03 +0000"), false),
+                "clock transition consumed a reboot"
+            );
+        });
         assert!(loaded.observe(parse_clock("2026-09-30 02:03 +0000"), false));
+        assert!(
+            !loaded.observe(parse_clock("2026-09-29 02:03 +0000"), false),
+            "clock rollback repeated a reboot"
+        );
+        assert!(!loaded.observe(parse_clock("2026-09-30 02:03 +0000"), false));
+        assert!(loaded.observe(parse_clock("2026-10-01 02:03 +0000"), false));
         assert_eq!(
             fs::metadata(dir.join(FILE_NAME))
                 .unwrap()

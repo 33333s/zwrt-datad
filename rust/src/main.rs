@@ -6,6 +6,7 @@ mod cloud_update;
 mod command;
 mod control;
 mod cooling;
+mod elapsed;
 mod extra_wifi;
 mod identity;
 mod model;
@@ -22,6 +23,7 @@ mod smtp_forward;
 mod speedtest;
 mod state;
 mod task_schedule;
+mod time_control;
 mod traffic_history;
 mod usb;
 mod webshell;
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
     }
+    app.spawn_time_control();
     app.spawn_reboot_schedule();
     app.spawn_task_schedule();
     app.spawn_sms_forward();
