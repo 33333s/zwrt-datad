@@ -10,6 +10,8 @@ pub enum Outcome {
 }
 
 pub const ACTIONS: &[&str] = &[
+    "hosts.save",
+    "hosts.restore",
     "time.config.set",
     "time.sync",
     "device.reboot",

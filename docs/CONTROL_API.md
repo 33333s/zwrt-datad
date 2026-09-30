@@ -36,6 +36,17 @@ Content-Type: application/json
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
+## Hosts
+
+| action | params | 说明 |
+| --- | --- | --- |
+| `hosts.status` | 无 | 按需读取固定 `/etc/hosts`、精确 SHA-256 版本、备份与 DNS 服务状态；读取失败不返回伪造的空内容 |
+| `hosts.save` | `content`、`expected_revision` | 最多 4096 字节 UTF-8；要求 `confirmed=true`，校验版本、首次备份、原子保存、读回并刷新 DNS |
+| `hosts.restore` | `expected_revision` | 要求 `confirmed=true`；版本校验后恢复首次备份并刷新 DNS |
+
+不接受任意文件路径或 shell 命令。云端控制帧仍限制 8 KiB，不截断超限内容。
+详情见 [`HOSTS_CONTROL.md`](HOSTS_CONTROL.md)。
+
 ## Cellular And Radio
 
 | action | params |

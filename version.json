@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.48",
+    "version": "0.10.49",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 OpenWrt 原厂授时服务停止状态的判断，确保时间校准接管与关闭恢复正常完成"
+    "notes": "新增按需 Hosts 管理，支持确认后的保存、DNS 刷新、版本冲突检查及备份恢复"
   }
 }

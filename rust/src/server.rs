@@ -68,6 +68,7 @@ pub(crate) struct Inner {
     speedtest: Arc<Mutex<SpeedTest>>,
     sms_forward: Arc<Mutex<Forwarder>>,
     time_control: crate::time_control::Manager,
+    hosts: Mutex<crate::hosts::Manager>,
 }
 
 struct DeviceSession {
@@ -76,6 +77,16 @@ struct DeviceSession {
 }
 
 impl App {
+    pub(crate) async fn panel_hosts_status(&self) -> Value {
+        self.inner.hosts.lock().await.status()
+    }
+    pub(crate) async fn panel_hosts_action(
+        &self,
+        action: &str,
+        params: Value,
+    ) -> Result<String, &'static str> {
+        self.inner.hosts.lock().await.action(action, params).await
+    }
     pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
         self.inner.tx.subscribe()
     }
@@ -279,6 +290,7 @@ impl App {
         webshell_enabled: bool,
     ) -> Result<Self> {
         let time_control = crate::time_control::Manager::new(&data_dir);
+        let hosts = crate::hosts::Manager::new(&data_dir);
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
         let mut initial = state::collect(interval.as_millis() as u64).await;
@@ -328,6 +340,7 @@ impl App {
                 speedtest: Arc::new(Mutex::new(speedtest)),
                 sms_forward: Arc::new(Mutex::new(sms_forward)),
                 time_control,
+                hosts: Mutex::new(hosts),
             }),
         };
         app.inner
@@ -1114,6 +1127,7 @@ fn capability_controls() -> Vec<&'static str> {
         "state.set_interval",
         "qos.reload",
         "time.status",
+        "hosts.status",
     ];
     controls.extend_from_slice(crate::control::ACTIONS);
     controls
@@ -1215,6 +1229,31 @@ async fn control(
             return invalid_parameter(action, "time.status accepts no parameters");
         }
         return control_ok(action, app.inner.time_control.status());
+    }
+    if action == "hosts.status" {
+        if body
+            .get("params")
+            .is_some_and(|v| !v.as_object().is_some_and(Map::is_empty))
+        {
+            return invalid_parameter(action, "hosts.status accepts no parameters");
+        }
+        return control_ok(action, app.panel_hosts_status().await);
+    }
+    if matches!(action, "hosts.save" | "hosts.restore") {
+        if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
+            return invalid_parameter(action, "hosts writes require confirmed=true");
+        }
+        return match app
+            .panel_hosts_action(action, body.get("params").cloned().unwrap_or(json!({})))
+            .await
+        {
+            Ok(revision) => control_ok(action, json!({"revision":revision})),
+            Err(code) => (
+                StatusCode::CONFLICT,
+                Json(json!({"ok":false,"action":action,"error":{"code":code}})),
+            )
+                .into_response(),
+        };
     }
     if matches!(action, "time.config.set" | "time.sync") {
         if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
@@ -1801,13 +1840,20 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 87 + 3);
-        for action in ["time.status", "time.config.set", "time.sync"] {
+        assert_eq!(controls.len(), 87 + 6);
+        for action in [
+            "time.status",
+            "time.config.set",
+            "time.sync",
+            "hosts.status",
+            "hosts.save",
+            "hosts.restore",
+        ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            87 + 3
+            87 + 6
         );
     }
 
