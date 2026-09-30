@@ -616,11 +616,11 @@ impl Platform {
                     | (std::mem::size_of::<RtcTime>() as u32) << 16
                     | (b'p' as u32) << 8
                     | 0x09;
-                if unsafe { libc::ioctl(file.as_raw_fd(), set as libc::c_ulong, &wanted) } != 0 {
+                if unsafe { libc::ioctl(file.as_raw_fd(), set as _, &wanted) } != 0 {
                     return Some(false);
                 };
                 let mut actual = wanted;
-                if unsafe { libc::ioctl(file.as_raw_fd(), get as libc::c_ulong, &mut actual) } != 0
+                if unsafe { libc::ioctl(file.as_raw_fd(), get as _, &mut actual) } != 0
                 {
                     return Some(false);
                 };
