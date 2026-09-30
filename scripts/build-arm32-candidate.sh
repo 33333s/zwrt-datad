@@ -21,6 +21,18 @@ exec "${ZIG:?}" ar "$@"
 SH
 chmod +x "$ROOT/build/arm32-toolchain/cc" "$ROOT/build/arm32-toolchain/ar"
 export ZIG
+
+# Signaling worker: small glibc ARM binary embedded into the main binary
+# (embedded only when DATAD_DIAG_WORKER is exported for the cargo build).
+cat > "$ROOT/build/arm32-toolchain/cc-glibc" <<SH
+#!/usr/bin/env bash
+exec "\${ZIG:?}" cc -target arm-linux-gnueabihf "\$@"
+SH
+chmod +x "$ROOT/build/arm32-toolchain/cc-glibc"
+"$ROOT/build/arm32-toolchain/cc-glibc" -Os -Wl,--strip-all -fno-stack-protector   -o "$ROOT/build/u50-diag-worker" "$ROOT/rust/u50_diag_worker.c" -ldl
+file "$ROOT/build/u50-diag-worker" | grep -q "ELF 32-bit.*ARM"
+export DATAD_DIAG_WORKER="$ROOT/build/u50-diag-worker"
+
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-self-contained=no"
 export CC_armv7_unknown_linux_musleabihf="$ROOT/build/arm32-toolchain/cc"
 export AR_armv7_unknown_linux_musleabihf="$ROOT/build/arm32-toolchain/ar"

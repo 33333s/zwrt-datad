@@ -1006,6 +1006,8 @@ async fn enrich(
         }),
     );
     fields.insert("interfaces".into(), u50_sys::interfaces(cfg).await);
+    fields.insert("u50_diag".into(), crate::u50_diag::block());
+    fields.insert("u50_signaling".into(), crate::u50_signal::block());
     if let Some(clients) = u50_sys::clients().await {
         // The OEM per-chip counters stay when they are present.
         if let Some(Value::Object(old)) = fields.get("clients") {
@@ -1056,6 +1058,8 @@ async fn collect(
 #[derive(Clone, Default)]
 pub struct RunOptions {
     pub enable_webshell: bool,
+    /// Enable the read-only signaling capture worker (diag DCI client).
+    pub signaling: bool,
     pub lan_addr: Option<SocketAddr>,
     pub auth_token: Option<String>,
     /// Directory for datad's own state (cloud.json, OTA, schedules, SMS
@@ -1076,6 +1080,7 @@ pub async fn run(
 ) -> Result<()> {
     let RunOptions {
         enable_webshell,
+        signaling,
         lan_addr,
         auth_token,
         data_dir,
@@ -1089,7 +1094,19 @@ pub async fn run(
         .timeout(Duration::from_secs(4))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let initial = collect(&client, &url, model, interval).await?;
+    if signaling {
+        crate::u50_signal::enable();
+        crate::u50_signal::configure(&data_dir);
+    }
+    let initial = if signaling && once {
+        // Give the worker a moment to register and produce a first status.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let snapshot = collect(&client, &url, model, interval).await?;
+        crate::u50_signal::shutdown();
+        snapshot
+    } else {
+        collect(&client, &url, model, interval).await?
+    };
     if once {
         println!("{}", serde_json::to_string(&initial)?);
         return Ok(());
@@ -1116,15 +1133,21 @@ pub async fn run(
     app.spawn_reboot_schedule();
     app.spawn_task_schedule();
     app.spawn_sms_forward();
-    if let Some(lan_addr) = lan_addr {
+    let result = if let Some(lan_addr) = lan_addr {
         tokio::try_join!(
             app.clone().serve(bind, false, false),
             app.serve(lan_addr, true, true)
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     } else {
-        app.serve(bind, local_requires_auth, false).await
+        app.serve(bind, local_requires_auth, false)
+            .await
+            .map(|_| ())
+    };
+    if signaling {
+        crate::u50_signal::shutdown();
     }
+    result
 }
 
 #[cfg(test)]
