@@ -4,7 +4,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::CString,
     fs,
-    path::Path,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -991,10 +992,26 @@ fn meminfo() -> Value {
     json!({"total":values.get("MemTotal").copied().unwrap_or_default(),"free":values.get("MemFree").copied().unwrap_or_default(),"available":values.get("MemAvailable").copied().unwrap_or_default(),"buffers":values.get("Buffers").copied().unwrap_or_default(),"cached":values.get("Cached").copied().unwrap_or_default(),"swap_total":values.get("SwapTotal").copied().unwrap_or_default(),"swap_free":values.get("SwapFree").copied().unwrap_or_default()})
 }
 
+/// The filesystem that holds this daemon: its own directory, so a device that
+/// is not installed under `/data` reports (and OTA checks) the space that an
+/// update would actually use.
+fn storage_path() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.canonicalize().ok())
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .filter(|dir| dir.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/data"))
+    })
+}
+
 // libc exposes statvfs counters with different integer widths across targets.
 #[allow(clippy::unnecessary_cast)]
 fn storage() -> Value {
-    let Ok(path) = CString::new("/data") else {
+    let Ok(path) = CString::new(storage_path().as_os_str().as_bytes()) else {
         return json!({"total":0,"used":0,"available":0});
     };
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };

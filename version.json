@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.44",
+    "version": "0.10.45",
     "asset": "zwrt-datad-aarch64",
-    "notes": "主线不再包含 ARM32/U50 代码，ARM32 改由独立的 arm32 分支维护；版本号保持已发布的 0.10.44，下次发布递增"
+    "notes": "OTA 安装器沿用已安装目录，存储检查改为 datad 所在分区"
   }
 }
