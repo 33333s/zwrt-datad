@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(net["nr_pci"], 0x384);
         assert_eq!(net["nr_cell_id"], 0x32343f007_i64);
         assert_eq!(net["nr_tac"], 0x320903);
-        assert_eq!(value.fields["device"]["api_template_supported"], 1);
+        assert_eq!(state["device"]["api_template_supported"], 1);
         assert_eq!(net["nr_rssi"], -71);
         assert_eq!(net["nr_bw"], "100MHz");
         assert_eq!(net["sa_bands"], "5,7,78,257,258");
