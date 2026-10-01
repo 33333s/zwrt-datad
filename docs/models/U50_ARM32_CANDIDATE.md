@@ -110,21 +110,32 @@ The first move to an OTA-capable build must be manual; later versions update the
 
 Mapped onto OEM goform actions (same request shapes as the firmware WebUI):
 
-- `band.set_lte` / `band.set_nr_sa` / `band.set_nr_nsa` — `BAND_SELECT` / `WAN_PERFORM_NR5G_SANSA_BAND_LOCK`.
+- `band.set_lte` / `band.set_nr_sa` / `band.set_nr_nsa` — `BAND_SELECT` / `WAN_PERFORM_NR5G_SANSA_BAND_LOCK`. These goforms sit in the firmware's developer-option checklist; the OEM bridge performs `DEVELOPER_OPTION_LOGIN` elevation automatically (once per session, admin hash held in memory only). Empty band lists clear the lock (mask `0`, `mode:"auto"`); explicit bands are validated against the factory tables. Verified with real writes on a U50 Pro.
 - `cell.lock_lte` / `cell.lock_nr` / `cell.unlock_all` — `LTE_LOCK_CELL_SET` / `NR5G_LOCK_CELL_SET`.
 - `traffic.set_limit` / `traffic.set_clear_day` — `DATA_LIMIT_SETTING` (the whole block is re-sent, untouched fields preserved); state `traffic.limit` / `traffic.clear_day` in the mainline shape.
 - `client.block` / `client.unblock` — OEM blacklist (`setDeviceAccessControlList`, `AclMode` 2); refused while the firmware is in whitelist mode. `client.kick` blocks the station briefly and re-allows it (the firmware has no plain disassociate call). `client.rename` — `EDIT_HOSTNAME`. State `clients` (`total/wifi/lan/list/blocked`) comes from `station_list`, `lan_station_list` and `queryDeviceAccessControlList`.
 
-Verified against a fake GoAhead in `tests/u50_platform_test.py`. Not yet exercised with a write on a real device: band/cell locks and traffic limits (they change live radio/billing behaviour).
+Verified against a fake GoAhead in `tests/u50_platform_test.py`; band locks, cell locks, Wi-Fi settings and the neighbor scan have since been exercised with real writes on a U50 Pro (traffic limits remain fake-verified only).
 
 ## Controls added in v0.10.48
 
 - `lan.set` — `DHCP_SETTING`: DHCP on/off, range and lease (whole hours). The LAN address/netmask cannot be changed: the firmware GoAhead only answers to `192.168.0.1`, which the daemon's own OEM channel needs. `dhcp_reboot_flag=1` is sent as the WebUI does.
 - `lan.set_mtu` — `SET_DEVICE_MTU` (`tcp_mss` = mtu − 40).
-- `wifi.set_module` — `SET_WIFI_INFO` master switch, read back from `wifi_onoff_state`.
-- Not mapped: `dns.set` (the OEM has no LAN DNS call; DNS lives inside APN profiles), `wifi.configure` and the other Wi-Fi actions (the firmware is dual-chip and its per-chip SSID/security protocol is not verified yet).
+- `wifi.set_module` — the `switchWiFiModule` master switch (`SwitchOption`), read back from `wifi_onoff_state`. The U50 Pro firmware has no working `SET_WIFI_INFO` dial.
+- Not mapped: `dns.set` (the OEM has no LAN DNS call; DNS lives inside APN profiles).
 
 Only exercised against the fake GoAhead so far.
+
+## Controls added in v0.10.58–v0.10.64
+
+- `wifi.status` — full mainline shape (`main_2g/main_5g/guest_2g/guest_5g` with `ssid/key/encryption/disabled/hidden/isolate/pmf/maxassoc/writable`); the key is the firmware's Base64 password, decoded. The secretless NMS panel view is unchanged.
+- `wifi.configure` — official `setAccessPointInfo` per access point; no-op detection, switch-only minimal writes, bounded readback retries across the AP self-restart, mainline field validation and encryption-name mapping.
+- `wifi.set_dual_band` — `switchWiFiModule` carrying the current switch/LAN flags, writing only `wifi_lbd_enable`.
+- `neighbor.set` / `neighbor.status` + `/state.neighbor` — mainline-shaped monitor fed by the OEM lists (`lte_ngbr_cell_info_ext`, `sa_ngbr_cell_manual_result_ext`); `/state.neighbor` is served live on U50.
+- `neighbor.list` — structured read of both lists; `neighbor.scan_sa` — the hidden debug page's SA manual scan flow (temporary `Only_5G` switch, `SCAN_NR5G_NEIGHBOR_CELL`, `m_netselect_status` polling, mode restore).
+- State `net.lte_band` / `net.nr5g_sa_band_lock` / `net.nr5g_nsa_band_lock` mainline aliases; the LTE lock value follows the authoritative `lte_band_lock` hex mask.
+
+All verified with real writes on a U50 Pro (firmware `BD_FLYMODEMMU5120V1.0.1B12`).
 
 ## Reviewed panel read models (v0.10.51)
 

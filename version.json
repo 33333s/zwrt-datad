@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.56",
+    "version": "0.10.64",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ARM32 U50 机内信令采集 worker（libdiag DCI 客户端，NR/LTE RRC OTA 订阅，state.u50_signaling）"
+    "notes": "U50 Pro /state.neighbor 改为实时读取：邻区采集开关切换后立即生效，不再有采样器一拍延迟"
   }
 }

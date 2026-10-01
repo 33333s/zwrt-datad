@@ -46,6 +46,25 @@
 邻区签名与解析布局依赖设备固件。未知布局保持未解析，不会用频率推断或空结果
 冒充成功测量。
 
+## U50（原厂固件）邻区
+
+U50 运行时同样暴露 `neighbor.set` / `neighbor.status` 与 `/state.neighbor`，状态形状与主线
+一致（`status / enabled / collector_running / cells / sampled_at / age_ms / generation /
+reason / source`），调用方无需区分平台。差异在数据来源：
+
+- **没有诊断采集进程**。U50 直接读原厂 GoAhead 接口的两个列表：
+  `lte_ngbr_cell_info_ext`（LTE/NSA，固件在注册后自动刷新）与
+  `sa_ngbr_cell_manual_result_ext`（SA，仅手动扫描后更新）。`source` 为 `oem_goform`。
+- `enabled:true` 时采样随状态采样器周期刷新；切换开关会立即采样一次，
+  且 `/state.neighbor` 在 U50 上是**请求时实时读取**——开关切换后下一次 `/state`
+  即反映新状态，无采样器一拍延迟。`cells` 字段为 `rat（"LTE"/"NR5G"）/pci/arfcn/band
+  （数值）/rsrp_dbm/sinr_db`。
+- U50 扩展动作：`neighbor.list`（只读两个列表的结构化结果）与 `neighbor.scan_sa`
+  （SA 手动扫描：自动切 `Only_5G` → `SCAN_NR5G_NEIGHBOR_CELL` → 轮询完成 → 取数 →
+  还原模式，详见 `CONTROL_API.md`）。
+- 主线的 `--neighbor-parse` 离线解析、qmdl 捕获目录与采集器资源限制不适用于 U50
+  （没有捕获文件，零磁盘占用）。
+
 ## 离线解析与测试
 
 ```sh

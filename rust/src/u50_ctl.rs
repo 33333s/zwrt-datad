@@ -24,6 +24,19 @@ pub struct Ctl {
     collector: Collector,
     oem: Bridge,
     last: Mutex<Option<Snapshot>>,
+    neighbor: Mutex<NeighborState>,
+}
+
+/// Session-scoped neighbor monitor mirroring the mainline `/state.neighbor`
+/// shape. The mainline feeds a diag capture; the U50 polls the OEM neighbor
+/// lists (auto-refreshing on LTE/NSA, manual-scan results on SA).
+#[derive(Default)]
+struct NeighborState {
+    enabled: bool,
+    generation: u64,
+    sampled_ms: Option<i64>,
+    cells: Vec<Value>,
+    fingerprint: u64,
 }
 
 static CTL: OnceLock<Ctl> = OnceLock::new();
@@ -33,6 +46,7 @@ pub fn install(collector: Collector, oem: Bridge) {
         collector,
         oem,
         last: Mutex::new(None),
+        neighbor: Mutex::new(NeighborState::default()),
     });
 }
 
@@ -73,6 +87,10 @@ pub const CONTROLS: &[&str] = &[
     "cell.lock_lte",
     "cell.lock_nr",
     "cell.unlock_all",
+    "neighbor.list",
+    "neighbor.scan_sa",
+    "neighbor.set",
+    "neighbor.status",
     "traffic.set_limit",
     "traffic.set_clear_day",
     "client.block",
@@ -82,6 +100,8 @@ pub const CONTROLS: &[&str] = &[
     "lan.set",
     "lan.set_mtu",
     "wifi.set_module",
+    "wifi.set_dual_band",
+    "wifi.configure",
 ];
 
 pub const READ_ACTIONS: &[&str] = &[
@@ -89,6 +109,8 @@ pub const READ_ACTIONS: &[&str] = &[
     "wifi.dual_band_status",
     "apn.list",
     "client.access",
+    "neighbor.list",
+    "neighbor.status",
 ];
 
 /// Verify the original WebUI admin password without creating or replacing
@@ -132,6 +154,81 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Effective Wi-Fi settings for one access point, in the mainline's
+/// section-field vocabulary.
+struct WifiTarget {
+    ssid: String,
+    key: String,
+    encryption: String,
+    hidden: String,
+    isolate: String,
+    pmf: String,
+    maxassoc: String,
+    enabled: String,
+}
+
+/// The firmware stores the key Base64-encoded when its PASSWORD_ENCODE
+/// feature flag is on; decode when the stored value round-trips, otherwise
+/// pass it through as plain text.
+fn wifi_decode_key(stored: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    if stored.is_empty() {
+        return String::new();
+    }
+    STANDARD
+        .decode(stored)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|text| {
+            !text.is_empty()
+                && STANDARD.encode(text) == stored
+                && !text.chars().any(char::is_control)
+        })
+        .unwrap_or_else(|| stored.to_owned())
+}
+fn wifi_encode_key(plain: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    STANDARD.encode(plain)
+}
+/// OEM AuthMode value as the mainline `encryption` name.
+fn wifi_status_encryption(auth_mode: &str) -> String {
+    match auth_mode {
+        "OPEN" => "none",
+        "WPA2PSK" => "psk2",
+        "WPAPSKWPA2PSK" => "psk-mixed",
+        "WPA3PSK" => "sae",
+        "WPA2PSKWPA3PSK" => "sae-mixed",
+        other => other,
+    }
+    .to_owned()
+}
+/// Any accepted mainline encryption spelling to the canonical one.
+fn wifi_canonical_encryption(value: &str) -> String {
+    match value {
+        "psk2+ccmp" => "psk2",
+        "psk-mixed+tkip+ccmp" => "psk-mixed",
+        other => other,
+    }
+    .to_owned()
+}
+/// Canonical encryption to the OEM write's (AuthMode, cipher) pair.
+fn wifi_auth_mode(encryption: &str) -> (&'static str, Option<&'static str>) {
+    match encryption {
+        "psk2" => ("WPA2PSK", Some("CCMP")),
+        "psk-mixed" => ("WPAPSKWPA2PSK", Some("TKIPCCMP")),
+        "sae" => ("WPA3PSK", Some("CCMP")),
+        "sae-mixed" => ("WPA2PSKWPA3PSK", Some("CCMP")),
+        _ => ("OPEN", None),
+    }
 }
 
 fn text<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -223,12 +320,55 @@ fn band_list(params: &Value, key: &str, max: u32) -> Result<Vec<u32>, String> {
     Ok(bands)
 }
 
-/// Match the original U50 WebUI's minimal hex mask representation.
+/// Match the original U50 WebUI's hex mask: always full 64-bit width with
+/// leading zeros (`0x000001e2080800d5`), lowercase — the firmware rejects
+/// shorter forms.
 fn lte_mask(bands: &[u32]) -> String {
     let mask = bands
         .iter()
         .fold(0u64, |mask, band| mask | 1u64 << (band - 1));
-    format!("0x{mask:x}")
+    format!("0x{mask:016x}")
+}
+
+/// Neighbor rows as the WebUI's `parseNeighborCellInfo` reads them:
+/// `;`-separated cells, `,`-separated fields, with the field order swapped
+/// between the two lists — SA rows are `pci,arfcn,rsrp,sinr,band`, LTE rows
+/// are `arfcn,pci,sinr,rsrp,band`. The band stays firmware text ("n78"/"3").
+fn neighbor_cells(raw: &str, rat: &str) -> Vec<Value> {
+    raw.split(';')
+        .filter(|row| !row.is_empty())
+        .filter_map(|row| {
+            let fields: Vec<&str> = row.split(',').collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            let (pci, arfcn, rsrp, sinr, band) = if rat == "NR5G" {
+                (fields[0], fields[1], fields[2], fields[3], fields[4])
+            } else {
+                (fields[1], fields[0], fields[3], fields[2], fields[4])
+            };
+            let number = |value: &str| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| n.unsigned_abs() < 1_000_000)
+            };
+            // Bands arrive as "n78"/"3"; the state object uses plain numbers.
+            let band = band.trim_start_matches(['n', 'b', 'B', 'N']);
+            if band.len() > 3 || !band.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let band = band.parse::<u32>().ok()?;
+            Some(json!({
+                "rat": rat,
+                "pci": number(pci)?,
+                "arfcn": number(arfcn)?,
+                "rsrp_dbm": number(rsrp)?,
+                "sinr_db": number(sinr)?,
+                "band": band,
+            }))
+        })
+        .collect()
 }
 
 fn network_mode(value: &str) -> Option<&'static str> {
@@ -329,8 +469,122 @@ impl Ctl {
         if let Some(sms) = crate::sms::snapshot().await {
             fresh.fields.insert("sms".into(), sms);
         }
+        if let Some(neighbor) = self.neighbor_sample().await {
+            fresh.fields.insert("neighbor".into(), neighbor);
+        }
         *self.last.lock().await = Some(fresh.clone());
         fresh
+    }
+
+    /// One neighbor sample when the monitor is enabled: reads both OEM lists,
+    /// bumps the generation on change and returns the mainline-shaped object.
+    async fn neighbor_sample(&self) -> Option<Value> {
+        let mut state = self.neighbor.lock().await;
+        if !state.enabled {
+            return Some(self.neighbor_status_locked(&state));
+        }
+        let raw = self
+            .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
+            .await
+            .ok()?;
+        let text = |key: &str| {
+            raw.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let mut cells = neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE");
+        cells.extend(neighbor_cells(
+            &text("sa_ngbr_cell_manual_result_ext"),
+            "NR5G",
+        ));
+        let fingerprint = serde_json::to_string(&cells).ok().map_or(0, |text| {
+            text.bytes().fold(0u64, |hash, byte| {
+                hash.wrapping_mul(31).wrapping_add(byte as u64)
+            })
+        });
+        if fingerprint != state.fingerprint {
+            state.fingerprint = fingerprint;
+            state.generation += 1;
+        }
+        state.cells = cells;
+        state.sampled_ms = Some(now_ms());
+        Some(self.neighbor_status_locked(&state))
+    }
+
+    fn neighbor_status_locked(&self, state: &NeighborState) -> Value {
+        let mut out = json!({
+            "status": if state.enabled { "ready" } else { "disabled" },
+            "enabled": state.enabled,
+            "collector_running": state.enabled,
+            "cells": state.cells,
+            "reason": if state.enabled { "none" } else { "disabled_by_default" },
+            "frames": 0, "malformed": 0, "partial": false, "discarded": 0,
+            "ambiguous_measurements": 0, "capture_bytes": 0,
+            "generation": state.generation,
+            "sampled_at": Value::Null, "age_ms": Value::Null,
+            "source": "oem_goform",
+        });
+        if let Some(sampled) = state.sampled_ms {
+            out["sampled_at"] = json!(sampled / 1000);
+            out["age_ms"] = json!(now_ms().saturating_sub(sampled));
+        }
+        out
+    }
+
+    /// `neighbor.set` toggles the in-memory monitor (session-scoped, exactly
+    /// like the mainline collector); enabling takes one sample immediately so
+    /// the reply already carries the current cells.
+    pub async fn neighbor_set(&self, enabled: bool) -> Outcome {
+        let mut state = self.neighbor.lock().await;
+        if state.enabled == enabled {
+            return Outcome::Ok(self.neighbor_status_locked(&state));
+        }
+        state.enabled = enabled;
+        state.cells = Vec::new();
+        state.fingerprint = 0;
+        state.sampled_ms = None;
+        if enabled {
+            self.neighbor_refresh(&mut state).await;
+        }
+        Outcome::Ok(self.neighbor_status_locked(&state))
+    }
+
+    /// One OEM read of both neighbor lists into the shared state.
+    async fn neighbor_refresh(&self, state: &mut NeighborState) {
+        let Ok(raw) = self
+            .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
+            .await
+        else {
+            return;
+        };
+        let text = |key: &str| {
+            raw.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let mut cells = neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE");
+        cells.extend(neighbor_cells(
+            &text("sa_ngbr_cell_manual_result_ext"),
+            "NR5G",
+        ));
+        let fingerprint = serde_json::to_string(&cells).ok().map_or(0, |text| {
+            text.bytes().fold(0u64, |hash, byte| {
+                hash.wrapping_mul(31).wrapping_add(byte as u64)
+            })
+        });
+        if fingerprint != state.fingerprint {
+            state.fingerprint = fingerprint;
+            state.generation += 1;
+        }
+        state.cells = cells;
+        state.sampled_ms = Some(now_ms());
+    }
+
+    pub async fn neighbor_status(&self) -> Result<Value, String> {
+        let state = self.neighbor.lock().await;
+        Ok(self.neighbor_status_locked(&state))
     }
 
     async fn read(&self, keys: &str) -> Result<Value, String> {
@@ -388,6 +642,295 @@ impl Ctl {
             .await?;
         let steering = self.read("wifi_lbd_enable").await.unwrap_or(Value::Null);
         crate::u50_panel::wifi_config(&points, &steering)
+    }
+
+    /// Raw access-point rows from `queryAccessPointInfo`.
+    async fn wifi_rows(&self) -> Result<Vec<Map<String, Value>>, String> {
+        let points = self
+            .oem
+            .local_read_single("queryAccessPointInfo", &BTreeMap::new())
+            .await?;
+        let rows = points
+            .get("ResponseList")
+            .and_then(Value::as_array)
+            .ok_or("invalid OEM Wi-Fi list")?;
+        Ok(rows
+            .iter()
+            .take(8)
+            .filter_map(|row| row.as_object().cloned())
+            .collect())
+    }
+
+    /// The access-point row for one band ("b"/"a") and index ("0" main,
+    /// "1" guest).
+    async fn wifi_row(&self, band: &str, index: &str) -> Option<Map<String, Value>> {
+        let rows = self.wifi_rows().await.ok()?;
+        rows.into_iter().find(|row| {
+            row.get("Band").and_then(Value::as_str) == Some(band)
+                && row.get("AccessPointIndex").and_then(Value::as_str) == Some(index)
+        })
+    }
+
+    /// Mainline-shaped `wifi.status`: full per-section settings including the
+    /// Wi-Fi key (the caller is the authenticated local/panel client, the
+    /// same trust level as the mainline, which also returns the key).
+    async fn wifi_status(&self) -> Result<Value, String> {
+        let rows = self.wifi_rows().await?;
+        let mut sections = Map::new();
+        for row in &rows {
+            let prefix = match row.get("Band").and_then(Value::as_str) {
+                Some("b") => "main_2g",
+                Some("a") => "main_5g",
+                _ => continue,
+            };
+            let section = match row.get("AccessPointIndex").and_then(Value::as_str) {
+                Some("0") => prefix.to_owned(),
+                Some("1") => prefix.replace("main", "guest"),
+                _ => continue,
+            };
+            let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
+            let flag = |key: &str| if text(key) == "1" { "1" } else { "0" };
+            let encryption = match text("AuthMode") {
+                "OPEN" => "none",
+                "WPA2PSK" => "psk2",
+                "WPAPSKWPA2PSK" => "psk-mixed",
+                "WPA3PSK" => "sae",
+                "WPA2PSKWPA3PSK" => "sae-mixed",
+                other => other,
+            };
+            sections.insert(
+                section,
+                json!({
+                    "ssid": text("SSID"),
+                    "key": wifi_decode_key(text("Password")),
+                    "encryption": encryption,
+                    "disabled": if text("AccessPointSwitchStatus") == "1" { "0" } else { "1" },
+                    "hidden": flag("ApBroadcastDisabled"),
+                    "isolate": flag("ApIsolate"),
+                    "pmf": text("Pmf_switch"),
+                    "maxassoc": text("ApMaxStationNumber"),
+                    "writable": true,
+                }),
+            );
+        }
+        if sections.is_empty() {
+            return Err("OEM Wi-Fi configuration unavailable".into());
+        }
+        Ok(Value::Object(sections))
+    }
+
+    /// Mainline `wifi.configure` on the OEM `setAccessPointInfo` goform.
+    /// Unchanged fields are re-sent from the current row (the WebUI builder
+    /// always submits the complete set); a no-op change performs no write.
+    async fn wifi_configure(&self, params: &Value) -> Outcome {
+        let section = match text(params, "section") {
+            Some(section @ ("main_2g" | "main_5g" | "guest_2g" | "guest_5g")) => section,
+            _ => return Outcome::Invalid("unsupported wifi section".into()),
+        };
+        let (band, ap_index) = match section {
+            "main_2g" => ("b", "0"),
+            "main_5g" => ("a", "0"),
+            "guest_2g" => ("b", "1"),
+            _ => ("a", "1"),
+        };
+        let mut wanted: BTreeMap<String, String> = BTreeMap::new();
+        for (name, value) in params.as_object().into_iter().flatten() {
+            if name == "section" || name == "enabled" {
+                continue;
+            }
+            let Some(value) = value.as_str() else {
+                return Outcome::Invalid(format!("Wi-Fi {name} must be a string"));
+            };
+            let valid = match name.as_str() {
+                "ssid" => !value.is_empty() && value.len() <= 32 && !value.contains(['\r', '\n']),
+                "encryption" => matches!(
+                    value,
+                    "none"
+                        | "psk2"
+                        | "psk2+ccmp"
+                        | "psk-mixed"
+                        | "psk-mixed+tkip+ccmp"
+                        | "sae"
+                        | "sae-mixed"
+                ),
+                "key" => {
+                    value.is_empty()
+                        || ((8..=63).contains(&value.len()) && !value.contains(['\r', '\n']))
+                }
+                "hidden" | "isolate" => matches!(value, "0" | "1"),
+                "pmf" => matches!(value, "0" | "1" | "2"),
+                "maxassoc" => value.parse::<u32>().is_ok_and(|n| (1..=128).contains(&n)),
+                other => {
+                    return Outcome::Invalid(format!(
+                        "Wi-Fi {other} is not configurable on this firmware"
+                    ));
+                }
+            };
+            if !valid {
+                return Outcome::Invalid(format!("invalid Wi-Fi {name}"));
+            }
+            wanted.insert(name.clone(), value.to_owned());
+        }
+        let mut enabled: Option<bool> = None;
+        if let Some(flag) = params.get("enabled") {
+            enabled = match flag {
+                Value::Bool(v) => Some(*v),
+                Value::Number(v) if v.as_i64() == Some(0) => Some(false),
+                Value::Number(v) if v.as_i64() == Some(1) => Some(true),
+                _ => return Outcome::Invalid("enabled must be boolean or 0/1".into()),
+            };
+        }
+        if wanted.is_empty() && enabled.is_none() {
+            return Outcome::Invalid("no wifi fields supplied".into());
+        }
+
+        let Some(current) = self.wifi_row(band, ap_index).await else {
+            return Outcome::Failed("OEM Wi-Fi section unavailable".into());
+        };
+        let current_text = |key: &str| {
+            current
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let mut target = WifiTarget {
+            ssid: wanted
+                .remove("ssid")
+                .unwrap_or_else(|| current_text("SSID")),
+            key: wanted
+                .remove("key")
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| wifi_decode_key(&current_text("Password"))),
+            encryption: wanted
+                .remove("encryption")
+                .map(|value| wifi_canonical_encryption(&value))
+                .unwrap_or_else(|| wifi_status_encryption(&current_text("AuthMode"))),
+            hidden: wanted
+                .remove("hidden")
+                .unwrap_or_else(|| current_text("ApBroadcastDisabled")),
+            isolate: wanted
+                .remove("isolate")
+                .unwrap_or_else(|| current_text("ApIsolate")),
+            pmf: wanted
+                .remove("pmf")
+                .unwrap_or_else(|| current_text("Pmf_switch")),
+            maxassoc: wanted
+                .remove("maxassoc")
+                .unwrap_or_else(|| current_text("ApMaxStationNumber")),
+            enabled: enabled
+                .map(|v| if v { "1" } else { "0" }.to_owned())
+                .unwrap_or_else(|| current_text("AccessPointSwitchStatus")),
+        };
+        // An open network carries no key; asking for "none" clears it.
+        if target.encryption == "none" {
+            target.key = String::new();
+        }
+        let row_matches = |row: &Map<String, Value>| {
+            let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
+            text("SSID") == target.ssid
+                && wifi_decode_key(text("Password")) == target.key
+                && wifi_status_encryption(text("AuthMode")) == target.encryption
+                && text("ApBroadcastDisabled") == target.hidden
+                && text("ApIsolate") == target.isolate
+                && text("Pmf_switch") == target.pmf
+                && text("ApMaxStationNumber") == target.maxassoc
+                && text("AccessPointSwitchStatus") == target.enabled
+        };
+        if row_matches(&current) {
+            return Outcome::Ok(json!({"section":section,"changed":false,"verified":true}));
+        }
+        // Mirror the WebUI builder: a switch-only change submits the switch
+        // status alone; otherwise the complete set is re-sent.
+        let settings_unchanged = current_text("SSID") == target.ssid
+            && wifi_decode_key(&current_text("Password")) == target.key
+            && wifi_status_encryption(&current_text("AuthMode")) == target.encryption
+            && current_text("ApBroadcastDisabled") == target.hidden
+            && current_text("ApIsolate") == target.isolate
+            && current_text("Pmf_switch") == target.pmf
+            && current_text("ApMaxStationNumber") == target.maxassoc;
+        let switch_only =
+            settings_unchanged && current_text("AccessPointSwitchStatus") != target.enabled;
+        let mut form: Vec<(&str, String)> = vec![
+            ("ChipIndex", current_text("ChipIndex")),
+            ("AccessPointIndex", ap_index.to_owned()),
+            ("QrImageShow", current_text("QrImageShow")),
+            ("wifi_syncparas_flag", "0".into()),
+        ];
+        if !switch_only {
+            let (auth_mode, cipher) = wifi_auth_mode(&target.encryption);
+            form.push(("SSID", target.ssid.clone()));
+            form.push(("ApIsolate", target.isolate.clone()));
+            form.push(("AuthMode", auth_mode.to_owned()));
+            form.push(("ApBroadcastDisabled", target.hidden.clone()));
+            form.push(("Pmf_switch", target.pmf.clone()));
+            form.push(("ApMaxStationNumber", target.maxassoc.clone()));
+            form.push(("EncrypType", cipher.unwrap_or("NONE").to_owned()));
+            if cipher.is_some() && !target.key.is_empty() {
+                form.push(("Password", wifi_encode_key(&target.key)));
+            }
+        }
+        form.push(("AccessPointSwitchStatus", target.enabled.clone()));
+        if let Err(error) = self.write("setAccessPointInfo", &form).await {
+            return Outcome::Failed(error);
+        }
+        // The access point restarts itself after a settings write; retry the
+        // readback until the OEM answers with the new row.
+        let verified = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                if let Some(row) = self.wifi_row(band, ap_index).await
+                    && row_matches(&row)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !verified {
+            return Outcome::Failed("Wi-Fi write was accepted but readback did not match".into());
+        }
+        Outcome::Ok(json!({"section":section,"changed":true,"verified":true}))
+    }
+
+    async fn wifi_set_dual_band(&self, params: &Value) -> Outcome {
+        let enabled = match params.get("enabled") {
+            Some(Value::Bool(v)) => *v,
+            Some(Value::Number(v)) if v.as_i64() == Some(0) => false,
+            Some(Value::Number(v)) if v.as_i64() == Some(1) => true,
+            _ => return Outcome::Invalid("enabled must be boolean or 0/1".into()),
+        };
+        let target = if enabled { "1" } else { "0" };
+        let current = self.field("wifi_lbd_enable").await.unwrap_or_default();
+        if current == target {
+            return Outcome::Ok(json!({"enabled":enabled,"changed":false,"verified":true}));
+        }
+        let module = self
+            .field("WiFiModuleSwitch")
+            .await
+            .unwrap_or_else(|| "1".into());
+        let lan_sec = self
+            .field("lan_sec_ssid_control")
+            .await
+            .unwrap_or_else(|| "0".into());
+        let result = self
+            .write(
+                "switchWiFiModule",
+                &[
+                    ("SwitchOption", module),
+                    ("lan_sec_ssid_control", lan_sec),
+                    ("wifi_lbd_enable", target.to_owned()),
+                ],
+            )
+            .await;
+        if let Err(error) = result {
+            return Outcome::Failed(error);
+        }
+        let verified = self
+            .wait_field("wifi_lbd_enable", |value| value == target)
+            .await;
+        Outcome::Ok(json!({"enabled":enabled,"changed":true,"verified":verified}))
     }
 
     /// OEM APN records contain username/password fields. Fetch a bounded
@@ -470,21 +1013,8 @@ impl Ctl {
             return Outcome::Invalid("this read action accepts no parameters".into());
         }
         let result = match action {
-            "wifi.status" => self.wifi_panel_config().await.map(|config| {
-                let mut sections = Map::new();
-                for (band, section) in [("2g", "main_2g"), ("5g", "main_5g")] {
-                    let row = &config["bands"][band];
-                    if row["supported"] == true {
-                        sections.insert(section.into(), json!({
-                            "ssid":row["ssid"],"encryption":row["encryption"],
-                            "disabled":row["enabled"].as_bool().map(|v|if v {"0"} else {"1"}),
-                            "hidden":row["hidden"].as_bool().map(|v|if v {"1"} else {"0"}),
-                            "pmf":row["pmf"],"maxassoc":row["maxassoc"],"writable":false
-                        }));
-                    }
-                }
-                Value::Object(sections)
-            }),
+            "wifi.status" => self.wifi_status().await,
+            "neighbor.status" => self.neighbor_status().await,
             "wifi.dual_band_status" => self.read("wifi_lbd_enable").await.and_then(|raw| {
                 let enabled = match raw.get("wifi_lbd_enable").and_then(Value::as_str) {
                     Some("0") => false,Some("1") => true,_ => return Err("OEM band steering state unavailable".into()),
@@ -493,6 +1023,28 @@ impl Ctl {
                     "WiFiDualBandSupported":"1","WiFiDualBandEnabled":if enabled {"1"} else {"0"},
                     "BandSteeringSwitch":if enabled {"1"} else {"0"}}))
             }),
+            "neighbor.list" => self
+                .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
+                .await
+                .map(|raw| {
+                    let text = |key: &str| {
+                        raw.get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    let network_type = text("network_type");
+                    // The firmware refreshes the LTE/NSA list by itself while
+                    // registered there; the SA list only changes after a manual
+                    // scan (neighbor.scan_sa).
+                    let primary = if network_type == "SA" { "sa" } else { "lte" };
+                    json!({
+                        "network_type": network_type,
+                        "primary": primary,
+                        "lte": neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE"),
+                        "sa": neighbor_cells(&text("sa_ngbr_cell_manual_result_ext"), "NR5G"),
+                    })
+                }),
             "apn.list" => self.apn_panel_config().await.map(|config| {
                 let profiles = |key: &str| {
                     let items = config[key].as_array().into_iter().flatten().map(|row|json!({
@@ -664,6 +1216,7 @@ impl Ctl {
             "cell.lock_lte" => self.cell_lock_lte(params).await,
             "cell.lock_nr" => self.cell_lock_nr(params).await,
             "cell.unlock_all" => self.cell_unlock_all().await,
+            "neighbor.scan_sa" => self.neighbor_scan_sa().await,
             "traffic.set_limit" => self.traffic_set_limit(params).await,
             "traffic.set_clear_day" => self.traffic_set_clear_day(params).await,
             "client.block" => self.client_access(params, true).await,
@@ -673,6 +1226,12 @@ impl Ctl {
             "lan.set" => self.lan_set(params).await,
             "lan.set_mtu" => self.lan_set_mtu(params).await,
             "wifi.set_module" => self.wifi_set_module(params).await,
+            "wifi.set_dual_band" => self.wifi_set_dual_band(params).await,
+            "wifi.configure" => self.wifi_configure(params).await,
+            "neighbor.set" => match params.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => self.neighbor_set(enabled).await,
+                None => Outcome::Invalid("enabled must be boolean".into()),
+            },
             _ => Outcome::NotHandled,
         }
     }
@@ -682,22 +1241,29 @@ impl Ctl {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
         };
-        let bands = if bands.is_empty() {
-            match self
-                .field("lte_band_1_64_factory")
-                .await
-                .as_deref()
-                .and_then(mask_value)
-                .filter(|v| *v != 0)
-            {
-                Some(mask) => (1..=64)
-                    .filter(|band| mask & (1u64 << (band - 1)) != 0)
-                    .collect(),
-                None => return Outcome::Failed("factory LTE bands unavailable".into()),
-            }
-        } else {
-            bands
+        // Empty list is the WebUI's deselect-all: `lte_band_mask` "0" clears
+        // the lock entirely (auto), it does not mean "lock every factory
+        // band". The firmware accepts any bits without validating them, so
+        // explicit bands are checked against the factory table first —
+        // locking a band the modem cannot serve would drop it offline.
+        if bands.is_empty() {
+            return self.band_auto_lte().await;
+        }
+        let factory = match self
+            .field("lte_band_1_64_factory")
+            .await
+            .as_deref()
+            .and_then(mask_value)
+        {
+            Some(mask) if mask != 0 => mask,
+            _ => return Outcome::Failed("factory LTE bands unavailable".into()),
         };
+        if let Some(bad) = bands
+            .iter()
+            .find(|band| factory & (1u64 << (*band - 1)) == 0)
+        {
+            return Outcome::Invalid(format!("LTE band {bad} is not supported by this modem"));
+        }
         let mask = lte_mask(&bands);
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
@@ -730,35 +1296,81 @@ impl Ctl {
         Outcome::Ok(json!({"result":"success","bands":bands,"mask":mask,"verified":true}))
     }
 
+    /// Clear the LTE band lock (mask "0"), matching the WebUI's deselect-all.
+    async fn band_auto_lte(&self) -> Outcome {
+        let mask = "0".to_owned();
+        let result = if self.collector.model == crate::u50::Model::U50S {
+            self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
+                .await
+        } else {
+            self.write(
+                "BAND_SELECT",
+                &[
+                    ("is_gw_band", "0".into()),
+                    ("gw_band_mask", "0".into()),
+                    ("is_lte_band", "1".into()),
+                    ("lte_band_mask", mask.clone()),
+                ],
+            )
+            .await
+        };
+        if let Err(error) = result {
+            return Outcome::Failed(error);
+        }
+        let verified = self
+            .wait_field("lte_band_lock", |value| mask_value(value) == Some(0))
+            .await;
+        if !verified {
+            return Outcome::Failed(
+                "OEM LTE band unlock was accepted but readback did not match".into(),
+            );
+        }
+        Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}))
+    }
+
+    /// The U50 Pro firmware gates `BAND_SELECT` and the NR lock goforms behind
+    /// its developer-option login; the OEM bridge elevates the session
+    /// transparently before those writes, so no mode dance is needed here.
+    /// Empty band list clears the lock (`nr5g_band_mask` "0"), mirroring the
+    /// WebUI's deselect-all; explicit bands are validated against the
+    /// modem's factory NR table.
     async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
         let bands = match band_list(params, "bands", 512) {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
         };
-        let bands = if bands.is_empty() {
-            let key = if nsa {
-                "nr5g_nsa_band_factory"
-            } else {
-                "nr5g_sa_band_factory"
-            };
-            match self
-                .field(key)
-                .await
-                .and_then(|value| band_list(&json!({"bands":value}), "bands", 512).ok())
-                .filter(|v| !v.is_empty())
-            {
-                Some(bands) => bands,
-                None => return Outcome::Failed("factory NR bands unavailable".into()),
+        let factory_key = if nsa {
+            "nr5g_nsa_band_factory"
+        } else {
+            "nr5g_sa_band_factory"
+        };
+        let factory = match self
+            .field(factory_key)
+            .await
+            .and_then(|value| band_list(&json!({"bands":value}), "bands", 512).ok())
+            .filter(|v| !v.is_empty())
+        {
+            Some(bands) => bands,
+            None => return Outcome::Failed("factory NR bands unavailable".into()),
+        };
+        let (bands, auto) = if bands.is_empty() {
+            (Vec::new(), true)
+        } else {
+            if let Some(bad) = bands.iter().find(|band| !factory.contains(band)) {
+                return Outcome::Invalid(format!("NR band {bad} is not supported by this modem"));
             }
+            (bands, false)
+        };
+        let csv = if auto {
+            "0".to_owned()
         } else {
             bands
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         };
-        let csv = bands
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        if let Err(error) = self
+        let write_result = self
             .write(
                 "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
                 &[
@@ -766,8 +1378,8 @@ impl Ctl {
                     ("type", if nsa { "1" } else { "0" }.into()),
                 ],
             )
-            .await
-        {
+            .await;
+        if let Err(error) = write_result {
             return Outcome::Failed(error);
         }
         let key = if nsa {
@@ -775,18 +1387,24 @@ impl Ctl {
         } else {
             "nr5g_sa_band_lock"
         };
-        let verified = self
-            .wait_field(key, |value| {
+        let verified = if auto {
+            self.wait_field(key, |value| value.trim() == "0").await
+        } else {
+            self.wait_field(key, |value| {
                 band_list(&json!({"bands":value}), "bands", 512)
                     .ok()
                     .as_deref()
                     == Some(bands.as_slice())
             })
-            .await;
+            .await
+        };
         if !verified {
             return Outcome::Failed(
                 "OEM NR band write was accepted but readback did not match".into(),
             );
+        }
+        if auto {
+            return Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}));
         }
         Outcome::Ok(json!({"result":"success","bands":bands,"verified":true}))
     }
@@ -858,6 +1476,95 @@ impl Ctl {
             (Ok(_), Ok(_)) => Outcome::Ok(json!({"lte":true,"nr":true})),
             (Err(error), _) | (_, Err(error)) => Outcome::Failed(error),
         }
+    }
+
+    /// Manual SA neighbor scan, mirroring the hidden debug page exactly:
+    /// the firmware only accepts the scan while net_select is `Only_5G`, so
+    /// a different mode is switched away, the scan is triggered and polled
+    /// through `m_netselect_status`, the harvested rows are returned and the
+    /// original mode is restored. Cell locks never need this dance — only
+    /// the scan does.
+    async fn neighbor_scan_sa(&self) -> Outcome {
+        const SWITCH_TIMEOUT: Duration = Duration::from_secs(25);
+        const SCAN_TIMEOUT: Duration = Duration::from_secs(150);
+        const POLL_GRACE: Duration = Duration::from_millis(1500);
+        let original = self.field("net_select").await.unwrap_or_default();
+        let mut failure = String::new();
+        let mut switched = false;
+        if original != "Only_5G" {
+            if self
+                .write(
+                    "SET_BEARER_PREFERENCE",
+                    &[("BearerPreference", "Only_5G".into())],
+                )
+                .await
+                .is_err()
+            {
+                return Outcome::Failed("network mode switch to Only_5G failed".into());
+            }
+            let reached = tokio::time::timeout(SWITCH_TIMEOUT, async {
+                loop {
+                    if self.field("net_select").await.as_deref() == Some("Only_5G") {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !reached {
+                failure = "network mode did not reach Only_5G in time".into();
+            } else {
+                switched = true;
+            }
+        }
+        if failure.is_empty() {
+            match self.write("SCAN_NR5G_NEIGHBOR_CELL", &[]).await {
+                Ok(_) => {
+                    // Give the firmware a moment to move m_netselect_status
+                    // off a possibly stale terminal value before polling.
+                    tokio::time::sleep(POLL_GRACE).await;
+                    let done = tokio::time::timeout(SCAN_TIMEOUT, async {
+                        loop {
+                            match self.field("m_netselect_status").await.as_deref() {
+                                Some("manual_selected") => return true,
+                                Some("manual_search_fail") => return false,
+                                _ => {}
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !done {
+                        failure = "SA neighbor scan failed or timed out".into();
+                    }
+                }
+                Err(error) => failure = error,
+            }
+        }
+        let cells = self
+            .field("sa_ngbr_cell_manual_result_ext")
+            .await
+            .unwrap_or_default();
+        if switched {
+            let _ = self
+                .write(
+                    "SET_BEARER_PREFERENCE",
+                    &[("BearerPreference", original.clone())],
+                )
+                .await;
+        }
+        if !failure.is_empty() {
+            return Outcome::Failed(failure);
+        }
+        let list = neighbor_cells(&cells, "NR5G");
+        Outcome::Ok(json!({
+            "result": "success",
+            "cells": list,
+            "count": list.len(),
+            "restored_mode": original,
+        }))
     }
 
     /// Access control: `AclMode` 2 = blacklist. Mac and name lists are
@@ -1333,8 +2040,10 @@ impl Ctl {
             Ok(Some(v @ (0 | 1))) => v,
             _ => return Outcome::Invalid("enabled must be 0 or 1".into()),
         };
+        // The U50 Pro firmware has `switchWiFiModule` (not `SET_WIFI_INFO`)
+        // and takes `SwitchOption` (not `wifiEnabled`), matching the WebUI.
         if let Err(error) = self
-            .write("SET_WIFI_INFO", &[("wifiEnabled", enabled.to_string())])
+            .write("switchWiFiModule", &[("SwitchOption", enabled.to_string())])
             .await
         {
             return Outcome::Failed(error);
@@ -1538,7 +2247,7 @@ mod band_mode_tests {
             assert!(band_list(&json!({"bands":value}), "bands", 64).is_err());
         }
         assert!(band_list(&json!({}), "bands", 64).is_err());
-        assert_eq!(lte_mask(&[1, 3, 41]), "0x10000000005");
+        assert_eq!(lte_mask(&[1, 3, 41]), "0x0000010000000005");
     }
     #[test]
     fn canonical_network_modes_and_common_aliases() {

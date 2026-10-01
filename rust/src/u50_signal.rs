@@ -212,6 +212,10 @@ fn read_status(path: &Path, now: SystemTime) -> Option<Map<String, Value>> {
         "cell",
         "codes",
         "pdu_types",
+        "five_qi",
+        "ambr",
+        "nas_last",
+        "nas_ts",
     ];
     let mut out = Map::new();
     for key in KEEP {
