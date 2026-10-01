@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.52",
+    "version": "0.10.53",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MU5252 外挂基带接口改用原厂名称：5G / 4G1（V3E2）/ 4G2（V3E1）；短信 sender 同步，旧编号仍可用"
+    "notes": "接入云管理时直接开启远程面板控制和云端终端；已接入的设备升级后一次性开启，之后本机关闭会被保留。NMS 打开设备内容仍须 Owner 限时授权"
   }
 }
