@@ -279,13 +279,16 @@ pub(super) fn unlink(dir: &File, n: &CString, is_dir: bool) -> Result<()> {
 pub(super) fn exchange_at(dir: &File, a: &CString, b: &CString) -> Result<()> {
     #[cfg(target_os = "linux")]
     let rc = unsafe {
-        libc::renameat2(
+        // Use the kernel ABI: some musl SDKs omit the libc wrapper even though
+        // their kernels support the same atomic rename operation.
+        libc::syscall(
+            libc::SYS_renameat2,
             dir.as_raw_fd(),
             a.as_ptr(),
             dir.as_raw_fd(),
             b.as_ptr(),
             libc::RENAME_EXCHANGE,
-        )
+        ) as libc::c_int
     };
     #[cfg(target_os = "macos")]
     let rc = unsafe {
@@ -311,13 +314,14 @@ pub(super) fn rename_at(dir: &File, from: &CString, to: &CString, overwrite: boo
         #[cfg(target_os = "linux")]
         {
             unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     dir.as_raw_fd(),
                     from.as_ptr(),
                     dir.as_raw_fd(),
                     to.as_ptr(),
                     libc::RENAME_NOREPLACE,
-                )
+                ) as libc::c_int
             }
         }
         #[cfg(target_os = "macos")]
