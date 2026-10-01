@@ -560,9 +560,9 @@ fn custom_aggregation(
         .into_iter()
         .map(|path| {
             let label = match path.interface.as_str() {
-                "rmnet_data0" => "X75",
-                "V3E1net0" => "V3E1",
-                "V3E2net0" => "V3E2",
+                "rmnet_data0" => "5G",
+                "V3E1net0" => "4G2",
+                "V3E2net0" => "4G1",
                 "eth0" => "Ethernet",
                 _ => &path.ip,
             };
@@ -1731,7 +1731,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         };
         let x75_qos = qos.clone();
         modems.push(json!({
-            "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
+            "id":"5G","role":"integrated_5g","transport":"rmnet","subid":active_subid,
             "ifname":"rmnet_data0","wan_interface":"zte_mwan2",
             "net":{"type":network_type,"bars":integer(&raw_net,"signalbar"),"roaming":string(&raw_net,"simcard_roam"),"operator":string(&raw_net,"network_provider_fullname"),"band":string(&raw_net,"wan_active_band"),"bandwidth":bandwidth,"nr_rsrp":integer(&raw_net,"nr5g_rsrp"),"nr_rsrq":integer(&raw_net,"nr5g_rsrq"),"nr_snr":string(&raw_net,"nr5g_snr"),"nr_pci":integer(&raw_net,"nr5g_pci"),"nr_cell_id":integer(&raw_net,"nr5g_cell_id"),"nr_tac":nr_tac,"nr_channel":integer(&raw_net,"nr5g_action_channel"),"lte_rsrp":integer(&raw_net,"lte_rsrp"),"lte_rsrq":integer(&raw_net,"lte_rsrq"),"lte_pci":integer(&raw_net,"lte_pci"),"cell_id":integer(&raw_net,"cell_id"),"lte_tac":lte_tac},
             "sim":{"state":string(&sim,"sim_states"),"slot":integer(&sim,"current_sim_slot"),"iccid":string(&sim,"sim_iccid"),"imsi":imsi,"msisdn":msisdn,"imei":string(&imei,"imei")},
@@ -1741,11 +1741,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             "qos":{"qci":x75_qos.qci,"ambr_dl":x75_qos.ambr_dl,"ambr_ul":x75_qos.ambr_ul,"sampled_at":0}
         }));
         let mut thermal_modems = vec![
-            json!({"id":"x75","available":cpu_temp>0,"celsius":if cpu_temp>0 {json!(cpu_temp)} else {Value::Null}}),
+            json!({"id":"5G","available":cpu_temp>0,"celsius":if cpu_temp>0 {json!(cpu_temp)} else {Value::Null}}),
         ];
         let adb = std::env::var("ZWRT_DATAD_ADB_BIN").ok();
-        for index in 0..2usize {
-            let id = if index == 0 { "v3e1" } else { "v3e2" };
+        // The vendor UI calls the external modems 4G1 (V3E2) and 4G2 (V3E1).
+        for index in [1usize, 0] {
+            let id = if index == 0 { "4G2" } else { "4G1" };
             let serial = if index == 0 {
                 "V3E1T12345"
             } else {
@@ -1854,9 +1855,9 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             .cloned()
             .unwrap_or_default();
         for (id, label, name) in [
-            ("x75", "X75", "zte_mwan2"),
-            ("v3e1", "V3E1", "zte_mwan3"),
-            ("v3e2", "V3E2", "zte_mwan4"),
+            ("5G", "5G", "zte_mwan2"),
+            ("4G1", "4G1", "zte_mwan4"),
+            ("4G2", "4G2", "zte_mwan3"),
             ("ethernet", "Ethernet", "waneth"),
         ] {
             let Some(path) = interfaces.get(name) else {
@@ -2246,7 +2247,7 @@ mod tests {
         assert_eq!(value["quic_tunnel_count"], 2);
         assert_eq!(value["path_count"], 2);
         assert_eq!(value["online_path_count"], 1);
-        assert_eq!(value["paths"][0]["label"], "X75");
+        assert_eq!(value["paths"][0]["label"], "5G");
         assert_eq!(value["paths"][0]["latency_ms"], 3.0);
         assert_eq!(value["paths"][0]["uptime_seconds"], 30.0);
     }

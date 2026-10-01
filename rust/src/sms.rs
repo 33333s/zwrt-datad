@@ -395,18 +395,29 @@ fn normalize_lists(replies: &[Value], key: Option<&[u8; 32]>) -> Result<Vec<Valu
     Ok(output)
 }
 
+/// Sender ids follow the vendor UI names (5G / 4G1 / 4G2). The pre-0.10.52
+/// chip-based ids stay accepted so older clients keep sending.
+fn canonical_sender(sender: &str) -> &str {
+    match sender.to_ascii_lowercase().as_str() {
+        "5g" | "x75" => "host",
+        "4g1" | "v3e2" => "4G1",
+        "4g2" | "v3e1" => "4G2",
+        _ => sender,
+    }
+}
+
 async fn send_external(
     sender: &str,
     number: &str,
     message: &str,
     sms_time: &str,
 ) -> Result<Value, String> {
-    let default = if sender == "v3e1" {
+    let default = if sender == "4G2" {
         "http://192.168.56.1/goform/goform_set_cmd_process"
     } else {
         "http://192.168.57.1/goform/goform_set_cmd_process"
     };
-    let variable = if sender == "v3e1" {
+    let variable = if sender == "4G2" {
         "ZWRT_DATAD_SMS_V3E1_URL"
     } else {
         "ZWRT_DATAD_SMS_V3E2_URL"
@@ -522,7 +533,7 @@ async fn send_host(number: &str, message: &str, sms_time: &str) -> Result<Value,
 pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
     let object = params.as_object().expect("server validates params");
     let text = |name: &str| object.get(name).and_then(Value::as_str);
-    let sender = text("sender").unwrap_or("host");
+    let sender = canonical_sender(text("sender").unwrap_or("host"));
     let (Some(number), Some(message), Some(sms_time)) =
         (text("number"), text("message_hex"), text("sms_time"))
     else {
@@ -532,8 +543,8 @@ pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
         return Err((true, "invalid SMS parameters".into()));
     }
     let result = match sender {
-        "v3e1" | "v3e2" => send_external(sender, number, message, sms_time).await,
-        "host" | "x75" => send_host(number, message, sms_time).await,
+        "4G1" | "4G2" => send_external(sender, number, message, sms_time).await,
+        "host" => send_host(number, message, sms_time).await,
         "sim1" | "sim2" => {
             let slot = if sender == "sim1" { 1 } else { 2 };
             if current_slot().await != slot {
@@ -549,6 +560,23 @@ pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sender_ids_follow_vendor_names_and_keep_legacy_aliases() {
+        for (input, expected) in [
+            ("5G", "host"),
+            ("5g", "host"),
+            ("x75", "host"),
+            ("host", "host"),
+            ("4G1", "4G1"),
+            ("v3e2", "4G1"),
+            ("4g2", "4G2"),
+            ("V3E1", "4G2"),
+            ("sim2", "sim2"),
+        ] {
+            assert_eq!(canonical_sender(input), expected, "{input}");
+        }
+    }
+
     use super::*;
 
     #[test]

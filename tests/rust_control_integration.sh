@@ -173,7 +173,7 @@ PY
 post '{"action":"nfc.set","params":{"enabled":true}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True; assert d["result"]=={"supported":True,"enabled":True,"switch":1,"flag":2,"changed":True,"verified":True},d'
 [ "$(cat "$MOCK_NFC_STATE_FILE")" = '1 2' ]
-post '{"action":"sms.send_raw","params":{"sender":"v3e1","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
+post '{"action":"sms.send_raw","params":{"sender":"4G2","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$TMP/sms-http.log" >/dev/null
 post '{"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 post '{"action":"sms.send_raw","params":{"sender":"sim2","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
