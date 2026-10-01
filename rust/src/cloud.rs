@@ -75,6 +75,8 @@ pub struct Config {
     pub services: Vec<Service>,
 }
 
+const CLOUD_FEATURE_DEFAULTS_MARKER: &str = "cloud-feature-defaults-v1";
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -211,12 +213,40 @@ impl Cloud {
             ),
         };
         let (tx, _) = watch::channel(runtime);
-        Self {
+        let mut cloud = Self {
             file,
             config,
             status: Arc::new(Mutex::new(status)),
             tx,
+        };
+        cloud.apply_cloud_feature_defaults(data_dir);
+        cloud
+    }
+
+    /// Devices that joined before the panel and cloud terminal were on by
+    /// default get them enabled once; a later local opt-out is respected.
+    fn apply_cloud_feature_defaults(&mut self, data_dir: &Path) {
+        let marker = data_dir.join(CLOUD_FEATURE_DEFAULTS_MARKER);
+        if marker.exists() {
+            return;
         }
+        if self.config.enabled
+            && self.config.remote_enabled
+            && (!self.config.remote_panel_control_enabled || !self.config.remote_webshell_enabled)
+        {
+            let mut next = self.config.clone();
+            next.remote_panel_control_enabled = true;
+            next.remote_webshell_enabled = true;
+            if validate(&next).is_err() || atomic_json(&self.file, &next).is_err() {
+                return;
+            }
+            self.config = next.clone();
+            // send_replace also updates the value before anyone subscribes.
+            if self.tx.borrow().is_some() {
+                self.tx.send_replace(Some(next));
+            }
+        }
+        let _ = fs::write(&marker, b"1\n");
     }
 
     pub fn start(&self, state: watch::Receiver<Snapshot>, app: crate::server::App) {
@@ -393,8 +423,11 @@ impl Cloud {
         config.password = input.password;
         config.enabled = true;
         config.remote_enabled = true;
-        config.remote_panel_control_enabled = false;
-        config.remote_webshell_enabled = false;
+        // Joining cloud management turns the panel and cloud terminal on. NMS
+        // still needs the owner's time-limited consent before any operator
+        // can open them, and the owner can switch either off again locally.
+        config.remote_panel_control_enabled = true;
+        config.remote_webshell_enabled = true;
         self.update(Update {
             config,
             clear_password: false,
@@ -1569,8 +1602,8 @@ mod tests {
             "7d77fceb-0592-529a-8d12-2b54068aaaff"
         );
         assert_eq!(public["config"]["remote_enabled"], true);
-        assert_eq!(public["config"]["remote_panel_control_enabled"], false);
-        assert_eq!(public["config"]["remote_webshell_enabled"], false);
+        assert_eq!(public["config"]["remote_panel_control_enabled"], true);
+        assert_eq!(public["config"]["remote_webshell_enabled"], true);
         assert_eq!(public["password_configured"], true);
         assert!(!public.to_string().contains("sample-secret"));
         assert!(
@@ -2143,6 +2176,56 @@ mod tests {
             vec!["https://custom.example"]
         );
         validate(&config).unwrap();
+    }
+
+    #[test]
+    fn joined_devices_get_panel_and_terminal_once_and_keep_a_later_opt_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-cloud-feature-defaults-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let mut joined = Config::default();
+        joined.enabled = true;
+        joined.remote_enabled = true;
+        joined.username = "device-user".into();
+        joined.password = "device-secret".into();
+        joined.model = "MU5252".into();
+        joined.identity = "9d2272fb-2b72-580c-a22b-6121e3e23929".into();
+        validate(&joined).unwrap();
+        fs::write(dir.join("cloud.json"), serde_json::to_vec(&joined).unwrap()).unwrap();
+
+        let mut cloud = Cloud::load(&dir);
+        assert!(cloud.config.remote_panel_control_enabled && cloud.config.remote_webshell_enabled);
+        let saved: Config =
+            serde_json::from_slice(&fs::read(dir.join("cloud.json")).unwrap()).unwrap();
+        assert!(saved.remote_webshell_enabled && saved.password == "device-secret");
+        assert!(cloud.tx.borrow().as_ref().unwrap().remote_webshell_enabled);
+
+        // The owner turns the terminal off locally; restarts keep that choice.
+        cloud
+            .save_remote_features(RemoteFeatures {
+                remote_panel_control_enabled: true,
+                remote_webshell_enabled: false,
+                services: cloud.config.services.clone(),
+            })
+            .unwrap();
+        let reloaded = Cloud::load(&dir);
+        assert!(!reloaded.config.remote_webshell_enabled);
+
+        // Devices that never joined cloud management are left alone.
+        let idle = std::env::temp_dir().join(format!(
+            "datad-cloud-feature-idle-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&idle).unwrap();
+        let fresh = Cloud::load(&idle);
+        assert!(!fresh.config.enabled && !fresh.config.remote_webshell_enabled);
+        assert!(!idle.join("cloud.json").exists());
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(idle);
     }
 
     #[test]

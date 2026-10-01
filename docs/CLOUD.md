@@ -2,7 +2,7 @@
 
 ## 仅凭 MQTT 凭据接入（0.10.23）
 
-NMS 创建待接入凭据后，只把一次显示的 MQTT 用户名（`enr_` 前缀）和密码填入设备。UFI 的简易接入表单调用本机 `POST /cloud/quick-connect`；datad 只在该路径下自动选用内置 NMS HTTPS/WSS 地址，并从本机状态读取厂商、型号、固件平台和稳定标识。已有高级配置不会因加载而改写；已启用的云端账户须在高级配置中更换。远程面板控制仍默认关闭。
+NMS 创建待接入凭据后，只把一次显示的 MQTT 用户名（`enr_` 前缀）和密码填入设备。UFI 的简易接入表单调用本机 `POST /cloud/quick-connect`；datad 只在该路径下自动选用内置 NMS HTTPS/WSS 地址，并从本机状态读取厂商、型号、固件平台和稳定标识。已有高级配置不会因加载而改写；已启用的云端账户须在高级配置中更换。从 0.10.53 起，简易接入同时开启远程面板控制和云端终端：NMS 侧任何运维账户（含超级管理员）仍须取得设备 Owner 限时授权（最长 7 天）才能打开，Owner 可随时在本机关闭任一开关。
 
 datad 优先使用 modem MSN 生成与 UFI 相同的稳定 UUID；若没有 MSN，依次使用设备序列号、IMEI，生成后固定保存在 `cloud.json`，后续状态变化不会重算。若取不到可靠标识或型号，保存失败，不注册随机身份。首次连接仅向 `onboard/<用户名>/hello` 发送签名身份报告；NMS 校验凭据、签名、账户和设备占用后返回绑定结果，datad 才订阅正式命令并发送正常遥测。待接入凭据只能绑定首台设备，失效、撤销或已被占用的身份不能继续接入。旧 `dev_` 凭据继续按原流程连接。
 
@@ -32,7 +32,7 @@ WSS 使用内嵌公共根证书与可选 `ca_pem` 验证证书及主机名，不
 
 ## 原生云端 WebShell
 
-从 0.10.11 起，`remote_webshell_enabled` 为独立布尔配置，默认 false；旧配置升级后不会自动开放终端。还需启用 `enabled`、`remote_enabled` 和进程的 `--webshell` 选项。通过已鉴权的本机 `/cloud/config` 保存完整配置即可切换；关闭或任何云端配置变更会终止旧终端。遥测仅在本地终端可用时声明 `datad.webshell`，并上报实际生效的 `remote_webshell_enabled`。
+从 0.10.11 起，`remote_webshell_enabled` 为独立布尔配置，`cloud.json` 缺省值为 false。从 0.10.53 起，简易接入时直接开启；升级前已启用云端与远程访问的设备，在首次以 0.10.53 加载时一次性开启远程面板控制与云端终端，并写入 `cloud-feature-defaults-v1` 标记，此后本机关闭会被保留。还需启用 `enabled`、`remote_enabled` 和进程的 `--webshell` 选项。通过已鉴权的本机 `/cloud/config` 保存完整配置即可切换；关闭或任何云端配置变更会终止旧终端。遥测仅在本地终端可用时声明 `datad.webshell`，并上报实际生效的 `remote_webshell_enabled`。
 
 `remote.open` 可使用 `target_service: "webshell"`、`target_port: 0`、1–1800 秒 TTL；不允许 `target_ports`，票据为 64 位十六进制。设备 WSS 地址必须严格匹配配置的平台与当前 request_id；保留 TLS 证书/主机名校验、MQTT 主题 ACL、非 retained 与会话去重。该逻辑服务直接使用进程内 PTY，不连接 TCP 端口、不代理本地管理 API，也不向云端发送 datad Token。
 
