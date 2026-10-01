@@ -88,6 +88,9 @@ SSE  /events
     "sa_bands": "1,28,41,78",
     "nsa_bands": "1,28,41,78",
     "lte_bands": "1,3,8,40,41",
+    "nr5g_sa_band_lock": "1,28,41,78",
+    "nr5g_nsa_band_lock": "1,28,41,78",
+    "lte_band": "1,3,8,40,41",
     "lte_supported_bands": "1,3,8,40,41",
     "nr_sa_supported_bands": "1,28,41,78",
     "nr_nsa_supported_bands": "1,28,41,78",
@@ -310,6 +313,7 @@ SSE  /events
 - `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
 - 顶层 `sample_interval_ms` 是当前 datad 全局采样与 SSE 推送周期。可通过 `state.set_interval` 在 `500..5000` 毫秒范围内运行时切换；所有 SSE 客户端共享同一周期。
+- `net.lte_band`、`net.nr5g_sa_band_lock`、`net.nr5g_nsa_band_lock` 是主线同名的当前锁频别名（逗号频段表），供按主线路径适配的客户端直接回读校验；U50 自有名字 `net.lte_bands / sa_bands / nsa_bands` 继续提供且值一致。U50 上 LTE 锁频值以 `lte_band_lock` 十六进制掩码为准（固件不会在写入后及时刷新 `lte_band_ext_lock` 列表）。
 - `net.lte_supported_bands`、`net.nr_sa_supported_bands`、`net.nr_nsa_supported_bands` 来自原厂 Web 同源的 `zwrt_zte_nwinfo.default_band_lock` 能力目录，与本轮锁频值分离。`net.lte_bands`、`net.sa_bands`、`net.nsa_bands` 继续表示当前允许/锁定范围。消费者应优先读取结构化的 `net.band_capabilities`；只有 `complete=true` 时三个数组才是完整设备能力，`source=device_default_band_lock` 表示数据由设备自身默认频段目录提供。目录缺失或任一列表非法时 `complete=false`、`source=unavailable`，支持频段字符串和数组均不使用当前锁频值回填。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 固定统计 `/data` 文件系统，`storage` 和 `throughput` 单位分别为字节和字节/秒。
 - `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
@@ -352,6 +356,12 @@ See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
 freshness, serving/CA filtering, error reasons and firmware-specific limitations.
 `no_supported_reports` explicitly distinguishes unsupported decoded signatures
 from absence of surrounding cells. The block is sent in regular SSE snapshots.
+
+On the U50 (original firmware) runtime the same object shape is served from the
+OEM GoAhead neighbor lists instead of a diag capture (`source:"oem_goform"`,
+no capture files), and `/state.neighbor` is read live at request time, so an
+`neighbor.set` toggle is reflected by the very next `/state` read.
+See [NEIGHBOR.md](NEIGHBOR.md#u50原厂固件邻区).
 
 `power.direct_supply` is optional and independent of the `battery` block. It is
 included only when the charger response contains `direct_power_supply_mode`:

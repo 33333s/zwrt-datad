@@ -286,6 +286,37 @@ the device firmware provides. Both actions use the existing token authentication
 
 - `apn.list` 与按需云端面板优先读取原厂 HTTP 配置；接口不可用时只读本地 `cfg` 的白名单标量。兜底仅报告当前 APN（`current`）、模式、名称和认证/PDP 类型，不报告完整配置目录，不读取 APN 账号、密码或原始序列化配置，保持 `writable:false`。模式未知、字段过长或读取超时明确失败。
 - `network.set_mode` 支持 `4G_AND_5G`（也接受 `auto`）、`Only_LTE`（`4G` / `LTE`）、`Only_5G`（`5G` / `NR`）。模式偏好与实际驻留网络是不同字段，选择 5G 不保证当地有 5G 覆盖。
-- 频段 `bands` 可以是逗号分隔的数字字符串或整数数组；空字符串 / 空数组恢复该设备实际出厂频段，缺少出厂数据时明确失败。
-- U50S 使用已验证的 `SET_NETWORK_BAND_LOCK` LTE 接口；U50Pro 候选保留旧协议。
+- 频段 `bands` 可以是逗号分隔的数字字符串或整数数组。**空字符串 / 空数组是解除锁定（自动）**，与官方 WebUI 取消全选一致：LTE 写掩码 `0`、NR 写 `nr5g_band_mask=0`，成功返回 `mode:"auto"`。它不是“锁定全部出厂频段”——锁定全部仍会禁止调制解调器选用表外频段，与自动不同。
+- 显式频段先对照设备出厂频段表（`lte_band_1_64_factory` / `nr5g_{sa,nsa}_band_factory`）校验：表外频段直接 `400` 拒绝且不发写。固件本身不校验频段位（实测会原样入库），锁上不支持的频段会导致失网，因此由 datad 挡在前面。
+- LTE 掩码为官方调试页同款 16 位零填充十六进制（如 `0x000001e2080800d5`）；NR 为逗号分隔十进制频段表（如 `1,3,5,8,28,41,77,78`），SA/NSA 以 `type` 区分。U50S 使用 `SET_NETWORK_BAND_LOCK`；U50Pro 使用 `BAND_SELECT` 与 `WAN_PERFORM_NR5G_SANSA_BAND_LOCK`——这两个 goform 位于固件 developer 门禁清单内，OEM 桥接层会用本机管理员哈希自动完成 `DEVELOPER_OPTION_LOGIN` 提权（会话内一次，凭据不落盘），调用方无感知。
 - 频段和网络模式写入仅在有界回读匹配后返回 `result.result="success"` 与 `verified=true`；原厂拒绝或回读不一致返回失败。
+- 锁频类写入不需要切网；仅 SA 手动邻区扫描（`neighbor.scan_sa`）需要临时切到 `Only_5G`，扫完自动还原原模式。
+
+### U50 Wi-Fi（主线契约）
+
+U50 的 Wi-Fi 动作与主线（U60pro）同名同形：
+
+- `wifi.status`：返回 `main_2g / main_5g / guest_2g / guest_5g` 各段的完整设置
+  `ssid / key / encryption / disabled / hidden / isolate / pmf / maxassoc / writable`。
+  `key` 为解码后的明文密码——与主线一致，受同一 token 鉴权保护；云端 NMS 面板视图仍然不含密码。
+- `wifi.configure`：官方 `setAccessPointInfo` 通道。字段校验与主线一致
+  （`ssid` ≤32、`key` 8–63 或空=保留原密码、`encryption` 枚举、`hidden/isolate/pmf` 0/1/2、
+  `maxassoc` 1–128、`enabled` 布尔；`disabled` 字段与主线一样拒收，请用 `enabled`）。
+  无变化不写（`changed:false`）；仅开关变化时只发 `AccessPointSwitchStatus`（官方 WebUI 同款
+  最小写）；写后有界回读重试（最长 25 秒）等 AP 自重启。加密名映射：`psk2→WPA2PSK`、
+  `psk-mixed→WPAPSKWPA2PSK`、`sae→WPA3PSK`、`sae-mixed→WPA2PSKWPA3PSK`；`none` 清空密码。
+- `wifi.set_dual_band`：官方双频合一开关走 `switchWiFiModule` 携带当前开关与 LAN 标志，
+  仅写 `wifi_lbd_enable`，回读校验；无变化 `changed:false`。
+- `wifi.set_module`：Wi-Fi 总开关（`switchWiFiModule` + `SwitchOption`），与主线动作名一致。
+
+### U50 邻区
+
+- `neighbor.set {enabled}` / `neighbor.status`：与主线同名同形状（见 `NEIGHBOR.md` 的 U50 章节）。
+  会话级开关、默认关闭；`/state.neighbor` 在 U50 上为请求时实时读取，切换后立即生效。
+- `neighbor.list`（U50 扩展，只读）：一次返回 `network_type`、`primary`、`lte[]`、`sa[]`
+  两个结构化列表（字段 `rat/pci/arfcn/band/rsrp_dbm/sinr_db`，`band` 为数值）。
+  LTE/NSA 邻区由固件注册后自动刷新；`sa[]` 只在手动扫描后变化。
+- `neighbor.scan_sa`（U50 扩展）：SA 手动扫描，镜像官方隐藏调试页——固件仅在
+  `net_select=Only_5G` 时接受扫描（`SCAN_NR5G_NEIGHBOR_CELL`，同样走自动提权），流程为
+  切 `Only_5G`（25 秒上限）→ 扫描 → 轮询 `m_netselect_status`（150 秒上限）→ 取 `sa[]` →
+  还原原模式。真机全程约 13 秒；锁小区不需要此流程。
