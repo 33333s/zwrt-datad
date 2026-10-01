@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.59",
+    "version": "0.10.60",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro 频段锁定修复：developer-option 门禁自动提权，LTE/NR SA/NSA 锁频全通"
+    "notes": "U50 Pro 邻小区：LTE 自动列表 + SA 手动扫描（自动切网/还原），developer 提权内建"
   }
 }

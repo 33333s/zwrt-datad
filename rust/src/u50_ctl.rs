@@ -73,6 +73,8 @@ pub const CONTROLS: &[&str] = &[
     "cell.lock_lte",
     "cell.lock_nr",
     "cell.unlock_all",
+    "neighbor.list",
+    "neighbor.scan_sa",
     "traffic.set_limit",
     "traffic.set_clear_day",
     "client.block",
@@ -89,6 +91,7 @@ pub const READ_ACTIONS: &[&str] = &[
     "wifi.dual_band_status",
     "apn.list",
     "client.access",
+    "neighbor.list",
 ];
 
 /// Verify the original WebUI admin password without creating or replacing
@@ -231,6 +234,44 @@ fn lte_mask(bands: &[u32]) -> String {
         .iter()
         .fold(0u64, |mask, band| mask | 1u64 << (band - 1));
     format!("0x{mask:016x}")
+}
+
+/// Neighbor rows as the WebUI's `parseNeighborCellInfo` reads them:
+/// `;`-separated cells, `,`-separated fields, with the field order swapped
+/// between the two lists — SA rows are `pci,arfcn,rsrp,sinr,band`, LTE rows
+/// are `arfcn,pci,sinr,rsrp,band`. The band stays firmware text ("n78"/"3").
+fn neighbor_cells(raw: &str, rat: &str) -> Vec<Value> {
+    raw.split(';')
+        .filter(|row| !row.is_empty())
+        .filter_map(|row| {
+            let fields: Vec<&str> = row.split(',').collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            let (pci, arfcn, rsrp, sinr, band) = if rat == "NR5G" {
+                (fields[0], fields[1], fields[2], fields[3], fields[4])
+            } else {
+                (fields[1], fields[0], fields[3], fields[2], fields[4])
+            };
+            let number = |value: &str| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| n.unsigned_abs() < 1_000_000)
+            };
+            if band.len() > 8 || !band.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            Some(json!({
+                "rat": rat,
+                "pci": number(pci)?,
+                "arfcn": number(arfcn)?,
+                "rsrp_dbm": number(rsrp)?,
+                "sinr_db": number(sinr)?,
+                "band": band,
+            }))
+        })
+        .collect()
 }
 
 fn network_mode(value: &str) -> Option<&'static str> {
@@ -495,6 +536,28 @@ impl Ctl {
                     "WiFiDualBandSupported":"1","WiFiDualBandEnabled":if enabled {"1"} else {"0"},
                     "BandSteeringSwitch":if enabled {"1"} else {"0"}}))
             }),
+            "neighbor.list" => self
+                .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
+                .await
+                .map(|raw| {
+                    let text = |key: &str| {
+                        raw.get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    let network_type = text("network_type");
+                    // The firmware refreshes the LTE/NSA list by itself while
+                    // registered there; the SA list only changes after a manual
+                    // scan (neighbor.scan_sa).
+                    let primary = if network_type == "SA" { "sa" } else { "lte" };
+                    json!({
+                        "network_type": network_type,
+                        "primary": primary,
+                        "lte": neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE"),
+                        "sa": neighbor_cells(&text("sa_ngbr_cell_manual_result_ext"), "NR5G"),
+                    })
+                }),
             "apn.list" => self.apn_panel_config().await.map(|config| {
                 let profiles = |key: &str| {
                     let items = config[key].as_array().into_iter().flatten().map(|row|json!({
@@ -666,6 +729,7 @@ impl Ctl {
             "cell.lock_lte" => self.cell_lock_lte(params).await,
             "cell.lock_nr" => self.cell_lock_nr(params).await,
             "cell.unlock_all" => self.cell_unlock_all().await,
+            "neighbor.scan_sa" => self.neighbor_scan_sa().await,
             "traffic.set_limit" => self.traffic_set_limit(params).await,
             "traffic.set_clear_day" => self.traffic_set_clear_day(params).await,
             "client.block" => self.client_access(params, true).await,
@@ -863,6 +927,95 @@ impl Ctl {
             (Ok(_), Ok(_)) => Outcome::Ok(json!({"lte":true,"nr":true})),
             (Err(error), _) | (_, Err(error)) => Outcome::Failed(error),
         }
+    }
+
+    /// Manual SA neighbor scan, mirroring the hidden debug page exactly:
+    /// the firmware only accepts the scan while net_select is `Only_5G`, so
+    /// a different mode is switched away, the scan is triggered and polled
+    /// through `m_netselect_status`, the harvested rows are returned and the
+    /// original mode is restored. Cell locks never need this dance — only
+    /// the scan does.
+    async fn neighbor_scan_sa(&self) -> Outcome {
+        const SWITCH_TIMEOUT: Duration = Duration::from_secs(25);
+        const SCAN_TIMEOUT: Duration = Duration::from_secs(150);
+        const POLL_GRACE: Duration = Duration::from_millis(1500);
+        let original = self.field("net_select").await.unwrap_or_default();
+        let mut failure = String::new();
+        let mut switched = false;
+        if original != "Only_5G" {
+            if self
+                .write(
+                    "SET_BEARER_PREFERENCE",
+                    &[("BearerPreference", "Only_5G".into())],
+                )
+                .await
+                .is_err()
+            {
+                return Outcome::Failed("network mode switch to Only_5G failed".into());
+            }
+            let reached = tokio::time::timeout(SWITCH_TIMEOUT, async {
+                loop {
+                    if self.field("net_select").await.as_deref() == Some("Only_5G") {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !reached {
+                failure = "network mode did not reach Only_5G in time".into();
+            } else {
+                switched = true;
+            }
+        }
+        if failure.is_empty() {
+            match self.write("SCAN_NR5G_NEIGHBOR_CELL", &[]).await {
+                Ok(_) => {
+                    // Give the firmware a moment to move m_netselect_status
+                    // off a possibly stale terminal value before polling.
+                    tokio::time::sleep(POLL_GRACE).await;
+                    let done = tokio::time::timeout(SCAN_TIMEOUT, async {
+                        loop {
+                            match self.field("m_netselect_status").await.as_deref() {
+                                Some("manual_selected") => return true,
+                                Some("manual_search_fail") => return false,
+                                _ => {}
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !done {
+                        failure = "SA neighbor scan failed or timed out".into();
+                    }
+                }
+                Err(error) => failure = error,
+            }
+        }
+        let cells = self
+            .field("sa_ngbr_cell_manual_result_ext")
+            .await
+            .unwrap_or_default();
+        if switched {
+            let _ = self
+                .write(
+                    "SET_BEARER_PREFERENCE",
+                    &[("BearerPreference", original.clone())],
+                )
+                .await;
+        }
+        if !failure.is_empty() {
+            return Outcome::Failed(failure);
+        }
+        let list = neighbor_cells(&cells, "NR5G");
+        Outcome::Ok(json!({
+            "result": "success",
+            "cells": list,
+            "count": list.len(),
+            "restored_mode": original,
+        }))
     }
 
     /// Access control: `AclMode` 2 = blacklist. Mac and name lists are

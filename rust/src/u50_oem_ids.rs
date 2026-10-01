@@ -54,6 +54,7 @@ pub const IDS: &[&str] = &[
     "SAVE_TIME_LIMITED",
     "SAVE_TSW",
     "SCAN_NETWORK",
+    "SCAN_NR5G_NEIGHBOR_CELL",
     "SEND_SMS",
     "SET_AUTO_POWER_SAVE",
     "SET_BIND_STATIC_ADDRESS",

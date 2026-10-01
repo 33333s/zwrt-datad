@@ -53,6 +53,11 @@ APN_RECORD = "Fixture($)fixture.apn($)unused($)unused($)PAP($)apn-account-secret
 STORE.update({"apn_mode": "manual", "apn_interface_version": "2", "profile_name_ui": "Fixture",
               "wan_apn_ui": "fixture.apn", "APN_config0": APN_RECORD, "apn_auto_config": APN_RECORD,
               "wifi_lbd_enable": "0"})
+# Neighbor rows straight from the firmware: `;`-separated cells. The middle LTE
+# row is malformed and must be dropped by the parser.
+STORE.update({"lte_ngbr_cell_info_ext": "3725,57,-13,-96,3;x,1,2,3,4;3650,973,-11,-101,28;",
+              "sa_ngbr_cell_manual_result_ext": "973,627264,-103,-14,n78;",
+              "m_netselect_status": ""})
 WIFI_POINTS = {"ResponseList": [
     {"ChipIndex": "0", "AccessPointIndex": "0", "Band": "b", "SSID": "fixture-24", "AuthMode": "WPA2PSK",
      "Password": "wifi-password-secret", "ApBroadcastDisabled": "0", "Pmf_switch": "1",
@@ -170,8 +175,13 @@ class Vendor(BaseHTTPRequestHandler):
                                           if k not in ("AD", "isTest")}))
             return self.send_json({"result": "0"})
         if action in ("BAND_SELECT", "WAN_PERFORM_NR5G_BAND_LOCK",
-                      "WAN_PERFORM_NR5G_SANSA_BAND_LOCK") and not Vendor.developer:
+                      "WAN_PERFORM_NR5G_SANSA_BAND_LOCK", "SCAN_NR5G_NEIGHBOR_CELL") and not Vendor.developer:
             return self.send_json({"result": "failure"})
+        if action == "SCAN_NR5G_NEIGHBOR_CELL":
+            # The firmware answers the scan request, then flips
+            # m_netselect_status when the manual search finishes.
+            STORE["m_netselect_status"] = "manual_selected"
+            STORE["sa_ngbr_cell_manual_result_ext"] = "973,627264,-103,-14,n78;361,633984,-97,-7,n41;"
         one = {key: values[0] for key, values in form.items()}
         LOG.append(("write", action, {k: v for k, v in one.items() if k not in ("AD", "isTest")}))
         if action == "SET_CONNECTION_MODE":
@@ -493,6 +503,37 @@ esac
         assert control(port, "cell.unlock_all", {})[0] == 200
         assert writes()[-2][2] == {"goformId": "LTE_LOCK_CELL_SET", "lte_pci_lock": "0", "lte_earfcn_lock": "0"}
         assert writes()[-1][2] == {"goformId": "NR5G_LOCK_CELL_SET", "nr5g_cell_lock": "1,1,1,1"}
+
+        # Neighbor cells: read-only list parses both firmwares' row shapes
+        # (LTE and SA swap the pci/arfcn and rsrp/sinr positions) and drops
+        # malformed rows.
+        status, result = control(port, "neighbor.list", {})
+        assert status == 200, result
+        cells = result["result"]
+        assert cells["network_type"] == "LTE" and cells["primary"] == "lte", cells
+        assert cells["lte"] == [
+            {"rat": "LTE", "pci": 57, "arfcn": 3725, "rsrp_dbm": -96, "sinr_db": -13, "band": "3"},
+            {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": "28"}], cells
+        assert cells["sa"] == [
+            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": "n78"}], cells
+
+        # SA neighbor scan: switch to Only_5G (the firmware precondition),
+        # scan, poll m_netselect_status, harvest, and restore the mode —
+        # whatever it was when the scan started.
+        before_mode = STORE["net_select"]
+        assert before_mode != "Only_5G"
+        mark = len(writes())
+        status, result = control(port, "neighbor.scan_sa", {})
+        assert status == 200 and result["result"]["result"] == "success", result
+        assert result["result"]["count"] == 2 and result["result"]["restored_mode"] == before_mode, result
+        assert result["result"]["cells"][1] == {"rat": "NR5G", "pci": 361, "arfcn": 633984,
+                                                "rsrp_dbm": -97, "sinr_db": -7, "band": "n41"}, result
+        scan_writes = [w for w in writes()[mark:] if w[1] in ("SCAN_NR5G_NEIGHBOR_CELL", "SET_BEARER_PREFERENCE")]
+        assert [w[1] for w in scan_writes] == ["SET_BEARER_PREFERENCE", "SCAN_NR5G_NEIGHBOR_CELL",
+                                               "SET_BEARER_PREFERENCE"], scan_writes
+        assert scan_writes[0][2]["BearerPreference"] == "Only_5G"
+        assert scan_writes[2][2]["BearerPreference"] == before_mode
+        assert STORE["net_select"] == before_mode
 
         # Traffic: the whole OEM limit block is re-sent, untouched fields preserved.
         status, result = control(port, "traffic.set_limit", {"enabled": 1, "type": 1, "value": "107374182400", "ratio": 90})
