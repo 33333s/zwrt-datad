@@ -151,6 +151,7 @@ struct PanelManagement<'a> {
     cloud: Option<&'a Value>,
     tasks: Option<&'a Value>,
     sms_forward: Option<&'a Value>,
+    hosts: Option<&'a Value>,
 }
 
 fn state_message_with_config(
@@ -190,6 +191,10 @@ fn state_message_with_config(
     if let Some(sms_forward) = management.sms_forward {
         view.as_object_mut()?
             .insert("sms_forward".into(), sms_forward.clone());
+    }
+    if let Some(hosts) = management.hosts {
+        view.as_object_mut()?
+            .insert("hosts_config".into(), hosts.clone());
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -335,6 +340,8 @@ fn needs_confirmation(action: &str) -> bool {
     matches!(
         action,
         "device.reboot"
+            | "hosts.save"
+            | "hosts.restore"
             | "time.config.set"
             | "time.sync"
             | "device.poweroff"
@@ -440,6 +447,7 @@ async fn control_result(
     speedtest: Option<&Arc<Mutex<SpeedTest>>>,
     cloud_app: Option<&App>,
 ) -> Message {
+    let mut hosts_revision = None;
     let code = if request.action == "usb.set"
         || (!control::ACTIONS.contains(&request.action.as_str())
             && request.action != "neighbor.set")
@@ -449,6 +457,20 @@ async fn control_result(
         Some("confirmation_required")
     } else if !valid_remote_band_list(&request.action, &request.params) {
         Some("invalid_parameter")
+    } else if matches!(request.action.as_str(), "hosts.save" | "hosts.restore") {
+        match cloud_app {
+            Some(app) => match app
+                .panel_hosts_action(&request.action, request.params.clone())
+                .await
+            {
+                Ok(revision) => {
+                    hosts_revision = Some(revision);
+                    None
+                }
+                Err(code) => Some(code),
+            },
+            None => Some("unsupported_action"),
+        }
     } else if matches!(request.action.as_str(), "time.config.set" | "time.sync") {
         match cloud_app {
             Some(app) => match app.panel_time_action(&request.action, request.params.clone()) {
@@ -615,11 +637,11 @@ async fn control_result(
             Err(_) => Some("device_call_timeout"),
         }
     };
-    Message::Text(
-        json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code})
-            .to_string()
-            .into(),
-    )
+    let mut reply = json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code});
+    if let Some(revision) = hosts_revision {
+        reply["revision"] = json!(revision);
+    }
+    Message::Text(reply.to_string().into())
 }
 
 pub(crate) async fn run(
@@ -720,6 +742,11 @@ pub(crate) async fn run(
     } else {
         None
     };
+    let mut hosts_config = if let Some(app) = &cloud_app {
+        Some(app.panel_hosts_status().await)
+    } else {
+        None
+    };
     let Some(first) = state_message_with_config(
         &last,
         if control_mode { 2 } else { 1 },
@@ -731,6 +758,7 @@ pub(crate) async fn run(
             cloud: cloud_management.as_ref(),
             tasks: scheduled_tasks.as_ref(),
             sms_forward: sms_forward_status.as_ref(),
+            hosts: hosts_config.as_ref(),
         },
     ) else {
         return;
@@ -756,18 +784,27 @@ pub(crate) async fn run(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     sample.tick().await;
     ping.tick().await;
+    let mut hosts_refresh = tokio::time::interval(Duration::from_secs(5));
+    hosts_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    hosts_refresh.tick().await;
     let mut used_ids = HashSet::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return,
             _ = shutdown.changed() => return,
+            _ = hosts_refresh.tick() => {
+                let next_hosts = if let Some(app)=&cloud_app {Some(app.panel_hosts_status().await)} else {None};
+                hosts_config = next_hosts;
+                let Some(message) = state_message_with_config(&last, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref()}) else { return; };
+                if socket.send(message).await.is_err() { return; }
+            },
             _ = sample.tick() => {
                 let next = state_rx.borrow().clone();
                 let next_history = history_rx.borrow_and_update().clone();
                 let next_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None};
                 let next_sms_forward = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};
                 if next != last || config_pending || next_history != history || next_tasks != scheduled_tasks || next_sms_forward != sms_forward_status {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref(),sms_forward:next_sms_forward.as_ref()}) else { return; };
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref(),sms_forward:next_sms_forward.as_ref(),hosts:hosts_config.as_ref()}) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     history = next_history;
@@ -793,14 +830,16 @@ pub(crate) async fn run(
                     let refresh_cooling = request.action.starts_with("cooling.");
                     let refresh_tasks = request.action.starts_with("schedule.task.");
                     let refresh_sms_forward = request.action.starts_with("sms.forward.");
+                    let refresh_hosts = matches!(request.action.as_str(), "hosts.save" | "hosts.restore");
                     if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref(), cloud_app.as_ref()).await).await.is_err() { return; }
-                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks || refresh_sms_forward {
+                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks || refresh_sms_forward || refresh_hosts {
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
                         if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
                         if refresh_tasks { scheduled_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None}; }
                         if refresh_sms_forward {sms_forward_status = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref()})
+                        if refresh_hosts {hosts_config = if let Some(app)=&cloud_app {Some(app.panel_hosts_status().await)} else {None};}
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref()})
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -914,6 +953,7 @@ mod tests {
                 cloud: Some(&reviewed),
                 tasks: None,
                 sms_forward: None,
+                hosts: None,
             },
         )
         .unwrap() else {
@@ -926,6 +966,75 @@ mod tests {
                 .get("password")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn hosts_content_only_leaves_through_explicit_panel_management() {
+        let hosts = json!({"supported":true,"writable":true,"has_backup":false,"dnsmasq":true,"content":"# panel-only fixture\n","revision":"a".repeat(64)});
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::from_iter([("hosts_config".into(), hosts.clone())]),
+        };
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected text");
+        };
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain["snapshot"].get("hosts_config").is_none());
+        let Message::Text(explicit) = state_message_with_config(
+            &snapshot,
+            2,
+            None,
+            None,
+            None,
+            None,
+            PanelManagement {
+                hosts: Some(&hosts),
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            panic!("expected text");
+        };
+        let explicit: Value = serde_json::from_str(&explicit).unwrap();
+        assert_eq!(explicit["snapshot"]["hosts_config"], hosts);
+        // On a subsequent unauthorised/default frame, the explicit content is
+        // neither cached in the sampling Snapshot nor retained by serialization.
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected text");
+        };
+        assert!(!plain.contains("panel-only fixture"));
+    }
+
+    #[tokio::test]
+    async fn hosts_writes_require_confirmation_and_fail_without_a_file_manager() {
+        for action in ["hosts.save", "hosts.restore"] {
+            assert!(needs_confirmation(action));
+            for confirmed in [false, true] {
+                let request = ControlRequest {
+                    kind: "control".into(),
+                    protocol_version: 2,
+                    request_id: "a".repeat(32),
+                    action: action.into(),
+                    params: json!({"expected_revision":"b".repeat(64)}),
+                    confirmed,
+                };
+                let Message::Text(raw) = control_result(request, None, None, None).await else {
+                    panic!("expected text");
+                };
+                let reply: Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(reply["ok"], false);
+                assert_eq!(
+                    reply["code"],
+                    if confirmed {
+                        "unsupported_action"
+                    } else {
+                        "confirmation_required"
+                    }
+                );
+                assert!(reply.get("revision").is_none());
+            }
+        }
     }
 
     #[test]
@@ -952,6 +1061,7 @@ mod tests {
                 cloud: None,
                 tasks: Some(&tasks),
                 sms_forward: None,
+                hosts: None,
             },
         )
         .unwrap() else {
@@ -983,6 +1093,7 @@ mod tests {
             None,
             PanelManagement {
                 sms_forward: Some(&status),
+                hosts: None,
                 ..Default::default()
             },
         )

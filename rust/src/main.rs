@@ -8,6 +8,7 @@ mod control;
 mod cooling;
 mod elapsed;
 mod extra_wifi;
+mod hosts;
 mod identity;
 mod model;
 mod neighbor;
