@@ -137,7 +137,7 @@ impl Staged {
                 .map_err(error)?;
         } else {
             self.file
-                .set_permissions(fs::Permissions::from_mode(0o644))
+                .set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(error)?;
         }
         self.file.sync_all().map_err(error)?;

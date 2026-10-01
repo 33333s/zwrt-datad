@@ -99,7 +99,14 @@ async fn basic_operations_and_paginated_unicode_names_preserve_content() {
     call(&mut s, "files.mkdir", json!({"path":dir})).await;
     let file = dir.join("file '中文.txt");
     let touched = call(&mut s, "files.touch", json!({"path":file})).await;
-    assert_eq!(touched["entry"]["mode"], "0644");
+    let created_mode = fs::metadata(&file).unwrap().mode() & 0o7777;
+    assert_eq!(touched["entry"]["mode"], format!("{created_mode:04o}"));
+    assert_eq!(created_mode & 0o600, 0o600);
+    assert_eq!(
+        created_mode & !0o644,
+        0,
+        "touch must respect the process umask"
+    );
     fs::write(&file, b"retain").unwrap();
     let rev = f.revision(&file);
     call(
