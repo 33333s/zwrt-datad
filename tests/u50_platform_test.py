@@ -71,6 +71,10 @@ WIFI_POINTS = {"ResponseList": [
      "Password": "", "ApIsolate": "0", "ApBroadcastDisabled": "0", "Pmf_switch": "0",
      "AccessPointSwitchStatus": "0", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "11", "BandWidth": "1"},
 ]}
+CHIP_ADVANCED = {"ResponseList": [
+    {"ChipIndex": "0", "CountryCode": "CN", "Channel": "0", "BandWidth": "2", "Band": "b", "WirelessMode": "4"},
+    {"ChipIndex": "1", "CountryCode": "CN", "Channel": "0", "BandWidth": "6", "Band": "a", "WirelessMode": "6"},
+]}
 LOG = []
 
 
@@ -124,6 +128,10 @@ class Vendor(BaseHTTPRequestHandler):
             return self.send_json({"RD": current})
         if keys == ["developer_option_loginfo"]:
             return self.send_json({"developer_option_loginfo": "ok" if Vendor.developer else ""})
+        if keys == ["queryWiFiChipAdvancedInfo"]:
+            assert "multi_data" not in query
+            assert "sid=two" in self.headers.get("Cookie", "")
+            return self.send_json(CHIP_ADVANCED)
         if keys in (["queryAccessPointInfo"], ["queryWiFiModuleSwitch"]):
             assert "multi_data" not in query, "Wi-Fi resources must use the WebUI single-command reads"
             assert "sid=two" in self.headers.get("Cookie", ""), "configuration must use the local OEM session"
@@ -220,6 +228,12 @@ class Vendor(BaseHTTPRequestHandler):
             STORE["wifi_onoff_state"] = one.get("wifiEnabled", one.get("SwitchOption", "1"))
             if "wifi_lbd_enable" in one:
                 STORE["wifi_lbd_enable"] = one["wifi_lbd_enable"]
+        elif action == "setWiFiChipAdvancedInfo":
+            row = next(row for row in CHIP_ADVANCED["ResponseList"]
+                       if row["ChipIndex"] == one.get("ChipIndex"))
+            for key in ("Channel", "BandWidth", "WirelessMode", "CountryCode"):
+                if key in one:
+                    row[key] = one[key]
         elif action == "setAccessPointInfo":
             row = next(row for row in WIFI_POINTS["ResponseList"]
                        if row["ChipIndex"] == one.get("ChipIndex")
@@ -604,6 +618,24 @@ esac
         assert control(port, "wifi.configure", {"section": "main_2g", "ssid": "x" * 33})[0] == 400
         assert control(port, "wifi.configure", {"section": "wifi_6g", "ssid": "nope"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
+
+        # 5G channel pinning: the per-radio write re-sends the current
+        # advanced set with only the channel moved.
+        mark = len(writes())
+        status, result = control(port, "wifi.configure", {"section": "main_5g", "channel": "149"})
+        assert status == 200 and result["result"]["changed"] is True, result
+        adv_write = next(w for w in writes()[mark:] if w[1] == "setWiFiChipAdvancedInfo")
+        assert adv_write[2] == {"goformId": "setWiFiChipAdvancedInfo", "ChipIndex": "1",
+                                "WirelessMode": "6", "CountryCode": "CN", "Channel": "149",
+                                "BandWidth": "6", "Band": "a"}, adv_write
+        assert CHIP_ADVANCED["ResponseList"][1]["Channel"] == "149"
+        status, result = control(port, "wifi.configure", {"section": "main_5g", "channel": "149"})
+        assert status == 200 and result["result"]["changed"] is False, result
+        assert control(port, "wifi.configure", {"section": "main_5g", "channel": "0"})[0] == 200
+        assert CHIP_ADVANCED["ResponseList"][1]["Channel"] == "0"
+        # Channel is a 5G-radio-only knob; other sections and bad values refuse.
+        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 400
+        assert control(port, "wifi.configure", {"section": "main_5g", "channel": "50"})[0] == 400
 
         # Band steering toggle rides the module-switch goform with the
         # current switch and LAN flags preserved.
