@@ -2186,13 +2186,15 @@ mod tests {
             rand::random::<u64>()
         ));
         fs::create_dir(&dir).unwrap();
-        let mut joined = Config::default();
-        joined.enabled = true;
-        joined.remote_enabled = true;
-        joined.username = "device-user".into();
-        joined.password = "device-secret".into();
-        joined.model = "MU5252".into();
-        joined.identity = "9d2272fb-2b72-580c-a22b-6121e3e23929".into();
+        let joined = Config {
+            enabled: true,
+            remote_enabled: true,
+            username: "device-user".into(),
+            password: "device-secret".into(),
+            model: "MU5252".into(),
+            identity: "9d2272fb-2b72-580c-a22b-6121e3e23929".into(),
+            ..Config::default()
+        };
         validate(&joined).unwrap();
         fs::write(dir.join("cloud.json"), serde_json::to_vec(&joined).unwrap()).unwrap();
 
