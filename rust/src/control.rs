@@ -1,4 +1,4 @@
-use crate::state;
+use crate::{apn_targets, device_session, state};
 use serde_json::{Map, Value, json};
 use std::{net::IpAddr, time::Duration};
 
@@ -6,6 +6,8 @@ pub enum Outcome {
     NotHandled,
     Invalid(String),
     Failed(String),
+    /// Failure with a stable machine-readable code (never the vendor text).
+    Coded(&'static str),
     Ok(Value),
 }
 
@@ -15,6 +17,7 @@ pub const ACTIONS: &[&str] = &[
     "time.config.set",
     "time.sync",
     "device.reboot",
+    "device.session.login",
     "schedule.reboot.set",
     "schedule.task.put",
     "schedule.task.remove",
@@ -337,38 +340,19 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "nfc.set" => nfc(params).await,
-        "apn.set_mode" => {
-            mapped_call(
-                params,
-                "zwrt_apn_object",
-                "set_apn_mode",
-                &[("mode", "apn_mode", true, true)],
-                false,
-            )
-            .await
+        "apn.set_mode" | "apn.add" | "apn.modify" | "apn.delete" | "apn.enable" => {
+            apn_action(action, params).await
         }
-        "apn.add" => apn(params, "add_manu_apn", false).await,
-        "apn.modify" => apn(params, "modify_manu_apn", true).await,
-        "apn.delete" => {
-            mapped_call(
-                params,
-                "zwrt_apn_object",
-                "delete_manu_apn",
-                &[("profile_id", "profileId", true, false)],
-                false,
-            )
-            .await
-        }
-        "apn.enable" => {
-            mapped_call(
-                params,
-                "zwrt_apn_object",
-                "enable_manu_apn_id",
-                &[("profile_id", "profileId", true, false)],
-                false,
-            )
-            .await
-        }
+        "device.session.login" => match device_session::password_param(params) {
+            None => Outcome::Invalid("params must contain only password".into()),
+            Some(password) => match device_session::login(password).await {
+                Ok(()) => Outcome::Ok(json!({"active":true})),
+                Err(device_session::LoginError::Invalid) => {
+                    Outcome::Invalid("password is not acceptable".into())
+                }
+                Err(error) => Outcome::Coded(error.code()),
+            },
+        },
         "traffic.set_limit" => {
             let enabled = match integer(params, "enabled", true) {
                 Ok(Some(value @ (0 | 1))) => value,
@@ -455,11 +439,18 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             }
             outcome
         }
-        "sms.send_raw" => match crate::sms::send(params).await {
-            Ok(value) => Outcome::Ok(value),
-            Err((true, error)) => Outcome::Invalid(error),
-            Err((false, error)) => Outcome::Failed(error),
-        },
+        "sms.send_raw" => {
+            // Fail before sending when the established vendor session is gone;
+            // the message is never replayed after a re-login.
+            if device_session::expired().await {
+                return Outcome::Coded("device_session_expired");
+            }
+            match crate::sms::send(params).await {
+                Ok(value) => Outcome::Ok(value),
+                Err((true, error)) => Outcome::Invalid(error),
+                Err((false, error)) => Outcome::Failed(error),
+            }
+        }
         "client.kick" => {
             mapped_call(
                 params,
@@ -735,13 +726,137 @@ async fn nfc(params: &Value) -> Outcome {
     }
     Outcome::Failed("NFC readback did not confirm the requested state".into())
 }
-async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
+async fn apn_action(action: &str, params: &Value) -> Outcome {
+    // An expired vendor session fails before any change; it is never retried.
+    if device_session::expired().await {
+        return Outcome::Coded("device_session_expired");
+    }
+    let slot = match apn_targets::slot_param(params) {
+        Ok(slot) => slot,
+        Err(error) => return Outcome::Invalid(error),
+    };
+    if let Some(slot) = slot {
+        if apn_targets::is_external(slot) && matches!(action, "apn.add" | "apn.delete") {
+            return Outcome::Invalid("external modem APN has a single fixed configuration".into());
+        }
+        if apn_targets::config(Some(slot)).await.is_none() {
+            return Outcome::Failed("APN target is not readable or writable".into());
+        }
+    }
+    let outcome = match action {
+        "apn.set_mode" => {
+            mapped_call_slot(
+                params,
+                "set_apn_mode",
+                &[("mode", "apn_mode", true, true)],
+                slot,
+            )
+            .await
+        }
+        "apn.add" => apn(params, "add_manu_apn", false, slot).await,
+        "apn.modify" => apn(params, "modify_manu_apn", true, slot).await,
+        "apn.delete" => {
+            mapped_call_slot(
+                params,
+                "delete_manu_apn",
+                &[("profile_id", "profileId", true, false)],
+                slot,
+            )
+            .await
+        }
+        "apn.enable" => {
+            mapped_call_slot(
+                params,
+                "enable_manu_apn_id",
+                &[("profile_id", "profileId", true, false)],
+                slot,
+            )
+            .await
+        }
+        _ => return Outcome::NotHandled,
+    };
+    match (&outcome, slot) {
+        (Outcome::Ok(_), Some(slot)) if !apn_change_confirmed(action, params, slot).await => {
+            Outcome::Failed("APN readback did not confirm the change".into())
+        }
+        _ => outcome,
+    }
+}
+
+async fn mapped_call_slot(
+    params: &Value,
+    method: &str,
+    specs: &[(&str, &str, bool, bool)],
+    slot: Option<i64>,
+) -> Outcome {
+    match mapped(params, specs) {
+        Ok(args) => {
+            call(
+                "zwrt_apn_object",
+                method,
+                apn_targets::with_slot(args, slot),
+            )
+            .await
+        }
+        Err(error) => Outcome::Invalid(error),
+    }
+}
+
+/// Reads the targeted configuration back (bounded) and checks the change took.
+async fn apn_change_confirmed(action: &str, params: &Value, slot: i64) -> bool {
+    let text = |name: &str, max: usize| -> String {
+        params
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(max)
+            .collect()
+    };
+    for attempt in 0..5 {
+        if attempt != 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let Some(config) = apn_targets::config(Some(slot)).await else {
+            continue;
+        };
+        let manual = config["manual"].as_array().cloned().unwrap_or_default();
+        let id = text("profile_id", 64);
+        let confirmed = match action {
+            "apn.set_mode" => config["mode"].as_i64() == params.get("mode").and_then(Value::as_i64),
+            "apn.enable" => config["enabled_id"] == json!(id),
+            "apn.delete" => manual.iter().all(|profile| profile["id"] != json!(id)),
+            "apn.modify" => manual.iter().any(|profile| {
+                profile["id"] == json!(id)
+                    && profile["name"] == json!(text("name", 64))
+                    && profile["apn"] == json!(text("apn", 128))
+            }),
+            "apn.add" => manual.iter().any(|profile| {
+                profile["name"] == json!(text("name", 64))
+                    && profile["apn"] == json!(text("apn", 128))
+            }),
+            _ => false,
+        };
+        if confirmed {
+            return true;
+        }
+    }
+    false
+}
+
+async fn apn(params: &Value, method: &str, profile_required: bool, slot: Option<i64>) -> Outcome {
     let mut effective = params.clone();
     if profile_required {
         let Some(id) = params.get("profile_id").and_then(Value::as_str) else {
             return Outcome::Invalid("profile_id is required".into());
         };
-        let list = match state::ubus("zwrt_apn_object", "getManuApnList", json!({})).await {
+        let list = match state::ubus(
+            "zwrt_apn_object",
+            "getManuApnList",
+            apn_targets::with_slot(json!({}), slot),
+        )
+        .await
+        {
             Ok(value) => value,
             Err(error) => return Outcome::Failed(error),
         };
@@ -754,10 +869,8 @@ async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
             }
         }
     }
-    mapped_call(
+    let args = match mapped(
         &effective,
-        "zwrt_apn_object",
-        method,
         &[
             ("profile_id", "profileId", profile_required, false),
             ("name", "profilename", true, false),
@@ -768,7 +881,14 @@ async fn apn(params: &Value, method: &str, profile_required: bool) -> Outcome {
             ("pdp_type", "pdpType", false, true),
             ("roaming_pdp_type", "roamingPdpType", false, true),
         ],
-        false,
+    ) {
+        Ok(args) => args,
+        Err(error) => return Outcome::Invalid(error),
+    };
+    call(
+        "zwrt_apn_object",
+        method,
+        apn_targets::with_slot(args, slot),
     )
     .await
 }
@@ -780,7 +900,11 @@ fn existing_apn_fields(reply: &Value, id: &str) -> Option<Map<String, Value>> {
         .find(|item| item.get("profileId").and_then(Value::as_str) == Some(id))?;
     let mut fields = Map::new();
     for name in ["username", "password"] {
-        let value = profile.get(name).and_then(Value::as_str)?;
+        // Some profiles (external modems) omit empty account fields.
+        let value = match profile.get(name) {
+            None => "",
+            Some(value) => value.as_str()?,
+        };
         if value.len() > 1024 {
             return None;
         }
@@ -2093,6 +2217,12 @@ mod tests {
         assert_eq!(fields["pdp_type"], 2);
         assert_eq!(fields["roaming_pdp_type"], 1);
         assert!(existing_apn_fields(&reply, "missing").is_none());
+        let sparse = json!({"apnListArray":[{"profileId":"p1","pdpType":1}]});
+        let fields = existing_apn_fields(&sparse, "p1").unwrap();
+        assert_eq!(fields["username"], "");
+        assert_eq!(fields["password"], "");
+        let broken = json!({"apnListArray":[{"profileId":"p1","username":7}]});
+        assert!(existing_apn_fields(&broken, "p1").is_none());
     }
     #[test]
     fn rejects_non_hex_mac() {

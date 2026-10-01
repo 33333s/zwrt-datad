@@ -495,6 +495,7 @@ async fn supervisor(
                 SessionEnd::Reconfigure => break,
                 SessionEnd::Stopped => return,
                 SessionEnd::Failed => {
+                    crate::update_status::runtime("reconnecting");
                     set_status(
                         &status,
                         "retrying",
@@ -651,6 +652,9 @@ async fn session(
                     ticker.reset();
                     heartbeat.reset();
                     set_status(&status, if pending {"enrolling"} else {"connected"}, "");
+                    if !pending {
+                        crate::update_status::runtime("connected");
+                    }
                     if pending {
                         if client.subscribe(format!("{enrollment_root}/result"), QoS::AtLeastOnce).await.is_err() {
                             bridge.shutdown(); updates.detach_all(); return SessionEnd::Failed;
@@ -683,6 +687,7 @@ async fn session(
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
                             }
                             set_status(&status,"connected","");
+                            crate::update_status::runtime("connected");
                             let snapshot=state_rx.borrow().clone();
                             if report(&client,config,&snapshot,&status,webshell_available,app.is_some()).await.is_err() {
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;

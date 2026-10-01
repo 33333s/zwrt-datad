@@ -87,6 +87,18 @@ impl App {
     ) -> Result<String, &'static str> {
         self.inner.hosts.lock().await.action(action, params).await
     }
+    /// Switches only the automatic datad update setting; the signed update
+    /// path, mirrors and install tasks stay as configured.
+    pub(crate) async fn panel_ota_set(&self, enabled: bool) -> Result<bool, String> {
+        let mut manager = tokio::time::timeout(Duration::from_secs(5), self.inner.ota.lock())
+            .await
+            .map_err(|_| "update_in_progress".to_string())?;
+        if manager.busy {
+            return Err("update_in_progress".into());
+        }
+        manager.set_auto_update(enabled)
+    }
+
     pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
         self.inner.tx.subscribe()
     }
@@ -1128,6 +1140,7 @@ fn capability_controls() -> Vec<&'static str> {
         "qos.reload",
         "time.status",
         "hosts.status",
+        "datad.ota.set",
     ];
     controls.extend_from_slice(crate::control::ACTIONS);
     controls
@@ -1399,6 +1412,21 @@ async fn control(
             Err(error) => control_failed(action, error),
         };
     }
+    if action == "datad.ota.set" {
+        let enabled = body
+            .get("params")
+            .and_then(Value::as_object)
+            .filter(|params| params.len() == 1)
+            .and_then(|params| params.get("enabled"))
+            .and_then(Value::as_bool);
+        let Some(enabled) = enabled else {
+            return invalid_parameter(action, "enabled must be the only field and a boolean");
+        };
+        return match app.panel_ota_set(enabled).await {
+            Ok(enabled) => control_ok(action, json!({"auto_update_enabled":enabled})),
+            Err(error) => control_failed(action, error),
+        };
+    }
     if action == "device.login_info" {
         return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
     }
@@ -1636,6 +1664,7 @@ async fn control(
         }
         crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
         crate::control::Outcome::Failed(error) => return control_failed(action, error),
+        crate::control::Outcome::Coded(code) => return coded_failure(action, code),
         crate::control::Outcome::NotHandled => {}
     }
     if action == "state.refresh" {
@@ -1681,6 +1710,21 @@ fn control_failed(action: &str, error: String) -> Response {
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}})),
+    )
+        .into_response()
+}
+
+fn coded_failure(action: &str, code: &'static str) -> Response {
+    let status = match code {
+        "invalid_credentials" => StatusCode::UNAUTHORIZED,
+        "device_session_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "device_session_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "device_session_expired" => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(json!({"ok":false,"action":action,"error":{"code":code,"message":code}})),
     )
         .into_response()
 }
@@ -1840,7 +1884,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 87 + 6);
+        assert_eq!(controls.len(), 87 + 6 + 2);
         for action in [
             "time.status",
             "time.config.set",
@@ -1848,12 +1892,14 @@ mod tests {
             "hosts.status",
             "hosts.save",
             "hosts.restore",
+            "device.session.login",
+            "datad.ota.set",
         ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            87 + 6
+            87 + 6 + 2
         );
     }
 

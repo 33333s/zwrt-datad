@@ -139,6 +139,36 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 认证字段为 `username/password/auth_mode/pdp_type/roaming_pdp_type`。
 
+### 多基带 APN 目标（0.10.54，MU5252）
+
+五个 `apn.*` 写动作可带整数 `slot_id`。`1/101/201` 是原厂 APN 配置目标：`1` → 5G 主基带，
+`101` → 4G2，`201` → 4G1，**不是**物理 SIM 卡槽（`sim.set_slot` 仍只接受 1/2）。
+datad 校验后把它翻译成设备接口的 `slotId`：
+
+- 只有模板带外挂基带（目前 MU5252）才接受 `slot_id`；其他型号、非整数、范围外或未知目标直接
+  `invalid_parameter`，不会回退去改主基带。不带 `slot_id` 时保持原单基带行为。
+- 写入前先读该目标；读取失败的目标（面板中 `writable:false`）拒绝写入。
+- 外挂基带（101/201）只有一套固定配置，datad 自身拒绝 `apn.add` / `apn.delete`。
+- 修改已有配置时读取的是同一目标的原账号字段；写入后读回该目标，不一致返回 `device_call_failed`。
+- 面板流 `apn_targets` 见 [`STATE_SCHEMA.md`](STATE_SCHEMA.md)。
+
+## 设备后台会话与自动更新（0.10.54，面板/本机控制）
+
+| action | params |
+|---|---|
+| `device.session.login` | `{"password":"..."}`，最长 1024 字节，保留首尾空格，拒绝换行和 NUL |
+| `datad.ota.set` | `{"enabled":true/false}`，面板要求 `confirmed=true` |
+
+`device.session.login` 按原厂网页的哈希流程调用 `zwrt_web.web_login`，用 `session list`
+确认会话后才返回 `{"active":true}`。密码只用于这一次调用，不保存、不进入快照、错误、日志或
+审计；datad 另限每分钟最多 3 次尝试，原厂锁定期内不发起登录。失败码：`invalid_credentials`、
+`device_session_rate_limited`、`device_session_unavailable`。注意原厂后台是单会话，成功登录会
+顶替网页端已有会话。
+
+由该动作建立的会话之后若被替换或过期，`sms.send_raw` 与全部 `apn.*` 写动作会在发送/修改前返回
+`device_session_expired`（本机 HTTP 409），不自动重试登录，也不会补发短信。从未登录过的设备保持
+旧行为。`datad.ota.set` 只改自动更新开关（保留服务器和来源），读回配置文件确认后才报告成功。
+
 ## USB, Sleep And NFC
 
 | action | params |

@@ -35,6 +35,41 @@ fn integer(v: &Value, key: &str) -> i64 {
         _ => 0,
     }
 }
+/// Devices whose cellular data call bypasses netifd (G5 Pro) leave the WAN
+/// interface empty while the vendor data service still reports the address.
+/// Fill only empty address lists, and only with a parseable address.
+fn with_cellular_addresses(mut wan: Value, cellular: &Value) -> Value {
+    let empty = |wan: &Value, family: &str| wan[family].as_array().is_none_or(Vec::is_empty);
+    if empty(&wan, "ipv4")
+        && let Some(address) = cellular
+            .get("ipv4_address")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<std::net::Ipv4Addr>().ok())
+            .filter(|ip| !ip.is_unspecified())
+    {
+        let mut entry = json!({"address":address.to_string()});
+        if let Some(mask) = cellular
+            .get("ipv4_netmask")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<std::net::Ipv4Addr>().ok())
+            .map(|mask| u32::from(mask).count_ones())
+        {
+            entry["mask"] = json!(mask);
+        }
+        wan["ipv4"] = json!([entry]);
+    }
+    if empty(&wan, "ipv6")
+        && let Some(address) = cellular
+            .get("ipv6_address")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<std::net::Ipv6Addr>().ok())
+            .filter(|ip| !ip.is_unspecified())
+    {
+        wan["ipv6"] = json!([{"address":address.to_string()}]);
+    }
+    wan
+}
+
 fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
@@ -1371,6 +1406,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     if matches!(template, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
         topflow_net_fallback(&mut raw_net, &uci_sets);
     }
+    crate::apn_targets::set_multi_modem(template == "MU5252");
     let mut net = Map::new();
     net.insert(
         "roaming_allowed".into(),
@@ -1571,7 +1607,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "thermal".into(),
         json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[],"protection":{"active":high_temp_level>0,"level":high_temp_level,"speed_limited":high_temp_level==2,"network_restricted":high_temp_level==3,"raw":if high_temp_raw.is_empty(){Value::Null}else{json!(high_temp_raw)}}}),
     );
-    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":interface(&wan4_if),"wan6":interface(&wan6_if),"lan_config":lan_config,"cellular":cellular}));
+    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":with_cellular_addresses(interface(&wan4_if),&cellular),"wan6":with_cellular_addresses(interface(&wan6_if),&cellular),"lan_config":lan_config,"cellular":cellular}));
     const UF: &[(&str, &str)] = &[
         ("iccid", "zwrt_zte_mdm.sim_info.sim_iccid"),
         ("imsi", "zwrt_zte_mdm.sim_info.sim_imsi"),
@@ -2260,5 +2296,35 @@ mod tests {
         assert_eq!(value["state"], "waiting");
         assert_eq!(value["quic_tunnel_count"], 0);
         assert_eq!(value["paths"], json!([]));
+    }
+    #[test]
+    fn empty_wan_interfaces_borrow_the_cellular_address() {
+        let cellular = json!({"ipv4_address":"121.203.249.121","ipv4_netmask":"255.255.255.252",
+            "ipv6_address":"2001:db8::7"});
+        let empty = interface(&json!({"up":false,"proto":"none"}));
+        let wan = with_cellular_addresses(empty.clone(), &cellular);
+        assert_eq!(
+            wan["ipv4"],
+            json!([{"address":"121.203.249.121","mask":30}])
+        );
+        assert_eq!(wan["ipv6"], json!([{"address":"2001:db8::7"}]));
+        assert_eq!(wan["up"], false, "only addresses are filled");
+        // The vendor reports "0" or junk when there is no address.
+        for bad in [
+            json!({"ipv4_address":"0","ipv6_address":"0"}),
+            json!({"ipv4_address":"0.0.0.0"}),
+            json!({"ipv4_address":"junk"}),
+            json!({}),
+        ] {
+            let wan = with_cellular_addresses(empty.clone(), &bad);
+            assert_eq!(wan["ipv4"], json!([]), "{bad}");
+            assert_eq!(wan["ipv6"], json!([]), "{bad}");
+        }
+        // netifd data always wins.
+        let managed = interface(&json!({"up":true,"proto":"dhcp","l3_device":"rmnet_data0",
+            "ipv4-address":[{"address":"10.1.2.3","mask":24}]}));
+        let wan = with_cellular_addresses(managed.clone(), &cellular);
+        assert_eq!(wan["ipv4"], managed["ipv4"]);
+        assert_eq!(wan["ipv6"], json!([{"address":"2001:db8::7"}]));
     }
 }

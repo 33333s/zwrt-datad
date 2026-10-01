@@ -105,6 +105,11 @@ APN 配置同样只在远程面板会话期间按需读取，输出仅限配置 
 
 ## 可选面板控制通道（0.10.21）
 
+0.10.54 为远程面板新增三个可选快照块 `apn_targets`、`device_session`、`datad_update`
+和动作 `device.session.login`、`datad.ota.set`，以及 `apn.*` 的 `slot_id` 目标；
+旧版本不发这些块时 NMS 仍可连接，只把对应功能显示为需升级。块定义见
+[`STATE_SCHEMA.md`](STATE_SCHEMA.md)，动作见 [`CONTROL_API.md`](CONTROL_API.md)。
+
 0.10.51 新增独立 `datad_files` 文件会话，复用远程面板控制开关、单次票据和
 TLS 来源验证，不开放设备本地文件端口；文件正文不进入普通遥测。其有界分块
 传输不改变现有面板 8 KiB 控制帧限制。详见 [`FILES.md`](FILES.md)。
