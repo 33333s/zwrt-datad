@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.65",
+    "version": "0.10.66",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro wifi.configure 支持 5G 信道固定（channel 字段，钉非 DFS 信道可消除 CAC 等待）"
+    "notes": "U50 /state.sim 新增 dual_sim 卡槽数能力字段（客户端据此显隐 SIM 切换）"
   }
 }
