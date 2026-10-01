@@ -1,5 +1,6 @@
 mod auth;
 mod cloud;
+mod cloud_files;
 mod cloud_panel;
 mod cloud_shell;
 mod cloud_update;
@@ -8,6 +9,7 @@ mod control;
 mod cooling;
 mod elapsed;
 mod extra_wifi;
+mod files;
 mod hosts;
 mod identity;
 mod model;

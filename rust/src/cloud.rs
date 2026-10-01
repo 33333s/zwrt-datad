@@ -745,6 +745,7 @@ async fn report(
         capabilities.push("datad.panel");
         if config.remote_enabled && config.remote_panel_control_enabled {
             capabilities.push("datad.panel.control");
+            capabilities.push("datad.files");
         }
     }
     let firmware = state
@@ -976,7 +977,7 @@ impl BridgeManager {
         };
         if matches!(
             command.target_service.as_str(),
-            "datad_panel" | "datad_panel_control"
+            "datad_panel" | "datad_panel_control" | "datad_files"
         ) && self.app.is_none()
         {
             return Some(reject("panel_unavailable".into()));
@@ -1004,6 +1005,21 @@ impl BridgeManager {
                     Duration::from_secs(command.ttl_seconds),
                     self.shutdown.subscribe(),
                     permit,
+                )
+                .await;
+            }
+            self.state.lock().await.active.remove(&command.request_id);
+            return;
+        }
+        if command.target_service == "datad_files" {
+            if let Some(app) = &self.app {
+                crate::cloud_files::run(
+                    &self.config,
+                    &command.remote_url,
+                    &command.token,
+                    app.inner._data_dir.clone(),
+                    Duration::from_secs(command.ttl_seconds),
+                    self.shutdown.subscribe(),
                 )
                 .await;
             }
@@ -1116,6 +1132,19 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
             || !command.token.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err("invalid_webshell_request".into());
+        }
+        return Ok(());
+    }
+    if command.target_service == "datad_files" {
+        if !config.remote_panel_control_enabled {
+            return Err("panel_control_disabled".into());
+        }
+        if command.target_port != 0
+            || !command.target_ports.is_empty()
+            || command.ttl_seconds > 3600
+            || !command.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid_files_request".into());
         }
         return Ok(());
     }
@@ -2285,6 +2314,46 @@ mod tests {
             validate_remote(&config, &command).unwrap_err(),
             "remote_disabled"
         );
+    }
+
+    #[test]
+    fn files_require_panel_control_and_a_dedicated_zero_port_ticket() {
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            ..Default::default()
+        };
+        let mut command = RemoteCommand {
+            protocol_version: 1,
+            request_id: "files-session".into(),
+            action: "remote.open".into(),
+            remote_url: "wss://nms.example.com/api/remote/device/files-session".into(),
+            token: "a".repeat(64),
+            target_service: "datad_files".into(),
+            target_port: 0,
+            target_ports: vec![],
+            ttl_seconds: 3600,
+        };
+        assert_eq!(
+            validate_remote(&config, &command).unwrap_err(),
+            "panel_control_disabled"
+        );
+        config.remote_panel_control_enabled = true;
+        validate_remote(&config, &command).unwrap();
+        for port in [80, 2333, 9460, 9461] {
+            command.target_port = port;
+            assert_eq!(
+                validate_remote(&config, &command).unwrap_err(),
+                "invalid_files_request"
+            );
+        }
+        command.target_port = 0;
+        command.ttl_seconds = 3601;
+        assert!(validate_remote(&config, &command).is_err());
+        command.ttl_seconds = 3600;
+        command.target_ports = vec![0];
+        assert!(validate_remote(&config, &command).is_err());
     }
 
     #[test]
