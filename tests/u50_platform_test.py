@@ -629,19 +629,16 @@ esac
         status, result = control(port, "neighbor.set", {"enabled": True})
         assert status == 200 and result["result"]["status"] == "ready", result
         assert result["result"]["source"] == "oem_goform"
-        deadline = time.monotonic() + 4
-        state = None
-        while time.monotonic() < deadline:
-            state = call(port, "/state")[1]["neighbor"]
-            if state["enabled"] is True:
-                break
-            time.sleep(0.2)
-        assert state["enabled"] is True and state["collector_running"] is True
+        # /state serves the monitor live: an immediate read (before the next
+        # sampler tick) must already reflect the toggle.
+        state = call(port, "/state")[1]["neighbor"]
+        assert state["enabled"] is True and state["collector_running"] is True, state
         assert state["sampled_at"] and state["age_ms"] >= 0
         lte, nr = state["cells"][0], next(c for c in state["cells"] if c["rat"] == "NR5G")
         assert (lte["rat"], lte["pci"], lte["arfcn"], lte["band"], lte["rsrp_dbm"]) == ("LTE", 57, 3725, 3, -96)
         assert (nr["rat"], nr["band"]) == ("NR5G", 78)
         assert control(port, "neighbor.set", {"enabled": False})[1]["result"]["status"] == "disabled"
+        assert call(port, "/state")[1]["neighbor"]["enabled"] is False
 
         # Traffic: the whole OEM limit block is re-sent, untouched fields preserved.
         status, result = control(port, "traffic.set_limit", {"enabled": 1, "type": 1, "value": "107374182400", "ratio": 90})

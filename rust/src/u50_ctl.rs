@@ -582,7 +582,7 @@ impl Ctl {
         state.sampled_ms = Some(now_ms());
     }
 
-    async fn neighbor_status(&self) -> Result<Value, String> {
+    pub async fn neighbor_status(&self) -> Result<Value, String> {
         let state = self.neighbor.lock().await;
         Ok(self.neighbor_status_locked(&state))
     }

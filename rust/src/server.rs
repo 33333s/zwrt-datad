@@ -1139,7 +1139,16 @@ async fn version() -> Json<DatadVersion> {
     Json(Default::default())
 }
 async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
-    Json(app.snapshot().await)
+    let mut snapshot = app.snapshot().await;
+    // The U50 neighbor monitor toggles instantly in memory; the cached
+    // snapshot would lag up to one sampler tick and make a client's
+    // post-toggle readback race. Serve its status live.
+    if let Some(ctl) = crate::u50_ctl::get()
+        && let Ok(live) = ctl.neighbor_status().await
+    {
+        snapshot.fields.insert("neighbor".into(), live);
+    }
+    Json(snapshot)
 }
 async fn usb_status(State(app): State<App>) -> Json<Value> {
     Json(

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.63",
+    "version": "0.10.64",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro 主线路径对齐：wifi.status含密钥/wifi.configure/wifi.set_dual_band，/state.neighbor+neighbor.set（OEM 采样）"
+    "notes": "U50 Pro /state.neighbor 改为实时读取：邻区采集开关切换后立即生效，不再有采样器一拍延迟"
   }
 }
