@@ -748,22 +748,29 @@ impl Ctl {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
         };
-        let bands = if bands.is_empty() {
-            match self
-                .field("lte_band_1_64_factory")
-                .await
-                .as_deref()
-                .and_then(mask_value)
-                .filter(|v| *v != 0)
-            {
-                Some(mask) => (1..=64)
-                    .filter(|band| mask & (1u64 << (band - 1)) != 0)
-                    .collect(),
-                None => return Outcome::Failed("factory LTE bands unavailable".into()),
-            }
-        } else {
-            bands
+        // Empty list is the WebUI's deselect-all: `lte_band_mask` "0" clears
+        // the lock entirely (auto), it does not mean "lock every factory
+        // band". The firmware accepts any bits without validating them, so
+        // explicit bands are checked against the factory table first —
+        // locking a band the modem cannot serve would drop it offline.
+        if bands.is_empty() {
+            return self.band_auto_lte().await;
+        }
+        let factory = match self
+            .field("lte_band_1_64_factory")
+            .await
+            .as_deref()
+            .and_then(mask_value)
+        {
+            Some(mask) if mask != 0 => mask,
+            _ => return Outcome::Failed("factory LTE bands unavailable".into()),
         };
+        if let Some(bad) = bands
+            .iter()
+            .find(|band| factory & (1u64 << (*band - 1)) == 0)
+        {
+            return Outcome::Invalid(format!("LTE band {bad} is not supported by this modem"));
+        }
         let mask = lte_mask(&bands);
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
@@ -796,37 +803,80 @@ impl Ctl {
         Outcome::Ok(json!({"result":"success","bands":bands,"mask":mask,"verified":true}))
     }
 
+    /// Clear the LTE band lock (mask "0"), matching the WebUI's deselect-all.
+    async fn band_auto_lte(&self) -> Outcome {
+        let mask = "0".to_owned();
+        let result = if self.collector.model == crate::u50::Model::U50S {
+            self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
+                .await
+        } else {
+            self.write(
+                "BAND_SELECT",
+                &[
+                    ("is_gw_band", "0".into()),
+                    ("gw_band_mask", "0".into()),
+                    ("is_lte_band", "1".into()),
+                    ("lte_band_mask", mask.clone()),
+                ],
+            )
+            .await
+        };
+        if let Err(error) = result {
+            return Outcome::Failed(error);
+        }
+        let verified = self
+            .wait_field("lte_band_lock", |value| mask_value(value) == Some(0))
+            .await;
+        if !verified {
+            return Outcome::Failed(
+                "OEM LTE band unlock was accepted but readback did not match".into(),
+            );
+        }
+        Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}))
+    }
+
     /// The U50 Pro firmware gates `BAND_SELECT` and the NR lock goforms behind
     /// its developer-option login; the OEM bridge elevates the session
     /// transparently before those writes, so no mode dance is needed here.
+    /// Empty band list clears the lock (`nr5g_band_mask` "0"), mirroring the
+    /// WebUI's deselect-all; explicit bands are validated against the
+    /// modem's factory NR table.
     async fn band_set_nr(&self, params: &Value, nsa: bool) -> Outcome {
         let bands = match band_list(params, "bands", 512) {
             Ok(bands) => bands,
             Err(error) => return Outcome::Invalid(error),
         };
-        let bands = if bands.is_empty() {
-            let key = if nsa {
-                "nr5g_nsa_band_factory"
-            } else {
-                "nr5g_sa_band_factory"
-            };
-            match self
-                .field(key)
-                .await
-                .and_then(|value| band_list(&json!({"bands":value}), "bands", 512).ok())
-                .filter(|v| !v.is_empty())
-            {
-                Some(bands) => bands,
-                None => return Outcome::Failed("factory NR bands unavailable".into()),
+        let factory_key = if nsa {
+            "nr5g_nsa_band_factory"
+        } else {
+            "nr5g_sa_band_factory"
+        };
+        let factory = match self
+            .field(factory_key)
+            .await
+            .and_then(|value| band_list(&json!({"bands":value}), "bands", 512).ok())
+            .filter(|v| !v.is_empty())
+        {
+            Some(bands) => bands,
+            None => return Outcome::Failed("factory NR bands unavailable".into()),
+        };
+        let (bands, auto) = if bands.is_empty() {
+            (Vec::new(), true)
+        } else {
+            if let Some(bad) = bands.iter().find(|band| !factory.contains(band)) {
+                return Outcome::Invalid(format!("NR band {bad} is not supported by this modem"));
             }
+            (bands, false)
+        };
+        let csv = if auto {
+            "0".to_owned()
         } else {
             bands
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         };
-        let csv = bands
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
         let write_result = self
             .write(
                 "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
@@ -844,18 +894,24 @@ impl Ctl {
         } else {
             "nr5g_sa_band_lock"
         };
-        let verified = self
-            .wait_field(key, |value| {
+        let verified = if auto {
+            self.wait_field(key, |value| value.trim() == "0").await
+        } else {
+            self.wait_field(key, |value| {
                 band_list(&json!({"bands":value}), "bands", 512)
                     .ok()
                     .as_deref()
                     == Some(bands.as_slice())
             })
-            .await;
+            .await
+        };
         if !verified {
             return Outcome::Failed(
                 "OEM NR band write was accepted but readback did not match".into(),
             );
+        }
+        if auto {
+            return Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}));
         }
         Outcome::Ok(json!({"result":"success","bands":bands,"verified":true}))
     }

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.60",
+    "version": "0.10.61",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro 邻小区：LTE 自动列表 + SA 手动扫描（自动切网/还原），developer 提权内建"
+    "notes": "U50 Pro 锁频语义对齐：空频段表=解除锁定（掩码0），频段按工厂表校验拒越界"
   }
 }

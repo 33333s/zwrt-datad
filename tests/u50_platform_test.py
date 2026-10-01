@@ -40,7 +40,7 @@ STORE = {
     "dial_mode": "manual_dial", "roam_setting_option": "off", "net_select": "4G_AND_5G",
     "simcard_active_slot": "1", "sms_unread_num": "1", "sms_dev_unread_num": "1",
     "sms_sim_unread_num": "0", "sms_nv_num_total": "1", "sms_sim_num_total": "0",
-    "lte_band_lock": "0x1c200000095", "lte_band_1_64_factory":"0x1c200000095", "nr5g_sa_band_factory":"5,7,78", "nr5g_nsa_band_factory":"5,7,78", "nr5g_sa_band_lock": "5,7,78", "nr5g_nsa_band_lock": "5,7,78",
+    "lte_band_lock": "0x1c200000095", "lte_band_1_64_factory":"0x1c200000095", "nr5g_sa_band_factory":"1,3,5,8,28,41,77,78", "nr5g_nsa_band_factory":"1,3,5,8,28,41,77,78", "nr5g_sa_band_lock": "5,7,78", "nr5g_nsa_band_lock": "5,7,78",
     "data_volume_limit_switch": "0", "data_volume_limit_unit": "", "data_volume_limit_size": "",
     "data_volume_alert_percent": "", "wan_auto_clear_flow_data_switch": "on", "traffic_clear_date": "1",
     "flux_limited_disconnect": "off",
@@ -462,13 +462,20 @@ esac
         assert status == 200 and nr_writes[-1][2]["type"] == "0"
         assert len([w for w in writes() if w[1] == "DEVELOPER_OPTION_LOGIN"]) == 1
 
-        # CSV/array parity, auto restoration and common mode names.
+        # CSV/array parity, auto-clear semantics and common mode names: an
+        # empty list clears the lock (the WebUI's deselect-all sends mask
+        # "0"), it never means "lock every factory band".
         assert control(port, "band.set_lte", {"bands": [1,3,41]})[0] == 200
         status, automatic = control(port, "band.set_lte", {"bands": ""})
-        assert status == 200 and automatic["result"]["verified"] is True, automatic
-        assert STORE["lte_band_lock"] == "0x000001c200000095"
+        assert status == 200 and automatic["result"] == {"result": "success", "mode": "auto", "verified": True}, automatic
+        assert STORE["lte_band_lock"] == "0" and writes()[-1][2]["lte_band_lock"] == "0"
         assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
-        assert STORE["nr5g_sa_band_lock"] == "5,7,78"
+        assert STORE["nr5g_sa_band_lock"] == "0"
+        # Bands outside the modem's factory tables are refused before any
+        # write reaches the firmware (it would store them verbatim and the
+        # modem would go offline hunting an unsupported band).
+        assert control(port, "band.set_lte", {"bands": "1,19"})[0] == 400
+        assert control(port, "band.set_nr_sa", {"bands": "79"})[0] == 400
         assert control(port, "network.set_mode", {"mode": "4G"})[1]["result"]["mode"] == "Only_LTE"
         assert control(port, "network.set_mode", {"mode": "auto"})[1]["result"]["mode"] == "4G_AND_5G"
 
