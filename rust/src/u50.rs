@@ -709,26 +709,34 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
         if let Some(value) = cfg.get("nr5g_tac").and_then(|v| hex_number(v, 0xFF_FFFF)) {
             net.insert("nr_tac".into(), json!(value));
         }
-        for (source, target) in [
-            ("nr5g_sa_band_lock", "sa_bands"),
-            ("nr5g_nsa_band_lock", "nsa_bands"),
+        for (source, target, alias) in [
+            ("nr5g_sa_band_lock", "sa_bands", "nr5g_sa_band_lock"),
+            ("nr5g_nsa_band_lock", "nsa_bands", "nr5g_nsa_band_lock"),
         ] {
             let bands = cfg.get(source).map(|v| band_csv(v)).unwrap_or_default();
             if !bands.is_empty() {
-                net.insert(target.into(), json!(join_bands(&bands)));
+                let joined = join_bands(&bands);
+                net.insert(target.into(), json!(joined));
+                // Mainline-compatible alias so generic clients can verify
+                // band locks from /state with the same field names.
+                net.insert(alias.into(), json!(joined));
             }
         }
-        let lte_locked = cfg
-            .get("lte_band_ext_lock")
-            .map(|v| band_csv(v))
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                cfg.get("lte_band_lock")
-                    .map(|v| band_mask(v, 0))
-                    .filter(|v| !v.is_empty())
-            });
-        if let Some(bands) = lte_locked {
-            net.insert("lte_bands".into(), json!(join_bands(&bands)));
+        // The hex mask is authoritative: the firmware's `lte_band_ext_lock`
+        // list only refreshes on its own schedule, so a freshly applied lock
+        // would otherwise still report the previous bands.
+        let lte_locked = match cfg.get("lte_band_lock").map(|v| band_mask(v, 0)) {
+            Some(bands) => bands,
+            None => cfg
+                .get("lte_band_ext_lock")
+                .map(|v| band_csv(v))
+                .unwrap_or_default(),
+        };
+        if !lte_locked.is_empty() {
+            let joined = join_bands(&lte_locked);
+            net.insert("lte_bands".into(), json!(joined.clone()));
+            // Mainline exposes lte_ext_band_lock as `lte_band`.
+            net.insert("lte_band".into(), json!(joined));
         }
         let lte = cfg
             .get("lte_band_1_64_factory")
@@ -1273,6 +1281,9 @@ mod tests {
             ("nr5g_sa_band_lock", "5,7,78,257,258"),
             ("nr5g_sa_band_factory", "1,3,5,8,28,41,78"),
             ("nr5g_nsa_band_factory", "1,3,5,8,28,41,78"),
+            // A freshly applied lock (bands 1,3,5) while the firmware's ext
+            // list still shows the previous set: the hex mask must win.
+            ("lte_band_lock", "0x15"),
             ("lte_band_ext_lock", "1,3,5,8,34,39,40,41"),
             ("lte_band_1_64_factory", "0x1c200000095"),
             ("sim_imsi", "460010000000000"),
@@ -1305,8 +1316,10 @@ mod tests {
         assert_eq!(net["nr_rssi"], -71);
         assert_eq!(net["nr_bw"], "100MHz");
         assert_eq!(net["sa_bands"], "5,7,78,257,258");
+        assert_eq!(net["nr5g_sa_band_lock"], "5,7,78,257,258");
         assert_eq!(state["dhcp"]["leasetime"], "24h");
-        assert_eq!(net["lte_bands"], "1,3,5,8,34,39,40,41");
+        assert_eq!(net["lte_bands"], "1,3,5");
+        assert_eq!(net["lte_band"], "1,3,5");
         assert_eq!(net["lte_supported_bands"], "1,3,5,8,34,39,40,41");
         assert_eq!(net["nr_sa_supported_bands"], "1,3,5,8,28,41,78");
         assert_eq!(net["band_capabilities"]["complete"], true);
