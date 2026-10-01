@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.51",
+    "version": "0.10.52",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增受控远程文件管理与分块传输，并修复 musl 原子文件操作兼容性"
+    "notes": "MU5252 外挂基带接口改用原厂名称：5G / 4G1（V3E2）/ 4G2（V3E1）；短信 sender 同步，旧编号仍可用"
   }
 }
