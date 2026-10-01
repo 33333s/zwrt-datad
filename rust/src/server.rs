@@ -563,12 +563,13 @@ impl App {
             self.inner.history_tx.send_replace(history.days());
         }
         drop(history);
-        let mut neighbor = self.inner.neighbor.lock().await;
-        neighbor
-            .tick(next.fields.get("net").unwrap_or(&Value::Null))
-            .await;
-        next.fields.insert("neighbor".into(), neighbor.status());
-        drop(neighbor);
+        if crate::u50_ctl::get().is_none() {
+            let mut neighbor = self.inner.neighbor.lock().await;
+            neighbor
+                .tick(next.fields.get("net").unwrap_or(&Value::Null))
+                .await;
+            next.fields.insert("neighbor".into(), neighbor.status());
+        }
         let mut old = self.inner.snapshot.write().await;
         let mut comparable = next.clone();
         comparable.ts = old.ts;
@@ -1279,6 +1280,28 @@ async fn control(
             crate::control::Outcome::Failed(error) => control_failed(action, error),
             crate::control::Outcome::NotHandled => {
                 control_failed(action, "read action unavailable".into())
+            }
+        };
+    }
+    if action == "neighbor.set"
+        && let Some(ctl) = crate::u50_ctl::get()
+    {
+        // The U50 runtime serves neighbor monitoring from its own OEM reads;
+        // the generic diag-collector manager is the mainline path only.
+        let outcome = match body
+            .get("params")
+            .and_then(|v| v.get("enabled"))
+            .and_then(Value::as_bool)
+        {
+            Some(enabled) => ctl.neighbor_set(enabled).await,
+            None => crate::control::Outcome::Invalid("enabled must be boolean".into()),
+        };
+        return match outcome {
+            crate::control::Outcome::Ok(value) => control_ok(action, value),
+            crate::control::Outcome::Invalid(error) => invalid_parameter(action, &error),
+            crate::control::Outcome::Failed(error) => control_failed(action, error),
+            crate::control::Outcome::NotHandled => {
+                control_failed(action, "neighbor action unavailable".into())
             }
         };
     }

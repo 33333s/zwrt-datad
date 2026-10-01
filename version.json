@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.62",
+    "version": "0.10.63",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro /state 补频段锁定字段（lte_band/nr5g_*_band_lock 主线同名，十六进制掩码优先），修复 App 回读校验失败"
+    "notes": "U50 Pro 主线路径对齐：wifi.status含密钥/wifi.configure/wifi.set_dual_band，/state.neighbor+neighbor.set（OEM 采样）"
   }
 }

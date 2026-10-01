@@ -60,11 +60,16 @@ STORE.update({"lte_ngbr_cell_info_ext": "3725,57,-13,-96,3;x,1,2,3,4;3650,973,-1
               "m_netselect_status": ""})
 WIFI_POINTS = {"ResponseList": [
     {"ChipIndex": "0", "AccessPointIndex": "0", "Band": "b", "SSID": "fixture-24", "AuthMode": "WPA2PSK",
-     "Password": "wifi-password-secret", "ApBroadcastDisabled": "0", "Pmf_switch": "1",
+     "Password": base64.b64encode(b"wifi-password-secret").decode(), "ApIsolate": "0",
+     "ApBroadcastDisabled": "0", "Pmf_switch": "1",
      "AccessPointSwitchStatus": "1", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "11", "BandWidth": "1"},
     {"ChipIndex": "1", "AccessPointIndex": "0", "Band": "a", "SSID": "fixture-5", "AuthMode": "WPA3PSK",
-     "Password": "wifi-password-secret", "ApBroadcastDisabled": "1", "Pmf_switch": "2",
+     "Password": base64.b64encode(b"wifi-password-secret").decode(), "ApIsolate": "0",
+     "ApBroadcastDisabled": "1", "Pmf_switch": "2",
      "AccessPointSwitchStatus": "1", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "149", "BandWidth": "4"},
+    {"ChipIndex": "0", "AccessPointIndex": "1", "Band": "b", "SSID": "fixture-guest", "AuthMode": "OPEN",
+     "Password": "", "ApIsolate": "0", "ApBroadcastDisabled": "0", "Pmf_switch": "0",
+     "AccessPointSwitchStatus": "0", "ApMaxStationNumber": "16", "CountryCode": "CN", "Channel": "11", "BandWidth": "1"},
 ]}
 LOG = []
 
@@ -213,6 +218,17 @@ class Vendor(BaseHTTPRequestHandler):
             STORE["mtu"], STORE["tcp_mss"] = one["mtu"], one["tcp_mss"]
         elif action == "SET_WIFI_INFO" or action == "switchWiFiModule":
             STORE["wifi_onoff_state"] = one.get("wifiEnabled", one.get("SwitchOption", "1"))
+            if "wifi_lbd_enable" in one:
+                STORE["wifi_lbd_enable"] = one["wifi_lbd_enable"]
+        elif action == "setAccessPointInfo":
+            row = next(row for row in WIFI_POINTS["ResponseList"]
+                       if row["ChipIndex"] == one.get("ChipIndex")
+                       and row["AccessPointIndex"] == one.get("AccessPointIndex"))
+            for key in ("SSID", "AuthMode", "EncrypType", "ApBroadcastDisabled", "ApIsolate",
+                        "Pmf_switch", "ApMaxStationNumber", "AccessPointSwitchStatus"):
+                if key in one:
+                    row[key] = one[key]
+            row["Password"] = one.get("Password", row["Password"])
         elif action == "DATA_LIMIT_SETTING":
             for key in ("data_volume_limit_switch", "data_volume_limit_unit", "data_volume_limit_size",
                         "data_volume_alert_percent", "wan_auto_clear_flow_data_switch", "traffic_clear_date"):
@@ -339,18 +355,23 @@ esac
         _, caps = call(port, "/capabilities")
         assert "cellular.set" in caps["controls"] and "sms.send_raw" in caps["controls"]
         assert not any(name.startswith("speedtest") for name in caps["controls"])
-        for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access"):
+        for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access",
+                       "wifi.configure", "wifi.set_dual_band", "neighbor.set", "neighbor.status"):
             assert action in caps["controls"]
-        assert "wifi.configure" not in caps["controls"] and "apn.add" not in caps["controls"]
+        assert "apn.add" not in caps["controls"]
 
         # Local reads use OEM resources, make no setting writes, and exclude
-        # keys embedded in the firmware's Wi-Fi and APN response objects.
+        # keys embedded in the firmware's APN response objects.
         before = len(writes())
         status, wifi = control(port, "wifi.status", {})
         assert status == 200, wifi
         assert wifi["result"]["main_2g"]["ssid"] == "fixture-24"
+        assert wifi["result"]["main_2g"]["key"] == "wifi-password-secret"
+        assert wifi["result"]["main_2g"]["isolate"] == "0"
+        assert wifi["result"]["main_2g"]["writable"] is True
         assert wifi["result"]["main_5g"]["encryption"] == "sae"
-        assert wifi["result"]["main_2g"]["writable"] is False
+        assert wifi["result"]["guest_2g"]["encryption"] == "none"
+        assert wifi["result"]["guest_2g"]["disabled"] == "1"
         status, dual = control(port, "wifi.dual_band_status", {})
         assert status == 200 and dual["result"]["enabled"] is False and dual["result"]["writable"] is False
         status, apn = control(port, "apn.list", {})
@@ -381,7 +402,11 @@ esac
         for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access"):
             assert control(port, action, {"arbitrary": "value"})[0] == 400
         assert len(writes()) == before, "read actions must not modify the device"
-        for secret in ("wifi-password-secret", "apn-account-secret", "apn-password-secret", ADMIN_HASH):
+        # The Wi-Fi key IS returned by wifi.status, matching the mainline
+        # contract the panel app is built against (same authenticated local
+        # API). APN and admin credentials still never leak.
+        assert "wifi-password-secret" not in json.dumps([dual, apn, cfg_view, clients_read])
+        for secret in ("apn-account-secret", "apn-password-secret", ADMIN_HASH):
             assert secret not in json.dumps([wifi, dual, apn, cfg_view, clients_read])
         assert control(port, "apn.add", {"name": "fixture"})[0] == 404
         assert len(writes()) == before
@@ -519,10 +544,10 @@ esac
         cells = result["result"]
         assert cells["network_type"] == "LTE" and cells["primary"] == "lte", cells
         assert cells["lte"] == [
-            {"rat": "LTE", "pci": 57, "arfcn": 3725, "rsrp_dbm": -96, "sinr_db": -13, "band": "3"},
-            {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": "28"}], cells
+            {"rat": "LTE", "pci": 57, "arfcn": 3725, "rsrp_dbm": -96, "sinr_db": -13, "band": 3},
+            {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": 28}], cells
         assert cells["sa"] == [
-            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": "n78"}], cells
+            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
 
         # SA neighbor scan: switch to Only_5G (the firmware precondition),
         # scan, poll m_netselect_status, harvest, and restore the mode —
@@ -534,13 +559,89 @@ esac
         assert status == 200 and result["result"]["result"] == "success", result
         assert result["result"]["count"] == 2 and result["result"]["restored_mode"] == before_mode, result
         assert result["result"]["cells"][1] == {"rat": "NR5G", "pci": 361, "arfcn": 633984,
-                                                "rsrp_dbm": -97, "sinr_db": -7, "band": "n41"}, result
+                                                "rsrp_dbm": -97, "sinr_db": -7, "band": 41}, result
         scan_writes = [w for w in writes()[mark:] if w[1] in ("SCAN_NR5G_NEIGHBOR_CELL", "SET_BEARER_PREFERENCE")]
         assert [w[1] for w in scan_writes] == ["SET_BEARER_PREFERENCE", "SCAN_NR5G_NEIGHBOR_CELL",
                                                "SET_BEARER_PREFERENCE"], scan_writes
         assert scan_writes[0][2]["BearerPreference"] == "Only_5G"
         assert scan_writes[2][2]["BearerPreference"] == before_mode
         assert STORE["net_select"] == before_mode
+
+        # Wi-Fi settings on the mainline contract: configure with no-op
+        # detection, switch-only saves, key handling and readback verify.
+        status, result = control(port, "wifi.configure", {"section": "main_2g"})
+        assert status == 400, result  # no fields
+        mark = len(writes())
+        saved = control(port, "wifi.status", {})[1]["result"]["main_2g"]
+        saved.pop("disabled")  # the mainline contract also rejects it on save
+        status, result = control(port, "wifi.configure", {"section": "main_2g", **{
+            key: value for key, value in saved.items() if key != "writable"}})
+        assert status == 200 and result["result"] == {"section": "main_2g", "changed": False, "verified": True}, result
+        assert len(writes()) == mark
+        status, result = control(port, "wifi.configure", {
+            "section": "main_2g", "ssid": "renamed-24", "key": "new-password-8", "hidden": "1", "isolate": "1"})
+        assert status == 200 and result["result"]["changed"] is True and result["result"]["verified"], result
+        wifi_write = next(w for w in writes()[mark:] if w[1] == "setAccessPointInfo")
+        assert wifi_write[2]["SSID"] == "renamed-24" and wifi_write[2]["AuthMode"] == "WPA2PSK"
+        assert wifi_write[2]["EncrypType"] == "CCMP"
+        assert wifi_write[2]["Password"] == base64.b64encode(b"new-password-8").decode()
+        assert wifi_write[2]["ApBroadcastDisabled"] == "1" and wifi_write[2]["ApIsolate"] == "1"
+        assert wifi_write[2]["wifi_syncparas_flag"] == "0"
+        row = control(port, "wifi.status", {})[1]["result"]["main_2g"]
+        assert row["ssid"] == "renamed-24" and row["key"] == "new-password-8"
+        assert row["hidden"] == "1" and row["isolate"] == "1"
+        # Switch-only save mirrors the WebUI: nothing but the switch status.
+        mark = len(writes())
+        status, result = control(port, "wifi.configure", {"section": "main_2g", "enabled": False})
+        assert status == 200 and result["result"]["changed"] is True, result
+        switch_write = next(w for w in writes()[mark:] if w[1] == "setAccessPointInfo")
+        assert switch_write[2]["AccessPointSwitchStatus"] == "0" and "SSID" not in switch_write[2]
+        assert control(port, "wifi.configure", {"section": "main_2g", "enabled": True})[0] == 200
+        # Empty key keeps the current password; invalid values are refused.
+        status, result = control(port, "wifi.configure", {"section": "main_2g", "ssid": "renamed-24", "key": ""})
+        assert status == 200 and result["result"]["changed"] is False, result
+        assert control(port, "wifi.configure", {"section": "main_2g", "key": "short"})[0] == 400
+        assert control(port, "wifi.configure", {"section": "main_2g", "ssid": "x" * 33})[0] == 400
+        assert control(port, "wifi.configure", {"section": "wifi_6g", "ssid": "nope"})[0] == 400
+        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
+
+        # Band steering toggle rides the module-switch goform with the
+        # current switch and LAN flags preserved.
+        mark = len(writes())
+        status, result = control(port, "wifi.set_dual_band", {"enabled": True})
+        assert status == 200 and result["result"] == {"enabled": True, "changed": True, "verified": True}, result
+        steering = next(w for w in writes()[mark:] if w[1] == "switchWiFiModule")
+        assert steering[2]["wifi_lbd_enable"] == "1" and steering[2]["SwitchOption"] == "1"
+        assert control(port, "wifi.dual_band_status", {})[1]["result"]["enabled"] is True
+        status, result = control(port, "wifi.set_dual_band", {"enabled": True})
+        assert status == 200 and result["result"]["changed"] is False, result
+        assert control(port, "wifi.set_dual_band", {"enabled": 2})[0] == 400
+        assert control(port, "wifi.set_dual_band", {})[0] == 400
+        control(port, "wifi.set_dual_band", {"enabled": False})
+
+        # Neighbor monitor: disabled by default, mainline-shaped /state object
+        # and session-scoped enable through the OEM lists.
+        state = call(port, "/state")[1]
+        assert state["neighbor"]["status"] == "disabled" and state["neighbor"]["cells"] == [], state["neighbor"]
+        status, result = control(port, "neighbor.status", {})
+        assert status == 200 and result["result"]["enabled"] is False, result
+        assert control(port, "neighbor.set", {"enabled": "yes"})[0] == 400
+        status, result = control(port, "neighbor.set", {"enabled": True})
+        assert status == 200 and result["result"]["status"] == "ready", result
+        assert result["result"]["source"] == "oem_goform"
+        deadline = time.monotonic() + 4
+        state = None
+        while time.monotonic() < deadline:
+            state = call(port, "/state")[1]["neighbor"]
+            if state["enabled"] is True:
+                break
+            time.sleep(0.2)
+        assert state["enabled"] is True and state["collector_running"] is True
+        assert state["sampled_at"] and state["age_ms"] >= 0
+        lte, nr = state["cells"][0], next(c for c in state["cells"] if c["rat"] == "NR5G")
+        assert (lte["rat"], lte["pci"], lte["arfcn"], lte["band"], lte["rsrp_dbm"]) == ("LTE", 57, 3725, 3, -96)
+        assert (nr["rat"], nr["band"]) == ("NR5G", 78)
+        assert control(port, "neighbor.set", {"enabled": False})[1]["result"]["status"] == "disabled"
 
         # Traffic: the whole OEM limit block is re-sent, untouched fields preserved.
         status, result = control(port, "traffic.set_limit", {"enabled": 1, "type": 1, "value": "107374182400", "ratio": 90})
@@ -612,7 +713,7 @@ esac
 
         # Device actions and unmapped actions.
         assert control(port, "device.reboot", {})[0] == 200 and writes()[-1][1] == "REBOOT_DEVICE"
-        assert control(port, "wifi.configure", {"section": "main_2g"})[0] == 404, "wifi.configure is not mapped yet"
+        assert control(port, "wifi.configure", {"section": "main_2g", "bogus": "x"})[0] == 400
         assert control(port, "cooling.fan.set_mode", {"mode": "custom"})[0] == 404
 
         # The credential never appears in any reply.
