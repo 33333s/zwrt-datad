@@ -17,6 +17,7 @@ The project is implemented in Rust. Device templates isolate firmware difference
 - Provides complete JSON snapshots through `GET /state` and change events through `GET /events`
 - Normalizes fields through model templates and reports available operations through `/capabilities`
 - Exposes constrained cellular, Wi-Fi, APN, SMS, power, and device controls through `POST /control`
+- Authenticated remote file sessions with typed operations, bounded transfers, version checks and guarded archive extraction
 - Provides access to the device's registered ubus objects for trusted management clients
 - Includes optional isolated neighbor-cell collection with resource and expiry limits
 - Includes optional NMS cloud connectivity and remote service entry points

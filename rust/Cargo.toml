@@ -22,6 +22,13 @@ anyhow = "1"
 aes-gcm = "0.10"
 axum = { version = "0.8", features = ["http1", "json", "query", "tokio", "ws"] }
 base64 = "0.22"
+bzip2 = { version = "=0.5.2", features = ["static"] }
+flate2 = { version = "=1.1.8", default-features = false, features = ["rust_backend"] }
+lzma-rs = "=0.3.0"
+crc32fast = "=1.5.2"
+tar = { version = "=0.4.45", default-features = false }
+xz2 = { version = "=0.1.7", features = ["static"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate", "bzip2"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 futures-util = "0.3"

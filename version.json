@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.49",
+    "version": "0.10.50",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增按需 Hosts 管理，支持确认后的保存、DNS 刷新、版本冲突检查及备份恢复"
+    "notes": "新增受控远程文件管理与分块传输，支持编辑、上传下载、权限和压缩解压"
   }
 }
