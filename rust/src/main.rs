@@ -1,3 +1,4 @@
+mod apn_targets;
 mod auth;
 mod cloud;
 mod cloud_files;
@@ -7,6 +8,7 @@ mod cloud_update;
 mod command;
 mod control;
 mod cooling;
+mod device_session;
 mod elapsed;
 mod extra_wifi;
 mod files;
@@ -28,6 +30,7 @@ mod state;
 mod task_schedule;
 mod time_control;
 mod traffic_history;
+mod update_status;
 mod usb;
 mod webshell;
 mod wifi;
@@ -152,6 +155,7 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
     }
+    update_status::runtime("started");
     app.spawn_time_control();
     app.spawn_reboot_schedule();
     app.spawn_task_schedule();

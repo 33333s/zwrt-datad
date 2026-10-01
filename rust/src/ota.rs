@@ -1,4 +1,4 @@
-use crate::{elapsed, time_control};
+use crate::{elapsed, time_control, update_status};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::{Client, Url};
@@ -39,6 +39,14 @@ impl Default for Config {
             sources: default_sources(),
         }
     }
+}
+
+fn publish_config(config: &Config) {
+    update_status::set_config(
+        config.enabled,
+        config.sources.iter().any(|source| source == "custom"),
+        &config.servers,
+    );
 }
 
 fn default_sources() -> Vec<String> {
@@ -197,6 +205,7 @@ impl Ota {
             last_auto_check: None,
             retry_deadline,
         };
+        publish_config(&manager.config);
         if manager.retry_deadline.is_some() {
             manager.save_status();
         }
@@ -260,7 +269,22 @@ impl Ota {
         }
         atomic_json(&self.dir.join("ota.json"), &config, 0o600)?;
         self.config = config;
+        publish_config(&self.config);
         Ok(json!({"success":true,"config":self.config}))
+    }
+
+    /// Changes only the automatic-update switch (servers and sources stay) and
+    /// confirms the stored configuration before reporting the new state.
+    pub fn set_auto_update(&mut self, enabled: bool) -> Result<bool, String> {
+        let mut config = self.config.clone();
+        config.enabled = enabled;
+        self.update_config(config)?;
+        let stored = read_json::<Config>(&self.dir.join("ota.json"))
+            .ok_or_else(|| "ota_config_readback_failed".to_string())?;
+        if stored.enabled != enabled || self.config.enabled != enabled {
+            return Err("ota_config_readback_failed".into());
+        }
+        Ok(enabled)
     }
 
     fn servers(&self) -> Vec<String> {
@@ -293,6 +317,9 @@ impl Ota {
         self.status.last_check_at = now();
         self.status.progress = 0;
         self.save_status();
+        update_status::update("checking");
+        let mut signature_failed = false;
+        let mut verified = false;
         let mut errors = Vec::new();
         let mut valid_but_current = None;
         for base in self.servers() {
@@ -314,6 +341,7 @@ impl Ota {
                 }
             };
             if verify(&self.key, &raw, &encoded).is_err() {
+                signature_failed = true;
                 errors.push(format!("{base}: 签名校验失败"));
                 continue;
             }
@@ -324,6 +352,10 @@ impl Ota {
                     continue;
                 }
             };
+            if !verified {
+                verified = true;
+                update_status::update("signature_verified");
+            }
             let candidate = Candidate {
                 manifest,
                 base_url: base,
@@ -361,8 +393,14 @@ impl Ota {
             self.status.state = "idle".into();
             self.candidate = Some(candidate.clone());
             self.save_status();
+            update_status::update("idle");
             return Ok(candidate);
         }
+        update_status::update(if signature_failed {
+            "signature_failed"
+        } else {
+            "failed"
+        });
         let error = format!("所有更新服务器均不可用或签名无效: {}", errors.join("; "));
         self.status.state = "error".into();
         self.status.error = error.clone();
@@ -393,14 +431,26 @@ impl Ota {
         self.status.progress = 5;
         self.status.wait_reasons.clear();
         self.save_status();
-        let raw = self
+        update_status::update("downloading");
+        let raw = match self
             .fetch(&source_url(&candidate.base_url, &installer.name), 16 << 20)
-            .await?;
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                update_status::update("download_failed");
+                return Err(error);
+            }
+        };
         if hex_sha256(&raw) != installer.sha256 {
+            update_status::update("download_failed");
             return Err("安装器 SHA-256 校验失败".into());
         }
         let installer_path = self.dir.join("ota-installer.sh");
-        atomic_write(&installer_path, &raw, 0o700)?;
+        if let Err(error) = atomic_write(&installer_path, &raw, 0o700) {
+            update_status::update("install_failed");
+            return Err(error);
+        }
         let binary = candidate
             .manifest
             .artifacts
@@ -420,15 +470,23 @@ impl Ota {
             shell_quote(&marker),
             shell_quote(&marker),
         );
-        atomic_write(&wrapper, script.as_bytes(), 0o700)?;
+        if let Err(error) = atomic_write(&wrapper, script.as_bytes(), 0o700) {
+            update_status::update("install_failed");
+            return Err(error);
+        }
         self.status.state = "installing".into();
         self.status.progress = 100;
         self.save_status();
-        Command::new("/bin/sh")
+        update_status::update("installing");
+        if let Err(error) = Command::new("/bin/sh")
             .arg(&wrapper)
             .kill_on_drop(false)
             .spawn()
-            .map_err(|e| e.to_string())?;
+        {
+            update_status::update("install_failed");
+            return Err(error.to_string());
+        }
+        update_status::update("restarting");
         Ok(())
     }
 
@@ -456,6 +514,7 @@ impl Ota {
         };
         let _ = fs::remove_file(marker);
         if value.trim() == "success" {
+            update_status::update("succeeded");
             self.status.state = "succeeded".into();
             self.status.current_version = env!("DATAD_VERSION").into();
             self.status.last_success_at = now();
@@ -465,6 +524,7 @@ impl Ota {
             self.status.next_retry_at = 0;
             self.retry_deadline = None;
         } else {
+            update_status::update("install_failed");
             self.status.state = "error".into();
             self.status.error = "安装器执行失败，已由安装器回滚".into();
             self.status.failure_count = self.status.failure_count.saturating_add(1);

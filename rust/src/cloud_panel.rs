@@ -1,9 +1,10 @@
 //! On-demand state stream for an authenticated NMS panel session. No local
 //! HTTP port, datad bearer token, or UFI process is exposed to the cloud.
 use crate::{
+    apn_targets,
     cloud::{Config, RemoteFeatures, websocket_tls},
     control::{self, Outcome},
-    cooling,
+    cooling, device_session,
     model::Snapshot,
     reboot_schedule::{self, Schedule},
     server::App,
@@ -12,7 +13,7 @@ use crate::{
     state,
     task_schedule::TaskInput,
     traffic_history::Usage,
-    wifi,
+    update_status, wifi,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -152,6 +153,9 @@ struct PanelManagement<'a> {
     tasks: Option<&'a Value>,
     sms_forward: Option<&'a Value>,
     hosts: Option<&'a Value>,
+    apn_targets: Option<&'a Value>,
+    device_session: Option<&'a Value>,
+    datad_update: Option<&'a Value>,
 }
 
 fn state_message_with_config(
@@ -195,6 +199,15 @@ fn state_message_with_config(
     if let Some(hosts) = management.hosts {
         view.as_object_mut()?
             .insert("hosts_config".into(), hosts.clone());
+    }
+    for (name, block) in [
+        ("apn_targets", management.apn_targets),
+        ("device_session", management.device_session),
+        ("datad_update", management.datad_update),
+    ] {
+        if let Some(block) = block {
+            view.as_object_mut()?.insert(name.into(), block.clone());
+        }
     }
     let raw = serde_json::to_vec(&json!({
         "type": "state", "protocol_version": version, "snapshot": view
@@ -265,45 +278,8 @@ async fn wifi_panel_config() -> Option<Value> {
     Some(json!({"countries":countries,"bands":bands,"dual_band":dual_band}))
 }
 
-fn panel_apn_profiles(reply: &Value) -> Vec<Value> {
-    reply.get("apnListArray").and_then(Value::as_array)
-        .into_iter().flatten().take(64).filter_map(|item| {
-            let id=item.get("profileId")?.as_str()?;
-            if id.is_empty() || id.len()>64 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte)) {return None;}
-            let limited=|name:&str,max:usize|->String{
-                item.get(name).and_then(Value::as_str).unwrap_or("").chars().take(max).collect()
-            };
-            Some(json!({
-                "id":id,"name":limited("profilename",64),"apn":limited("wanapn",128),
-                "pdp_type":item.get("pdpType").and_then(Value::as_i64).filter(|v|(0..=3).contains(v)),
-                "auth_mode":item.get("pppAuthMode").and_then(Value::as_i64).filter(|v|(0..=3).contains(v)),
-                "enabled":item.get("isEnable").and_then(Value::as_bool)==Some(true)
-            }))
-        }).collect()
-}
-
 async fn apn_panel_config() -> Option<Value> {
-    let (mode, automatic, manual, enabled) = tokio::join!(
-        state::ubus("zwrt_apn_object", "get_apn_mode", json!({})),
-        state::ubus("zwrt_apn_object", "getAutoApnList", json!({})),
-        state::ubus("zwrt_apn_object", "getManuApnList", json!({})),
-        state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({}))
-    );
-    let (Ok(mode), Ok(automatic), Ok(manual), Ok(enabled)) = (mode, automatic, manual, enabled)
-    else {
-        return None;
-    };
-    let mode = mode
-        .get("apn_mode")
-        .and_then(Value::as_i64)
-        .filter(|v| *v == 0 || *v == 1)?;
-    let enabled_id = enabled
-        .get("profileId")
-        .and_then(Value::as_str)
-        .filter(|v| v.len() <= 64)
-        .unwrap_or("");
-    Some(json!({"mode":mode,"enabled_id":enabled_id,
-        "automatic":panel_apn_profiles(&automatic),"manual":panel_apn_profiles(&manual)}))
+    apn_targets::config(None).await
 }
 
 #[derive(Deserialize)]
@@ -380,6 +356,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "apn.modify"
             | "apn.enable"
             | "apn.delete"
+            | "datad.ota.set"
             | "multiwan.interface.set"
             | "multiwan.member.set"
             | "multiwan.policy.set"
@@ -450,7 +427,7 @@ async fn control_result(
     let mut hosts_revision = None;
     let code = if request.action == "usb.set"
         || (!control::ACTIONS.contains(&request.action.as_str())
-            && request.action != "neighbor.set")
+            && !matches!(request.action.as_str(), "neighbor.set" | "datad.ota.set"))
     {
         Some("unsupported_action")
     } else if needs_confirmation(&request.action) && !request.confirmed {
@@ -486,6 +463,14 @@ async fn control_result(
                 Err(_) => Some("invalid_parameter"),
             },
             None => Some("unsupported_action"),
+        }
+    } else if request.action == "datad.ota.set" {
+        match (cloud_app, remote_neighbor_enabled(&request.params)) {
+            (Some(app), Some(enabled)) => match app.panel_ota_set(enabled).await {
+                Ok(_) => None,
+                Err(_) => Some("device_call_failed"),
+            },
+            _ => Some("invalid_parameter"),
         }
     } else if request.action == "neighbor.set" {
         match (cloud_app, remote_neighbor_enabled(&request.params)) {
@@ -633,10 +618,18 @@ async fn control_result(
             Ok(Outcome::Ok(_)) => None,
             Ok(Outcome::Invalid(_)) => Some("invalid_parameter"),
             Ok(Outcome::Failed(_)) => Some("device_call_failed"),
+            Ok(Outcome::Coded(code)) => Some(code),
             Ok(Outcome::NotHandled) => Some("unsupported_action"),
             Err(_) => Some("device_call_timeout"),
         }
     };
+    match code {
+        Some("device_call_failed" | "device_call_timeout") => {
+            update_status::runtime("command_failed")
+        }
+        Some("device_session_expired") => update_status::runtime("session_expired"),
+        _ => {}
+    }
     let mut reply = json!({"type":"control_result","protocol_version":2,"request_id":request.request_id,"ok":code.is_none(),"code":code});
     if let Some(revision) = hosts_revision {
         reply["revision"] = json!(revision);
@@ -747,6 +740,8 @@ pub(crate) async fn run(
     } else {
         None
     };
+    let mut device_session_block = Some(device_session::panel_status().await);
+    let mut datad_update_block = Some(update_status::panel_block());
     let Some(first) = state_message_with_config(
         &last,
         if control_mode { 2 } else { 1 },
@@ -759,6 +754,9 @@ pub(crate) async fn run(
             tasks: scheduled_tasks.as_ref(),
             sms_forward: sms_forward_status.as_ref(),
             hosts: hosts_config.as_ref(),
+            apn_targets: None,
+            device_session: device_session_block.as_ref(),
+            datad_update: datad_update_block.as_ref(),
         },
     ) else {
         return;
@@ -768,16 +766,20 @@ pub(crate) async fn run(
     }
     // Extra configuration is fetched only while a remote panel is open. It
     // contains reviewed UI fields, never Wi-Fi keys or raw vendor responses.
-    let (wifi_result, apn_result, cooling_result) = tokio::join!(
+    let (wifi_result, apn_result, cooling_result, targets_result) = tokio::join!(
         tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()),
         tokio::time::timeout(Duration::from_secs(6), apn_panel_config()),
-        tokio::time::timeout(Duration::from_secs(6), cooling::panel_config())
+        tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()),
+        tokio::time::timeout(Duration::from_secs(12), apn_targets::panel_targets())
     );
+    let mut apn_targets_block = targets_result.ok().flatten();
     let mut wifi_config = wifi_result.ok().flatten();
     let mut apn_config = apn_result.ok().flatten();
     let mut cooling_config = cooling_result.ok().flatten();
-    let mut config_pending =
-        wifi_config.is_some() || apn_config.is_some() || cooling_config.is_some();
+    let mut config_pending = wifi_config.is_some()
+        || apn_config.is_some()
+        || cooling_config.is_some()
+        || apn_targets_block.is_some();
     let mut sample = tokio::time::interval(Duration::from_secs(1));
     sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -795,7 +797,9 @@ pub(crate) async fn run(
             _ = hosts_refresh.tick() => {
                 let next_hosts = if let Some(app)=&cloud_app {Some(app.panel_hosts_status().await)} else {None};
                 hosts_config = next_hosts;
-                let Some(message) = state_message_with_config(&last, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref()}) else { return; };
+                device_session_block = Some(device_session::panel_status().await);
+                datad_update_block = Some(update_status::panel_block());
+                let Some(message) = state_message_with_config(&last, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref(),apn_targets:apn_targets_block.as_ref(),device_session:device_session_block.as_ref(),datad_update:datad_update_block.as_ref()}) else { return; };
                 if socket.send(message).await.is_err() { return; }
             },
             _ = sample.tick() => {
@@ -803,8 +807,10 @@ pub(crate) async fn run(
                 let next_history = history_rx.borrow_and_update().clone();
                 let next_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None};
                 let next_sms_forward = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};
+                let next_update = Some(update_status::panel_block());
+                if next_update != datad_update_block { datad_update_block = next_update; config_pending = true; }
                 if next != last || config_pending || next_history != history || next_tasks != scheduled_tasks || next_sms_forward != sms_forward_status {
-                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref(),sms_forward:next_sms_forward.as_ref(),hosts:hosts_config.as_ref()}) else { return; };
+                    let Some(message) = state_message_with_config(&next, if control_mode {2} else {1}, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&next_history), PanelManagement {cloud:cloud_management.as_ref(),tasks:next_tasks.as_ref(),sms_forward:next_sms_forward.as_ref(),hosts:hosts_config.as_ref(),apn_targets:apn_targets_block.as_ref(),device_session:device_session_block.as_ref(),datad_update:datad_update_block.as_ref()}) else { return; };
                     if socket.send(message).await.is_err() { return; }
                     last = next;
                     history = next_history;
@@ -831,15 +837,22 @@ pub(crate) async fn run(
                     let refresh_tasks = request.action.starts_with("schedule.task.");
                     let refresh_sms_forward = request.action.starts_with("sms.forward.");
                     let refresh_hosts = matches!(request.action.as_str(), "hosts.save" | "hosts.restore");
+                    let refresh_session = matches!(request.action.as_str(), "device.session.login" | "sms.send_raw") || refresh_apn;
+                    let refresh_update = request.action == "datad.ota.set";
                     if socket.send(control_result(request, schedule.as_ref(), speedtest.as_ref(), cloud_app.as_ref()).await).await.is_err() { return; }
-                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks || refresh_sms_forward || refresh_hosts {
+                    if refresh_wifi || refresh_apn || refresh_cooling || refresh_tasks || refresh_sms_forward || refresh_hosts || refresh_session || refresh_update {
+                        if refresh_session {device_session_block = Some(device_session::panel_status().await);}
+                        if refresh_update {datad_update_block = Some(update_status::panel_block());}
                         if refresh_wifi {wifi_config = tokio::time::timeout(Duration::from_secs(6), wifi_panel_config()).await.ok().flatten();}
-                        if refresh_apn {apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();}
+                        if refresh_apn {
+                            apn_config = tokio::time::timeout(Duration::from_secs(6), apn_panel_config()).await.ok().flatten();
+                            apn_targets_block = tokio::time::timeout(Duration::from_secs(12), apn_targets::panel_targets()).await.ok().flatten();
+                        }
                         if refresh_cooling {cooling_config = tokio::time::timeout(Duration::from_secs(6), cooling::panel_config()).await.ok().flatten();}
                         if refresh_tasks { scheduled_tasks = if let Some(app)=&cloud_app {Some(app.panel_task_status().await)} else {None}; }
                         if refresh_sms_forward {sms_forward_status = if let Some(app)=&cloud_app {Some(app.panel_sms_forward_status().await)} else {None};}
                         if refresh_hosts {hosts_config = if let Some(app)=&cloud_app {Some(app.panel_hosts_status().await)} else {None};}
-                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref()})
+                        if let Some(message) = state_message_with_config(&last, 2, wifi_config.as_ref(), apn_config.as_ref(), cooling_config.as_ref(), Some(&history), PanelManagement {cloud:cloud_management.as_ref(),tasks:scheduled_tasks.as_ref(),sms_forward:sms_forward_status.as_ref(),hosts:hosts_config.as_ref(),apn_targets:apn_targets_block.as_ref(),device_session:device_session_block.as_ref(),datad_update:datad_update_block.as_ref()})
                             && socket.send(message).await.is_err() { return; }
                     }
                 },
@@ -954,6 +967,7 @@ mod tests {
                 tasks: None,
                 sms_forward: None,
                 hosts: None,
+                ..Default::default()
             },
         )
         .unwrap() else {
@@ -1062,6 +1076,7 @@ mod tests {
                 tasks: Some(&tasks),
                 sms_forward: None,
                 hosts: None,
+                ..Default::default()
             },
         )
         .unwrap() else {
@@ -1148,7 +1163,7 @@ mod tests {
              "username":"must-not-leak","password":"must-not-leak"},
             {"profileId":"../bad","profilename":"Bad","password":"must-not-leak"}
         ]});
-        let filtered = panel_apn_profiles(&raw);
+        let filtered = apn_targets::profiles(&raw);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["id"], "profile-1");
         assert_eq!(filtered[0]["apn"], "internet");
@@ -1526,5 +1541,136 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    fn control(action: &str, params: Value, confirmed: bool) -> ControlRequest {
+        parse_control(
+            &json!({"type":"control","protocol_version":2,"request_id":"0123456789abcdef0123456789abcdef",
+                "action":action,"params":params,"confirmed":confirmed})
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    async fn result_code(request: ControlRequest) -> Value {
+        let Message::Text(raw) = control_result(request, None, None, None).await else {
+            panic!("expected text frame")
+        };
+        serde_json::from_str::<Value>(&raw).unwrap()["code"].clone()
+    }
+
+    #[test]
+    fn new_status_blocks_only_enter_authorized_panel_frames() {
+        let snapshot = Snapshot {
+            ts: 7,
+            datad: DatadVersion::default(),
+            fields: Map::new(),
+        };
+        let targets = json!({"targets":[{"slot_id":1,"config":{"writable":true,"mode":1,"enabled_id":"","automatic":[],"manual":[]}}]});
+        let session = json!({"supported":true,"reauth_supported":true,"active":null});
+        let update = json!({"supported":true,"auto_update_supported":true,"auto_update_enabled":false,
+            "phase":"idle","runtime_events":[{"ts":1,"code":"connected"}],"update_events":[]});
+        let Message::Text(plain) = state_message(&snapshot).unwrap() else {
+            panic!("expected state");
+        };
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        for name in ["apn_targets", "device_session", "datad_update"] {
+            assert!(plain["snapshot"].get(name).is_none(), "{name}");
+        }
+        let Message::Text(raw) = state_message_with_config(
+            &snapshot,
+            2,
+            None,
+            None,
+            None,
+            None,
+            PanelManagement {
+                apn_targets: Some(&targets),
+                device_session: Some(&session),
+                datad_update: Some(&update),
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            panic!("expected panel state");
+        };
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["snapshot"]["apn_targets"], targets);
+        assert_eq!(frame["snapshot"]["device_session"], session);
+        assert!(frame["snapshot"]["device_session"]["active"].is_null());
+        assert_eq!(frame["snapshot"]["datad_update"], update);
+    }
+
+    #[tokio::test]
+    async fn ota_switch_needs_confirmation_and_exactly_one_boolean() {
+        assert_eq!(
+            result_code(control("datad.ota.set", json!({"enabled":true}), false)).await,
+            "confirmation_required"
+        );
+        for params in [
+            json!({}),
+            json!({"enabled":"true"}),
+            json!({"enabled":1}),
+            json!({"enabled":true,"url":"https://example.invalid"}),
+        ] {
+            assert_eq!(
+                result_code(control("datad.ota.set", params, true)).await,
+                "invalid_parameter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn device_session_login_rejects_bad_passwords_before_any_device_call() {
+        for params in [
+            json!({}),
+            json!({"password":""}),
+            json!({"password":"two\nlines"}),
+            json!({"password":"nul\u{0}byte"}),
+            json!({"password":"p".repeat(1025)}),
+            json!({"password":"ok","extra":1}),
+            json!({"password":7}),
+        ] {
+            assert_eq!(
+                result_code(control("device.session.login", params, false)).await,
+                "invalid_parameter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apn_target_writes_are_validated_before_any_device_call() {
+        let _guard = apn_targets::TEST_LOCK.lock().await;
+        apn_targets::set_multi_modem(true);
+        for (action, params) in [
+            ("apn.add", json!({"slot_id":101,"name":"n","apn":"a"})),
+            ("apn.add", json!({"slot_id":201,"name":"n","apn":"a"})),
+            ("apn.delete", json!({"slot_id":101,"profile_id":"p1"})),
+            ("apn.delete", json!({"slot_id":201,"profile_id":"p1"})),
+            ("apn.enable", json!({"slot_id":2,"profile_id":"p1"})),
+            ("apn.enable", json!({"slot_id":"101","profile_id":"p1"})),
+            ("apn.set_mode", json!({"slot_id":999,"mode":1})),
+            (
+                "apn.modify",
+                json!({"slot_id":-1,"profile_id":"p1","name":"n","apn":"a"}),
+            ),
+        ] {
+            assert_eq!(
+                result_code(control(action, params.clone(), true)).await,
+                "invalid_parameter",
+                "{action} {params}"
+            );
+        }
+        apn_targets::set_multi_modem(false);
+        assert_eq!(
+            result_code(control(
+                "apn.enable",
+                json!({"slot_id":1,"profile_id":"p1"}),
+                true
+            ))
+            .await,
+            "invalid_parameter"
+        );
+        apn_targets::set_multi_modem(true);
     }
 }

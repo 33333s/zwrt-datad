@@ -1371,6 +1371,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     if matches!(template, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
         topflow_net_fallback(&mut raw_net, &uci_sets);
     }
+    crate::apn_targets::set_multi_modem(template == "MU5252");
     let mut net = Map::new();
     net.insert(
         "roaming_allowed".into(),
