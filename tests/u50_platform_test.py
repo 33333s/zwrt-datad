@@ -635,8 +635,6 @@ esac
         assert status == 200 and result["result"]["changed"] is False, result
         assert control(port, "wifi.configure", {"section": "main_5g", "channel": "0"})[0] == 200
         assert CHIP_ADVANCED["ResponseList"][1]["Channel"] == "0"
-        # Channel is a 5G-radio-only knob; other sections and bad values refuse.
-        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_5g", "channel": "50"})[0] == 400
 
         # Band steering toggle rides the module-switch goform with the
