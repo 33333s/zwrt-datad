@@ -42,6 +42,8 @@ const CFG_KEYS: &[&str] = &[
     "realtime_rx_bytes",
     "monthly_tx_bytes",
     "monthly_rx_bytes",
+    "daily_down_bytes",
+    "daily_up_bytes",
     "wifi_onoff_state",
     "wifi_access_sta_num",
     "modem_main_state",
@@ -498,6 +500,8 @@ fn from_sources(
         ("realtime_tx_bytes", "tx_bytes"),
         ("monthly_rx_bytes", "month_rx_bytes"),
         ("monthly_tx_bytes", "month_tx_bytes"),
+        ("daily_down_bytes", "today_rx_bytes"),
+        ("daily_up_bytes", "today_tx_bytes"),
     ] {
         if let Some(value) = source_number(cfg, goform, source, 0, i64::MAX) {
             traffic.insert(target.into(), json!(value));
@@ -641,9 +645,12 @@ fn insert_number(
     cfg: &BTreeMap<String, String>,
     key: &str,
     max: i64,
-) {
+) -> bool {
     if let Some(value) = cfg_number(cfg, key, 0, max) {
         map.insert(target.into(), json!(value));
+        true
+    } else {
+        false
     }
 }
 
@@ -802,20 +809,25 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
     {
         let traffic = block(fields, "traffic");
         insert_number(traffic, "session_time", cfg, "realtime_time", i64::MAX);
-        insert_number(
+        // OEM key is daily_down_bytes on U50 Pro; ZWRT uses slot1_daily_rx_bytes.
+        if !insert_number(
             traffic,
             "day_rx_bytes",
             cfg,
             "slot1_daily_rx_bytes",
             i64::MAX,
-        );
-        insert_number(
+        ) {
+            insert_number(traffic, "day_rx_bytes", cfg, "daily_down_bytes", i64::MAX);
+        }
+        if !insert_number(
             traffic,
             "day_tx_bytes",
             cfg,
             "slot1_daily_tx_bytes",
             i64::MAX,
-        );
+        ) {
+            insert_number(traffic, "day_tx_bytes", cfg, "daily_up_bytes", i64::MAX);
+        }
         insert_number(traffic, "max_rx_speed", cfg, "peak_rx_bytes", i64::MAX);
         insert_number(traffic, "max_tx_speed", cfg, "peak_tx_bytes", i64::MAX);
         for (target, home, roam) in [
