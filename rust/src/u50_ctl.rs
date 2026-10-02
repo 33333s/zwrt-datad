@@ -801,8 +801,16 @@ impl Ctl {
                 "hidden" | "isolate" => matches!(value, "0" | "1"),
                 "pmf" => matches!(value, "0" | "1" | "2"),
                 "maxassoc" => value.parse::<u32>().is_ok_and(|n| (1..=128).contains(&n)),
-                "channel" if section == "main_5g" => {
-                    matches!(value, "0") || WIFI_5G_CHANNELS.contains(&value)
+                "channel" => {
+                    if section == "main_5g" {
+                        matches!(value, "0") || WIFI_5G_CHANNELS.contains(&value)
+                    } else {
+                        // 2.4 GHz: channels 1-13
+                        matches!(value, "0")
+                            || (value.len() <= 2
+                                && value.bytes().all(|b| b.is_ascii_digit())
+                                && value.parse::<u8>().is_ok_and(|ch| (1..=13).contains(&ch)))
+                    }
                 }
                 other => {
                     return Outcome::Invalid(format!(
