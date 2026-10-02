@@ -950,19 +950,35 @@ impl Ctl {
         }
         if let Some(channel) = target.channel.as_ref() {
             // The radio write re-sends the full advanced set from the current
-            // row, exactly like the WebUI's builder. A DFS channel restarts
-            // the radio and adds the regulatory CAC before beacons.
+            // row, exactly like the WebUI's builder. Without the row we would
+            // be writing empty radio parameters — refuse instead.
+            let Some(chip) = chip_row.as_ref() else {
+                return Outcome::Failed("OEM Wi-Fi radio configuration unavailable".into());
+            };
+            let radio_text = |key: &str| {
+                chip.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
             let mut form: Vec<(&str, String)> = vec![
-                ("ChipIndex", chip_text("ChipIndex")),
-                ("WirelessMode", chip_text("WirelessMode")),
-                ("CountryCode", chip_text("CountryCode")),
+                ("ChipIndex", radio_text("ChipIndex")),
+                ("WirelessMode", radio_text("WirelessMode")),
+                ("CountryCode", radio_text("CountryCode")),
                 ("Channel", channel.clone()),
-                ("BandWidth", chip_text("BandWidth")),
+                ("BandWidth", radio_text("BandWidth")),
             ];
-            if band == "a" && !chip_text("Band").is_empty() {
-                form.push(("Band", chip_text("Band")));
+            if band == "a" && !radio_text("Band").is_empty() {
+                form.push(("Band", radio_text("Band")));
             }
             if let Err(error) = self.write("setWiFiChipAdvancedInfo", &form).await {
+                // AP settings (if any) were already applied above; surface
+                // that so the caller does not assume nothing changed.
+                if ap_changed {
+                    return Outcome::Failed(format!(
+                        "AP settings were applied, but the channel write failed: {error}"
+                    ));
+                }
                 return Outcome::Failed(error);
             }
             let verified = tokio::time::timeout(Duration::from_secs(30), async {
