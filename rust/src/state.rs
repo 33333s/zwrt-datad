@@ -70,6 +70,18 @@ fn with_cellular_addresses(mut wan: Value, cellular: &Value) -> Value {
     wan
 }
 
+/// Last resort after netifd and the vendor data service: the addresses of the
+/// kernel's default-route interface. Read only when the list is still empty.
+fn with_kernel_addresses(mut wan: Value, family: &str, read: fn() -> Vec<Value>) -> Value {
+    if wan[family].as_array().is_none_or(Vec::is_empty) {
+        let addresses = read();
+        if !addresses.is_empty() {
+            wan[family] = json!(addresses);
+        }
+    }
+    wan
+}
+
 fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
@@ -1607,7 +1619,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "thermal".into(),
         json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[],"protection":{"active":high_temp_level>0,"level":high_temp_level,"speed_limited":high_temp_level==2,"network_restricted":high_temp_level==3,"raw":if high_temp_raw.is_empty(){Value::Null}else{json!(high_temp_raw)}}}),
     );
-    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":with_cellular_addresses(interface(&wan4_if),&cellular),"wan6":with_cellular_addresses(interface(&wan6_if),&cellular),"lan_config":lan_config,"cellular":cellular}));
+    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":with_kernel_addresses(with_cellular_addresses(interface(&wan4_if),&cellular),"ipv4",crate::kernel_wan::ipv4),"wan6":with_kernel_addresses(with_cellular_addresses(interface(&wan6_if),&cellular),"ipv6",crate::kernel_wan::ipv6),"lan_config":lan_config,"cellular":cellular}));
     const UF: &[(&str, &str)] = &[
         ("iccid", "zwrt_zte_mdm.sim_info.sim_iccid"),
         ("imsi", "zwrt_zte_mdm.sim_info.sim_imsi"),
@@ -2326,5 +2338,48 @@ mod tests {
         let wan = with_cellular_addresses(managed.clone(), &cellular);
         assert_eq!(wan["ipv4"], managed["ipv4"]);
         assert_eq!(wan["ipv6"], json!([{"address":"2001:db8::7"}]));
+    }
+    #[test]
+    fn kernel_addresses_are_only_the_last_resort() {
+        fn kernel() -> Vec<Value> {
+            vec![json!({"address":"121.203.249.121","mask":30})]
+        }
+        fn nothing() -> Vec<Value> {
+            Vec::new()
+        }
+        let empty = interface(&json!({"up":false,"proto":"none"}));
+        // Vendor reports "0" everywhere: the kernel fills in, nothing else changes.
+        let wan = with_kernel_addresses(
+            with_cellular_addresses(
+                empty.clone(),
+                &json!({"ipv4_address":"0","ipv4_netmask":"0"}),
+            ),
+            "ipv4",
+            kernel,
+        );
+        assert_eq!(
+            wan["ipv4"],
+            json!([{"address":"121.203.249.121","mask":30}])
+        );
+        assert_eq!(wan["up"], false);
+        assert_eq!(wan["proto"], "none");
+        // Cellular still beats the kernel.
+        let wan = with_kernel_addresses(
+            with_cellular_addresses(empty.clone(), &json!({"ipv4_address":"10.0.0.2"})),
+            "ipv4",
+            kernel,
+        );
+        assert_eq!(wan["ipv4"], json!([{"address":"10.0.0.2"}]));
+        // netifd beats both.
+        let managed = interface(&json!({"ipv4-address":[{"address":"192.0.2.1","mask":24}]}));
+        assert_eq!(
+            with_kernel_addresses(managed.clone(), "ipv4", kernel)["ipv4"],
+            managed["ipv4"]
+        );
+        // Nothing found anywhere stays empty.
+        assert_eq!(
+            with_kernel_addresses(empty, "ipv6", nothing)["ipv6"],
+            json!([])
+        );
     }
 }

@@ -14,6 +14,7 @@ mod extra_wifi;
 mod files;
 mod hosts;
 mod identity;
+mod kernel_wan;
 mod model;
 mod neighbor;
 mod neighbor_manager;
