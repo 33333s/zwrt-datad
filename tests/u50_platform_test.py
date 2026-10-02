@@ -617,7 +617,9 @@ esac
         assert control(port, "wifi.configure", {"section": "main_2g", "key": "short"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_2g", "ssid": "x" * 33})[0] == 400
         assert control(port, "wifi.configure", {"section": "wifi_6g", "ssid": "nope"})[0] == 400
+        # 2.4G accepts 1-13 (and 0=auto); 5G-only channels refuse on 2.4G.
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
+        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 200
 
         # 5G channel pinning: the per-radio write re-sends the current
         # advanced set with only the channel moved.
@@ -633,8 +635,6 @@ esac
         assert status == 200 and result["result"]["changed"] is False, result
         assert control(port, "wifi.configure", {"section": "main_5g", "channel": "0"})[0] == 200
         assert CHIP_ADVANCED["ResponseList"][1]["Channel"] == "0"
-        # Channel is a 5G-radio-only knob; other sections and bad values refuse.
-        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_5g", "channel": "50"})[0] == 400
 
         # Band steering toggle rides the module-switch goform with the
