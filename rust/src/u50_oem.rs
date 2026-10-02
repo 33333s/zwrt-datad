@@ -580,7 +580,14 @@ impl Bridge {
     ) -> Result<Value, String> {
         let token = self.local_token().await?;
         match self.write(&token, goform_id, params, true).await {
-            Err(error) if error.contains("session") || error.contains("login") => {
+            // "OEM action rejected" is what the goahead returns when its cookie
+            // expired mid-session — the same recoverable condition as the
+            // explicit session/login errors. Drop and retry once.
+            Err(error)
+                if error.contains("session")
+                    || error.contains("login")
+                    || error.contains("OEM action rejected") =>
+            {
                 self.drop_session().await;
                 let token = self.local_token().await?;
                 self.write(&token, goform_id, params, true).await
