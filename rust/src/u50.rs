@@ -561,15 +561,17 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "simcard_active_slot", 0, 4) {
         sim.insert("current_slot".into(), json!(value));
     }
-    // Capability flag for clients: physical SIM slot count (1 on single-SIM
-    // units). OEM keys differ across images; absent key means single SIM.
-    let dual = cfg
+    // Capability flag for clients: physical SIM slot count. Only emitted
+    // when the OEM actually reports it — an absent key lets clients decide
+    // on their own instead of mistaking a default for real information.
+    if let Some(dual) = cfg
         .get("support_dual_sim")
         .or_else(|| cfg.get("dual_sim_support"))
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(1)
-        .clamp(1, 2);
-    sim.insert("dual_sim".into(), json!(dual));
+        .filter(|v| (1..=2).contains(v))
+    {
+        sim.insert("dual_sim".into(), json!(dual));
+    }
     if !sim.is_empty() {
         fields.insert("sim".into(), Value::Object(sim));
     }
