@@ -739,6 +739,21 @@ impl Ctl {
                 }),
             );
         }
+        // queryAccessPointInfo's Channel is the runtime/auto-selected value
+        // (0 = auto); the pinned channel lives in queryWiFiChipAdvancedInfo.
+        // Merge it into the main sections so clients can display what is
+        // actually configured rather than what the radio happens to run on.
+        for (band, section) in [("b", "main_2g"), ("a", "main_5g")] {
+            if let Some(chip) = self.wifi_chip_row(band).await
+                && let Some(pinned) = chip
+                    .get("Channel")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                && let Some(target) = sections.get_mut(section)
+            {
+                target["channel"] = json!(pinned);
+            }
+        }
         if sections.is_empty() {
             return Err("OEM Wi-Fi configuration unavailable".into());
         }
