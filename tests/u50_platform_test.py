@@ -617,7 +617,9 @@ esac
         assert control(port, "wifi.configure", {"section": "main_2g", "key": "short"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_2g", "ssid": "x" * 33})[0] == 400
         assert control(port, "wifi.configure", {"section": "wifi_6g", "ssid": "nope"})[0] == 400
+        # 2.4G accepts 1-13 (and 0=auto); 5G-only channels refuse on 2.4G.
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
+        assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 200
 
         # 5G channel pinning: the per-radio write re-sends the current
         # advanced set with only the channel moved.
