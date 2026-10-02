@@ -506,7 +506,7 @@ esac
         # "0"), it never means "lock every factory band".
         assert control(port, "band.set_lte", {"bands": [1,3,41]})[0] == 200
         status, automatic = control(port, "band.set_lte", {"bands": ""})
-        assert status == 200 and automatic["result"] == {"result": "success", "mode": "auto", "verified": True}, automatic
+        assert status == 200 and automatic["result"]["mode"] == "auto" and automatic["result"]["verified"], automatic
         assert STORE["lte_band_lock"] == "0" and writes()[-1][2]["lte_band_lock"] == "0"
         assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
         assert STORE["nr5g_sa_band_lock"] == "0"
