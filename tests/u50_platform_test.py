@@ -510,7 +510,7 @@ esac
         # auto = factory bands (U50 Pro: mask 0 = no service, not auto)
         assert STORE["lte_band_lock"] == "0x000001c200000095"  # factory mask
         assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
-        assert STORE["nr5g_sa_band_lock"] == "5,7,78"  # factory list
+        assert STORE["nr5g_sa_band_lock"] == "1,3,5,8,28,41,77,78"  # factory list
         # Bands outside the modem's factory tables are refused before any
         # write reaches the firmware (it would store them verbatim and the
         # modem would go offline hunting an unsupported band).
