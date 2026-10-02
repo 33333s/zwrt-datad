@@ -1429,7 +1429,28 @@ impl Ctl {
 
     /// Clear the LTE band lock (mask "0"), matching the WebUI's deselect-all.
     async fn band_auto_lte(&self) -> Outcome {
-        let mask = "0".to_owned();
+        // On the U50 Pro firmware, mask "0" means "no bands allowed" (the modem
+        // goes NO_SERVICE). The safe "unlock" is to explicitly allow every
+        // factory band — delegate to the explicit write path with all bands.
+        let factory = match self
+            .field("lte_band_1_64_factory")
+            .await
+            .as_deref()
+            .and_then(mask_value)
+            .filter(|v| *v != 0)
+        {
+            Some(mask) => mask,
+            None => return Outcome::Failed("factory LTE bands unavailable".into()),
+        };
+        let bands: Vec<u32> = (1..=64)
+            .filter(|band| factory & (1u64 << (band - 1)) != 0)
+            .map(|band| band as u32)
+            .collect();
+        if bands.is_empty() {
+            return Outcome::Failed("factory LTE bands unavailable".into());
+        }
+        // Build the explicit write form (same as band_set_lte with explicit bands)
+        let mask = lte_mask(&bands);
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
                 .await
@@ -1449,14 +1470,16 @@ impl Ctl {
             return Outcome::Failed(error);
         }
         let verified = self
-            .wait_field("lte_band_lock", |value| mask_value(value) == Some(0))
+            .wait_field("lte_band_lock", |value| {
+                mask_value(value) == mask_value(&mask)
+            })
             .await;
         if !verified {
             return Outcome::Failed(
                 "OEM LTE band unlock was accepted but readback did not match".into(),
             );
         }
-        Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}))
+        Outcome::Ok(json!({"result":"success","mode":"auto","bands":bands,"verified":true}))
     }
 
     /// The U50 Pro firmware gates `BAND_SELECT` and the NR lock goforms behind
@@ -1492,8 +1515,15 @@ impl Ctl {
             }
             (bands, false)
         };
+        let auto_bands = factory
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let csv = if auto {
-            "0".to_owned()
+            // On the U50 Pro firmware, mask "0" means "no bands allowed".
+            // "Unlock" = allow every factory NR band.
+            auto_bands.clone()
         } else {
             bands
                 .iter()
@@ -1518,8 +1548,10 @@ impl Ctl {
         } else {
             "nr5g_sa_band_lock"
         };
+        let auto_expected = auto_bands;
         let verified = if auto {
-            self.wait_field(key, |value| value.trim() == "0").await
+            self.wait_field(key, |value| value.trim() == auto_expected)
+                .await
         } else {
             self.wait_field(key, |value| {
                 band_list(&json!({"bands":value}), "bands", 512)
