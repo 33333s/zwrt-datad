@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.55",
+    "version": "0.10.56",
     "asset": "zwrt-datad-aarch64",
-    "notes": "WAN 地址的最后兜底：netifd 和原厂蜂窝数据都没有有效地址时，读内核默认路由所在接口的 IPv4/IPv6 地址（G5 Pro 原厂 zwrt_data 报 disconnected 但实际在线）"
+    "notes": "ubus 改为直连 ubusd socket，不再每次调用都启动 ubus 进程；所有 ubus 请求经单一执行器串行，控制请求优先于状态采集，卡住的原厂对象自动冷却；socket 不可用时自动回退 ubus 命令"
   }
 }

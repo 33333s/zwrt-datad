@@ -52,6 +52,15 @@ jobs:
       - run: python3 ../tests/wifi_control_test.py target/debug/zwrt-datad
       - run: ../tests/rust_control_integration.sh
       - run: python3 ../tests/rust_cooling_test.py target/debug/zwrt-datad
+      - name: Integration suites over the ubus socket protocol
+        run: |
+          for suite in rust_sms_test.py rust_usb_test.py rust_apn_session_test.py identity_test.py \
+                       rust_webshell_test.py rust_sse_limit_test.py version_test.py time_control_test.py \
+                       cloud_embedded_test.py neighbor_http_test.py direct_supply_test.py wifi_control_test.py; do
+            sh ../tests/with_mock_ubusd.sh python3 "../tests/$suite" target/debug/zwrt-datad
+          done
+          sh ../tests/with_mock_ubusd.sh sh ../tests/service_token_test.sh target/debug/zwrt-datad
+          sh ../tests/with_mock_ubusd.sh ../tests/rust_control_integration.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --features keymaster-worker --bin keymaster-worker -- -D warnings
       - run: cargo build --locked --release

@@ -31,6 +31,7 @@ mod state;
 mod task_schedule;
 mod time_control;
 mod traffic_history;
+mod ubus_socket;
 mod update_status;
 mod usb;
 mod webshell;
@@ -81,6 +82,37 @@ struct Args {
     data_dir: PathBuf,
 }
 
+fn differing_paths(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(left), Value::Object(right)) => {
+            let keys: std::collections::BTreeSet<_> = left.keys().chain(right.keys()).collect();
+            for key in keys {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match (left.get(key), right.get(key)) {
+                    (Some(x), Some(y)) => differing_paths(x, y, &child, out),
+                    _ => out.push(child),
+                }
+            }
+        }
+        _ if a != b => out.push(if path.is_empty() {
+            "(root)".into()
+        } else {
+            path.into()
+        }),
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     cloud::init_crypto();
@@ -99,6 +131,43 @@ async fn main() -> Result<()> {
                 std::process::exit(64);
             }
         }
+    }
+    if raw.get(1).map(String::as_str) == Some("--ubus-compare") {
+        // Read-only calls only: `object:method [json-args]`, run through both backends.
+        let mut failed = false;
+        for spec in raw.iter().skip(2) {
+            let (target, args) = spec.split_once(' ').unwrap_or((spec, "{}"));
+            let Some((object, method)) = target.split_once(':') else {
+                eprintln!("expected object:method, got {target}");
+                std::process::exit(64);
+            };
+            let args: serde_json::Value = serde_json::from_str(args)?;
+            let cli = state::ubus_cli(object, method, args.clone()).await;
+            let socket = ubus_socket::call(object, method, &args).await;
+            let same = matches!((&cli, &socket), (Ok(a), Some(Ok(b))) if a == b)
+                || matches!((&cli, &socket), (Err(a), Some(Err(b))) if a == b);
+            failed |= !same;
+            println!(
+                "{} {target} cli={} socket={}",
+                if same { "SAME" } else { "DIFF" },
+                match &cli {
+                    Ok(v) => format!("ok:{}b", v.to_string().len()),
+                    Err(e) => format!("err:{e}"),
+                },
+                match &socket {
+                    Some(Ok(v)) => format!("ok:{}b", v.to_string().len()),
+                    Some(Err(e)) => format!("err:{e}"),
+                    None => "unavailable".into(),
+                }
+            );
+            // Paths only: values may hold identifiers and never leave the device.
+            if !same && let (Ok(a), Some(Ok(b))) = (&cli, &socket) {
+                let mut paths = Vec::new();
+                differing_paths(a, b, "", &mut paths);
+                println!("  differing paths: {}", paths.join(", "));
+            }
+        }
+        std::process::exit(i32::from(failed));
     }
     let args = Args::parse();
     if args.usb_status {
