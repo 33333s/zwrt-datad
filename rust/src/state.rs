@@ -2077,6 +2077,24 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
     if !args.is_object() {
         return Err("args must be an object".into());
     }
+    if crate::ubus_socket::enabled() {
+        match crate::ubus_socket::call(service, method, &args).await {
+            Some(result) => return result,
+            None if crate::ubus_socket::strict() => {
+                return Err("ubus socket unavailable".into());
+            }
+            None => {}
+        }
+    }
+    ubus_cli(service, method, args).await
+}
+
+pub async fn ubus_cli(service: &str, method: &str, args: Value) -> Result<Value, String> {
+    validate_name(service)?;
+    validate_name(method)?;
+    if !args.is_object() {
+        return Err("args must be an object".into());
+    }
     let body = serde_json::to_string(&args).map_err(|e| e.to_string())?;
     let raw = command::run(
         &ubus_bin(),

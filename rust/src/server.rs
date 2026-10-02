@@ -602,7 +602,16 @@ impl App {
     async fn refresh_snapshot(&self) {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
-        let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        let round = std::time::Instant::now();
+        let mut next = crate::ubus_socket::collecting(state::collect(
+            self.inner.interval_ms.load(Ordering::Relaxed),
+        ))
+        .await;
+        crate::ubus_socket::record_round(round.elapsed());
+        if std::env::var("ZWRT_DATAD_UBUS_STATS").as_deref() == Ok("1") {
+            next.fields
+                .insert("ubus_stats".into(), crate::ubus_socket::stats());
+        }
         next.fields
             .insert("time".into(), self.inner.time_control.status());
         next.fields.insert(
