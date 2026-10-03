@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.56",
+    "version": "0.10.57",
     "asset": "zwrt-datad-aarch64",
-    "notes": "ubus 改为直连 ubusd socket，不再每次调用都启动 ubus 进程；所有 ubus 请求经单一执行器串行，控制请求优先于状态采集，卡住的原厂对象自动冷却；socket 不可用时自动回退 ubus 命令"
+    "notes": "修复 MU5250/MC7523/MC8532B 无法发送短信（这些固件的短信服务接收明文号码和正文，datad 误发了加密信封，仅 MU5252 需要加密）；APN 写动作在单基带机型上接受 slot_id=1（原样当主基带），不再整体拒绝"
   }
 }

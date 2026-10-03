@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 binary = Path(sys.argv[1]).resolve()
 mock = Path(__file__).with_name('mock_sms_ubus.py').resolve()
+root_uci = Path(__file__).with_name('mock_sms_uci.py').resolve()
 with tempfile.TemporaryDirectory(prefix='datad-sms-test-') as name:
     root = Path(name)
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -32,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='datad-sms-test-') as name:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     env = dict(os.environ, SMS_FIXTURE=str(root), ZWRT_DATAD_UBUS_BIN=str(mock),
-               ZWRT_DATAD_UCI_BIN='/usr/bin/false', ZWRT_DATAD_OTA_DISABLE_AUTO='1',
+               ZWRT_DATAD_UCI_BIN=str(root_uci), ZWRT_DATAD_OTA_DISABLE_AUTO='1',
                ZWRT_DATAD_COOLING_CONFIG=str(root / 'cooling'))
     process = subprocess.Popen([str(binary), '--port', str(port), '--data-dir', str(root / 'data'),
                                 '--auth-token-file', str(root / 'token')], env=env,
@@ -114,7 +115,17 @@ with tempfile.TemporaryDirectory(prefix='datad-sms-test-') as name:
         # that plaintext models remain readable without a vendor RSA session.
         assert action('send_raw', params)[0] == 502
         wait_for(lambda s: len(s['list']) == 1 and s['list'][0]['text'] == '测试1' and not s['stale'])
-        print('SMS: flat PEM, encrypted pagination, rekey, stale cache, bounds, auth, plaintext, fixture send and no-retry PASS')
+        # Firmware without sms_no_need_encryption_flag (MU5250, MC7523, MC8532B):
+        # the wms service takes plain number/body, never an envelope.
+        setup(count=1, plaintext=True, reject_registration=False, encrypted_send=False)
+        before = sends()
+        # The fixture asserts the vendor call carries the plain number and body.
+        assert action('send_raw', params)[0] == 200
+        assert sends() == before + 1
+        setup(send_failure=True)
+        assert action('send_raw', params)[0] == 502
+        assert sends() == before + 2, 'a failed plain send is not retried either'
+        print('SMS: flat PEM, encrypted pagination, rekey, stale cache, bounds, auth, plaintext, plain send on unencrypted firmware, fixture send and no-retry PASS')
     finally:
         process.terminate()
         try:

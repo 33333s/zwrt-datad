@@ -60,12 +60,18 @@ elif service == 'zwrt_wms' and method == 'zte_libwms_get_sms_data':
             for i in range(start, min(start + params['data_per_page'], config['count']))]
     print(json.dumps({'messages': rows}))
 elif service == 'zwrt_wms' and method == 'zte_libwms_send_sms':
-    key = keyfile.read_bytes()
-    def decrypt(value):
-        raw = base64.b64decode(value)
-        return AESGCM(key).decrypt(raw[:12], raw[28:] + raw[12:28], None).decode()
-    assert decrypt(params['number']) == '10086'
-    assert decrypt(params['message_body']) == '6D4B8BD5'
+    if config.get('encrypted_send', True):
+        key = keyfile.read_bytes()
+        def decrypt(value):
+            raw = base64.b64decode(value)
+            return AESGCM(key).decrypt(raw[:12], raw[28:] + raw[12:28], None).decode()
+        assert decrypt(params['number']) == '10086'
+        assert decrypt(params['message_body']) == '6D4B8BD5'
+    else:
+        # MU5250 / MC7523 / MC8532B firmware: the wms service takes plain text.
+        assert params['number'] == '10086', params
+        assert params['message_body'] == '6D4B8BD5', params
+    assert params['encode_type'] == 'UNICODE' and params['id'] == '-1'
     with (root / 'sends.log').open('a') as log:
         log.write('fixture send verified\n')
     print('{"result":"success"}')

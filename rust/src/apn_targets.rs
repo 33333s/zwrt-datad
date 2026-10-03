@@ -39,6 +39,10 @@ pub fn is_external(slot: i64) -> bool {
 
 /// `Ok(None)` keeps the legacy single-modem call; an unavailable or malformed
 /// `slot_id` is an error and must never fall back to the main modem.
+///
+/// Slot 1 is the main modem on every device. Single-modem devices have no
+/// other target, so `slot_id: 1` there is the plain legacy call (clients that
+/// always send a target keep working); any other value is refused.
 pub fn slot_param(params: &Value) -> Result<Option<i64>, String> {
     let Some(value) = params.get("slot_id") else {
         return Ok(None);
@@ -46,7 +50,14 @@ pub fn slot_param(params: &Value) -> Result<Option<i64>, String> {
     let slot = value
         .as_i64()
         .ok_or_else(|| "slot_id must be an integer".to_string())?;
-    if !multi_modem() || !TARGETS.iter().any(|(id, _)| *id == slot) {
+    if !multi_modem() {
+        return if slot == TARGETS[0].0 {
+            Ok(None)
+        } else {
+            Err("slot_id is not an available APN target".into())
+        };
+    }
+    if !TARGETS.iter().any(|(id, _)| *id == slot) {
         return Err("slot_id is not an available APN target".into());
     }
     Ok(Some(slot))
@@ -232,9 +243,21 @@ mod tests {
         ] {
             assert!(slot_param(&json!({"slot_id":bad})).is_err(), "{bad}");
         }
+        // Single-modem devices: slot 1 is the main modem (the legacy call), nothing else exists.
         set_multi_modem(false);
-        assert!(slot_param(&json!({"slot_id":1})).is_err());
+        assert_eq!(slot_param(&json!({"slot_id":1})), Ok(None));
         assert_eq!(slot_param(&json!({})), Ok(None));
+        for bad in [
+            json!(0),
+            json!(2),
+            json!(101),
+            json!(201),
+            json!("1"),
+            json!(1.5),
+            json!(true),
+        ] {
+            assert!(slot_param(&json!({"slot_id":bad})).is_err(), "{bad}");
+        }
         set_multi_modem(true);
     }
 
