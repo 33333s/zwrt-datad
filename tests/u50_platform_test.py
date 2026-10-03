@@ -621,6 +621,11 @@ esac
         # 2.4G accepts 1-13 (and 0=auto); 5G-only channels refuse on 2.4G.
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 200
+        # Guest sections never set the radio channel (a 2.4G value must not reach the 5G radio).
+        for guest in ("guest_2g", "guest_5g"):
+            for channel in ("6", "36", "0"):
+                assert control(port, "wifi.configure", {"section": guest, "channel": channel})[0] == 400, (guest, channel)
+        assert control(port, "wifi.configure", {"section": "main_5g", "channel": "6"})[0] == 400
 
         # 5G channel pinning: the per-radio write re-sends the current
         # advanced set with only the channel moved.

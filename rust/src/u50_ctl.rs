@@ -801,17 +801,20 @@ impl Ctl {
                 "hidden" | "isolate" => matches!(value, "0" | "1"),
                 "pmf" => matches!(value, "0" | "1" | "2"),
                 "maxassoc" => value.parse::<u32>().is_ok_and(|n| (1..=128).contains(&n)),
-                "channel" => {
-                    if section == "main_5g" {
-                        matches!(value, "0") || WIFI_5G_CHANNELS.contains(&value)
-                    } else {
-                        // 2.4 GHz: channels 1-13
+                // The channel belongs to the whole radio, so only the main
+                // sections may set it; a guest section would otherwise write
+                // the other band's channel list onto the wrong radio.
+                "channel" => match section {
+                    "main_5g" => matches!(value, "0") || WIFI_5G_CHANNELS.contains(&value),
+                    // 2.4 GHz: channels 1-13
+                    "main_2g" => {
                         matches!(value, "0")
                             || (value.len() <= 2
                                 && value.bytes().all(|b| b.is_ascii_digit())
                                 && value.parse::<u8>().is_ok_and(|ch| (1..=13).contains(&ch)))
                     }
-                }
+                    _ => false,
+                },
                 other => {
                     return Outcome::Invalid(format!(
                         "Wi-Fi {other} is not configurable on this firmware"
@@ -900,8 +903,8 @@ impl Ctl {
                 .unwrap_or("")
                 .to_owned()
         };
-        // The channel is a per-radio setting; only the 5G radio exposes it
-        // here (the 2.4G write additionally needs an unverified rate field).
+        // The channel is a per-radio setting, written through the radio's
+        // advanced-info goform (main_5g and main_2g; guest sections refuse it).
         let channel_target = wanted_channel.filter(|value| *value != chip_text("Channel"));
         let channel_changed = channel_target.is_some();
         let ap_changed = !row_matches(&current);
