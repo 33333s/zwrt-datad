@@ -413,7 +413,8 @@ impl Cloud {
             config.identity =
                 deterministic_uuid(&format!("ufi-device:{}:{}", stable_id.0, stable_id.1));
         }
-        config.platform = if matches!(model, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
+        config.platform = if matches!(model, "MU5250" | "MU5252" | "MC7523" | "MC8532B" | "MC8531")
+        {
             "qualcomm"
         } else {
             "generic"

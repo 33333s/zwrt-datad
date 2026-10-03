@@ -30,6 +30,7 @@
 | --- | --- |
 | `MU5250` | U60 Pro |
 | `MC8532B` | G5 Pro |
+| `MC8531` | G5 Ultra |
 | `MU5252` | TopFlow |
 | `MC7523` | G5 Max WiFi |
 
