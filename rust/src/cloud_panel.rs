@@ -234,9 +234,19 @@ async fn wifi_panel_config() -> Option<Value> {
         .take(256)
         .collect();
     let mut bands = Map::new();
-    for (band, section) in [("2g", "main_2g"), ("5g", "main_5g")] {
-        let radio = status.get("radios")?.get(band)?;
-        let radio_name = if band == "2g" { "wifi0" } else { "wifi1" };
+    for band in wifi::BANDS {
+        let section = wifi::main_section(band);
+        let radio = match status.get("radios")?.get(band) {
+            Some(radio) => radio,
+            // 6 GHz is only present on models that have it.
+            None if band == "6g" => continue,
+            None => return None,
+        };
+        let radio_name = radio
+            .get("section")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| if band == "2g" { "wifi0" } else { "wifi1" }.into());
         let prefix = format!("wireless.{section}");
         let supported = !state::uci_read(&format!("{prefix}.device"))
             .await

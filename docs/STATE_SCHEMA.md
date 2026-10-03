@@ -302,6 +302,7 @@ SSE  /events
 - `device.api_template_supported = 1` 表示当前机型已有明确模板；`0` 表示只落到了内部兼容模板，不应视为正式适配完成。
 - `battery`、`wlan`、`nfc`、`sms` 等可选块由模板决定是否输出；兼容模板会按实际接口探测结果输出。缺少整个块表示该接口不可用，块存在而字段值为 `0` 表示有效零值。
 - 当模板不输出 `battery` 时，`uci_device_info` 内的 `battery_*` 与 `power_adapter` 厂商占位字段也会同步过滤，避免消费者从兼容缓存重新推断出不存在的电池。
+- `/state.wlan.bands` 逐频段列出有 SSID 的主 AP（`band` 为 `2g/5g/6g`，含 `ssid/enc/enabled`），没有任何 SSID 时不输出；`wlan` 顶层仍是第一个启用的频段，保持原有字段。
 - `/state.wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取。
 - `device.full_ubus = 1` 表示当前模板开放 `POST /ubus/call`；现有模板默认均为 `1`。
 - MC8532B、MC8531 的 `net` 优先读取实时 ubus，失败时回退选定的 `zte_nwinfo` UCI 缓存；`uci_device_info.radio_*` 同步暴露这组只读缓存字段，不提供任意 UCI 透传。

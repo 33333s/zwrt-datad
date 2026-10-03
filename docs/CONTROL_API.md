@@ -73,8 +73,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 | action | params |
 |---|---|
-| `wifi.status` | 无，返回 `main_2g/main_5g` 配置 |
-| `wireless.config` | 无参数时返回两频段国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
+| `wifi.status` | 无，返回 `main_2g/main_5g` 配置；有 6 GHz 的机型（MC8531）同时返回 `main_6g` |
+| `wireless.config` | 无参数时返回各频段（2g/5g，有 6 GHz 的机型另有 6g）国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
 | `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
 | `wifi.set_dual_band` | `enabled`，布尔值 |
 | `wifi.set_module` | `enabled`，`0/1` |
@@ -108,12 +108,20 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 客户端应调用这个控制动作，不要用 `router_set_wifi_isolate` 代替。
 通用 ubus 透传保持原厂语义，不会替客户端改写错误的方法调用。
 
+`wifi.configure` 的 `section` 可取 `main_2g/main_5g/guest_2g/guest_5g`；设备有 6 GHz AP（UCI
+存在 `main_6g`）时还可取 `main_6g/guest_6g`，没有 6 GHz 的机型对这两个段返回 400，不会凭空创建。
+6 GHz 强制 WPA3，`encryption` 只接受 `sae`。`client.block/unblock` 的黑名单同样写入 6 GHz 的主/访客
+段（仅当它们存在）。
+
 `wifi.configure` 检查原厂 reload 的业务结果和提交后的字段读回；原厂拒绝或
 读回不一致返回错误。`verified=true` 只表示配置已核对，不表示 AP 广播已恢复；
 原厂异步无线重载可能还需要数十秒。失败时配置可能已经提交，应重新读取确认。
 
-`wireless.config` 的国家码作用于整台无线芯片，因此写入任一频段时会同步
-`wireless.wifi0.country` 与 `wireless.wifi1.country`。信道 `0` 或 `auto` 表示自动。
+频段与射频（wifi-device）的对应关系因机型而异（MC8531：`wifi2`=2.4G、`wifi0`=5G、`wifi1`=6G），
+datad 读取 `wireless.main_<频段>.device` 确定，只有该段没有给出时才回退到 `wifi0`（2g）/`wifi1`（5g）。
+`wireless.config` 的国家码作用于整台无线芯片，因此写入任一频段时会同步所有射频的
+`country`（2g/5g，有 6 GHz 的机型含 6g）。信道列表按频率判定频段：iwinfo 不返回 `band` 字段时
+（MC8531）按中心频率区分 2.4/5/6 GHz，因为 5 GHz 与 6 GHz 的信道号会重复。信道 `0` 或 `auto` 表示自动。
 国家码变更后，datad 会先让厂商 `zwrt_wlan.reload` 应用监管域，再读取
 `iwinfo.freqlist` 校验目标信道；因此原厂静态 `channellist` 未列出的 100-144
 只有在目标国家的设备驱动实际开放时才能写入。设备重载期间会等待最长 20 秒让

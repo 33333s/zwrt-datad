@@ -986,12 +986,22 @@ async fn revert_wireless(error: String) -> Outcome {
     Outcome::Failed(error)
 }
 
+/// Sections `wifi.configure` and the client policy may touch: the four
+/// historic ones everywhere, plus the 6 GHz pair on models that have a 6 GHz AP.
+async fn wifi_sections() -> Vec<&'static str> {
+    let mut sections = vec!["main_2g", "main_5g", "guest_2g", "guest_5g"];
+    if crate::wifi::band_present("6g").await {
+        sections.extend(["main_6g", "guest_6g"]);
+    }
+    sections
+}
 async fn wifi_configure(params: &Value) -> Outcome {
     let section = match string(params, "section", true) {
-        Ok(Some(v)) if matches!(v.as_str(), "main_2g" | "main_5g" | "guest_2g" | "guest_5g") => v,
+        Ok(Some(v)) if wifi_sections().await.contains(&v.as_str()) => v,
         Ok(_) => return Outcome::Invalid("unsupported wifi section".into()),
         Err(e) => return Outcome::Invalid(e),
     };
+    let six_ghz = section.ends_with("_6g");
     let mut updates = Vec::new();
     for field in [
         "ssid",
@@ -1023,6 +1033,8 @@ async fn wifi_configure(params: &Value) -> Outcome {
     for (field, value) in &updates {
         let valid = match *field {
             "ssid" => !value.is_empty() && value.len() <= 32 && !value.contains(['\r', '\n']),
+            // 6 GHz requires WPA3-SAE; every other mode would not associate.
+            "encryption" if six_ghz => value == "sae",
             "encryption" => matches!(
                 value.as_str(),
                 "none"
@@ -1091,7 +1103,7 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         Ok(_) => return Outcome::Invalid("invalid mac address".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    for section in ["main_2g", "main_5g", "guest_2g", "guest_5g"] {
+    for section in wifi_sections().await {
         let filter = format!("wireless.{section}.macfilter");
         let list = format!("wireless.{section}.denymaclist");
         if let Err(e) = state::uci_write("set", &filter, Some("deny")).await {
@@ -1476,15 +1488,17 @@ fn status_channels(status: &Value, band: &str) -> Vec<i64> {
         .map(|v| v.iter().filter_map(Value::as_i64).collect())
         .unwrap_or_default()
 }
-async fn restore_wireless_config(radio: &str, old0: &str, old1: &str, old_channel: &str) -> bool {
-    for (path, value) in [
-        ("wireless.wifi0.country", old0),
-        ("wireless.wifi1.country", old1),
-    ] {
+async fn restore_wireless_config(
+    radio: &str,
+    old_countries: &[(String, String)],
+    old_channel: &str,
+) -> bool {
+    for (radio_name, value) in old_countries {
+        let path = format!("wireless.{radio_name}.country");
         let result = if value.is_empty() {
-            state::uci_write("delete", path, None).await
+            state::uci_write("delete", &path, None).await
         } else {
-            state::uci_write("set", path, Some(value)).await
+            state::uci_write("set", &path, Some(value)).await
         };
         if result.is_err() {
             return false;
@@ -1501,12 +1515,27 @@ async fn restore_wireless_config(radio: &str, old0: &str, old1: &str, old_channe
         && state::ubus("zwrt_wlan", "reload", json!({})).await.is_ok()
 }
 async fn wireless_config(params: &Value) -> Outcome {
+    let bands = crate::wifi::present_bands().await;
     let band = match string(params, "band", true) {
-        Ok(Some(v)) if matches!(v.as_str(), "2g" | "5g") => v,
-        Ok(_) => return Outcome::Invalid("band must be 2g or 5g".into()),
+        Ok(Some(v)) if bands.contains(&v.as_str()) => v,
+        Ok(_) => {
+            return Outcome::Invalid(
+                if bands.contains(&"6g") {
+                    "band must be 2g, 5g or 6g"
+                } else {
+                    "band must be 2g or 5g"
+                }
+                .into(),
+            );
+        }
         Err(e) => return Outcome::Invalid(e),
     };
-    let radio = if band == "2g" { "wifi0" } else { "wifi1" };
+    let radio = crate::wifi::radio_for(&band).await;
+    let radio = radio.as_str();
+    let mut radios = Vec::new();
+    for name in &bands {
+        radios.push(crate::wifi::radio_for(name).await);
+    }
     let initial = match crate::wifi::wireless_config_status().await {
         Ok(v) => v,
         Err(e) => return Outcome::Failed(e),
@@ -1551,11 +1580,23 @@ async fn wireless_config(params: &Value) -> Outcome {
         }
         None => None,
     };
-    let old0 = state::uci_read("wireless.wifi0.country").await;
-    let old1 = state::uci_read("wireless.wifi1.country").await;
+    let mut old_countries = Vec::new();
+    for name in &radios {
+        old_countries.push((
+            name.clone(),
+            state::uci_read(&format!("wireless.{name}.country")).await,
+        ));
+    }
+    let old0 = old_countries
+        .iter()
+        .find(|(name, _)| name == radio)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
     let channel_path = format!("wireless.{radio}.channel");
     let old_channel = state::uci_read(&channel_path).await;
-    let country_changed = country.as_ref().is_some_and(|v| v != &old0 || v != &old1);
+    let country_changed = country
+        .as_ref()
+        .is_some_and(|v| old_countries.iter().any(|(_, old)| v != old));
     let channel_changed = channel.is_some_and(|v| v.to_string() != old_channel);
     if !country_changed && !channel_changed {
         return Outcome::Ok(
@@ -1572,9 +1613,10 @@ async fn wireless_config(params: &Value) -> Outcome {
     }
     if country_changed {
         let value = country.as_deref().unwrap();
-        for path in ["wireless.wifi0.country", "wireless.wifi1.country"] {
-            if state::uci_write("set", path, Some(value)).await.is_err() {
-                let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+        for name in &radios {
+            let path = format!("wireless.{name}.country");
+            if state::uci_write("set", &path, Some(value)).await.is_err() {
+                let _ = restore_wireless_config(radio, &old_countries, &old_channel).await;
                 return Outcome::Failed(
                     "failed to apply country; previous configuration restored".into(),
                 );
@@ -1585,13 +1627,13 @@ async fn wireless_config(params: &Value) -> Outcome {
                 .await
                 .is_err()
         {
-            let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let _ = restore_wireless_config(radio, &old_countries, &old_channel).await;
             return Outcome::Failed("failed to stage automatic channel".into());
         }
         if state::uci_write("commit", "wireless", None).await.is_err()
             || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err()
         {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored = restore_wireless_config(radio, &old_countries, &old_channel).await;
             return Outcome::Failed(format!(
                 "failed to apply country; previous configuration {}",
                 if restored {
@@ -1619,7 +1661,7 @@ async fn wireless_config(params: &Value) -> Outcome {
     }
     if let Some(v) = channel {
         if !status_channels(&final_status, &band).contains(&v) {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored = restore_wireless_config(radio, &old_countries, &old_channel).await;
             return Outcome::Invalid(format!(
                 "channel {v} is not permitted for {band} under country {}{}",
                 country.as_deref().unwrap_or(&old0),
@@ -1637,7 +1679,7 @@ async fn wireless_config(params: &Value) -> Outcome {
                 || state::uci_write("commit", "wireless", None).await.is_err()
                 || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err())
         {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored = restore_wireless_config(radio, &old_countries, &old_channel).await;
             return Outcome::Failed(format!(
                 "failed to apply channel; previous configuration {}",
                 if restored {

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.59",
+    "version": "0.10.60",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 MC8531（G5 Ultra）设备模板：按 MC8532B 同类处理网络回退、无电池和云平台识别，并补充机型文档与测试"
+    "notes": "MC8531 增加 6 GHz Wi-Fi 支持：state.wlan.bands、wifi.status/wifi.configure/wireless.config/client.block 覆盖 6G；按 UCI 解析各频段对应的射频，修正 MC8531 上 2G/5G 信道和国家码写到错误射频的问题"
   }
 }

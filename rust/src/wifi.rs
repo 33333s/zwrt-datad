@@ -208,40 +208,111 @@ pub async fn advanced_status() -> Result<Value, String> {
     }))
 }
 
+/// Wireless bands datad knows about. 2.4 and 5 GHz exist everywhere; 6 GHz is
+/// only reported on models whose wireless config carries a `main_6g` section.
+pub const BANDS: [&str; 3] = ["2g", "5g", "6g"];
+
+pub fn main_section(band: &str) -> String {
+    format!("main_{band}")
+}
+
+/// Whether this model has a primary AP section for the band.
+pub async fn band_present(band: &str) -> bool {
+    let section = format!("wireless.main_{band}");
+    !state::uci_read(&format!("{section}.device"))
+        .await
+        .is_empty()
+        || !state::uci_read(&format!("{section}.ssid")).await.is_empty()
+}
+
+/// Bands this model has, in 2g/5g/6g order. 2g and 5g are always listed so
+/// models without the section keep their previous behaviour.
+pub async fn present_bands() -> Vec<&'static str> {
+    let mut bands = vec!["2g", "5g"];
+    if band_present("6g").await {
+        bands.push("6g");
+    }
+    bands
+}
+
+/// The wifi-device (radio) serving a band. The band-to-radio order differs
+/// between models (MC8531: wifi2 is 2.4 GHz, wifi0 is 5 GHz, wifi1 is 6 GHz),
+/// so read it from the primary AP section and only fall back to the historic
+/// wifi0/wifi1 naming when the section does not say.
+pub async fn radio_for(band: &str) -> String {
+    let device = state::uci_read(&format!("wireless.main_{band}.device")).await;
+    if safe_ifname(&device) {
+        return device;
+    }
+    match band {
+        "2g" => "wifi0".into(),
+        "5g" => "wifi1".into(),
+        _ => String::new(),
+    }
+}
+
 pub async fn wireless_config_status() -> Result<Value, String> {
-    let mut channel_2g = Vec::new();
-    let mut channel_5g = Vec::new();
+    let bands = present_bands().await;
+    let mut radios = Vec::new();
+    for band in &bands {
+        radios.push((*band, radio_for(band).await));
+    }
+    let mut channels: Vec<(&str, Vec<i64>)> =
+        bands.iter().map(|band| (*band, Vec::new())).collect();
     if let Some(results) = iwinfo("freqlist").await {
-        parse_channels(&results, &mut channel_2g, &mut channel_5g);
+        parse_channels(&results, &mut channels);
     }
-    let from_iwinfo = !channel_2g.is_empty() || !channel_5g.is_empty();
-    if channel_2g.is_empty() {
-        channel_2g = parse_channel_list(&state::uci_read("wireless.wifi0.channellist").await);
+    let from_iwinfo = channels.iter().any(|(_, list)| !list.is_empty());
+    for (band, list) in channels.iter_mut() {
+        if list.is_empty() {
+            // Some iwinfo builds only list the channels of the radio behind the
+            // queried interface, so ask the band's own AP interface.
+            let ifname = state::uci_read(&format!("wireless.main_{band}.ifname")).await;
+            if safe_ifname(&ifname)
+                && let Some(results) = iwinfo_on("freqlist", &ifname).await
+            {
+                let mut single: Vec<(&str, Vec<i64>)> = vec![(*band, Vec::new())];
+                parse_channels(&results, &mut single);
+                *list = single.remove(0).1;
+            }
+        }
     }
-    if channel_5g.is_empty() {
-        channel_5g = parse_channel_list(&state::uci_read("wireless.wifi1.channellist").await);
+    let from_iwinfo = from_iwinfo || channels.iter().any(|(_, list)| !list.is_empty());
+    for ((_, list), (_, radio)) in channels.iter_mut().zip(&radios) {
+        if list.is_empty() {
+            *list = parse_channel_list(
+                &state::uci_read(&format!("wireless.{radio}.channellist")).await,
+            );
+        }
     }
-    let country_2g = state::uci_read("wireless.wifi0.country").await;
-    let country_5g = state::uci_read("wireless.wifi1.country").await;
     let mut countries = iwinfo("countrylist")
         .await
         .map(|results| parse_countries(&results))
         .unwrap_or_default();
-    for country in [&country_2g, &country_5g] {
+    let mut radio_countries = Vec::new();
+    for (_, radio) in &radios {
+        radio_countries.push(state::uci_read(&format!("wireless.{radio}.country")).await);
+    }
+    for country in &radio_countries {
         let normalized = country.to_ascii_uppercase();
         if valid_country(&normalized) && !countries.contains(&normalized) {
             countries.push(normalized);
         }
     }
+    let same = radio_countries.windows(2).all(|pair| pair[0] == pair[1]);
+    let mut radio_output = Map::new();
+    for ((band, radio), (_, list)) in radios.iter().zip(channels) {
+        radio_output.insert(
+            (*band).into(),
+            wireless_radio(radio, &main_section(band), list).await,
+        );
+    }
     Ok(json!({
         "country_scope":"device",
-        "country":if country_2g == country_5g { country_2g } else { String::new() },
+        "country":if same { radio_countries.first().cloned().unwrap_or_default() } else { String::new() },
         "channel_source":if from_iwinfo { "iwinfo" } else { "uci" },
         "countries":countries,
-        "radios":{
-            "2g":wireless_radio("wifi0","main_2g",channel_2g).await,
-            "5g":wireless_radio("wifi1","main_5g",channel_5g).await,
-        }
+        "radios":radio_output
     }))
 }
 
@@ -255,13 +326,18 @@ async fn iwinfo(method: &str) -> Option<Vec<Value>> {
         if !safe_ifname(&device) {
             continue;
         }
-        if let Ok(value) = state::ubus("iwinfo", method, json!({"device":device})).await
-            && let Some(results) = value.get("results").and_then(Value::as_array)
-        {
-            return Some(results.clone());
+        if let Some(results) = iwinfo_on(method, &device).await {
+            return Some(results);
         }
     }
     None
+}
+
+async fn iwinfo_on(method: &str, device: &str) -> Option<Vec<Value>> {
+    let value = state::ubus("iwinfo", method, json!({"device":device}))
+        .await
+        .ok()?;
+    value.get("results").and_then(Value::as_array).cloned()
 }
 
 async fn wireless_radio(section: &str, ap_section: &str, mut channels: Vec<i64>) -> Value {
@@ -281,7 +357,25 @@ async fn wireless_radio(section: &str, ap_section: &str, mut channels: Vec<i64>)
     })
 }
 
-fn parse_channels(results: &[Value], channel_2g: &mut Vec<i64>, channel_5g: &mut Vec<i64>) {
+/// Band of an iwinfo frequency entry: the `band` field when the firmware gives
+/// one, otherwise the centre frequency (channel numbers repeat between 5 and
+/// 6 GHz, so the number alone cannot tell them apart).
+fn channel_band(item: &Value) -> Option<&'static str> {
+    match item.get("band").and_then(Value::as_i64) {
+        Some(2) => return Some("2g"),
+        Some(5) => return Some("5g"),
+        Some(6) => return Some("6g"),
+        _ => {}
+    }
+    match item.get("mhz").and_then(Value::as_i64)? {
+        2400..=2500 => Some("2g"),
+        5150..=5895 => Some("5g"),
+        5925..=7125 => Some("6g"),
+        _ => None,
+    }
+}
+
+fn parse_channels(results: &[Value], channels: &mut [(&str, Vec<i64>)]) {
     for item in results {
         let restricted = item
             .get("restricted")
@@ -293,10 +387,11 @@ fn parse_channels(results: &[Value], channel_2g: &mut Vec<i64>, channel_5g: &mut
             .get("channel")
             .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
             .unwrap_or_default();
-        match item.get("band").and_then(Value::as_i64) {
-            Some(2) if channel > 0 => channel_2g.push(channel),
-            Some(5) if channel > 0 => channel_5g.push(channel),
-            _ => {}
+        let Some(band) = channel_band(item).filter(|_| channel > 0) else {
+            continue;
+        };
+        if let Some((_, list)) = channels.iter_mut().find(|(name, _)| *name == band) {
+            list.push(channel);
         }
     }
 }
@@ -630,16 +725,43 @@ mod tests {
     }
 
     #[test]
+    fn classifies_channels_by_frequency_when_the_band_is_not_reported() {
+        // MC8531's iwinfo omits `band`, and 5 and 6 GHz reuse channel numbers.
+        let results = vec![
+            json!({"channel":1,"mhz":2412,"restricted":false}),
+            json!({"channel":36,"mhz":5180,"restricted":false}),
+            json!({"channel":1,"mhz":5955,"restricted":false}),
+            json!({"channel":5,"mhz":5975,"restricted":true}),
+            json!({"channel":233,"mhz":7115}),
+            json!({"channel":9}),
+        ];
+        let mut bands: Vec<(&str, Vec<i64>)> =
+            vec![("2g", Vec::new()), ("5g", Vec::new()), ("6g", Vec::new())];
+        parse_channels(&results, &mut bands);
+        assert_eq!(bands[0].1, [1]);
+        assert_eq!(bands[1].1, [36]);
+        assert_eq!(bands[2].1, [1, 233]);
+        // A band that is not on this model is simply not collected.
+        let mut dual: Vec<(&str, Vec<i64>)> = vec![("2g", Vec::new()), ("5g", Vec::new())];
+        parse_channels(&results, &mut dual);
+        assert_eq!(dual[1].1, [36]);
+        // An explicit band wins over the frequency.
+        assert_eq!(channel_band(&json!({"band":6,"mhz":5180})), Some("6g"));
+    }
+
+    #[test]
     fn parses_wireless_capabilities_without_restricted_channels() {
         let results = vec![
             json!({"band":2,"channel":1,"restricted":false}),
             json!({"band":5,"channel":100,"restricted":true}),
             json!({"band":5,"channel":149}),
         ];
-        let (mut two, mut five) = (Vec::new(), Vec::new());
-        parse_channels(&results, &mut two, &mut five);
-        assert_eq!(two, [1]);
-        assert_eq!(five, [149]);
+        let mut bands: Vec<(&str, Vec<i64>)> =
+            vec![("2g", Vec::new()), ("5g", Vec::new()), ("6g", Vec::new())];
+        parse_channels(&results, &mut bands);
+        assert_eq!(bands[0].1, [1]);
+        assert_eq!(bands[1].1, [149]);
+        assert!(bands[2].1.is_empty());
         assert_eq!(parse_channel_list("36, 40,40,bad"), [36, 40]);
         assert_eq!(
             parse_countries(&[json!({"iso3166":"hk"}), json!({"code":"00"})]),
