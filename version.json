@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.66",
+    "version": "0.10.67",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro wifi.configure 信道固定：5G(36-165) + 2.4G(1-13)，wifi.status 回读固定信道（queryWiFiChipAdvancedInfo 合并）"
+    "notes": "U50 Pro OEM 会话过期自动重登 + /state.traffic 当日流量（day_rx/day_tx + today_rx/today_tx）"
   }
 }
