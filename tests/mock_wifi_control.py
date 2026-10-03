@@ -37,6 +37,15 @@ if args[:1] == ['set']:
     data['config'][key] = value
     save()
     sys.exit(0)
+if args[:1] in (['add_list'], ['del_list']):
+    log()
+    key, value = args[1].split('=', 1)
+    items = [item for item in data['config'].get(key, '').split() if item != value]
+    if args[0] == 'add_list':
+        items.append(value)
+    data['config'][key] = ' '.join(items)
+    save()
+    sys.exit(0)
 if args[:1] in (['commit'], ['revert']):
     log()
     sys.exit(0)

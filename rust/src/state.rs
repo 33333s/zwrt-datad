@@ -192,9 +192,30 @@ fn tracking_area(raw: &Value, live_key: &str, uci_value: &str, max: i64) -> i64 
     };
     if (1..=max).contains(&value) { value } else { 0 }
 }
+/// Per-band summary of the primary APs (2.4/5/6 GHz) that have an SSID, so a
+/// consumer can see every band instead of only the first enabled one.
+fn wlan_bands(sets: &[BTreeMap<String, String>]) -> Vec<Value> {
+    ["2g", "5g", "6g"]
+        .into_iter()
+        .filter_map(|band| {
+            let section = format!("wireless.main_{band}");
+            let ssid = uci_get(sets, &format!("{section}.ssid"));
+            (!ssid.is_empty()).then(|| {
+                json!({
+                    "band":band,
+                    "ssid":ssid,
+                    "enc":uci_get(sets,&format!("{section}.encryption")),
+                    "enabled":i64::from(uci_get(sets,&format!("{section}.disabled"))!="1"),
+                })
+            })
+        })
+        .collect()
+}
 fn blocked_client_macs(sets: &[BTreeMap<String, String>]) -> Vec<String> {
     let mut blocked = BTreeSet::new();
-    'sections: for section in ["main_2g", "main_5g", "guest_2g", "guest_5g"] {
+    'sections: for section in [
+        "main_2g", "main_5g", "guest_2g", "guest_5g", "main_6g", "guest_6g",
+    ] {
         let path = format!("wireless.{section}.denymaclist");
         for entry in uci_get(sets, &path).split_whitespace() {
             let mac = entry.trim_matches('\'').to_ascii_lowercase();
@@ -1545,14 +1566,14 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     }
     tout.insert("limit".into(), limit);
     tout.insert("clear_day".into(), clear_day);
-    let wifi = ["main_2g", "main_5g"]
+    let wifi = ["main_2g", "main_5g", "main_6g"]
         .into_iter()
         .find(|s| {
             !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty()
                 && uci_get(&uci_sets, &format!("wireless.{s}.disabled")) != "1"
         })
         .or_else(|| {
-            ["main_2g", "main_5g"]
+            ["main_2g", "main_5g", "main_6g"]
                 .into_iter()
                 .find(|s| !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty())
         });
@@ -1612,7 +1633,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         json!({"qci":qos.qci,"ambr_dl":qos.ambr_dl,"ambr_ul":qos.ambr_ul,"usb_mode":string(&usb,"mode")}),
     );
     if let Some(s) = wifi {
-        fields.insert("wlan".into(),json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")}));
+        let mut wlan = json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")});
+        let bands = wlan_bands(&uci_sets);
+        if !bands.is_empty() {
+            wlan["bands"] = Value::Array(bands);
+        }
+        fields.insert("wlan".into(), wlan);
     }
     if nfc_ok
         && nfc.as_object().is_some_and(|v| {
@@ -2203,6 +2229,39 @@ mod tests {
             tracking_area(&json!({}), "nr5g_tac", "16777216", NR_TAC_MAX),
             0
         );
+    }
+    #[test]
+    fn wlan_bands_lists_every_band_with_an_ssid() {
+        let wireless = BTreeMap::from([
+            ("wireless.main_2g.ssid".to_owned(), "Home".to_owned()),
+            (
+                "wireless.main_2g.encryption".to_owned(),
+                "psk2+ccmp".to_owned(),
+            ),
+            ("wireless.main_5g.ssid".to_owned(), "Home-5G".to_owned()),
+            ("wireless.main_5g.disabled".to_owned(), "1".to_owned()),
+            ("wireless.main_6g.ssid".to_owned(), "Home-6G".to_owned()),
+            ("wireless.main_6g.encryption".to_owned(), "sae".to_owned()),
+        ]);
+        let bands = wlan_bands(&[wireless]);
+        assert_eq!(bands.len(), 3);
+        assert_eq!(bands[0]["band"], "2g");
+        assert_eq!(bands[0]["enabled"], 1);
+        assert_eq!(bands[1]["enabled"], 0);
+        assert_eq!(bands[2]["band"], "6g");
+        assert_eq!(bands[2]["enc"], "sae");
+        // A model without 6 GHz reports only the bands it has.
+        let dual = BTreeMap::from([("wireless.main_2g.ssid".to_owned(), "Home".to_owned())]);
+        assert_eq!(wlan_bands(&[dual]).len(), 1);
+        assert!(wlan_bands(&[BTreeMap::new()]).is_empty());
+    }
+    #[test]
+    fn blocked_client_macs_include_the_6ghz_sections() {
+        let wireless = BTreeMap::from([(
+            "wireless.guest_6g.denymaclist".to_owned(),
+            "'AA:BB:CC:DD:EE:01'".to_owned(),
+        )]);
+        assert_eq!(blocked_client_macs(&[wireless]), vec!["aa:bb:cc:dd:ee:01"]);
     }
     #[test]
     fn blocked_client_macs_are_bounded_and_validated() {

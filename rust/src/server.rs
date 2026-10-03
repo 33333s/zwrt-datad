@@ -1520,7 +1520,11 @@ async fn control(
     }
     if action == "wifi.status" {
         let mut result = serde_json::Map::new();
-        for section in ["main_2g", "main_5g"] {
+        let mut sections = vec!["main_2g", "main_5g"];
+        if crate::wifi::band_present("6g").await {
+            sections.push("main_6g");
+        }
+        for section in sections {
             let mut item = serde_json::Map::new();
             for field in [
                 "ssid",

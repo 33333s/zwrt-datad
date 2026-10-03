@@ -138,6 +138,66 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         setup(restore_on_reload=True)
         code, body = request('wifi.configure', {'section': 'main_2g', 'key': 'private-new-key'})
         assert code == 502 and 'private-new-key' not in json.dumps(body), body
+
+        # 6 GHz model (MC8531): radios are wifi2 (2.4G), wifi0 (5G), wifi1 (6G), not wifi0/wifi1.
+        six = dict(config)
+        for band, radio, ssid, enc, channels, country in [
+                ('2g', 'wifi2', 'Six 2G', 'sae-mixed', '1,6,11', 'HK'),
+                ('5g', 'wifi0', 'Six 5G', 'sae-mixed', '36,40,44', 'HK'),
+                ('6g', 'wifi1', 'Six 6G', 'sae', '1,5,9', 'CN')]:
+            six[f'wireless.main_{band}.device'] = radio
+            six[f'wireless.main_{band}.ssid'] = ssid
+            six[f'wireless.main_{band}.encryption'] = enc
+            six[f'wireless.main_{band}.disabled'] = '0'
+            six[f'wireless.{radio}.channellist'] = channels
+            six[f'wireless.{radio}.country'] = country
+            six[f'wireless.{radio}.channel'] = '0'
+        six['wireless.guest_6g.ssid'] = 'Guest 6G'
+        fixture.write_text(json.dumps(dict(config=six, lbd='0')))
+        status = request('wifi.status')[1]['result']
+        assert status['main_6g']['ssid'] == 'Six 6G' and status['main_6g']['encryption'] == 'sae', status
+        report = request('wireless.config')[1]['result']
+        assert set(report['radios']) == {'2g', '5g', '6g'}, report
+        assert [report['radios'][b]['section'] for b in ('2g', '5g', '6g')] == ['wifi2', 'wifi0', 'wifi1'], report
+        assert report['radios']['6g']['supported_channels'] == [0, 1, 5, 9], report
+        assert report['radios']['6g']['ap_section'] == 'main_6g' and report['country'] == '', report
+        before = len(writes())
+        code, body = request('wireless.config', dict(band='6g', channel=5))
+        assert code == 200 and body['result']['changed'], body
+        code, body = request('wireless.config', dict(band='2g', channel=6))
+        assert code == 200 and body['result']['changed'], body
+        new = [json.dumps(args) for args in writes()[before:]]
+        assert any('wireless.wifi1.channel=5' in item for item in new), new
+        assert any('wireless.wifi2.channel=6' in item for item in new), new
+        assert not any('wireless.wifi0.channel' in item for item in new), new
+        assert request('wireless.config', dict(band='6g', channel=7))[0] == 400
+        assert request('wireless.config', dict(band='7g', channel=1))[0] == 400
+        before = len(writes())
+        assert request('wireless.config', dict(band='5g', country='CN'))[1]['result']['changed']
+        new = [json.dumps(args) for args in writes()[before:]]
+        for radio in ('wifi2', 'wifi0', 'wifi1'):
+            assert any(f'wireless.{radio}.country=CN' in item for item in new), new
+        # 6 GHz needs WPA3-SAE; everything else would never associate.
+        for encryption in ('psk2', 'sae-mixed', 'none'):
+            assert request('wifi.configure', dict(section='main_6g', encryption=encryption))[0] == 400
+        code, body = request('wifi.configure', dict(section='main_6g', ssid='New 6G', encryption='sae'))
+        assert code == 200 and body['result']['changed'], body
+        assert request('wifi.status')[1]['result']['main_6g']['ssid'] == 'New 6G'
+        assert request('wifi.configure', dict(section='guest_6g', ssid='Guest 6G 2'))[0] == 200
+        before = len(writes())
+        assert request('client.block', dict(mac='00:11:22:33:44:55'))[0] == 200
+        new = [json.dumps(args) for args in writes()[before:]]
+        for section in ('main_2g', 'main_5g', 'guest_2g', 'guest_5g', 'main_6g', 'guest_6g'):
+            assert any(f'wireless.{section}.denymaclist=00:11:22:33:44:55' in item for item in new), (section, new)
+        # A model without a 6 GHz AP must neither accept nor create the 6 GHz sections.
+        setup()
+        assert request('wifi.configure', dict(section='main_6g', ssid='x'))[0] == 400
+        assert 'main_6g' not in request('wifi.status')[1]['result']
+        assert set(request('wireless.config')[1]['result']['radios']) == {'2g', '5g'}
+        assert request('wireless.config', dict(band='6g', channel=1))[0] == 400
+        before = len(writes())
+        assert request('client.block', dict(mac='00:11:22:33:44:66'))[0] == 200
+        assert not any('6g' in json.dumps(args) for args in writes()[before:])
         assert not any('router_set_wifi_isolate' in args for args in writes())
         print('Wi-Fi status fields, steering mapping, no-op, validation, auth, failure/readback and credential redaction PASS')
     finally:
