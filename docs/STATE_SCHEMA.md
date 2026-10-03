@@ -41,7 +41,11 @@ SSE  /events
 消费者不应直接打 `ubus`，也不应自己扫 `key.log`。
 
 状态块是可选的。设备模板只输出当前设备支持的块；例如无电池的 CPE
-不会输出 `battery`，而不是用 `percent:-1`、`temp:0` 伪装成有效数据。
+不会输出 `battery`，而不是用 `percent:-1`、`temp:0` 伪装成有效数据。没有电池的机型
+（包括没有专属模板的 CPE，如 MC8531）的原厂 `zwrt_bsp.battery` 会返回占位值
+（`battery_online:0`、`battery_capacity:0`）；0.10.58 起 `battery_online` 明确为 `0` 时不输出
+`battery`（固件没有该字段时保持原行为）。datad 自更新的“电量必须高于 10%”检查同样只在
+电池存在（`battery.online` 不为 `0`）时生效。
 消费者必须用 JSON key 是否存在判断能力，不能用数值真假判断，因为
 `battery.percent=0`、`charging=0` 和 `wlan.enabled=0` 都是合法状态。
 

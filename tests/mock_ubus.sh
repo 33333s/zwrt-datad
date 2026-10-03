@@ -187,6 +187,8 @@ case "$service:$method" in
         ;;
     zwrt_bsp.battery:list)
         [ "${MOCK_NO_BATTERY:-0}" = '1' ] && exit 1
+        # CPEs answer with a placeholder instead of failing: nothing fitted, capacity 0.
+        [ "${MOCK_BATTERY_ABSENT:-0}" = '1' ] && { printf '%s\n' '{"battery_online":0,"battery_capacity":0,"battery_temperature":0,"battery_health":0,"battery_using_hw_fg_chip":-2}'; exit 0; }
         printf '%s\n' '{"battery_capacity":0,"battery_temperature":30000,"battery_online":1,"battery_health":1}'
         ;;
     zwrt_bsp.charger:list)

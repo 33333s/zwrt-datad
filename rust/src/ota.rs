@@ -576,8 +576,12 @@ impl Ota {
             self.idle_observed_at = None;
             reasons.push("系统时间正在切换".into());
         }
+        // A device without a battery (CPEs) still reports a placeholder block
+        // (online 0, capacity 0); that is not a flat battery.
+        let battery_absent = number_at(snapshot, &["battery", "online"]) == Some(0.0);
         let battery = number_at(snapshot, &["battery", "percent"])
-            .or_else(|| number_at(snapshot, &["system", "battery_percent"]));
+            .or_else(|| number_at(snapshot, &["system", "battery_percent"]))
+            .filter(|_| !battery_absent);
         if battery.is_some_and(|value| value <= 10.0) {
             reasons.push("电量必须高于 10%".into());
         }
@@ -921,6 +925,33 @@ mod tests {
         let mut ota = Ota::load(&dir).unwrap();
         let reasons = ota.safety(&json!({"battery":{"percent":10},"runtime":{"storage":{"available":1},"cpu_usage_tenths":900,"throughput":{"rx_bps":9999999,"tx_bps":0}},"neighbor":{"enabled":true}}), true);
         assert_eq!(reasons, ["电量必须高于 10%", "可用存储不足 64 MiB"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_battery_is_not_a_low_battery() {
+        let dir = std::env::temp_dir().join(format!("zwrt-datad-ota-nobat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load(&dir).unwrap();
+        let storage = json!({"available":134217728});
+        let with = |battery: Value| json!({"battery":battery,"runtime":{"storage":storage}});
+        // CPE placeholder: no battery fitted.
+        assert!(
+            ota.safety(&with(json!({"percent":0,"online":0})), true)
+                .is_empty()
+        );
+        // A real low battery still blocks, including a battery that reads 0 %.
+        for battery in [
+            json!({"percent":10,"online":1}),
+            json!({"percent":0,"online":1}),
+            json!({"percent":5}),
+        ] {
+            assert_eq!(ota.safety(&with(battery), true), ["电量必须高于 10%"]);
+        }
+        assert!(
+            ota.safety(&with(json!({"percent":80,"online":1})), true)
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

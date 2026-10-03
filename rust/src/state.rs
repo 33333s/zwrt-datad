@@ -82,6 +82,14 @@ fn with_kernel_addresses(mut wan: Value, family: &str, read: fn() -> Vec<Value>)
     wan
 }
 
+fn battery_not_fitted(battery: &Value) -> bool {
+    match battery.get("battery_online") {
+        Some(Value::Number(value)) => value.as_i64() == Some(0),
+        Some(Value::String(value)) => value.trim() == "0",
+        _ => false,
+    }
+}
+
 fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
@@ -1570,7 +1578,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "clients".into(),
         json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list,"blocked":blocked}),
     );
-    let hide_battery = matches!(template, "MC7523" | "MC8532B");
+    // No battery fitted (CPEs, and models whose template says so): the vendor
+    // service still answers with a placeholder (`battery_online` 0, capacity 0),
+    // which must not be shown, forwarded or compared as a real 0 % battery.
+    let hide_battery = matches!(template, "MC7523" | "MC8532B") || battery_not_fitted(&battery);
     if !hide_battery
         && battery_ok
         && battery
@@ -2399,5 +2410,19 @@ mod tests {
             with_kernel_addresses(empty, "ipv6", nothing)["ipv6"],
             json!([])
         );
+    }
+    #[test]
+    fn only_an_explicit_battery_online_zero_means_no_battery() {
+        assert!(battery_not_fitted(
+            &json!({"battery_online":0,"battery_capacity":0})
+        ));
+        assert!(battery_not_fitted(&json!({"battery_online":"0"})));
+        assert!(!battery_not_fitted(
+            &json!({"battery_online":1,"battery_capacity":65})
+        ));
+        assert!(!battery_not_fitted(&json!({"battery_online":"1"})));
+        // Firmware without the field keeps the block: absence of evidence is not evidence.
+        assert!(!battery_not_fitted(&json!({"battery_capacity":65})));
+        assert!(!battery_not_fitted(&json!({})));
     }
 }
