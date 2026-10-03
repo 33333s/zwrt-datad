@@ -158,9 +158,21 @@ with tempfile.TemporaryDirectory(prefix='datad-apn-session-') as name:
     process, port = start()
     try:
         wait_template(port, 'MU5250')
+        # Clients that always send a target keep working: slot 1 is the main modem, i.e. the legacy call.
         reset_calls()
-        response = control(port, 'apn.enable', {'slot_id': 1, 'profile_id': 'p1'})
-        assert response[0] == 400 and error_code(response) == 'invalid_parameter', response
+        for action, params in [('apn.enable', {'slot_id': 1, 'profile_id': 'p1'}),
+                               ('apn.set_mode', {'slot_id': 1, 'mode': 1}),
+                               ('apn.modify', {'slot_id': 1, 'profile_id': 'p1', 'name': 'n', 'apn': 'a'}),
+                               ('apn.add', {'slot_id': 1, 'name': 'n2', 'apn': 'a2'})]:
+            response = control(port, action, params)
+            assert response[0] == 200, (action, response)
+        assert writes() and all('slotId' not in row[2] for row in writes()), writes()
+        assert all('slotId' not in row[2] for row in calls('zwrt_apn_object'))
+        # Any other target does not exist here and is refused before the device is touched.
+        reset_calls()
+        for slot in (0, 2, 101, 201):
+            response = control(port, 'apn.enable', {'slot_id': slot, 'profile_id': 'p1'})
+            assert response[0] == 400 and error_code(response) == 'invalid_parameter', (slot, response)
         assert calls('zwrt_apn_object') == []
         assert control(port, 'apn.enable', {'profile_id': 'p1'})[0] == 200
     finally:

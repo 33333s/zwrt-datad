@@ -1661,16 +1661,20 @@ mod tests {
                 "{action} {params}"
             );
         }
+        // Single-modem devices have only the main modem: other targets are refused.
         apn_targets::set_multi_modem(false);
-        assert_eq!(
-            result_code(control(
-                "apn.enable",
-                json!({"slot_id":1,"profile_id":"p1"}),
-                true
-            ))
-            .await,
-            "invalid_parameter"
-        );
+        for slot in [101, 201, 0, 2] {
+            assert_eq!(
+                result_code(control(
+                    "apn.enable",
+                    json!({"slot_id":slot,"profile_id":"p1"}),
+                    true
+                ))
+                .await,
+                "invalid_parameter",
+                "{slot}"
+            );
+        }
         apn_targets::set_multi_modem(true);
     }
 }

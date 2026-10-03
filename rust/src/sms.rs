@@ -501,19 +501,27 @@ async fn select_slot(slot: i64) -> Result<(), String> {
     Err(format!("SIM slot {slot} did not become active"))
 }
 
+/// Only firmwares that carry `sms_no_need_encryption_flag=0` (MU5252) expect
+/// the AES envelope on send. The others (MU5250, MC7523, MC8532B) have no such
+/// flag and their wms service takes the number and body as plain text, like
+/// their own web UI sends them; an envelope there is read as a literal number.
+async fn send_needs_encryption() -> bool {
+    state::uci_read("zwrt_wms.config.sms_no_need_encryption_flag").await == "0"
+}
+
 async fn send_host(number: &str, message: &str, sms_time: &str) -> Result<Value, String> {
     let _io = SMS_IO.lock().await;
-    reset_crypto_session().await;
-    let mut key = ensure_crypto_session().await?;
-    let encrypted_number = encrypt(&key, number)?;
-    let encrypted_message = encrypt(&key, message)?;
-    key.zeroize();
-    state::ubus(
-        "zwrt_wms",
-        "zte_libwms_send_sms",
-        json!({"number":encrypted_number,"message_body":encrypted_message,"sms_time":sms_time,"encode_type":"UNICODE","id":"-1"}),
-    )
-    .await?;
+    let args = if send_needs_encryption().await {
+        reset_crypto_session().await;
+        let mut key = ensure_crypto_session().await?;
+        let encrypted_number = encrypt(&key, number)?;
+        let encrypted_message = encrypt(&key, message)?;
+        key.zeroize();
+        json!({"number":encrypted_number,"message_body":encrypted_message,"sms_time":sms_time,"encode_type":"UNICODE","id":"-1"})
+    } else {
+        json!({"number":number,"message_body":message,"sms_time":sms_time,"encode_type":"UNICODE","id":"-1"})
+    };
+    state::ubus("zwrt_wms", "zte_libwms_send_sms", args).await?;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let Ok(reply) =
