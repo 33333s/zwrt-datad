@@ -1,6 +1,6 @@
 # zwrt-datad
 
-面向中兴 ARM64 5G 路由设备的统一数据与控制服务。
+面向中兴 ARM32 5G路由设备的统一数据与控制服务。
 
 [English](README_EN.md) · [最新版本](https://github.com/33333s/zwrt-datad/releases/latest) · [API 文档](docs/API.md)
 
