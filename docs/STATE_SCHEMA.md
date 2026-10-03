@@ -285,6 +285,8 @@ SSE  /events
   - 见 [`models/MU5250.md`](models/MU5250.md)
 - `device.api_template = MC8532B`
   - 见 [`models/MC8532B.md`](models/MC8532B.md)
+- `device.api_template = MC8531`
+  - 见 [`models/MC8531.md`](models/MC8531.md)
 - `device.api_template = MU5252`
   - 见 [`models/MU5252.md`](models/MU5252.md)
 - `device.api_template = MC7523`
@@ -302,7 +304,7 @@ SSE  /events
 - 当模板不输出 `battery` 时，`uci_device_info` 内的 `battery_*` 与 `power_adapter` 厂商占位字段也会同步过滤，避免消费者从兼容缓存重新推断出不存在的电池。
 - `/state.wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取。
 - `device.full_ubus = 1` 表示当前模板开放 `POST /ubus/call`；现有模板默认均为 `1`。
-- MC8532B 的 `net` 优先读取实时 ubus，失败时回退选定的 `zte_nwinfo` UCI 缓存；`uci_device_info.radio_*` 同步暴露这组只读缓存字段，不提供任意 UCI 透传。
+- MC8532B、MC8531 的 `net` 优先读取实时 ubus，失败时回退选定的 `zte_nwinfo` UCI 缓存；`uci_device_info.radio_*` 同步暴露这组只读缓存字段，不提供任意 UCI 透传。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。
 - `system.model` / `hostname` 是设备自报字段，消费端不应把示例值当成固定机型常量。
@@ -316,7 +318,7 @@ SSE  /events
 - 顶层 `sample_interval_ms` 是当前 datad 全局采样与 SSE 推送周期。可通过 `state.set_interval` 在 `500..5000` 毫秒范围内运行时切换；所有 SSE 客户端共享同一周期。
 - `net.lte_supported_bands`、`net.nr_sa_supported_bands`、`net.nr_nsa_supported_bands` 来自原厂 Web 同源的 `zwrt_zte_nwinfo.default_band_lock` 能力目录，与本轮锁频值分离。`net.lte_bands`、`net.sa_bands`、`net.nsa_bands` 继续表示当前允许/锁定范围。消费者应优先读取结构化的 `net.band_capabilities`；只有 `complete=true` 时三个数组才是完整设备能力，`source=device_default_band_lock` 表示数据由设备自身默认频段目录提供。目录缺失或任一列表非法时 `complete=false`、`source=unavailable`，支持频段字符串和数组均不使用当前锁频值回填。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 固定统计 `/data` 文件系统，`storage` 和 `throughput` 单位分别为字节和字节/秒。
-- `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
+- `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC8531、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
 - MU5252 的 `thermal.modems` 固定包含 `5G`、`4G1`、`4G2`。5G（X75）温度来自主机 thermal ubus；4G1/4G2（V3E2/V3E1）每 30 秒通过固定 ADB serial 读取外挂系统的 `zte_power/adc2_temp` 并缓存。`available=false` 时 `celsius=null`；其他模板当前返回空 `modems`。
 - MU5252 额外输出 `aggregation` 与 `cooling`；其他模板完全省略这两个块。`aggregation.enabled` 仅在 `zwrt_router.network.opms_wan_mode == SMULTIWAN` 时为 `true`，`aggregation.mode` 保留厂商当前模式文本。`aggregation.provisioned` 只表示厂商是否已下发 ICG 设备配置，不输出实际 ICG ID；`state` 为 `disabled` / `unprovisioned` / `waiting` / `online`，`online` 只在 `zte_icg_agg` 进程确实持有出站 `ESTABLISHED` TCP socket 时为真。datad 会从该进程的 `/proc/<pid>/fd` 反查 socket inode，排除其本地监听端口和入站管理连接，所以不依赖可能被云端运行时下发覆盖的 `/home/icg/icg.conf`；有隧道时 `server.source=runtime` 并显示占多数的实际远端，否则回退静态配置且 `source=config`。`controller.icg_process_running` / `mwan3_running` 分别标示两个控制层是否运行。`paths[]` 来自 `mwan3 status`，同时用 `network.interface.* status` 补充底层 `interface_up/available/pending`；按 X75/V3E1/V3E2（以及实际启用时的 Ethernet）分别输出接口、跟踪/在线状态、探测延迟、丢包、时长和探测目标。路径摘要优先采用状态为 `up` 或 `online` 的实际检测目标，忽略 `reliability=1` 产生的 `skipped` 备用目标；没有在线目标时回退第一个非 `skipped` 样本。目标项中的 `up` 与 `online` 均归一化为 `online=true`。mwan3 运行时路径 `online` 表示探测在线；ICG 模式下 mwan3 不运行，`online` 改为表示底层接口已连接，并继续用 `pending/available` 区分待拨号与可用。它描述承载链路状态，不等同于 ICG 内部 TCP 隧道；mwan3 未运行时不会伪造延迟或丢包。`traffic.remaining_bytes` / `today_used_bytes` 来自厂商落盘 UCI 字节值，`remaining_raw` / `today_used_raw` 继续保留同一原始文本以兼容旧消费者。云端接口以短超时每 60 秒低频触发刷新；接口超时或未返回有效字段时继续使用 UCI 真值，不能阻塞高频主采样。
 - MU5252 还输出结构化 `multiwan`：`mode`、`active`、`service_running` 和 `sections[]`。`sections[]` 只包含 mwan3 的安全配置字段，并按 `globals` / `interface` / `member` / `policy` / `rule` 标明类型；list 选项输出为数组。不会输出原始 UCI 文本。固件只在 `mode=MULTIWAN` 时运行 mwan3；`SMULTIWAN` 是 ICG 模式，此时配置可编辑保存但不生效，延迟/丢包为空属于正常状态。

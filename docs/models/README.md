@@ -11,6 +11,10 @@
   - 匹配：`model_name = MC8532B`
   - 展示名称：`G5 Pro`
   - 文档：[`MC8532B.md`](MC8532B.md)
+- `MC8531`
+  - 匹配：`model_name = MC8531`
+  - 展示名称：`G5 Ultra`
+  - 文档：[`MC8531.md`](MC8531.md)
 - `MU5252`
   - 匹配：`model_name = MU5252`
   - 展示名称：`TopFlow`

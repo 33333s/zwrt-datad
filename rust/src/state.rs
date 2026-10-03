@@ -1421,9 +1421,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "mu5252" => "MU5252",
         "mc7523" => "MC7523",
         "mc8532b" => "MC8532B",
+        "mc8531" => "MC8531",
         _ => "legacy_compat",
     };
-    if matches!(template, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
+    if matches!(
+        template,
+        "MU5250" | "MU5252" | "MC7523" | "MC8532B" | "MC8531"
+    ) {
         topflow_net_fallback(&mut raw_net, &uci_sets);
     }
     crate::apn_targets::set_multi_modem(template == "MU5252");
@@ -1581,7 +1585,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     // No battery fitted (CPEs, and models whose template says so): the vendor
     // service still answers with a placeholder (`battery_online` 0, capacity 0),
     // which must not be shown, forwarded or compared as a real 0 % battery.
-    let hide_battery = matches!(template, "MC7523" | "MC8532B") || battery_not_fitted(&battery);
+    let hide_battery =
+        matches!(template, "MC7523" | "MC8532B" | "MC8531") || battery_not_fitted(&battery);
     if !hide_battery
         && battery_ok
         && battery

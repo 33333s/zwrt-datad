@@ -37,6 +37,7 @@ jobs:
       - run: python3 ../tests/rust_sms_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_usb_test.py target/debug/zwrt-datad
       - run: python3 ../tests/battery_absent_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/mc8531_template_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_apn_session_test.py target/debug/zwrt-datad
       - run: python3 ../tests/identity_test.py target/debug/zwrt-datad
       - run: python3 ../tests/installer_test.py
