@@ -174,7 +174,15 @@ struct WifiTarget {
     pmf: String,
     maxassoc: String,
     enabled: String,
+    channel: Option<String>,
 }
+
+/// Standard CN 5 GHz channel numbers accepted by the firmware (DFS ones
+/// included; a DFS pick adds the regulatory 60 s CAC before beacons).
+const WIFI_5G_CHANNELS: &[&str] = &[
+    "36", "40", "44", "48", "52", "56", "60", "64", "100", "104", "108", "112", "116", "120",
+    "124", "128", "132", "136", "140", "144", "149", "153", "157", "161", "165",
+];
 
 /// The firmware stores the key Base64-encoded when its PASSWORD_ENCODE
 /// feature flag is on; decode when the stored value round-trips, otherwise
@@ -661,6 +669,24 @@ impl Ctl {
             .collect())
     }
 
+    /// The radio row from `queryWiFiChipAdvancedInfo` for one band.
+    async fn wifi_chip_row(&self, band: &str) -> Option<Map<String, Value>> {
+        let reply = self
+            .oem
+            .local_read_single("queryWiFiChipAdvancedInfo", &BTreeMap::new())
+            .await
+            .ok()?;
+        reply
+            .get("ResponseList")?
+            .as_array()?
+            .iter()
+            .take(4)
+            .find_map(|row| {
+                let object = row.as_object()?;
+                (object.get("Band").and_then(Value::as_str) == Some(band)).then(|| object.clone())
+            })
+    }
+
     /// The access-point row for one band ("b"/"a") and index ("0" main,
     /// "1" guest).
     async fn wifi_row(&self, band: &str, index: &str) -> Option<Map<String, Value>> {
@@ -713,6 +739,21 @@ impl Ctl {
                 }),
             );
         }
+        // queryAccessPointInfo's Channel is the runtime/auto-selected value
+        // (0 = auto); the pinned channel lives in queryWiFiChipAdvancedInfo.
+        // Merge it into the main sections so clients can display what is
+        // actually configured rather than what the radio happens to run on.
+        for (band, section) in [("b", "main_2g"), ("a", "main_5g")] {
+            if let Some(chip) = self.wifi_chip_row(band).await
+                && let Some(pinned) = chip
+                    .get("Channel")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                && let Some(target) = sections.get_mut(section)
+            {
+                target["channel"] = json!(pinned);
+            }
+        }
         if sections.is_empty() {
             return Err("OEM Wi-Fi configuration unavailable".into());
         }
@@ -760,6 +801,20 @@ impl Ctl {
                 "hidden" | "isolate" => matches!(value, "0" | "1"),
                 "pmf" => matches!(value, "0" | "1" | "2"),
                 "maxassoc" => value.parse::<u32>().is_ok_and(|n| (1..=128).contains(&n)),
+                // The channel belongs to the whole radio, so only the main
+                // sections may set it; a guest section would otherwise write
+                // the other band's channel list onto the wrong radio.
+                "channel" => match section {
+                    "main_5g" => matches!(value, "0") || WIFI_5G_CHANNELS.contains(&value),
+                    // 2.4 GHz: channels 1-13
+                    "main_2g" => {
+                        matches!(value, "0")
+                            || (value.len() <= 2
+                                && value.bytes().all(|b| b.is_ascii_digit())
+                                && value.parse::<u8>().is_ok_and(|ch| (1..=13).contains(&ch)))
+                    }
+                    _ => false,
+                },
                 other => {
                     return Outcome::Invalid(format!(
                         "Wi-Fi {other} is not configurable on this firmware"
@@ -794,6 +849,7 @@ impl Ctl {
                 .unwrap_or("")
                 .to_owned()
         };
+        let wanted_channel = wanted.remove("channel");
         let mut target = WifiTarget {
             ssid: wanted
                 .remove("ssid")
@@ -821,6 +877,7 @@ impl Ctl {
             enabled: enabled
                 .map(|v| if v { "1" } else { "0" }.to_owned())
                 .unwrap_or_else(|| current_text("AccessPointSwitchStatus")),
+            channel: None,
         };
         // An open network carries no key; asking for "none" clears it.
         if target.encryption == "none" {
@@ -837,59 +894,136 @@ impl Ctl {
                 && text("ApMaxStationNumber") == target.maxassoc
                 && text("AccessPointSwitchStatus") == target.enabled
         };
-        if row_matches(&current) {
+        let chip_row = self.wifi_chip_row(band).await;
+        let chip_text = |key: &str| {
+            chip_row
+                .as_ref()
+                .and_then(|row| row.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        // The channel is a per-radio setting, written through the radio's
+        // advanced-info goform (main_5g and main_2g; guest sections refuse it).
+        let channel_target = wanted_channel.filter(|value| *value != chip_text("Channel"));
+        let channel_changed = channel_target.is_some();
+        let ap_changed = !row_matches(&current);
+        if !ap_changed && !channel_changed {
             return Outcome::Ok(json!({"section":section,"changed":false,"verified":true}));
         }
-        // Mirror the WebUI builder: a switch-only change submits the switch
-        // status alone; otherwise the complete set is re-sent.
-        let settings_unchanged = current_text("SSID") == target.ssid
-            && wifi_decode_key(&current_text("Password")) == target.key
-            && wifi_status_encryption(&current_text("AuthMode")) == target.encryption
-            && current_text("ApBroadcastDisabled") == target.hidden
-            && current_text("ApIsolate") == target.isolate
-            && current_text("Pmf_switch") == target.pmf
-            && current_text("ApMaxStationNumber") == target.maxassoc;
-        let switch_only =
-            settings_unchanged && current_text("AccessPointSwitchStatus") != target.enabled;
-        let mut form: Vec<(&str, String)> = vec![
-            ("ChipIndex", current_text("ChipIndex")),
-            ("AccessPointIndex", ap_index.to_owned()),
-            ("QrImageShow", current_text("QrImageShow")),
-            ("wifi_syncparas_flag", "0".into()),
-        ];
-        if !switch_only {
-            let (auth_mode, cipher) = wifi_auth_mode(&target.encryption);
-            form.push(("SSID", target.ssid.clone()));
-            form.push(("ApIsolate", target.isolate.clone()));
-            form.push(("AuthMode", auth_mode.to_owned()));
-            form.push(("ApBroadcastDisabled", target.hidden.clone()));
-            form.push(("Pmf_switch", target.pmf.clone()));
-            form.push(("ApMaxStationNumber", target.maxassoc.clone()));
-            form.push(("EncrypType", cipher.unwrap_or("NONE").to_owned()));
-            if cipher.is_some() && !target.key.is_empty() {
-                form.push(("Password", wifi_encode_key(&target.key)));
+        target.channel = channel_target;
+        // The AP settings write only happens when they actually move; a
+        // channel-only change skips straight to the radio write below.
+        let mut form: Vec<(&str, String)> = Vec::new();
+        if ap_changed {
+            // Mirror the WebUI builder: a switch-only change submits the switch
+            // status alone; otherwise the complete set is re-sent.
+            let settings_unchanged = current_text("SSID") == target.ssid
+                && wifi_decode_key(&current_text("Password")) == target.key
+                && wifi_status_encryption(&current_text("AuthMode")) == target.encryption
+                && current_text("ApBroadcastDisabled") == target.hidden
+                && current_text("ApIsolate") == target.isolate
+                && current_text("Pmf_switch") == target.pmf
+                && current_text("ApMaxStationNumber") == target.maxassoc;
+            let switch_only =
+                settings_unchanged && current_text("AccessPointSwitchStatus") != target.enabled;
+            form = vec![
+                ("ChipIndex", current_text("ChipIndex")),
+                ("AccessPointIndex", ap_index.to_owned()),
+                ("QrImageShow", current_text("QrImageShow")),
+                ("wifi_syncparas_flag", "0".into()),
+            ];
+            if !switch_only {
+                let (auth_mode, cipher) = wifi_auth_mode(&target.encryption);
+                form.push(("SSID", target.ssid.clone()));
+                form.push(("ApIsolate", target.isolate.clone()));
+                form.push(("AuthMode", auth_mode.to_owned()));
+                form.push(("ApBroadcastDisabled", target.hidden.clone()));
+                form.push(("Pmf_switch", target.pmf.clone()));
+                form.push(("ApMaxStationNumber", target.maxassoc.clone()));
+                form.push(("EncrypType", cipher.unwrap_or("NONE").to_owned()));
+                if cipher.is_some() && !target.key.is_empty() {
+                    form.push(("Password", wifi_encode_key(&target.key)));
+                }
             }
+            form.push(("AccessPointSwitchStatus", target.enabled.clone()));
         }
-        form.push(("AccessPointSwitchStatus", target.enabled.clone()));
-        if let Err(error) = self.write("setAccessPointInfo", &form).await {
+        if !form.is_empty()
+            && let Err(error) = self.write("setAccessPointInfo", &form).await
+        {
             return Outcome::Failed(error);
         }
-        // The access point restarts itself after a settings write; retry the
-        // readback until the OEM answers with the new row.
-        let verified = tokio::time::timeout(Duration::from_secs(25), async {
-            loop {
-                if let Some(row) = self.wifi_row(band, ap_index).await
-                    && row_matches(&row)
-                {
-                    return true;
+        if ap_changed {
+            // The access point restarts itself after a settings write; retry
+            // the readback until the OEM answers with the new row.
+            let verified = tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    if let Some(row) = self.wifi_row(band, ap_index).await
+                        && row_matches(&row)
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(700)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(700)).await;
+            })
+            .await
+            .unwrap_or(false);
+            if !verified {
+                return Outcome::Failed(
+                    "Wi-Fi write was accepted but readback did not match".into(),
+                );
             }
-        })
-        .await
-        .unwrap_or(false);
-        if !verified {
-            return Outcome::Failed("Wi-Fi write was accepted but readback did not match".into());
+        }
+        if let Some(channel) = target.channel.as_ref() {
+            // The radio write re-sends the full advanced set from the current
+            // row, exactly like the WebUI's builder. Without the row we would
+            // be writing empty radio parameters — refuse instead.
+            let Some(chip) = chip_row.as_ref() else {
+                return Outcome::Failed("OEM Wi-Fi radio configuration unavailable".into());
+            };
+            let radio_text = |key: &str| {
+                chip.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let mut form: Vec<(&str, String)> = vec![
+                ("ChipIndex", radio_text("ChipIndex")),
+                ("WirelessMode", radio_text("WirelessMode")),
+                ("CountryCode", radio_text("CountryCode")),
+                ("Channel", channel.clone()),
+                ("BandWidth", radio_text("BandWidth")),
+            ];
+            if band == "a" && !radio_text("Band").is_empty() {
+                form.push(("Band", radio_text("Band")));
+            }
+            if let Err(error) = self.write("setWiFiChipAdvancedInfo", &form).await {
+                // AP settings (if any) were already applied above; surface
+                // that so the caller does not assume nothing changed.
+                if ap_changed {
+                    return Outcome::Failed(format!(
+                        "AP settings were applied, but the channel write failed: {error}"
+                    ));
+                }
+                return Outcome::Failed(error);
+            }
+            let verified = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let Some(row) = self.wifi_chip_row(band).await
+                        && row.get("Channel").and_then(Value::as_str) == Some(channel.as_str())
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if !verified {
+                return Outcome::Failed(
+                    "Wi-Fi channel write was accepted but readback did not match".into(),
+                );
+            }
         }
         Outcome::Ok(json!({"section":section,"changed":true,"verified":true}))
     }
@@ -1298,7 +1432,28 @@ impl Ctl {
 
     /// Clear the LTE band lock (mask "0"), matching the WebUI's deselect-all.
     async fn band_auto_lte(&self) -> Outcome {
-        let mask = "0".to_owned();
+        // On the U50 Pro firmware, mask "0" means "no bands allowed" (the modem
+        // goes NO_SERVICE). The safe "unlock" is to explicitly allow every
+        // factory band — delegate to the explicit write path with all bands.
+        let factory = match self
+            .field("lte_band_1_64_factory")
+            .await
+            .as_deref()
+            .and_then(mask_value)
+            .filter(|v| *v != 0)
+        {
+            Some(mask) => mask,
+            None => return Outcome::Failed("factory LTE bands unavailable".into()),
+        };
+        let bands: Vec<u32> = (1..=64)
+            .filter(|band| factory & (1u64 << (band - 1)) != 0)
+            .map(|band| band as u32)
+            .collect();
+        if bands.is_empty() {
+            return Outcome::Failed("factory LTE bands unavailable".into());
+        }
+        // Build the explicit write form (same as band_set_lte with explicit bands)
+        let mask = lte_mask(&bands);
         let result = if self.collector.model == crate::u50::Model::U50S {
             self.write("SET_NETWORK_BAND_LOCK", &[("lte_band_lock", mask.clone())])
                 .await
@@ -1318,14 +1473,16 @@ impl Ctl {
             return Outcome::Failed(error);
         }
         let verified = self
-            .wait_field("lte_band_lock", |value| mask_value(value) == Some(0))
+            .wait_field("lte_band_lock", |value| {
+                mask_value(value) == mask_value(&mask)
+            })
             .await;
         if !verified {
             return Outcome::Failed(
                 "OEM LTE band unlock was accepted but readback did not match".into(),
             );
         }
-        Outcome::Ok(json!({"result":"success","mode":"auto","verified":true}))
+        Outcome::Ok(json!({"result":"success","mode":"auto","bands":bands,"verified":true}))
     }
 
     /// The U50 Pro firmware gates `BAND_SELECT` and the NR lock goforms behind
@@ -1361,8 +1518,15 @@ impl Ctl {
             }
             (bands, false)
         };
+        let auto_bands = factory
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let csv = if auto {
-            "0".to_owned()
+            // On the U50 Pro firmware, mask "0" means "no bands allowed".
+            // "Unlock" = allow every factory NR band.
+            auto_bands.clone()
         } else {
             bands
                 .iter()
@@ -1387,8 +1551,10 @@ impl Ctl {
         } else {
             "nr5g_sa_band_lock"
         };
+        let auto_expected = auto_bands;
         let verified = if auto {
-            self.wait_field(key, |value| value.trim() == "0").await
+            self.wait_field(key, |value| value.trim() == auto_expected)
+                .await
         } else {
             self.wait_field(key, |value| {
                 band_list(&json!({"bands":value}), "bands", 512)

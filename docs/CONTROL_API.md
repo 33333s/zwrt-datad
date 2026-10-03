@@ -305,6 +305,13 @@ U50 的 Wi-Fi 动作与主线（U60pro）同名同形：
   无变化不写（`changed:false`）；仅开关变化时只发 `AccessPointSwitchStatus`（官方 WebUI 同款
   最小写）；写后有界回读重试（最长 25 秒）等 AP 自重启。加密名映射：`psk2→WPA2PSK`、
   `psk-mixed→WPAPSKWPA2PSK`、`sae→WPA3PSK`、`sae-mixed→WPA2PSKWPA3PSK`；`none` 清空密码。
+- `wifi.configure` 额外接受 **`channel`**（`main_5g` 与 `main_2g`）：`"0"` 恢复自动选信道，
+  5G 为标准信道号（36–165），2.4G 为 1–13。写入走官方 `setWiFiChipAdvancedInfo`，重发当前无线模式/
+  国家码/带宽仅改信道，回读校验。**DFS 信道（52–64、100–144）开台前有法规强制的
+  约 60 秒 CAC 静默**——自动模式挤到 DFS 信道就是 5G 开得慢的根源；钉死
+  36–48 或 149–165 等**非 DFS 信道**即可秒开。信道是整颗射频的设置，只在主段（`main_2g`/`main_5g`）暴露，访客段拒绝；
+  `wifi.status` 的主段 `channel` 返回 `queryWiFiChipAdvancedInfo` 里的固定信道（`0` 表示自动）。
+  `band.set_lte`/`band.set_nr_*` 传空列表（解锁）改为写入完整工厂频段表，因为 U50 Pro 固件的掩码 `0` 表示“不允许任何频段”。
 - `wifi.set_dual_band`：官方双频合一开关走 `switchWiFiModule` 携带当前开关与 LAN 标志，
   仅写 `wifi_lbd_enable`，回读校验；无变化 `changed:false`。
 - `wifi.set_module`：Wi-Fi 总开关（`switchWiFiModule` + `SwitchOption`），与主线动作名一致。

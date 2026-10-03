@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.64",
+    "version": "0.10.66",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro /state.neighbor 改为实时读取：邻区采集开关切换后立即生效，不再有采样器一拍延迟"
+    "notes": "U50 Pro wifi.configure 信道固定：5G(36-165) + 2.4G(1-13)，wifi.status 回读固定信道（queryWiFiChipAdvancedInfo 合并）"
   }
 }
