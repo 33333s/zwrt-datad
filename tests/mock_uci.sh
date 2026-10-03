@@ -26,6 +26,13 @@ case "$*" in
     *__mock_fail__*) exit 1 ;;
 esac
 
+# This fixture is a TopFlow (MU5252): its firmware asks for encrypted SMS sends.
+# MOCK_SMS_PLAIN=1 simulates the firmwares that carry no such flag.
+if [ "${1:-}" = "-q" ] && [ "${2:-}" = "get" ] && [ "${3:-}" = "zwrt_wms.config.sms_no_need_encryption_flag" ] && [ -z "${MOCK_SMS_PLAIN:-}" ]; then
+    printf '0\n'
+    exit 0
+fi
+
 if [ "${1:-}" = "-q" ] && [ "${2:-}" = "show" ] && [ "${3:-}" = "zte_nwinfo" ]; then
     printf '%s\n' \
         "zte_nwinfo.sys_info.network_type='${MOCK_UCI_NETWORK_TYPE:-SA}'" \
