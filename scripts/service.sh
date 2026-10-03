@@ -28,8 +28,45 @@ process_matches() {
     if [ -n "$actual" ] && { [ "$actual" = "$expected" ] || [ "$actual" = "$BIN" ]; }; then
         return 0
     fi
-    first_arg="$(tr '\000' '\n' 2>/dev/null < "/proc/$check_pid/cmdline" | sed -n '1p')"
+    # The process can exit between the checks above and this read.
+    first_arg="$({ tr '\000' '\n' < "/proc/$check_pid/cmdline"; } 2>/dev/null | sed -n '1p')"
     [ "$first_arg" = "$expected" ] || [ "$first_arg" = "$BIN" ]
+}
+
+# start/stop/restart run one at a time. Two callers racing at boot (rc.local plus
+# another starter) or during an update would both launch the daemon; the loser
+# died on "Address in use" and left that line in the log of every device.
+LOCK_DIR="$SERVICE_DIR/.service.lock"
+LOCK_HELD=0
+
+release_lock() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    rm -rf "$LOCK_DIR"
+    LOCK_HELD=0
+}
+
+acquire_lock() {
+    lock_tries=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        lock_holder=""
+        [ ! -f "$LOCK_DIR/pid" ] || IFS= read -r lock_holder < "$LOCK_DIR/pid" 2>/dev/null || true
+        case "$lock_holder" in
+            *[!0-9]*) lock_holder="" ;;
+        esac
+        # A holder that is gone (killed mid-start) must not block the service.
+        if [ -n "$lock_holder" ] && [ ! -d "/proc/$lock_holder" ]; then
+            rm -rf "$LOCK_DIR"
+            continue
+        fi
+        lock_tries=$((lock_tries + 1))
+        if [ "$lock_tries" -gt 30 ]; then
+            echo "zwrt-datad：等待其他启动/停止操作超时，继续执行" >&2
+            return 0
+        fi
+        sleep 1
+    done
+    printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+    LOCK_HELD=1
 }
 
 write_pid() {
@@ -199,6 +236,15 @@ status() {
     echo "zwrt-datad 未在运行"
     return 1
 }
+
+case "$1" in
+    start|stop|restart)
+        mkdir -p "$SERVICE_DIR" 2>/dev/null || true
+        acquire_lock
+        trap release_lock EXIT
+        trap 'release_lock; exit 1' HUP INT TERM
+        ;;
+esac
 
 case "$1" in
     start) start ;;

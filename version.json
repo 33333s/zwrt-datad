@@ -3,6 +3,6 @@
   "datad": {
     "version": "0.10.60",
     "asset": "zwrt-datad-aarch64",
-    "notes": "MC8531 增加 6 GHz Wi-Fi 支持：state.wlan.bands、wifi.status/wifi.configure/wireless.config/client.block 覆盖 6G；按 UCI 解析各频段对应的射频，修正 MC8531 上 2G/5G 信道和国家码写到错误射频的问题"
+    "notes": "MC8531 增加 6 GHz Wi-Fi 支持（state.wlan.bands、wifi.status/wifi.configure/wireless.config/client.block 覆盖 6G；按 UCI 解析各频段对应的射频，修正 MC8531 上 2G/5G 信道和国家码写到错误射频）；service.sh 启动/停止互斥，并发启动不再留下 “Address in use” 日志，监听失败信息带地址，压掉停止时的 /proc 读取报错"
   }
 }

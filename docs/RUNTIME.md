@@ -58,6 +58,10 @@ datad 直接连接 ubusd 的 unix socket（`/var/run/ubus/ubus.sock`）发起请
 
 `zwrt-datad --ubus-compare 对象:方法 ['{json参数}'] …` 把只读调用分别经 socket 和 `ubus call` 执行并比较，只输出是否一致与不一致的字段路径，不输出字段值；上新机型或固件前可先用它核对。部分原厂接口每次调用都会重新加密敏感字段（如 APN `password`、MU5252 的 `msisdn`/`sim_imsi`），这些路径本来就会不同。
 
+## 并发启动与日志里的 “Address in use”
+
+`service.sh` 的 `start`/`stop`/`restart` 会先取目录锁 `<数据目录>/.service.lock`，同一时刻只有一个调用在执行；后来者等待，等到时看到服务已在运行就直接返回。0.10.59 以前，两个调用方同时启动（例如开机时 `rc.local` 和另一个启动者，或更新过程中）会各自拉起一个进程，输家因端口被占用退出，并在 `zwrt-datad.log` 留下一行 `Error: Address in use (os error 98)`，服务本身不受影响。持锁进程被杀留下的锁会被识别并清理；等待超过 30 秒则继续执行并给出提示。监听失败时的错误信息现在带上地址，例如 `cannot listen on 127.0.0.1:9460: Address in use (os error 98) (is another zwrt-datad already running?)`。
+
 ## 运行检查
 
 ### 设备签名身份

@@ -704,7 +704,11 @@ impl App {
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind(addr).await.map_err(|error| {
+            anyhow::anyhow!(
+                "cannot listen on {addr}: {error} (is another zwrt-datad already running?)"
+            )
+        })?;
         let result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
