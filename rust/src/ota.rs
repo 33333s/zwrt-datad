@@ -49,7 +49,19 @@ fn publish_config(config: &Config) {
     );
 }
 
+/// Order matters: sources are tried first to last. Servers the user configured
+/// (`custom`) come first, then GitHub, with the netdisk mirror as the fallback.
 fn default_sources() -> Vec<String> {
+    ["custom", "github", "netdisk"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Before 0.10.62 the default put the netdisk ahead of GitHub. A stored list that
+/// is exactly that old default was never a choice, so it follows the new default;
+/// any other stored order is the user's and is kept.
+fn legacy_default_sources() -> Vec<String> {
     ["custom", "netdisk", "github"]
         .into_iter()
         .map(str::to_owned)
@@ -165,9 +177,12 @@ fn retry_delay(failures: u8) -> Duration {
 impl Ota {
     pub fn load(dir: &Path) -> Result<Self, String> {
         let key = parse_public_key(PUBLIC_KEY)?;
-        let config = read_json::<Config>(&dir.join("ota.json"))
+        let mut config = read_json::<Config>(&dir.join("ota.json"))
             .filter(|value| validate_config(value).is_ok())
             .unwrap_or_default();
+        if config.sources == legacy_default_sources() {
+            config.sources = default_sources();
+        }
         let stored = read_json::<StoredStatus>(&dir.join("ota-state.json")).unwrap_or_default();
         let mut status = stored.status;
         status.current_version = env!("DATAD_VERSION").into();
@@ -289,16 +304,15 @@ impl Ota {
 
     fn servers(&self) -> Vec<String> {
         let mut seen = HashSet::new();
-        let enabled: HashSet<_> = self.config.sources.iter().map(String::as_str).collect();
         let mut ordered = Vec::new();
-        if enabled.contains("custom") {
-            ordered.extend(self.config.servers.iter().map(String::as_str));
-        }
-        if enabled.contains("netdisk") {
-            ordered.push(NETDISK);
-        }
-        if enabled.contains("github") {
-            ordered.push(GITHUB);
+        // Sources are tried in the configured order.
+        for source in &self.config.sources {
+            match source.as_str() {
+                "custom" => ordered.extend(self.config.servers.iter().map(String::as_str)),
+                "netdisk" => ordered.push(NETDISK),
+                "github" => ordered.push(GITHUB),
+                _ => {}
+            }
         }
         ordered
             .into_iter()
@@ -1186,6 +1200,55 @@ mod tests {
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");
         assert!(ota.status.signature_verified);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_sources_default_to_github_then_netdisk_and_follow_the_stored_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "zwrt-datad-ota-order-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let order = |dir: &Path| Ota::load(dir).unwrap().servers();
+        // Nothing stored: GitHub first, the netdisk mirror as the fallback.
+        assert_eq!(order(&dir), vec![GITHUB.to_owned(), NETDISK.to_owned()]);
+        // The user's own servers come before both.
+        fs::write(
+            dir.join("ota.json"),
+            r#"{"enabled":true,"servers":["https://mirror.example/updates/"],"sources":["custom","github","netdisk"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            order(&dir),
+            vec![
+                "https://mirror.example/updates".to_owned(),
+                GITHUB.to_owned(),
+                NETDISK.to_owned()
+            ]
+        );
+        // The pre-0.10.62 default (netdisk first) was never a choice and follows the new default.
+        fs::write(
+            dir.join("ota.json"),
+            r#"{"enabled":true,"servers":[],"sources":["custom","netdisk","github"]}"#,
+        )
+        .unwrap();
+        assert_eq!(order(&dir), vec![GITHUB.to_owned(), NETDISK.to_owned()]);
+        // Any other stored order or subset is the user's and is kept.
+        fs::write(
+            dir.join("ota.json"),
+            r#"{"enabled":true,"servers":[],"sources":["netdisk","github"]}"#,
+        )
+        .unwrap();
+        assert_eq!(order(&dir), vec![NETDISK.to_owned(), GITHUB.to_owned()]);
+        fs::write(
+            dir.join("ota.json"),
+            r#"{"enabled":true,"servers":["https://mirror.example/u"],"sources":["custom"]}"#,
+        )
+        .unwrap();
+        assert_eq!(order(&dir), vec!["https://mirror.example/u".to_owned()]);
         let _ = fs::remove_dir_all(dir);
     }
 }
