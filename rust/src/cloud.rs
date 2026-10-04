@@ -466,6 +466,7 @@ async fn supervisor(
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
 ) {
+    let mut started = false;
     loop {
         let config = config_rx.borrow_and_update().clone();
         let Some(config) = config else {
@@ -482,6 +483,12 @@ async fn supervisor(
             continue;
         }
         let mut delay = Duration::from_secs(1);
+        if !std::mem::replace(&mut started, true) {
+            tokio::select! {
+                _ = tokio::time::sleep(random_up_to(STARTUP_JITTER)) => {},
+                _ = config_rx.changed() => continue,
+            }
+        }
         loop {
             set_status(&status, "connecting", "");
             match session(
@@ -503,7 +510,7 @@ async fn supervisor(
                         "云端连接中断或认证失败，请检查地址、证书与设备凭据",
                     );
                     tokio::select! {
-                        _ = tokio::time::sleep(delay) => {},
+                        _ = tokio::time::sleep(delay.mul_f64(0.5 + rand::random::<f64>())) => {},
                         changed = config_rx.changed() => {
                             if changed.is_err() { return; }
                             break;
@@ -520,6 +527,56 @@ enum SessionEnd {
     Reconfigure,
     Stopped,
     Failed,
+}
+
+/// Presence heartbeat period. NMS treats a device as offline after 60 s of
+/// silence, so 20 s keeps a threefold margin while cutting database writes.
+const HEARTBEAT_SECONDS: u64 = 20;
+/// A device that has just started spreads its first connection over this window
+/// so a thousand devices do not hit the broker together after an NMS restart.
+const STARTUP_JITTER: Duration = Duration::from_secs(5);
+/// `device` and `network` telemetry are only re-sent when they change, or after
+/// this long so NMS keeps a fresh copy.
+const SLOW_PAYLOAD_REFRESH: Duration = Duration::from_secs(3600);
+
+fn random_up_to(max: Duration) -> Duration {
+    max.mul_f64(rand::random::<f64>())
+}
+
+/// A tick every `HEARTBEAT_SECONDS`, with a random first tick inside the first
+/// period so devices that connect together do not beat together.
+fn heartbeat_interval() -> tokio::time::Interval {
+    let period = Duration::from_secs(HEARTBEAT_SECONDS);
+    let start = tokio::time::Instant::now() + random_up_to(period).max(Duration::from_secs(1));
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+/// Last published `device`/`network` payloads, so unchanged ones are skipped.
+#[derive(Default)]
+struct ReportCache {
+    device: Option<(u64, std::time::Instant)>,
+    network: Option<(u64, std::time::Instant)>,
+}
+
+impl ReportCache {
+    /// True when the payload changed or its last copy is older than the refresh.
+    fn due(slot: &mut Option<(u64, std::time::Instant)>, payload: &Value) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        payload.to_string().hash(&mut hasher);
+        let hash = hasher.finish();
+        match slot {
+            Some((previous, at)) if *previous == hash && at.elapsed() < SLOW_PAYLOAD_REFRESH => {
+                false
+            }
+            _ => {
+                *slot = Some((hash, std::time::Instant::now()));
+                true
+            }
+        }
+    }
 }
 
 const MQTT_ADDRESS_ERROR: &str = "MQTT 地址格式为 ssl://主机:端口 或 wss://主机[:端口]/mqtt";
@@ -623,10 +680,10 @@ async fn session(
         config.report_interval_seconds,
     )));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Presence must remain faster than NMS's 30-second offline deadline,
+    // Presence must stay well inside NMS's 60-second offline deadline,
     // independently of the user-selected telemetry reporting interval.
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = heartbeat_interval();
+    let mut cache = ReportCache::default();
     loop {
         tokio::select! {
             changed = config_rx.changed() => {
@@ -651,7 +708,8 @@ async fn session(
                     connected = true;
                     enrolled = !pending;
                     ticker.reset();
-                    heartbeat.reset();
+                    heartbeat = heartbeat_interval();
+                    cache = ReportCache::default();
                     set_status(&status, if pending {"enrolling"} else {"connected"}, "");
                     if !pending {
                         crate::update_status::runtime("connected");
@@ -667,7 +725,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
+                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some(), &mut cache, true).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -690,7 +748,7 @@ async fn session(
                             set_status(&status,"connected","");
                             crate::update_status::runtime("connected");
                             let snapshot=state_rx.borrow().clone();
-                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some()).await.is_err() {
+                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some(),&mut cache,true).await.is_err() {
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
                             }
                         } else {
@@ -709,6 +767,10 @@ async fn session(
                                 updates.spawn(async move { app.cloud_update(command, config).await });
                             }
                         }
+                        continue;
+                    }
+                    if let Ok(close) = serde_json::from_slice::<RemoteClose>(&message.payload) {
+                        bridge.close(close).await;
                         continue;
                     }
                     if let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload)
@@ -733,7 +795,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &snapshot, &status, webshell_available, app.is_some()).await.is_err() {
+                if report(&client, config, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -767,6 +829,30 @@ async fn publish_and_flush(
     .map_err(|_| "MQTT offline status acknowledgement timed out".to_owned())?
 }
 
+/// Short human-readable device names from the vendor config. Anything
+/// that is empty, over-long or not plain printable text is left out.
+fn device_label(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty() && text.chars().count() <= 64 && text.chars().all(|c| !c.is_control()))
+        .then(|| text.to_owned())
+}
+
+/// The real hardware model (for example MU5002D), as distinct from the
+/// `model` the device identity and MQTT topics were created with.
+fn hardware_model(state: &Value) -> Option<String> {
+    ["/device/model_name", "/uci_device_info/common_model_name"]
+        .into_iter()
+        .find_map(|pointer| {
+            state
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| topic(value))
+                .map(str::to_owned)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn report(
     client: &AsyncClient,
     config: &Config,
@@ -774,9 +860,16 @@ async fn report(
     status: &Arc<Mutex<Status>>,
     webshell_available: bool,
     panel_available: bool,
+    cache: &mut ReportCache,
+    full: bool,
 ) -> Result<(), String> {
     let state = serde_json::to_value(snapshot).unwrap_or(Value::Null);
-    let mut capabilities = vec!["datad.update", "datad.remote", "datad.remote_origins"];
+    let mut capabilities = vec![
+        "datad.update",
+        "datad.remote",
+        "datad.remote_origins",
+        "datad.remote_close",
+    ];
     if webshell_available {
         capabilities.push("datad.webshell");
     }
@@ -792,7 +885,7 @@ async fn report(
         .and_then(|value| value.get("sw_version").or_else(|| value.get("fw")))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    publish(client, format!("{}/telemetry/device", root(config)), json!({
+    let mut device = json!({
         "vendor":config.vendor,"model":config.model,"device_id":config.identity,
         "id_type":config.identity_type,"platform":config.platform,
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
@@ -800,25 +893,50 @@ async fn report(
         "remote_origins":reported_remote_origins(config),
         "remote_panel_control_enabled":config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
-    })).await?;
-    publish(
-        client,
-        format!("{}/status", root(config)),
-        json!({"online":true}),
-    )
-    .await?;
+    });
+    if let Some(object) = device.as_object_mut() {
+        if let Some(model) = hardware_model(&state) {
+            object.insert("hardware_model".into(), json!(model));
+        }
+        for (key, pointer) in [
+            ("device_market_name", "/uci_device_info/device_market_name"),
+            ("device_alias_name", "/uci_device_info/device_alias_name"),
+        ] {
+            if let Some(label) = device_label(state.pointer(pointer)) {
+                object.insert(key.into(), json!(label));
+            }
+        }
+    }
+    // `due` also records the payload, so it runs even for a full report.
+    let device_due = ReportCache::due(&mut cache.device, &device);
+    if full || device_due {
+        publish(client, format!("{}/telemetry/device", root(config)), device).await?;
+    }
+    // Presence between full reports comes from the heartbeat alone.
+    if full {
+        publish(
+            client,
+            format!("{}/status", root(config)),
+            json!({"online":true}),
+        )
+        .await?;
+    }
     publish(
         client,
         format!("{}/telemetry/system", root(config)),
         system_telemetry(&state),
     )
     .await?;
-    publish(
-        client,
-        format!("{}/telemetry/network", root(config)),
-        json!({"upstream":{"ipv4":upstream_addresses(&state,"wan4","ipv4"),"ipv6":upstream_addresses(&state,"wan6","ipv6")},"cell":serving_cell(&state)}),
-    )
-    .await?;
+    let network = json!({"upstream":{"ipv4":upstream_addresses(&state,"wan4","ipv4"),"ipv6":upstream_addresses(&state,"wan6","ipv6")},"cell":serving_cell(&state)});
+    let network_due = ReportCache::due(&mut cache.network, &network);
+    if full || network_due {
+        publish(
+            client,
+            format!("{}/telemetry/network", root(config)),
+            network,
+        )
+        .await?;
+    }
     let mut guard = status.lock().unwrap();
     guard.state = "connected".into();
     guard.error.clear();
@@ -947,6 +1065,17 @@ struct RemoteCommand {
     ttl_seconds: u64,
 }
 
+/// `remote.close`: NMS ends a session it opened. `target_session_id` is the
+/// `request_id` of the matching `remote.open`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteClose {
+    protocol_version: i64,
+    request_id: String,
+    action: String,
+    target_session_id: String,
+}
+
 #[derive(Default)]
 struct BridgeState {
     active: HashSet<String>,
@@ -974,6 +1103,8 @@ struct BridgeManager {
     app: Option<crate::server::App>,
     state: Arc<AsyncMutex<BridgeState>>,
     shutdown: watch::Sender<bool>,
+    /// Per-session stop signals, so one session can be closed on its own.
+    sessions: Arc<std::sync::Mutex<HashMap<String, watch::Sender<bool>>>>,
 }
 
 impl BridgeManager {
@@ -984,11 +1115,46 @@ impl BridgeManager {
             app,
             state: Arc::new(AsyncMutex::new(BridgeState::default())),
             shutdown,
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     fn shutdown(&self) {
         self.shutdown.send_replace(true);
+        if let Ok(sessions) = self.sessions.lock() {
+            for stop in sessions.values() {
+                stop.send_replace(true);
+            }
+        }
+    }
+
+    /// Ends one session now instead of waiting for its TTL. Closing is
+    /// idempotent; for an id this device has not seen yet it also records the id
+    /// so a late or re-sent `remote.open` for the closed session is ignored.
+    async fn close(&self, command: RemoteClose) {
+        if command.protocol_version != 1
+            || command.action != "remote.close"
+            || !topic(&command.request_id)
+            || !topic(&command.target_session_id)
+        {
+            return;
+        }
+        let stop = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&command.target_session_id).cloned());
+        match stop {
+            Some(stop) => {
+                stop.send_replace(true);
+            }
+            None => {
+                let mut state = self.state.lock().await;
+                if !state.already_seen(&command.target_session_id) && state.seen.len() < 128 {
+                    state.remember(command.target_session_id);
+                }
+            }
+        }
     }
 
     async fn receive(&self, command: RemoteCommand) -> Option<Value> {
@@ -1024,8 +1190,18 @@ impl BridgeManager {
         state.active.insert(command.request_id.clone());
         state.remember(command.request_id.clone());
         drop(state);
+        let (stop, stop_rx) = watch::channel(*self.shutdown.borrow());
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(command.request_id.clone(), stop);
+        }
         let manager = self.clone();
-        tokio::spawn(async move { manager.run_bridge(command, shell_permit).await });
+        tokio::spawn(async move {
+            let id = command.request_id.clone();
+            manager.run_bridge(command, shell_permit, stop_rx).await;
+            if let Ok(mut sessions) = manager.sessions.lock() {
+                sessions.remove(&id);
+            }
+        });
         None
     }
 
@@ -1033,6 +1209,7 @@ impl BridgeManager {
         &self,
         command: RemoteCommand,
         shell_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        stop: watch::Receiver<bool>,
     ) {
         if let Some(permit) = shell_permit {
             if let Some(app) = &self.app {
@@ -1042,7 +1219,7 @@ impl BridgeManager {
                     &command.remote_url,
                     &command.token,
                     Duration::from_secs(command.ttl_seconds),
-                    self.shutdown.subscribe(),
+                    stop.clone(),
                     permit,
                 )
                 .await;
@@ -1058,7 +1235,7 @@ impl BridgeManager {
                     &command.token,
                     app.inner._data_dir.clone(),
                     Duration::from_secs(command.ttl_seconds),
-                    self.shutdown.subscribe(),
+                    stop.clone(),
                 )
                 .await;
             }
@@ -1083,7 +1260,7 @@ impl BridgeManager {
                     &command.remote_url,
                     &command.token,
                     Duration::from_secs(command.ttl_seconds),
-                    self.shutdown.subscribe(),
+                    stop.clone(),
                 )
                 .await;
             }
@@ -1094,7 +1271,7 @@ impl BridgeManager {
         for _ in 0..4 {
             let config = self.config.clone();
             let command = command.clone();
-            let shutdown = self.shutdown.subscribe();
+            let shutdown = stop.clone();
             workers.spawn(async move {
                 loop {
                     if bridge_pipe(&config, &command, shutdown.clone()).await {
@@ -2751,13 +2928,19 @@ mod tests {
             vendor: "ZTE".into(),
             model: "MU5252".into(),
             identity: "fixture-device".into(),
-            report_interval_seconds: 3600,
+            // One-second telemetry makes any repeated device/network payload show up fast.
+            report_interval_seconds: 1,
             ..Default::default()
         };
         let mut fields = serde_json::Map::new();
         fields.insert(
             "system".into(),
             json!({"sw_version":"test","cpu_usage":23,"mem_used_pct":42}),
+        );
+        fields.insert("device".into(), json!({"model_name":"MU5002D"}));
+        fields.insert(
+            "uci_device_info".into(),
+            json!({"device_market_name":"U60 Pro","device_alias_name":"  Alias\u{7}  "}),
         );
         fields.insert("thermal".into(), json!({"cpu_celsius":51}));
         fields.insert("password".into(), json!("do-not-upload"));
@@ -2766,7 +2949,7 @@ mod tests {
             datad: Default::default(),
             fields,
         };
-        let (_state_tx, state_rx) = watch::channel(snapshot);
+        let (state_tx, state_rx) = watch::channel(snapshot.clone());
         let (config_tx, config_rx) = watch::channel(Some(config.clone()));
         let status = Arc::new(Mutex::new(Status::default()));
         let session_task = tokio::spawn({
@@ -2774,7 +2957,7 @@ mod tests {
             async move { session(&config, state_rx, config_rx, status, None).await }
         });
         let mut found = HashSet::new();
-        while found.len() < 3 {
+        while found.len() < 4 {
             let report = tokio::time::timeout(Duration::from_secs(8), reports_rx.recv())
                 .await
                 .unwrap()
@@ -2782,8 +2965,22 @@ mod tests {
             let encoded = report.to_string();
             assert!(!encoded.contains("do-not-upload"));
             assert_eq!(report["protocol_version"], 1);
+            if report.get("upstream").is_some() {
+                found.insert("network");
+            }
             if report["model"] == "MU5252" {
                 assert_eq!(report["firmware_version"], "test");
+                // Real model and marketing name travel with the device payload;
+                // a name with control characters is dropped rather than cleaned.
+                assert_eq!(report["hardware_model"], "MU5002D");
+                assert_eq!(report["device_market_name"], "U60 Pro");
+                assert!(report.get("device_alias_name").is_none(), "{report}");
+                assert!(
+                    report["capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("datad.remote_close"))
+                );
                 found.insert("device");
             }
             if report["online"] == true {
@@ -2796,15 +2993,38 @@ mod tests {
                 found.insert("system");
             }
         }
-        // Long telemetry intervals must still emit an independent presence heartbeat.
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // Presence comes from the independent heartbeat (first tick within one
+        // 20 s period). While system telemetry keeps flowing every second, the
+        // unchanged device and network payloads must not be sent again.
+        tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 let report = reports_rx.recv().await.unwrap();
                 assert!(
                     report.get("model").is_none(),
-                    "unexpected full telemetry report"
+                    "unchanged device payload re-sent: {report}"
+                );
+                assert!(
+                    report.get("upstream").is_none(),
+                    "unchanged network payload re-sent: {report}"
                 );
                 if report["online"] == true {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // A changed network payload goes out on the next tick.
+        let mut changed = snapshot.clone();
+        changed.fields.insert(
+            "interfaces".into(),
+            json!({"wan4":{"ipv4":[{"address":"203.0.113.9"}]}}),
+        );
+        state_tx.send(changed).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let report = reports_rx.recv().await.unwrap();
+                if report["upstream"]["ipv4"] == json!(["203.0.113.9"]) {
                     break;
                 }
             }
@@ -2956,5 +3176,127 @@ mod tests {
             .unwrap()
             .unwrap();
         echo_task.abort();
+    }
+
+    #[test]
+    fn slow_payloads_are_sent_on_change_or_after_an_hour() {
+        let mut slot = None;
+        let payload = json!({"a":1});
+        assert!(ReportCache::due(&mut slot, &payload), "first copy is sent");
+        assert!(
+            !ReportCache::due(&mut slot, &payload),
+            "unchanged is skipped"
+        );
+        assert!(
+            ReportCache::due(&mut slot, &json!({"a":2})),
+            "changed is sent"
+        );
+        assert!(!ReportCache::due(&mut slot, &json!({"a":2})));
+        // Backdate the last copy beyond the refresh window.
+        slot = slot.map(|(hash, _)| {
+            (
+                hash,
+                std::time::Instant::now() - SLOW_PAYLOAD_REFRESH - Duration::from_secs(1),
+            )
+        });
+        assert!(
+            ReportCache::due(&mut slot, &json!({"a":2})),
+            "hourly refresh"
+        );
+        assert!(!ReportCache::due(&mut slot, &json!({"a":2})));
+    }
+
+    #[test]
+    fn device_names_are_plain_short_text_and_the_hardware_model_is_a_topic_safe_name() {
+        assert_eq!(
+            device_label(Some(&json!(" U60 Pro "))).as_deref(),
+            Some("U60 Pro")
+        );
+        assert_eq!(
+            device_label(Some(&json!("中兴 G5"))).as_deref(),
+            Some("中兴 G5")
+        );
+        assert!(device_label(Some(&json!(""))).is_none());
+        assert!(device_label(Some(&json!("   "))).is_none());
+        assert!(device_label(Some(&json!("a\nb"))).is_none());
+        assert!(device_label(Some(&json!("x".repeat(65)))).is_none());
+        assert!(device_label(Some(&json!(7))).is_none());
+        assert!(device_label(None).is_none());
+        let state = json!({"device":{"model_name":"MU5120A"},"uci_device_info":{"common_model_name":"OTHER"}});
+        assert_eq!(hardware_model(&state).as_deref(), Some("MU5120A"));
+        let fallback = json!({"uci_device_info":{"common_model_name":"MU5002D"}});
+        assert_eq!(hardware_model(&fallback).as_deref(), Some("MU5002D"));
+        assert!(hardware_model(&json!({"device":{"model_name":"bad/model"}})).is_none());
+        assert!(hardware_model(&json!({})).is_none());
+    }
+
+    #[test]
+    fn heartbeat_has_a_threefold_margin_inside_the_offline_deadline() {
+        const { assert!(HEARTBEAT_SECONDS == 20 && HEARTBEAT_SECONDS * 3 <= 60) };
+        for _ in 0..50 {
+            assert!(random_up_to(STARTUP_JITTER) <= STARTUP_JITTER);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_close_ends_one_session_and_blocks_a_late_open_of_a_closed_one() {
+        let manager = BridgeManager::new(Config::default(), None);
+        let (first, first_rx) = watch::channel(false);
+        let (second, second_rx) = watch::channel(false);
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("session-a".into(), first);
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("session-b".into(), second);
+        let close = |target: &str| RemoteClose {
+            protocol_version: 1,
+            request_id: "close-request".into(),
+            action: "remote.close".into(),
+            target_session_id: target.into(),
+        };
+        manager.close(close("session-a")).await;
+        assert!(*first_rx.borrow(), "targeted session stops");
+        assert!(!*second_rx.borrow(), "other sessions keep running");
+        manager.close(close("session-a")).await; // idempotent
+        // A close for a session this device never saw is remembered, so a re-sent
+        // remote.open for it is ignored rather than opening the closed session.
+        manager.close(close("never-opened")).await;
+        assert!(manager.state.lock().await.already_seen("never-opened"));
+        // Malformed closes change nothing.
+        for bad in [
+            RemoteClose {
+                protocol_version: 2,
+                ..close("session-b")
+            },
+            RemoteClose {
+                action: "remote.open".into(),
+                ..close("session-b")
+            },
+            RemoteClose {
+                target_session_id: "bad/id".into(),
+                ..close("session-b")
+            },
+            RemoteClose {
+                request_id: String::new(),
+                ..close("session-b")
+            },
+        ] {
+            manager.close(bad).await;
+        }
+        assert!(!*second_rx.borrow());
+        // Whole-bridge shutdown still stops every session.
+        manager.shutdown();
+        assert!(*second_rx.borrow());
+        // The wire shapes are distinct, so dispatch cannot confuse the two.
+        let wire = r#"{"protocol_version":1,"request_id":"0123456789abcdef0123456789abcdef","action":"remote.close","target_session_id":"s1"}"#;
+        assert!(serde_json::from_str::<RemoteClose>(wire).is_ok());
+        assert!(serde_json::from_str::<RemoteCommand>(wire).is_err());
+        let extra = r#"{"protocol_version":1,"request_id":"r","action":"remote.close","target_session_id":"s1","x":1}"#;
+        assert!(serde_json::from_str::<RemoteClose>(extra).is_err());
     }
 }

@@ -47,6 +47,8 @@ WSS 必须协商 `nms-webshell-v1`。设备使用 `Authorization: Bearer <sessio
 
 `remote_origins` 是可选的 HTTPS 站点地址列表，默认空，最多 4 个。主 `platform_url` 始终保留。示例：`platform_url: "https://nms.example.com"`、`remote_origins: ["https://relay.example.com:16001"]`。仅接受明确的主机及端口，禁止通配符、用户信息、路径、查询参数、片段、空白和重复地址；不提供跳过 TLS 校验选项。
 
+OTA 更新来源（`ota.sources`）按列表顺序依次尝试：默认是 `custom`（用户配置的服务器）→ `github` → `netdisk`；已保存的列表按保存的顺序执行（0.10.62 之前的默认顺序 `custom, netdisk, github` 会自动按新默认处理）。
+
 当 `platform_url` 与 `broker` 都使用上面的内置免费地址时，datad 还把 `https://a.ericsfj.com:16001` 加入**运行时有效的备用远程来源**，即使旧 `cloud.json` 的 `remote_origins` 仍为空。该地址只用于已启用远程访问且经 NMS 会话票据授权的 WebSocket，不改变 MQTT/心跳入口，也不表示会员资格。NMS 遥测报告包含这个有效来源；`GET /cloud/config` 和 UFI 自定义表单保持用户保存的 `remote_origins` 原值。只要主 NMS 或 MQTT 地址改为自定义值，隐式会员来源即不再加入；用户显式配置的备用来源仍照常生效。
 
 `remote.open` 可连接主地址或已配置备用地址对应的 WSS，其他主机、端口和会话路径仍被拒绝。遥测声明 `datad.remote_origins` 并上报规范化后的全部允许地址。空列表保持旧版只允许主平台的行为。保存配置会关闭旧会话并重新上报；原有本地认证、WebShell 开关、资源上限和签名更新规则保持不变。

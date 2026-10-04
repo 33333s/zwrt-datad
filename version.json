@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.61",
+    "version": "0.10.62",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 4G（LTE）邻区：直接读取调制解调器自己的扫描列表（zte_nwinfo.manual_scan.lteg_nbr_content），无需 DIAG 采集，输出在 neighbor.lte，并在启用邻区采集时并入 neighbor.cells"
+    "notes": "远程会话结束时设备立即断开（remote.close / datad.remote_close）；device 遥测增加 hardware_model、device_market_name、device_alias_name；心跳改为 20 秒并加启动/重连抖动；device 与 network 遥测只在变化时或每小时发送；OTA 默认来源顺序改为自定义→GitHub→网盘"
   }
 }
