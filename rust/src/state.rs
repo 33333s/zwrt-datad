@@ -1594,6 +1594,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             a
         }
     };
+    let lte_scan = uci_get(&uci_sets, "zte_nwinfo.manual_scan.lteg_nbr_content");
+    crate::neighbor_lte::set_raw(
+        uci_sets
+            .iter()
+            .any(|set| set.contains_key("zte_nwinfo.manual_scan.lteg_nbr_content"))
+            .then(|| lte_scan.to_owned()),
+    );
     let mut fields = Map::new();
     fields.insert("net".into(), Value::Object(net));
     fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));

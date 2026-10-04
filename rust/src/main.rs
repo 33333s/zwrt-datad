@@ -17,6 +17,7 @@ mod identity;
 mod kernel_wan;
 mod model;
 mod neighbor;
+mod neighbor_lte;
 mod neighbor_manager;
 mod ota;
 mod qos;

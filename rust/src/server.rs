@@ -308,6 +308,7 @@ impl App {
         let mut initial = state::collect(interval.as_millis() as u64).await;
         initial.fields.insert("time".into(), time_control.status());
         let mut neighbor = NeighborManager::new(neighbor_enabled);
+        neighbor.observe_lte(initial.fields.get("net").unwrap_or(&Value::Null));
         neighbor
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
             .await;
@@ -628,6 +629,7 @@ impl App {
         }
         drop(history);
         let mut neighbor = self.inner.neighbor.lock().await;
+        neighbor.observe_lte(next.fields.get("net").unwrap_or(&Value::Null));
         neighbor
             .tick(next.fields.get("net").unwrap_or(&Value::Null))
             .await;

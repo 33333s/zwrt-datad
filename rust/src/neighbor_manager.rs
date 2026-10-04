@@ -1,4 +1,5 @@
 use crate::neighbor;
+use crate::neighbor_lte;
 use crate::qtrace_mask::QTRACE_MASK;
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -32,7 +33,15 @@ pub struct Manager {
     latest: Value,
     sampled_ms: Option<i64>,
     fingerprint: u64,
+    /// Latest vendor-scan LTE block, refreshed independently of the DIAG collector.
+    lte: Value,
+    lte_fingerprint: u64,
+    lte_changed_ms: Option<i64>,
 }
+
+/// The modem rewrites its LTE scan list every few seconds; a list that has not
+/// changed for this long no longer describes the current surroundings.
+const LTE_STALE_MS: i64 = 300_000;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -42,6 +51,19 @@ fn now_ms() -> i64 {
 }
 fn disabled() -> Value {
     json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""})
+}
+
+fn lte_block(
+    status: &str,
+    reason: &str,
+    cells: &[Value],
+    changed_ms: Option<i64>,
+    age_ms: Option<i64>,
+) -> Value {
+    json!({
+        "supported":reason != "not_reported","status":status,"reason":reason,"cells":cells,
+        "sampled_at":changed_ms.map(|v| v / 1000),"age_ms":age_ms,"source":"vendor_scan"
+    })
 }
 
 fn collector_supported(path: &Path) -> bool {
@@ -81,6 +103,9 @@ impl Manager {
             latest: disabled(),
             sampled_ms: None,
             fingerprint: 0,
+            lte: lte_block("unavailable", "not_reported", &[], None, None),
+            lte_fingerprint: 0,
+            lte_changed_ms: None,
         };
         if force {
             manager.enabled = true;
@@ -99,7 +124,75 @@ impl Manager {
             out["sampled_at"] = json!(sampled / 1000);
             out["age_ms"] = json!(now_ms().saturating_sub(sampled));
         }
+        let mut lte = self.lte.clone();
+        if let Some(changed) = self.lte_changed_ms
+            && lte["supported"] == true
+        {
+            lte["age_ms"] = json!(now_ms().saturating_sub(changed));
+        }
+        // With the collector on, 4G neighbours join the common list so existing
+        // consumers see them; the modem's own list replaces the DIAG-derived LTE
+        // rows because it is the direct measurement.
+        if self.enabled
+            && matches!(out["status"].as_str(), Some("ready" | "empty"))
+            && matches!(lte["status"].as_str(), Some("ready" | "empty"))
+            && let Some(cells) = out["cells"].as_array_mut()
+        {
+            cells.retain(|cell| cell["rat"] != "LTE");
+            let vendor = lte["cells"].as_array().cloned().unwrap_or_default();
+            if !vendor.is_empty() {
+                cells.extend(vendor);
+                out["status"] = json!("ready");
+                out["reason"] = json!("none");
+            }
+        }
+        out["lte"] = lte;
         out
+    }
+    /// Refreshes the LTE neighbour block from the modem's scan list. Cheap and
+    /// independent of the DIAG collector, so it also runs while `enabled` is false.
+    pub fn observe_lte(&mut self, net: &Value) {
+        let raw = neighbor_lte::raw();
+        let Some(raw) = raw else {
+            self.lte = lte_block("unavailable", "not_reported", &[], None, None);
+            return;
+        };
+        let network_type = net["type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let mut hasher = DefaultHasher::new();
+        raw.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let now = now_ms();
+        if fingerprint != self.lte_fingerprint || self.lte_changed_ms.is_none() {
+            self.lte_fingerprint = fingerprint;
+            self.lte_changed_ms = Some(now);
+        }
+        let age = now.saturating_sub(self.lte_changed_ms.unwrap_or(now));
+        let no_lte = network_type.is_empty()
+            || (network_type.contains("SA") && !network_type.contains("NSA"));
+        if no_lte {
+            // Stand-alone 5G has no LTE anchor, so the list would be a leftover.
+            self.lte = lte_block(
+                "unavailable",
+                "not_on_lte",
+                &[],
+                self.lte_changed_ms,
+                Some(age),
+            );
+            return;
+        }
+        let cells = filter_cells(neighbor_lte::parse(&raw), net);
+        let (status, reason) = if age > LTE_STALE_MS {
+            ("stale", "scan_list_not_updating")
+        } else if cells.is_empty() {
+            ("empty", "no_neighbours_reported")
+        } else {
+            ("ready", "none")
+        };
+        let shown = if status == "stale" { Vec::new() } else { cells };
+        self.lte = lte_block(status, reason, &shown, self.lte_changed_ms, Some(age));
     }
     pub async fn set_enabled(&mut self, enabled: bool) -> Result<Value, String> {
         if enabled == self.enabled {
@@ -490,6 +583,9 @@ mod capability_tests {
             latest: disabled(),
             sampled_ms: None,
             fingerprint: 0,
+            lte: lte_block("unavailable", "not_reported", &[], None, None),
+            lte_fingerprint: 0,
+            lte_changed_ms: None,
         };
         assert!(manager.set_enabled(true).await.is_err());
         assert!(!manager.enabled);
@@ -497,5 +593,119 @@ mod capability_tests {
         assert_eq!(manager.status()["status"], "error");
         assert_eq!(manager.status()["reason"], "collector_start_failed");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn bare_manager() -> Manager {
+        Manager::new(false)
+    }
+
+    // The raw list is process-wide state, so these tests share one lock.
+    static LTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn net(kind: &str) -> Value {
+        json!({"type":kind,"lte_channel":2850,"lte_pci":347,"lteca":"","nr_channel":0,"nr_pci":0})
+    }
+
+    #[test]
+    fn lte_scan_list_drops_the_serving_cell_and_labels_frequency_relation() {
+        let _guard = LTE_LOCK.lock().unwrap();
+        neighbor_lte::set_raw(Some(
+            "347,2850,B7,-90,-14;490,2850,B7,-93,-18;339,38852,B40,-95,-16;".into(),
+        ));
+        let mut manager = bare_manager();
+        manager.observe_lte(&net("LTE-NSA"));
+        let status = manager.status();
+        let lte = &status["lte"];
+        assert_eq!(lte["supported"], true);
+        assert_eq!(lte["status"], "ready");
+        let cells = lte["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 2, "serving 347/2850 removed: {cells:?}");
+        assert_eq!(cells[0]["pci"], 490);
+        assert_eq!(cells[0]["frequency_relation"], "intra");
+        assert_eq!(cells[1]["pci"], 339);
+        assert_eq!(cells[1]["frequency_relation"], "inter");
+        assert_eq!(cells[1]["band"], 40);
+        // Collector off: the common list is untouched.
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["cells"], json!([]));
+        neighbor_lte::set_raw(None);
+    }
+
+    #[test]
+    fn lte_block_is_unavailable_without_the_field_or_without_an_lte_anchor() {
+        let _guard = LTE_LOCK.lock().unwrap();
+        let mut manager = bare_manager();
+        neighbor_lte::set_raw(None);
+        manager.observe_lte(&net("LTE"));
+        assert_eq!(manager.status()["lte"]["supported"], false);
+        assert_eq!(manager.status()["lte"]["reason"], "not_reported");
+        neighbor_lte::set_raw(Some("490,2850,B7,-93,-18;".into()));
+        for kind in ["NR5G-SA", "SA", ""] {
+            manager.observe_lte(&net(kind));
+            let lte = manager.status()["lte"].clone();
+            assert_eq!(lte["status"], "unavailable", "{kind:?}");
+            assert_eq!(lte["reason"], "not_on_lte");
+            assert_eq!(lte["cells"], json!([]));
+        }
+        for kind in ["LTE", "LTE-NSA", "ENDC"] {
+            manager.observe_lte(&net(kind));
+            assert_eq!(manager.status()["lte"]["status"], "ready", "{kind:?}");
+        }
+        neighbor_lte::set_raw(None);
+    }
+
+    #[test]
+    fn unchanged_scan_list_goes_stale_and_hides_its_cells() {
+        let _guard = LTE_LOCK.lock().unwrap();
+        neighbor_lte::set_raw(Some("490,2850,B7,-93,-18;".into()));
+        let mut manager = bare_manager();
+        manager.observe_lte(&net("LTE"));
+        assert_eq!(manager.status()["lte"]["status"], "ready");
+        manager.lte_changed_ms = Some(now_ms() - LTE_STALE_MS - 1_000);
+        manager.observe_lte(&net("LTE"));
+        let lte = manager.status()["lte"].clone();
+        assert_eq!(lte["status"], "stale");
+        assert_eq!(lte["cells"], json!([]));
+        // A changed list is fresh again.
+        neighbor_lte::set_raw(Some("490,2850,B7,-94,-18;".into()));
+        manager.observe_lte(&net("LTE"));
+        assert_eq!(manager.status()["lte"]["status"], "ready");
+        neighbor_lte::set_raw(None);
+    }
+
+    #[test]
+    fn enabled_collector_merges_vendor_lte_cells_into_the_common_list() {
+        let _guard = LTE_LOCK.lock().unwrap();
+        neighbor_lte::set_raw(Some("490,2850,B7,-93,-18;".into()));
+        let mut manager = bare_manager();
+        manager.enabled = true;
+        manager.latest = json!({"status":"ready","enabled":true,"cells":[
+            {"rat":"NR","pci":10,"arfcn":627264,"band":78,"rsrp_dbm":-85},
+            {"rat":"LTE","pci":99,"arfcn":100,"band":1,"rsrp_dbm":-70}],
+            "reason":"none"});
+        manager.observe_lte(&net("LTE-NSA"));
+        let cells = manager.status()["cells"].as_array().unwrap().clone();
+        let rats: Vec<_> = cells
+            .iter()
+            .map(|c| (c["rat"].as_str().unwrap(), c["pci"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            rats,
+            vec![("NR", 10), ("LTE", 490)],
+            "DIAG LTE row replaced by the modem's list"
+        );
+        // No DIAG cells at all: the 4G list alone makes the block ready.
+        manager.latest =
+            json!({"status":"empty","enabled":true,"cells":[],"reason":"no_supported_reports"});
+        let status = manager.status();
+        assert_eq!(status["status"], "ready");
+        assert_eq!(status["reason"], "none");
+        assert_eq!(status["cells"].as_array().unwrap().len(), 1);
+        // Without the vendor field the DIAG LTE rows are kept.
+        neighbor_lte::set_raw(None);
+        manager.observe_lte(&net("LTE-NSA"));
+        manager.latest = json!({"status":"ready","enabled":true,"cells":[
+            {"rat":"LTE","pci":99,"arfcn":100,"band":1,"rsrp_dbm":-70}],"reason":"none"});
+        assert_eq!(manager.status()["cells"].as_array().unwrap().len(), 1);
     }
 }
