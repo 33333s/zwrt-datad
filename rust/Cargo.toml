@@ -6,6 +6,11 @@ rust-version = "1.89"
 default-run = "zwrt-datad"
 
 [features]
+# `mesh` is the WebRTC direct data path (docs/MESH.md). Builds that cannot afford
+# the extra ~2.5 MB turn it off with --no-default-features; the daemon then simply
+# never advertises the mesh capabilities.
+default = ["mesh"]
+mesh = ["dep:str0m"]
 keymaster-worker = []
 
 [[bin]]
@@ -19,6 +24,7 @@ required-features = ["keymaster-worker"]
 
 [dependencies]
 anyhow = "1"
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"], optional = true }
 aes-gcm = "0.10"
 axum = { version = "0.8", features = ["http1", "json", "query", "tokio", "ws"] }
 base64 = "0.22"

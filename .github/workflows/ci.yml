@@ -66,5 +66,7 @@ jobs:
           sh ../tests/with_mock_ubusd.sh sh ../tests/service_token_test.sh target/debug/zwrt-datad
           sh ../tests/with_mock_ubusd.sh ../tests/rust_control_integration.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - run: cargo test --locked --no-default-features
       - run: cargo clippy --locked --features keymaster-worker --bin keymaster-worker -- -D warnings
       - run: cargo build --locked --release
