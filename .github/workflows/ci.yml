@@ -82,4 +82,7 @@ jobs:
           sh ../tests/with_mock_ubusd.sh ../tests/rust_control_integration.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --features keymaster-worker --bin keymaster-worker -- -D warnings
-      - run: cargo build --locked --release
+      # The LTO release build is one long single-threaded link; releases are built
+      # on the build machine anyway, so a PR only needs it on main and tags.
+      - if: github.event_name != 'pull_request'
+        run: cargo build --locked --release
