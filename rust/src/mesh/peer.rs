@@ -30,8 +30,9 @@ const LOW_WATER: usize = 64 * 1024;
 pub struct Config {
     pub stun: Vec<SocketAddr>,
     pub ports: (u16, u16),
-    /// Loopback is only ever advertised by tests.
-    pub include_loopback: bool,
+    /// Tests advertise loopback and nothing else, so they do not depend on the
+    /// host's interfaces; real sessions never advertise loopback.
+    pub loopback_only: bool,
 }
 
 pub struct Link {
@@ -43,8 +44,12 @@ pub struct Link {
     pub port: u16,
 }
 
-/// Non-loopback IPv4 addresses of this device, for host candidates.
-pub fn local_addresses(include_loopback: bool) -> Vec<IpAddr> {
+/// Non-loopback IPv4 addresses of this device, for host candidates (or just
+/// loopback when `loopback_only`, for tests).
+pub fn local_addresses(loopback_only: bool) -> Vec<IpAddr> {
+    if loopback_only {
+        return vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    }
     let mut out = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills a linked list that freeifaddrs releases below.
@@ -58,7 +63,7 @@ pub fn local_addresses(include_loopback: bool) -> Vec<IpAddr> {
             cursor = entry.ifa_next;
             let up = entry.ifa_flags & libc::IFF_UP as u32 != 0;
             let loopback = entry.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
-            if !up || (loopback && !include_loopback) || entry.ifa_addr.is_null() {
+            if !up || loopback || entry.ifa_addr.is_null() {
                 continue;
             }
             if i32::from((*entry.ifa_addr).sa_family) != libc::AF_INET {
@@ -155,7 +160,7 @@ fn remote_candidate(message: &Value) -> Option<Candidate> {
 
 /// Runs until the connection ends, the offer is refused or the task is aborted.
 pub async fn run(offer: String, config: Config, mut link: Link) {
-    let addresses = local_addresses(config.include_loopback);
+    let addresses = local_addresses(config.loopback_only);
     let Some(mut sockets) = bind(&addresses, config.ports).await else {
         return;
     };

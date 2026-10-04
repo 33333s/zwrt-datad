@@ -105,7 +105,7 @@ pub async fn run(
     port: u16,
     session_ttl: Duration,
     mut stop: watch::Receiver<bool>,
-    include_loopback: bool,
+    loopback_only: bool,
 ) {
     let (Some(ports), Some(stun)) = (params.ports(), params.stun_servers()) else {
         return;
@@ -156,7 +156,7 @@ pub async fn run(
                         let addresses = resolve(&stun).await;
                         let task = tokio::spawn(peer::run(
                             sdp.to_owned(),
-                            peer::Config { stun: addresses, ports, include_loopback },
+                            peer::Config { stun: addresses, ports, loopback_only },
                             peer::Link { signals: signal_tx.clone(), remote_ice: remote_rx, port },
                         ));
                         peer = Some(Peer { task, remote_ice });
