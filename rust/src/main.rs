@@ -15,6 +15,8 @@ mod files;
 mod hosts;
 mod identity;
 mod kernel_wan;
+#[cfg(feature = "mesh")]
+mod mesh;
 mod model;
 mod neighbor;
 mod neighbor_lte;

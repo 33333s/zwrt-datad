@@ -1063,7 +1063,18 @@ struct RemoteCommand {
     #[serde(default)]
     target_ports: Vec<u16>,
     ttl_seconds: u64,
+    /// `"mesh"` asks for the direct WebRTC data path (docs/P2P.md).
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    mesh: Option<MeshParams>,
 }
+
+#[cfg(feature = "mesh")]
+type MeshParams = crate::mesh::Params;
+/// Without the `mesh` feature the object is accepted and refused at validation.
+#[cfg(not(feature = "mesh"))]
+type MeshParams = Value;
 
 /// `remote.close`: NMS ends a session it opened. `target_session_id` is the
 /// `request_id` of the matching `remote.open`.
@@ -1267,6 +1278,28 @@ impl BridgeManager {
             self.state.lock().await.active.remove(&command.request_id);
             return;
         }
+        // A mesh-only web session (empty `target_ports`) has no pooled tunnel
+        // connections: the data channel is its only transport.
+        #[cfg(feature = "mesh")]
+        if command.target_service == "router_web"
+            && command.transport.as_deref() == Some("mesh")
+            && command.target_ports.is_empty()
+        {
+            if let Some(mesh) = &command.mesh {
+                crate::mesh::run(
+                    &self.config,
+                    mesh,
+                    &command.token,
+                    command.target_port,
+                    Duration::from_secs(command.ttl_seconds),
+                    stop.clone(),
+                    false,
+                )
+                .await;
+            }
+            self.state.lock().await.active.remove(&command.request_id);
+            return;
+        }
         let mut workers = JoinSet::new();
         for _ in 0..4 {
             let config = self.config.clone();
@@ -1291,6 +1324,60 @@ impl BridgeManager {
         .await;
         workers.abort_all();
         self.state.lock().await.active.remove(&command.request_id);
+    }
+}
+
+/// Only `transport:"mesh"` exists. It needs the `mesh` build feature, a
+/// well-formed `mesh` object and a rendezvous URL on an approved origin.
+fn validate_transport(config: &Config, command: &RemoteCommand) -> Result<(), String> {
+    let Some(transport) = &command.transport else {
+        return if command.mesh.is_some() {
+            Err("invalid_request".into())
+        } else {
+            Ok(())
+        };
+    };
+    if transport != "mesh" {
+        return Err("invalid_request".into());
+    }
+    #[cfg(not(feature = "mesh"))]
+    {
+        let _ = config;
+        Err("mesh_unsupported".into())
+    }
+    #[cfg(feature = "mesh")]
+    {
+        let Some(mesh) = &command.mesh else {
+            return Err("invalid_request".into());
+        };
+        if mesh.v != 1
+            || mesh.ports().is_none()
+            || mesh.stun_servers().is_none()
+            || !(1..=3600).contains(&mesh.ttl_seconds)
+            || mesh.rendezvous_url.len() > 2048
+            || mesh
+                .rendezvous_url
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err("invalid_mesh".into());
+        }
+        let url = Url::parse(&mesh.rendezvous_url).map_err(|_| "invalid_mesh")?;
+        let approved = effective_remote_origins(config).iter().any(|origin| {
+            url.host_str() == origin.host_str()
+                && url.port_or_known_default() == origin.port_or_known_default()
+        });
+        if url.scheme() != "wss"
+            || !approved
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.query() != Some("transport=mesh")
+            || url.path() != format!("/api/remote/device/{}", command.request_id)
+        {
+            return Err("invalid_mesh".into());
+        }
+        Ok(())
     }
 }
 
@@ -1338,6 +1425,7 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
     {
         return Err("multiple_ports_unsupported".into());
     }
+    validate_transport(config, command)?;
     if command.target_service == "webshell" {
         if !config.remote_webshell_enabled {
             return Err("webshell_disabled".into());
@@ -2321,6 +2409,8 @@ mod tests {
             target_port: 80,
             target_ports: vec![],
             ttl_seconds: 900,
+            transport: None,
+            mesh: None,
         };
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
@@ -2520,6 +2610,8 @@ mod tests {
             target_port: 2333,
             target_ports: vec![],
             ttl_seconds: 900,
+            transport: None,
+            mesh: None,
         };
         validate_remote(&config, &command).unwrap();
         command.target_ports = vec![2333, 80];
@@ -2547,6 +2639,8 @@ mod tests {
             target_port: 0,
             target_ports: vec![],
             ttl_seconds: 3600,
+            transport: None,
+            mesh: None,
         };
         validate_remote(&config, &command).unwrap();
         command.target_port = 9460;
@@ -2602,6 +2696,8 @@ mod tests {
             target_port: 0,
             target_ports: vec![],
             ttl_seconds: 3600,
+            transport: None,
+            mesh: None,
         };
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
@@ -2642,6 +2738,8 @@ mod tests {
             target_port: 80,
             target_ports: vec![],
             ttl_seconds: 900,
+            transport: None,
+            mesh: None,
         };
         assert!(validate_remote(&config, &command).is_err());
         config.remote_origins = vec!["https://relay.example.com:16001".into()];
@@ -2746,6 +2844,8 @@ mod tests {
             target_port: 0,
             target_ports: vec![],
             ttl_seconds: 1800,
+            transport: None,
+            mesh: None,
         };
         assert_eq!(
             validate_remote(&config, &command).unwrap_err(),
@@ -3080,6 +3180,8 @@ mod tests {
                 target_port: 2333,
                 target_ports: vec![],
                 ttl_seconds: 30,
+                transport: None,
+                mesh: None,
             };
             let (_tx, rx) = watch::channel(false);
             let stop =
@@ -3159,6 +3261,8 @@ mod tests {
             target_port: echo_port,
             target_ports: vec![],
             ttl_seconds: 30,
+            transport: None,
+            mesh: None,
         };
         validate_remote(&config, &command).unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3298,5 +3402,127 @@ mod tests {
         assert!(serde_json::from_str::<RemoteCommand>(wire).is_err());
         let extra = r#"{"protocol_version":1,"request_id":"r","action":"remote.close","target_session_id":"s1","x":1}"#;
         assert!(serde_json::from_str::<RemoteClose>(extra).is_err());
+    }
+
+    #[cfg(feature = "mesh")]
+    #[test]
+    fn mesh_transport_needs_a_well_formed_object_and_an_approved_rendezvous() {
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            ..Default::default()
+        };
+        config.remote_origins = vec![DEFAULT_MEMBER_ORIGIN.into()];
+        let rendezvous = format!(
+            "{}/api/remote/device/mesh-1?transport=mesh",
+            DEFAULT_PLATFORM_URL.replace("https://", "wss://")
+        );
+        let base = || RemoteCommand {
+            protocol_version: 1,
+            request_id: "mesh-1".into(),
+            action: "remote.open".into(),
+            remote_url: format!(
+                "{}/api/remote/device/mesh-1",
+                DEFAULT_PLATFORM_URL.replace("https://", "wss://")
+            ),
+            token: "a".repeat(64),
+            target_service: "router_web".into(),
+            target_port: 80,
+            target_ports: vec![],
+            ttl_seconds: 900,
+            transport: Some("mesh".into()),
+            mesh: Some(
+                serde_json::from_value(json!({
+                    "v":1,"stun":["stun:services.ericsfj.com:3478","stun:stun.cloudflare.com:3478"],
+                    "udp_ports":"49160-49223","ttl_seconds":900,"rendezvous_url":rendezvous
+                }))
+                .unwrap(),
+            ),
+        };
+        validate_remote(&config, &base()).unwrap();
+        let mutate = |change: &dyn Fn(&mut RemoteCommand)| {
+            let mut command = base();
+            change(&mut command);
+            validate_remote(&config, &command)
+        };
+        let with_mesh = |change: &dyn Fn(&mut crate::mesh::Params)| {
+            mutate(&|command| change(command.mesh.as_mut().unwrap()))
+        };
+        assert_eq!(with_mesh(&|m| m.v = 2).unwrap_err(), "invalid_mesh");
+        assert_eq!(
+            with_mesh(&|m| m.udp_ports = "80-90".into()).unwrap_err(),
+            "invalid_mesh"
+        );
+        assert_eq!(
+            with_mesh(&|m| m.stun = vec!["stun:a.example:3478".into(); 5]).unwrap_err(),
+            "invalid_mesh"
+        );
+        assert_eq!(
+            with_mesh(&|m| m.stun = vec!["http://a.example".into()]).unwrap_err(),
+            "invalid_mesh"
+        );
+        assert_eq!(
+            with_mesh(&|m| m.ttl_seconds = 0).unwrap_err(),
+            "invalid_mesh"
+        );
+        assert_eq!(
+            with_mesh(&|m| m.ttl_seconds = 3601).unwrap_err(),
+            "invalid_mesh"
+        );
+        for bad in [
+            "wss://evil.example/api/remote/device/mesh-1?transport=mesh",
+            "ws://a.ericsfj.com:16001/api/remote/device/mesh-1?transport=mesh",
+            "wss://a.ericsfj.com:16001/api/remote/device/other?transport=mesh",
+            "wss://a.ericsfj.com:16001/api/remote/device/mesh-1",
+            "wss://a.ericsfj.com:16001/api/remote/device/mesh-1?transport=mesh&x=1",
+            "wss://a.ericsfj.com:16001/api/remote/device/mesh-1?transport=tunnel",
+            "wss://user:pw@a.ericsfj.com:16001/api/remote/device/mesh-1?transport=mesh",
+            "wss://a.ericsfj.com:16001/api/remote/device/mesh-1?transport=mesh#frag",
+            "wss://a.ericsfj.com:16001/api/remote/device/mesh-1?transport=mesh x",
+        ] {
+            assert_eq!(
+                with_mesh(&|m| m.rendezvous_url = bad.into()).unwrap_err(),
+                "invalid_mesh",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            mutate(&|c| c.transport = Some("tunnel".into())).unwrap_err(),
+            "invalid_request"
+        );
+        assert_eq!(mutate(&|c| c.mesh = None).unwrap_err(), "invalid_request");
+        assert_eq!(
+            mutate(&|c| c.transport = None).unwrap_err(),
+            "invalid_request"
+        );
+        // The ordinary request without the new fields is untouched.
+        assert!(
+            mutate(&|c| {
+                c.transport = None;
+                c.mesh = None;
+            })
+            .is_ok()
+        );
+        // An approved alternate origin works for the rendezvous exactly as for the tunnel.
+        let mut other = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://relay.example".into(),
+            ..Default::default()
+        };
+        other.remote_origins.clear();
+        let mut command = base();
+        command.remote_url = "wss://relay.example/api/remote/device/mesh-1".into();
+        command.mesh.as_mut().unwrap().rendezvous_url =
+            "wss://relay.example/api/remote/device/mesh-1?transport=mesh".into();
+        validate_remote(&other, &command).unwrap();
+        command.mesh.as_mut().unwrap().rendezvous_url = format!(
+            "{}/api/remote/device/mesh-1?transport=mesh",
+            DEFAULT_PLATFORM_URL.replace("https://", "wss://")
+        );
+        assert_eq!(
+            validate_remote(&other, &command).unwrap_err(),
+            "invalid_mesh"
+        );
     }
 }

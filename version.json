@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.62",
+    "version": "0.10.63",
     "asset": "zwrt-datad-aarch64",
-    "notes": "远程会话结束时设备立即断开（remote.close / datad.remote_close）；device 遥测增加 hardware_model、device_market_name、device_alias_name；心跳改为 20 秒并加启动/重连抖动；device 与 network 遥测只在变化时或每小时发送；OTA 默认来源顺序改为自定义→GitHub→网盘"
+    "notes": "直连（WebRTC）数据通道核心：mesh 特性、会合 WebSocket、str0m 对端、STUN 和数据通道 ping/pong（尚未声明 datad.mesh 能力，设备网页代理随后加入）"
   }
 }
