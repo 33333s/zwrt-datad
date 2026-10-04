@@ -1,7 +1,11 @@
 name: ci
 
 on:
+  # A PR is tested once (pull_request); pushes are only tested on main and on
+  # release tags, so the single self-hosted runner no longer runs every commit twice.
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -14,7 +18,7 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "datad-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: 4
+      CARGO_BUILD_JOBS: 12
       RUST_CONTROL_PORT: 29460
     defaults:
       run:
@@ -23,6 +27,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The self-hosted runner keeps the build cache between jobs: checkout removes
+      # the untracked `target` link, so point it at the persistent directory again
+      # and start over once the cache is large.
+      - name: Persistent build cache (self-hosted runner only)
+        if: runner.environment == 'self-hosted'
+        working-directory: rust
+        run: |
+          cache=/var/lib/datad-ci/cargo-target
+          mkdir -p "$cache"
+          if [ "$(du -sm "$cache" | cut -f1)" -gt 12000 ]; then rm -rf "$cache"/* "$cache"/.[!.]* 2>/dev/null || true; fi
+          ln -sfn "$cache" target
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy,rustfmt
