@@ -34,6 +34,37 @@
 完整状态字段见 [`STATE_SCHEMA.md`](STATE_SCHEMA.md)，控制动作见
 [`CONTROL_API.md`](CONTROL_API.md)。
 
+## 4G（LTE）邻区
+
+4G 邻区不需要 DIAG 采集：厂商 `zte_nwinfo` 服务在设备驻留 LTE（含 NSA 的 LTE 锚点）时，
+每隔几秒把调制解调器自己的扫描结果写进
+`zte_nwinfo.manual_scan.lteg_nbr_content`，格式为 `PCI,EARFCN,B<频段>,RSRP,RSRQ;`，
+第一条是服务小区，其后是同频和异频邻区。datad 在每次状态刷新时读取它，**不管 `neighbor`
+是否启用**，结果输出在 `neighbor.lte`：
+
+```json
+{"supported":true,"status":"ready","reason":"none","source":"vendor_scan",
+ "sampled_at":1791000000,"age_ms":4200,
+ "cells":[{"rat":"LTE","pci":490,"arfcn":2850,"band":7,"rsrp_dbm":-93,"rsrq_db":-18,
+           "frequency_relation":"intra","frequency_evidence":"explicit",
+           "samples":1,"direct_hits":0,"source":"vendor_scan"}]}
+```
+
+- `status`：`ready`、`empty`（没有邻区）、`stale`、`unavailable`。
+- `unavailable` 的 `reason`：`not_reported`（固件没有这个字段，`supported=false`）、
+  `not_on_lte`（网络类型为空或独立组网 SA，没有 LTE 锚点，遗留列表不输出）。
+- 已去掉服务小区和载波聚合成员，`frequency_relation` 为 `intra/inter`。
+- `rsrp_dbm` 取整数 dBm，`rsrq_db` 取整数 dB，缺失或越界为 `null`；EARFCN 0 是合法值；
+  PCI 超过 503、RSRP 不在 -140..-30 的记录直接丢弃，不修补。同一 PCI+EARFCN 取最强读数，
+  最多 32 个小区，从强到弱排序。
+- 厂商列表没有时间戳，datad 记录列表**内容最后一次变化**的时间；超过 300 秒不变视为
+  `stale`，此时不输出小区。`age_ms` 是自上次变化起的毫秒数。
+- 已启用 DIAG 采集（`neighbor.enabled=true`）且状态为 `ready/empty` 时，4G 小区同时并入
+  `neighbor.cells`，并替换 DIAG 解析出的 LTE 行（调制解调器的直接测量更可靠）；此时仅有 4G
+  邻区也会使 `status=ready`。固件没有该字段时保留 DIAG 的 LTE 行。
+- 已在 MC7523（LTE-NSA）、MC8532B 和 TopFlow（ENDC）上确认该列表约每 10 秒变化，且包含
+  同频与异频邻区；SA 驻留时的行为按上面规则不输出。
+
 ## 隔离与资源限制
 
 采集和解析在独立工作进程中执行，不阻塞 datad 主循环。模块只管理自己启动的

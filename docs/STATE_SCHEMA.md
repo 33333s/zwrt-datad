@@ -359,7 +359,9 @@ is available; NMS uses this flag to keep unsupported remote controls disabled.
 It has an independent collection lifecycle and can be enabled through
 `neighbor.set` for the current datad process. Restarting datad restores disabled;
 disabling stops the collector and removes its capture logs before returning.
-See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
+`neighbor.lte` carries the 4G neighbour cells read directly from the modem's own scan list
+(no DIAG collector, available while `enabled=false`); see the 4G section of
+[NEIGHBOR.md](NEIGHBOR.md). See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
 freshness, serving/CA filtering, error reasons and firmware-specific limitations.
 `no_supported_reports` explicitly distinguishes unsupported decoded signatures
 from absence of surrounding cells. The block is sent in regular SSE snapshots.
