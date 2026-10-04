@@ -19,6 +19,9 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 14
+      # Tests do not need full debug info; line tables keep backtraces readable and
+      # make the compile and link much smaller and faster.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       RUST_CONTROL_PORT: 29460
     defaults:
       run:
@@ -38,6 +41,8 @@ jobs:
           mkdir -p "$cache"
           if [ "$(du -sm "$cache" | cut -f1)" -gt 12000 ]; then rm -rf "$cache"/* "$cache"/.[!.]* 2>/dev/null || true; fi
           ln -sfn "$cache" target
+          # lld links the large test binaries several times faster than the default linker.
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy,rustfmt
