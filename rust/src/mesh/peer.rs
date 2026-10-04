@@ -265,10 +265,8 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
                                 queued += pong.len();
                                 queue.push_back((false, pong.into_bytes()));
                             }
-                        } else {
-                            if let Ok((header, payload)) = frame::decode(&data.data) {
-                                service.handle(header, payload);
-                            }
+                        } else if let Ok((header, payload)) = frame::decode(&data.data) {
+                            service.handle(header, payload);
                         }
                     }
                     _ => {}
