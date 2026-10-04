@@ -39,6 +39,39 @@ the data channel is the only transport. Other services ignore the mesh object an
    passes, when the browser has been away for more than 30 seconds (the first browser gets 120 seconds to
    arrive), or when the connection or rendezvous socket is lost for good.
 
+## HTTP over the channel (`router_web`)
+
+`http`, `http.body`, `http.ack` and `http.cancel` frames serve the device web UI from `127.0.0.1:<session
+port>`:
+
+- request header `{"t":"http","id":N,"method","path","headers":[[name,value],…],"body_len":L}` plus the first
+  up to 128 KiB of the body as payload, then `http.body` frames until `body_len` bytes arrived. Methods are
+  `GET HEAD POST PUT DELETE PATCH OPTIONS`; the path must be origin-form (an absolute URI, `//authority` or a
+  `port` other than the session's is `target_not_allowed`); at most 64 headers, 32 MiB of body;
+- the device opens one connection per request, sends `Host: 127.0.0.1:<port>`, rewrites `origin`
+  (`http://127.0.0.1:<port>`) and path-form `referer` (`http://127.0.0.1:<port><path>`), drops hop-by-hop headers
+  and `content-length`/`expect`, never follows redirects and refuses `101` upgrades;
+- the reply is one `http.head` (`status`, lower-case `headers` with `set-cookie` repeated, `last` when there is no
+  body) and `http.body` frames of at most 64 KiB; `Content-Length`, chunked and close-delimited bodies are all
+  decoded. At most 1 MiB is unacknowledged per request (`http.ack`); `http.cancel` or losing the channel closes
+  the upstream connection. At most 16 requests run at once (`busy` beyond that) and at most 32 MiB of request
+  bodies are held per session. Errors are `{"id","ok":false,"error"}` with `upstream_unreachable`,
+  `upstream_timeout`, `upstream_closed`, `bad_response`, `bad_request`, `body_too_large`, `too_large`, `busy`.
+
+A `datad_files` session that negotiated a direct channel keeps its normal tunnel; the channel answers every
+request with `ok:false,"unsupported"` so the browser uses the relay (files are not served directly yet).
+
 ## Capabilities
 
-`datad.mesh` and `datad.mesh_http` are advertised only by builds that serve the matching services.
+Builds with the `mesh` feature advertise `datad.mesh` and `datad.mesh_http` (together with the existing
+`datad.remote_close`, which NMS also requires). Without the feature neither is advertised.
+
+## Tests
+
+- `cargo test mesh::` runs everything over loopback, including a str0m "browser" talking to the device through a
+  fake rendezvous hub (ICE, DTLS, SCTP, a 3 MiB flow-controlled download byte for byte).
+- `ZWRT_MESH_STUN_TEST=stun:stun.cloudflare.com:3478 cargo test stun_probe` needs the network and checks the
+  server-reflexive candidate.
+- `cargo test browser_interop -- --ignored --nocapture` serves a page that plays NMS's browser; open the printed
+  URL in Chrome. Setting `MESH_NO_DEVICE=1 MESH_HUB_PORT=<port>` leaves the device end to a real device running
+  `device_side` (`MESH_HUB`, `MESH_WEB_PORT`, `MESH_STUN`, `MESH_SECONDS`).

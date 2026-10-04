@@ -40,8 +40,8 @@ pub struct Link {
     pub signals: mpsc::Sender<Value>,
     /// Browser candidates (`ice` objects as they arrived).
     pub remote_ice: mpsc::Receiver<Value>,
-    /// The device web port this session may reach.
-    pub port: u16,
+    /// What the channel serves.
+    pub mode: super::Mode,
 }
 
 /// Non-loopback IPv4 addresses of this device, for host candidates (or just
@@ -221,7 +221,7 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
 
     let mut channel: Option<ChannelId> = None;
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut service = Service::new(link.port, out_tx);
+    let mut service = Service::new(link.mode, out_tx);
     let mut queue: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
     let mut queued = 0usize;
     let mut remote_count = 0usize;

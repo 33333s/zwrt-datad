@@ -4,11 +4,14 @@
 //! answers the browser's offer and serves the `nms` data channel. The classic
 //! tunnel is the fallback, so every failure here simply ends the direct path.
 mod frame;
+mod http;
 mod peer;
 mod rendezvous;
 mod service;
 mod stun;
 
+#[cfg(test)]
+mod browser_interop;
 #[cfg(test)]
 mod e2e_tests;
 
@@ -29,6 +32,16 @@ const FIRST_PEER_GRACE: Duration = Duration::from_secs(120);
 /// How long the browser may stay away once it was there.
 const PEER_DOWN_GRACE: Duration = Duration::from_secs(30);
 const MAX_OFFER_BYTES: usize = 16 * 1024;
+
+/// What this session serves over the channel.
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    /// The device web UI on this local port (`router_web`).
+    Web(u16),
+    /// A files session: the tunnel carries all of it and the channel only
+    /// answers file requests with `ok:false`, so the browser uses the relay.
+    Files,
+}
 
 /// The `mesh` object NMS adds to `remote.open`.
 #[derive(Clone, Debug, Deserialize)]
@@ -102,7 +115,7 @@ pub async fn run(
     config: &Config,
     params: &Params,
     token: &str,
-    port: u16,
+    mode: Mode,
     session_ttl: Duration,
     mut stop: watch::Receiver<bool>,
     loopback_only: bool,
@@ -157,7 +170,7 @@ pub async fn run(
                         let task = tokio::spawn(peer::run(
                             sdp.to_owned(),
                             peer::Config { stun: addresses, ports, loopback_only },
-                            peer::Link { signals: signal_tx.clone(), remote_ice: remote_rx, port },
+                            peer::Link { signals: signal_tx.clone(), remote_ice: remote_rx, mode },
                         ));
                         peer = Some(Peer { task, remote_ice });
                     }

@@ -870,6 +870,9 @@ async fn report(
         "datad.remote_origins",
         "datad.remote_close",
     ];
+    // The direct data path: web UI proxy now; files stay on the relay.
+    #[cfg(feature = "mesh")]
+    capabilities.extend(["datad.mesh", "datad.mesh_http"]);
     if webshell_available {
         capabilities.push("datad.webshell");
     }
@@ -1239,6 +1242,29 @@ impl BridgeManager {
             return;
         }
         if command.target_service == "datad_files" {
+            // The files tunnel carries everything; a direct channel, if the browser
+            // negotiated one, only refuses file requests so it uses the relay.
+            #[cfg(feature = "mesh")]
+            let direct = command.mesh.clone().map(|mesh| {
+                let (config, token, ttl, stop) = (
+                    self.config.clone(),
+                    command.token.clone(),
+                    Duration::from_secs(command.ttl_seconds),
+                    stop.clone(),
+                );
+                tokio::spawn(async move {
+                    crate::mesh::run(
+                        &config,
+                        &mesh,
+                        &token,
+                        crate::mesh::Mode::Files,
+                        ttl,
+                        stop,
+                        false,
+                    )
+                    .await;
+                })
+            });
             if let Some(app) = &self.app {
                 crate::cloud_files::run(
                     &self.config,
@@ -1249,6 +1275,10 @@ impl BridgeManager {
                     stop.clone(),
                 )
                 .await;
+            }
+            #[cfg(feature = "mesh")]
+            if let Some(direct) = direct {
+                direct.abort();
             }
             self.state.lock().await.active.remove(&command.request_id);
             return;
@@ -1290,7 +1320,7 @@ impl BridgeManager {
                     &self.config,
                     mesh,
                     &command.token,
-                    command.target_port,
+                    crate::mesh::Mode::Web(command.target_port),
                     Duration::from_secs(command.ttl_seconds),
                     stop.clone(),
                     false,

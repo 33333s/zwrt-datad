@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.63",
+    "version": "0.10.64",
     "asset": "zwrt-datad-aarch64",
-    "notes": "直连（WebRTC）数据通道核心：mesh 特性、会合 WebSocket、str0m 对端、STUN 和数据通道 ping/pong（尚未声明 datad.mesh 能力，设备网页代理随后加入）"
+    "notes": "设备网页直连（WebRTC）：通过数据通道代理设备网页（router_web），声明 datad.mesh 与 datad.mesh_http 能力；文件通道仍走 NMS 中转。包含 0.10.63 的直连通道核心；ARM64 默认带 mesh 特性（约 +2.5 MB），可用 --no-default-features 编出"
   }
 }

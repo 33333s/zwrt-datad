@@ -23,16 +23,28 @@ use tokio_tungstenite::{
 #[derive(Debug, Default)]
 struct Seen {
     pong: Option<Value>,
-    reply: Option<(Value, Vec<u8>)>,
+    /// Every binary frame, in arrival order.
+    frames: Vec<(Value, Vec<u8>)>,
+}
+
+/// What the fake browser sends once the channel opens, and how many terminal
+/// replies (`last:true` or `ok:false`) it waits for before reporting.
+struct Plan {
+    requests: Vec<Vec<u8>>,
+    replies: usize,
+    /// The browser's own address; loopback unless a test wants a real interface.
+    bind: std::net::IpAddr,
+    /// The device advertises only loopback (default) or every real interface.
+    loopback_only: bool,
 }
 
 async fn browser(
     to_hub: mpsc::Sender<Value>,
     mut from_device: mpsc::Receiver<Value>,
     seen: mpsc::Sender<Seen>,
-    request: Option<Vec<u8>>,
+    plan: Plan,
 ) {
-    let socket = StdUdp::bind("127.0.0.1:0").unwrap();
+    let socket = StdUdp::bind((plan.bind, 0)).unwrap();
     socket.set_nonblocking(true).unwrap();
     let local = socket.local_addr().unwrap();
     let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
@@ -65,20 +77,30 @@ async fn browser(
                     sent = true;
                     let mut channel = rtc.channel(id).unwrap();
                     assert!(channel.write(false, br#"{"t":"ping","n":42}"#).unwrap());
-                    if let Some(request) = &request {
+                    for request in &plan.requests {
                         assert!(channel.write(true, request).unwrap());
                     }
                 }
                 Output::Event(Event::ChannelData(data)) => {
                     if data.binary {
                         let (header, payload) = frame::decode(&data.data).unwrap();
-                        report.reply = Some((header, payload.to_vec()));
+                        if header["t"] == "http.body" && !payload.is_empty() {
+                            // Acknowledge what was consumed, as the real browser proxy does.
+                            let ack =
+                                json!({"t":"http.ack","id":header["id"],"bytes":payload.len()});
+                            let ack = frame::encode(&ack, b"").unwrap();
+                            let _ = rtc.channel(channel_id).unwrap().write(true, &ack);
+                        }
+                        report.frames.push((header, payload.to_vec()));
                     } else {
                         report.pong = serde_json::from_slice(&data.data).ok();
                     }
-                    let done =
-                        report.pong.is_some() && (request.is_none() || report.reply.is_some());
-                    if done {
+                    let terminal = report
+                        .frames
+                        .iter()
+                        .filter(|(h, _)| h["last"] == true || h["ok"] == false)
+                        .count();
+                    if report.pong.is_some() && terminal >= plan.replies {
                         let _ = seen.send(report).await;
                         return;
                     }
@@ -169,23 +191,19 @@ async fn hub(
     }
 }
 
-async fn session(request: Option<Vec<u8>>) -> (Seen, Option<String>, bool) {
+async fn session(plan: Plan, port: u16) -> (Seen, Option<String>, bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "ws://{}/api/remote/device/session?transport=mesh",
         listener.local_addr().unwrap()
     );
+    let loopback_only = plan.loopback_only;
     let (browser_to_hub, hub_from_browser) = mpsc::channel(32);
     let (hub_to_browser, browser_from_device) = mpsc::channel(32);
     let (checked_tx, checked_rx) = oneshot::channel();
     tokio::spawn(hub(listener, hub_from_browser, hub_to_browser, checked_tx));
     let (seen_tx, mut seen_rx) = mpsc::channel(1);
-    tokio::spawn(browser(
-        browser_to_hub,
-        browser_from_device,
-        seen_tx,
-        request,
-    ));
+    tokio::spawn(browser(browser_to_hub, browser_from_device, seen_tx, plan));
     let params = Params {
         v: 1,
         stun: vec![],
@@ -202,10 +220,10 @@ async fn session(request: Option<Vec<u8>>) -> (Seen, Option<String>, bool) {
                 &config,
                 &params,
                 "t".repeat(64).as_str(),
-                80,
+                Mode::Web(port),
                 Duration::from_secs(60),
                 stop_rx,
-                true,
+                loopback_only,
             )
             .await;
         }
@@ -224,12 +242,25 @@ async fn session(request: Option<Vec<u8>>) -> (Seen, Option<String>, bool) {
     (seen, auth, origin)
 }
 
+fn plan(requests: Vec<Value>, payloads: Vec<&[u8]>, replies: usize) -> Plan {
+    Plan {
+        requests: requests
+            .iter()
+            .zip(payloads)
+            .map(|(header, payload)| frame::encode(header, payload).unwrap())
+            .collect(),
+        replies,
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        loopback_only: true,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_device_answers_the_offer_and_serves_the_channel() {
-    let request = frame::encode(&json!({"t":"nope","id":3}), b"").unwrap();
-    let (seen, auth, origin) = session(Some(request)).await;
+    let (seen, auth, origin) =
+        session(plan(vec![json!({"t":"nope","id":3})], vec![b""], 1), 80).await;
     assert_eq!(seen.pong, Some(json!({"t":"pong","n":42})));
-    let (header, _) = seen.reply.expect("reply to the unsupported request");
+    let (header, _) = &seen.frames[0];
     assert_eq!(header["id"], 3);
     assert_eq!(header["ok"], false);
     assert_eq!(header["error"], "unsupported");
@@ -238,4 +269,141 @@ async fn the_device_answers_the_offer_and_serves_the_channel() {
         Some(format!("Bearer {}", "t".repeat(64)).as_str())
     );
     assert!(!origin, "the device must not send an Origin header");
+}
+
+/// A device web server that returns a pattern of the requested size.
+async fn web(size: usize) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let body: Vec<u8> = (0..size).map(|n| ((n * 31 + 7) & 255) as u8).collect();
+                let reply = if head.starts_with("GET /missing") {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+                } else {
+                    [format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nSet-Cookie: a=1\r\nContent-Length: {size}\r\n\r\n").into_bytes(), body].concat()
+                };
+                let _ = socket.write_all(&reply).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_web_ui_is_served_over_the_channel_byte_exact() {
+    let size = 3 * 1024 * 1024 + 17;
+    let port = web(size).await;
+    let requests = vec![
+        json!({"t":"http","id":1,"method":"GET","path":"/big.bin","headers":[["accept","*/*"]],"body_len":0}),
+        json!({"t":"http","id":2,"method":"GET","path":"/missing","headers":[],"body_len":0}),
+        json!({"t":"http","id":3,"method":"GET","path":"/x","headers":[],"body_len":0,"port":8080}),
+    ];
+    let (seen, _, _) = session(plan(requests, vec![b"", b"", b""], 3), port).await;
+    let big: Vec<u8> = seen
+        .frames
+        .iter()
+        .filter(|(h, _)| h["id"] == 1 && h["t"] == "http.body")
+        .flat_map(|(_, payload)| payload.clone())
+        .collect();
+    let expected: Vec<u8> = (0..size).map(|n| ((n * 31 + 7) & 255) as u8).collect();
+    assert_eq!(big.len(), expected.len());
+    assert!(
+        big == expected,
+        "3 MiB download through the data channel must be byte-exact"
+    );
+    let head = seen
+        .frames
+        .iter()
+        .find(|(h, _)| h["id"] == 1 && h["t"] == "http.head")
+        .unwrap();
+    assert_eq!(head.0["status"], 200);
+    let missing = seen
+        .frames
+        .iter()
+        .find(|(h, _)| h["id"] == 2 && h["t"] == "http.head")
+        .unwrap();
+    assert_eq!(
+        (missing.0["status"].clone(), missing.0["last"].clone()),
+        (json!(404), json!(true))
+    );
+    let refused = seen.frames.iter().find(|(h, _)| h["id"] == 3).unwrap();
+    assert_eq!(refused.0["error"], "target_not_allowed");
+}
+
+/// The same exchange over this host's real interface addresses, which is what a
+/// device does (one socket per address, one port). Skipped on a host without any.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_connects_over_its_real_interface_addresses() {
+    let Some(address) = peer::local_addresses(false).into_iter().next() else {
+        eprintln!("no non-loopback interface: skipped");
+        return;
+    };
+    let mut plan = plan(vec![json!({"t":"nope","id":3})], vec![b""], 1);
+    plan.bind = address;
+    plan.loopback_only = false;
+    let (seen, _, _) = session(plan, 80).await;
+    assert_eq!(seen.pong, Some(json!({"t":"pong","n":42})));
+    assert_eq!(seen.frames[0].0["error"], "unsupported");
+}
+
+/// Needs the network: `ZWRT_MESH_STUN_TEST=stun:stun.cloudflare.com:3478 cargo test stun_probe`.
+/// The device must offer a server-reflexive candidate learned on its ICE socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn stun_probe_yields_a_server_reflexive_candidate() {
+    let Ok(server) = std::env::var("ZWRT_MESH_STUN_TEST") else {
+        eprintln!("ZWRT_MESH_STUN_TEST not set: skipped");
+        return;
+    };
+    let (host, port) = stun::parse_server(&server).expect("stun:host[:port]");
+    let resolved = resolve(&[(host, port)]).await;
+    assert!(!resolved.is_empty(), "STUN server did not resolve");
+    let mut rtc = Rtc::builder().build(StdInstant::now());
+    let mut api = rtc.sdp_api();
+    api.add_channel("nms".into());
+    let (offer, _) = api.apply().unwrap();
+    let (signals, mut seen) = mpsc::channel(32);
+    let (_remote, remote_ice) = mpsc::channel(8);
+    let task = tokio::spawn(peer::run(
+        offer.to_sdp_string(),
+        peer::Config {
+            stun: resolved,
+            ports: (49160, 49223),
+            loopback_only: false,
+        },
+        peer::Link {
+            signals,
+            remote_ice,
+            mode: Mode::Files,
+        },
+    ));
+    let found = timeout_srflx(&mut seen).await;
+    task.abort();
+    let candidate = found.expect("no srflx candidate within 8 s");
+    eprintln!("srflx: {candidate}");
+    assert!(candidate.contains("typ srflx"));
+}
+
+async fn timeout_srflx(seen: &mut mpsc::Receiver<Value>) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(message) = seen.recv().await {
+            if let Some(text) = message["candidate"]["candidate"].as_str()
+                && text.contains("typ srflx")
+            {
+                return Some(text.to_owned());
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
