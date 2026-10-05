@@ -222,8 +222,8 @@ SSE  /events
   },
   "qos": {
     "qci": 9,
-    "ambr_dl": "20008.641",
-    "ambr_ul": "10008.640",
+    "ambr_dl": "20000.000",
+    "ambr_ul": "10000.000",
     "usb_mode": "debug"
   },
   "device": {
@@ -346,7 +346,7 @@ SSE  /events
 - `nfc.switch/enabled/flag`：中兴原厂 NFC Wi-Fi 状态与目标 AP 标记。`nfc.set` 省略 `flag` 时保持当前原厂值，写入后必须读回确认；不再调用原厂页面未使用的 `zwrt_nfc_wifi_change`。
 - WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
-- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时完整流式扫描两份日志，只缓存 `[DATA]` 解析材料；当前日志追加时增量读取，检测到 rename 轮转、截断或原地重写时完整重扫两份日志。当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；`qos.reload` 会主动失效缓存并重读。
+- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时完整流式扫描两份日志，只缓存 `[DATA]` 解析材料；当前日志追加时增量读取，检测到 rename 轮转、截断或原地重写时完整重扫两份日志。当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内采用最新的数据承载（LTE EPS 承载或 NR PDU 会话），只有写明了其他 PLMN（`access_point=*.mncXXX.mccYYY.*` 与当前 `net.mcc/net.mnc` 不符）的承载降级。LTE APN-AMBR 按 TS 24.301 解码：厂商日志的 `_ext2` 把 8640 kbps 基值也加了进去（如 500 Mbps 打印成 `508.640Mbps`），解析时扣回；`_ext2=0.000` 表示没有扩展-2 字节，改用 `_ext`。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；`qos.reload` 会主动失效缓存并重读。
 - `clients.list` 只包含固件无线/有线访问列表确认在线的设备，无线设备排列在有线设备之前；DHCP 租约只补全主机名和 IP，不决定在线状态。列表上限 32 条，消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms.unread` 默认每 5 秒读取一次；`sms.list` 启动、容量/未读统计变化、缓存失效及最长每 30 秒进行有界同步：NV/SIM 分别每页 64 条、最多 4 页，按消息 ID 去重，总上限 512 条。达到分页上限或设备重复返回整页时 `sms.truncated=true`。发送尝试结束、删除或标记已读成功后使缓存失效。读取/解密失败保留最近成功列表并设置 `sms.stale=true`、`sms.error`，不把失败伪装成成功的空列表；无历史数据时列表仍为空，但有明确错误。正常时 `stale=false` 且不含 `error`。厂商密文由 Rust RSA/AES-GCM 实现处理，兼容单行 PEM 公钥；解密失败最多重建一次会话并重新读取，不自动重发短信。号码和正文输出为 UTF-8 明文；消费者不应再实现厂商会话密钥或解密逻辑。相关写操作通过 [`CONTROL_API.md`](CONTROL_API.md) 执行。
 
