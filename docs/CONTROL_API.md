@@ -221,6 +221,7 @@ datad 校验后把它翻译成设备接口的 `slotId`：
 | action | params | 说明 |
 |---|---|---|
 | `aggregation.set` | `enabled` | 开启时切到 `SMULTIWAN` 并停止 mwan3；关闭时停止 ICG、切到 `MULTIWAN` 并重启 mwan3 |
+| `multiwan.status` | 无 | 只读，按需读取 mwan3：返回 `mode`、`active`、`service_running`、`sections[]`（mwan3 安全配置字段，按 `globals`/`interface`/`member`/`policy`/`rule` 标明类型，list 为数组）和 `paths[]`/`path_count`/`online_path_count`（X75/V3E1/V3E2/启用时的 Ethernet 承载链路的接口、跟踪/在线状态、探测延迟、丢包、时长和探测目标；摘要优先选 `up/online` 目标、忽略 `skipped`；mwan3 未运行时 `online` 表示底层接口已连接）。会调用约 1 秒的 `mwan3 status`，只在打开聚合详情或多 WAN 配置时请求；非 MU5252 返回参数错误 |
 | `multiwan.interface.set` | `section` 与探测字段 | 修改已存在 interface 的启用、Ping 目标、次数、包大小、TTL、超时、间隔和上下线阈值 |
 | `multiwan.member.set` | `section,metric,weight` | 修改已存在 member 的优先级与权重 |
 | `multiwan.policy.set` | `section,last_resort,use_member` | 修改已存在 policy 的成员列表与无可用链路时动作 |

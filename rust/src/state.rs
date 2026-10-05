@@ -682,11 +682,7 @@ fn split_uci_list(value: &str) -> Vec<String> {
         .filter(|v| !v.is_empty())
         .collect()
 }
-fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool) -> Value {
-    let source = sets.iter().find(|set| set.contains_key("mwan3.globals"));
-    let Some(source) = source else {
-        return json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":[]});
-    };
+fn mwan_sections(source: &BTreeMap<String, String>) -> Vec<Value> {
     let mut ids: Vec<_> = source
         .iter()
         .filter_map(|(key, value)| {
@@ -747,7 +743,78 @@ fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool
         }
         sections.push(Value::Object(item));
     }
-    json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
+    sections
+}
+fn mwan3_running() -> bool {
+    std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|v| v != 0)
+        || proc_find_command("mwan3track").is_some()
+        || proc_cmdline_contains("mwan_monitor.sh")
+}
+/// On-demand mwan3 view for `multiwan.status`. `ubus call mwan3 status` is an
+/// rpcd shell script that takes over a second on TopFlow, so the periodic
+/// sample never calls it; only an explicit control request does.
+pub async fn multiwan_status() -> Value {
+    let mode = uci_read("zwrt_router.network.opms_wan_mode").await;
+    let running = mwan3_running();
+    let sections = mwan_sections(&uci_show("mwan3").await);
+    let mwan_status = object(ubus("mwan3", "status", json!({})).await);
+    let mut paths = Vec::new();
+    let interfaces = mwan_status
+        .get("interfaces")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (id, label, name) in [
+        ("5G", "5G", "zte_mwan2"),
+        ("4G1", "4G1", "zte_mwan4"),
+        ("4G2", "4G2", "zte_mwan3"),
+        ("ethernet", "Ethernet", "waneth"),
+    ] {
+        let Some(path) = interfaces.get(name) else {
+            continue;
+        };
+        let enabled = parse_bool(path, "enabled");
+        let path_running = parse_bool(path, "running");
+        let mwan_up = parse_bool(path, "up");
+        let iface = object(ubus(&format!("network.interface.{name}"), "status", json!({})).await);
+        let interface_up = parse_bool(&iface, "up");
+        let up = mwan_up || interface_up;
+        if !enabled && !path_running && !up {
+            continue;
+        }
+        let status = string(path, "status");
+        let online = status.eq_ignore_ascii_case("online")
+            || (path_running && mwan_up)
+            || (!running && interface_up);
+        let mut targets = Vec::new();
+        if let Some(raw_targets) = path.get("track_ip").and_then(Value::as_array) {
+            for target in raw_targets {
+                let target_status = string(target, "status");
+                let target_online =
+                    matches!(target_status.to_ascii_lowercase().as_str(), "online" | "up");
+                targets.push(json!({"ip":string(target,"ip"),"status":target_status,"online":target_online,"latency_ms":target.get("latency").cloned().unwrap_or(Value::Null),"packet_loss_percent":target.get("packetloss").cloned().unwrap_or(Value::Null)}));
+            }
+        }
+        let preferred = targets
+            .iter()
+            .find(|target| target["online"] == true)
+            .or_else(|| targets.iter().find(|target| target["status"] != "skipped"));
+        let mut result = json!({"id":id,"label":label,"interface":name,"enabled":enabled,"running":path_running,"up":up,"online":online,"interface_up":interface_up,"interface_available":parse_bool(&iface,"available"),"interface_pending":parse_bool(&iface,"pending"),"status":status,"tracking":string(path,"tracking"),"uptime_seconds":integer(path,"uptime"),"targets":targets});
+        if let Some(preferred) = preferred {
+            if !preferred["latency_ms"].is_null() {
+                result["latency_ms"] = preferred["latency_ms"].clone();
+            }
+            if !preferred["packet_loss_percent"].is_null() {
+                result["packet_loss_percent"] = preferred["packet_loss_percent"].clone();
+            }
+        }
+        paths.push(result);
+    }
+    let online_path_count = paths.iter().filter(|path| path["online"] == true).count();
+    json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections,"path_count":paths.len(),"online_path_count":online_path_count,"paths":paths})
 }
 fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
     let zone = crate::cooling::zone_path();
@@ -1419,7 +1486,6 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "zwrt_zte_nwinfo",
         "zwrt_sleep",
         "wireless",
-        "mwan3",
     ];
     let mut uci_sets = Vec::new();
     for p in packages {
@@ -1937,69 +2003,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         }
         fields.insert("modems".into(), Value::Array(modems));
         let mode = uci_read("zwrt_router.network.opms_wan_mode").await;
-        let mwan_running = std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .is_some_and(|v| v != 0)
-            || proc_find_command("mwan3track").is_some()
-            || proc_cmdline_contains("mwan_monitor.sh");
+        let mwan_running = mwan3_running();
         let custom_icg_pid = proc_find_command("icg-client");
-        let mwan_status = object(ubus("mwan3", "status", json!({})).await);
-        let mut paths = Vec::new();
-        let interfaces = mwan_status
-            .get("interfaces")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        for (id, label, name) in [
-            ("5G", "5G", "zte_mwan2"),
-            ("4G1", "4G1", "zte_mwan4"),
-            ("4G2", "4G2", "zte_mwan3"),
-            ("ethernet", "Ethernet", "waneth"),
-        ] {
-            let Some(path) = interfaces.get(name) else {
-                continue;
-            };
-            let enabled = parse_bool(path, "enabled");
-            let running = parse_bool(path, "running");
-            let mwan_up = parse_bool(path, "up");
-            let iface =
-                object(ubus(&format!("network.interface.{name}"), "status", json!({})).await);
-            let interface_up = parse_bool(&iface, "up");
-            let up = mwan_up || interface_up;
-            if !enabled && !running && !up {
-                continue;
-            }
-            let status = string(path, "status");
-            let online = status.eq_ignore_ascii_case("online")
-                || (running && mwan_up)
-                || (!mwan_running && interface_up);
-            let mut targets = Vec::new();
-            if let Some(raw_targets) = path.get("track_ip").and_then(Value::as_array) {
-                for target in raw_targets {
-                    let target_status = string(target, "status");
-                    let target_online =
-                        matches!(target_status.to_ascii_lowercase().as_str(), "online" | "up");
-                    targets.push(json!({"ip":string(target,"ip"),"status":target_status,"online":target_online,"latency_ms":target.get("latency").cloned().unwrap_or(Value::Null),"packet_loss_percent":target.get("packetloss").cloned().unwrap_or(Value::Null)}));
-                }
-            }
-            let preferred = targets
-                .iter()
-                .find(|target| target["online"] == true)
-                .or_else(|| targets.iter().find(|target| target["status"] != "skipped"));
-            let mut result = json!({"id":id,"label":label,"interface":name,"enabled":enabled,"running":running,"up":up,"online":online,"interface_up":interface_up,"interface_available":parse_bool(&iface,"available"),"interface_pending":parse_bool(&iface,"pending"),"status":status,"tracking":string(path,"tracking"),"uptime_seconds":integer(path,"uptime"),"targets":targets});
-            if let Some(preferred) = preferred {
-                if !preferred["latency_ms"].is_null() {
-                    result["latency_ms"] = preferred["latency_ms"].clone();
-                }
-                if !preferred["packet_loss_percent"].is_null() {
-                    result["packet_loss_percent"] = preferred["packet_loss_percent"].clone();
-                }
-            }
-            paths.push(result);
-        }
-        let path_count = paths.len();
-        let online_path_count = paths.iter().filter(|path| path["online"] == true).count();
         let (tcp_tunnel_count, runtime_ip, runtime_port, icg_running) = tcp_aggregation_summary();
         let provisioned = !uci_read("zwrt_router.icgmwan.IcgDevId").await.is_empty();
         let remaining = uci_read("zwrt_router.icgmwan.residual_flow").await;
@@ -2059,11 +2064,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
                 ),
             );
         } else {
-            fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"paths":paths,"path_count":path_count,"online_path_count":online_path_count,"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
+            fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
         }
+        // mwan3 config and per-path probes come only from `multiwan.status`.
         fields.insert(
             "multiwan".into(),
-            topflow_multiwan(&uci_sets, &mode, mwan_running),
+            json!({"mode":mode,"active":mode=="MULTIWAN","service_running":mwan_running}),
         );
         let revision = crate::cooling::control_revision();
         let fan_enabled = uci_read("zwrt_deviceui.Device.fan_switch_status")

@@ -74,6 +74,7 @@ pub const ACTIONS: &[&str] = &[
     "client.rename",
     "client.block",
     "client.unblock",
+    "multiwan.status",
     "multiwan.interface.set",
     "multiwan.member.set",
     "multiwan.policy.set",
@@ -464,6 +465,12 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "client.rename" => client_rename(params).await,
         "client.block" => client_access(params, true).await,
         "client.unblock" => client_access(params, false).await,
+        "multiwan.status" => {
+            if !crate::apn_targets::multi_modem() {
+                return Outcome::Invalid("multiwan.status is only available on MU5252".into());
+            }
+            Outcome::Ok(state::multiwan_status().await)
+        }
         "multiwan.interface.set" => multiwan_interface(params).await,
         "multiwan.member.set" => multiwan_member(params).await,
         "multiwan.policy.set" => multiwan_policy(params).await,

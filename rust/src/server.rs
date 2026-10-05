@@ -1903,7 +1903,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 87 + 6 + 2);
+        assert_eq!(controls.len(), 88 + 6 + 2);
         for action in [
             "time.status",
             "time.config.set",
@@ -1918,7 +1918,7 @@ mod tests {
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            87 + 6 + 2
+            88 + 6 + 2
         );
     }
 
