@@ -25,6 +25,56 @@ use tokio::{
     time::Instant,
 };
 
+/// How many recent device-side ping timings `/state.mesh.ping` keeps.
+const PING_SAMPLES: usize = 32;
+static PINGS: std::sync::Mutex<std::collections::VecDeque<(f64, f64)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1e6).round() / 1e3
+}
+
+/// One answered ping: when its datagram arrived, when the pong went into SCTP
+/// and when the first datagram after that left the socket.
+fn record_ping(
+    received: std::time::Instant,
+    written: std::time::Instant,
+    sent: std::time::Instant,
+) {
+    let sample = (
+        ms(sent.saturating_duration_since(received)),
+        ms(written.saturating_duration_since(received)),
+    );
+    let mut pings = PINGS.lock().unwrap_or_else(|e| e.into_inner());
+    if pings.len() == PING_SAMPLES {
+        pings.pop_front();
+    }
+    pings.push_back(sample);
+}
+
+/// Device-side handling time of recent channel pings, newest last, or `None`
+/// before the first one. `total_ms` runs from the ping datagram's arrival to the
+/// first datagram sent after the pong; `write_ms` to the pong entering SCTP.
+pub fn ping_stats() -> Option<Value> {
+    let pings = PINGS.lock().unwrap_or_else(|e| e.into_inner());
+    if pings.is_empty() {
+        return None;
+    }
+    let mut totals: Vec<f64> = pings.iter().map(|(total, _)| *total).collect();
+    totals.sort_by(f64::total_cmp);
+    let recent: Vec<Value> = pings
+        .iter()
+        .map(|(total, write)| serde_json::json!({"total_ms":total,"write_ms":write}))
+        .collect();
+    Some(serde_json::json!({
+        "count":totals.len(),
+        "min_ms":totals[0],
+        "median_ms":totals[totals.len() / 2],
+        "max_ms":totals[totals.len() - 1],
+        "recent":recent
+    }))
+}
+
 /// A direct session never outlives one hour.
 const MAX_TTL: Duration = Duration::from_secs(3600);
 /// The browser has to appear within this long after the device joined.

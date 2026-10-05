@@ -33,7 +33,11 @@ the data channel is the only transport. Other services ignore the mesh object an
 3. ICE uses one UDP socket per local IPv4 address, all on the same port, preferring a random port of
    `udp_ports`. Candidates are host plus server-reflexive (a STUN binding probe on the ICE socket); there is no
    TURN. Browser candidates that are mDNS names cannot be parsed and are skipped.
-4. The channel answers `{"t":"ping","n":N}` with `{"t":"pong","n":N}`. Binary frames are
+4. The channel answers `{"t":"ping","n":N}` with `{"t":"pong","n":N}` straight away: pongs go into SCTP ahead of
+   queued HTTP frames and the datagram leaves in the same loop pass (0.10.67 and earlier waited for the next
+   timer or inbound packet, adding up to about 200 ms). A pong still follows whatever is already in the ordered
+   channel's SCTP send buffer (at most 128 KiB). `/state.mesh.ping` keeps the device-side handling time of the
+   last 32 pings (see STATE_SCHEMA.md). Binary frames are
    `[u32 BE header length][JSON header][payload]`, at most 256 KiB, header at most 32 KiB.
 5. Everything ends, with no further remote data, on `remote.close`, when `ttl_seconds` (at most one hour)
    passes, when the browser has been away for more than 30 seconds (the first browser gets 120 seconds to

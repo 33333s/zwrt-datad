@@ -23,6 +23,8 @@ use tokio_tungstenite::{
 #[derive(Debug, Default)]
 struct Seen {
     pong: Option<Value>,
+    /// Round trip of each numbered ping, in order.
+    rtts: Vec<Duration>,
     /// Every binary frame, in arrival order.
     frames: Vec<(Value, Vec<u8>)>,
 }
@@ -36,7 +38,11 @@ struct Plan {
     bind: std::net::IpAddr,
     /// The device advertises only loopback (default) or every real interface.
     loopback_only: bool,
+    /// Extra pings after the first, one every `PING_GAP`, each timed.
+    pings: u32,
 }
+
+const PING_GAP: Duration = Duration::from_millis(300);
 
 async fn browser(
     to_hub: mpsc::Sender<Value>,
@@ -66,6 +72,9 @@ async fn browser(
     let mut report = Seen::default();
     let mut sent = false;
     let mut buffer = vec![0u8; 2048];
+    let mut next_ping = 0u32;
+    let mut ping_at = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let mut ping_sent: std::collections::HashMap<u64, StdInstant> = Default::default();
     loop {
         let deadline = loop {
             match rtc.poll_output().unwrap() {
@@ -80,6 +89,7 @@ async fn browser(
                     for request in &plan.requests {
                         assert!(channel.write(true, request).unwrap());
                     }
+                    ping_at = tokio::time::Instant::now() + PING_GAP;
                 }
                 Output::Event(Event::ChannelData(data)) => {
                     if data.binary {
@@ -93,14 +103,26 @@ async fn browser(
                         }
                         report.frames.push((header, payload.to_vec()));
                     } else {
-                        report.pong = serde_json::from_slice(&data.data).ok();
+                        let pong: Option<Value> = serde_json::from_slice(&data.data).ok();
+                        if let Some(at) = pong
+                            .as_ref()
+                            .and_then(|p| p["n"].as_u64())
+                            .and_then(|n| ping_sent.remove(&n))
+                        {
+                            report.rtts.push(at.elapsed());
+                        } else {
+                            report.pong = pong;
+                        }
                     }
                     let terminal = report
                         .frames
                         .iter()
                         .filter(|(h, _)| h["last"] == true || h["ok"] == false)
                         .count();
-                    if report.pong.is_some() && terminal >= plan.replies {
+                    if report.pong.is_some()
+                        && terminal >= plan.replies
+                        && report.rtts.len() as u32 >= plan.pings
+                    {
                         let _ = seen.send(report).await;
                         return;
                     }
@@ -117,6 +139,14 @@ async fn browser(
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 let _ = rtc.handle_input(Input::Timeout(StdInstant::now()));
+            }
+            _ = tokio::time::sleep_until(ping_at), if next_ping < plan.pings => {
+                next_ping += 1;
+                let n = 1000 + next_ping;
+                let text = json!({"t":"ping","n":n}).to_string();
+                assert!(rtc.channel(channel_id).unwrap().write(false, text.as_bytes()).unwrap());
+                ping_sent.insert(u64::from(n), StdInstant::now());
+                ping_at = tokio::time::Instant::now() + PING_GAP;
             }
             message = from_device.recv() => {
                 let Some(message) = message else { return };
@@ -252,6 +282,7 @@ fn plan(requests: Vec<Value>, payloads: Vec<&[u8]>, replies: usize) -> Plan {
         replies,
         bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         loopback_only: true,
+        pings: 0,
     }
 }
 
@@ -406,4 +437,44 @@ async fn timeout_srflx(seen: &mut mpsc::Receiver<Value>) -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// Over loopback the link adds nothing, so a pong must come straight back.
+#[tokio::test(flavor = "multi_thread")]
+async fn pings_are_answered_without_waiting_for_a_timer() {
+    let mut plan = plan(vec![], vec![], 0);
+    plan.pings = 12;
+    let (seen, _, _) = session(plan, 80).await;
+    let mut rtts = seen.rtts.clone();
+    rtts.sort();
+    eprintln!("loopback ping rtt: {rtts:?}");
+    assert_eq!(rtts.len(), 12);
+    assert!(rtts[rtts.len() / 2] < Duration::from_millis(20), "{rtts:?}");
+}
+
+/// Pongs skip the queued HTTP frames, so a running download does not hold them back.
+#[tokio::test(flavor = "multi_thread")]
+async fn pings_stay_fast_during_a_download() {
+    let size = 32 * 1024 * 1024;
+    let port = web(size).await;
+    let requests =
+        vec![json!({"t":"http","id":1,"method":"GET","path":"/big.bin","headers":[],"body_len":0})];
+    let mut plan = plan(requests, vec![b""], 1);
+    plan.pings = 6;
+    let started = StdInstant::now();
+    let (seen, _, _) = session(plan, port).await;
+    let mut rtts = seen.rtts.clone();
+    rtts.sort();
+    eprintln!(
+        "ping rtt during download: {rtts:?}, session {:?}",
+        started.elapsed()
+    );
+    let body: usize = seen
+        .frames
+        .iter()
+        .filter(|(h, _)| h["id"] == 1 && h["t"] == "http.body")
+        .map(|(_, payload)| payload.len())
+        .sum();
+    assert_eq!(body, size);
+    assert!(rtts[rtts.len() / 2] < Duration::from_millis(50), "{rtts:?}");
 }

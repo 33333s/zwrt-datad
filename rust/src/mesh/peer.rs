@@ -224,6 +224,11 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
     let mut service = Service::new(link.mode, out_tx);
     let mut queue: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
     let mut queued = 0usize;
+    // Pongs bypass the HTTP queue, so a busy download never holds them back.
+    let mut pongs: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+    // Pongs handed to SCTP and not yet followed by an outgoing datagram.
+    let mut unsent_pongs: Vec<(Instant, Instant)> = Vec::new();
+    let mut received_at = Instant::now();
     let mut remote_count = 0usize;
 
     loop {
@@ -245,8 +250,26 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
                             .send_to(&transmit.contents, transmit.destination)
                             .await;
                     }
+                    for (received, written) in unsent_pongs.drain(..) {
+                        super::record_ping(received, written, Instant::now());
+                    }
                 }
-                Ok(Output::Timeout(at)) => break at,
+                Ok(Output::Timeout(at)) => {
+                    // Writing into SCTP only queues data; the datagrams carrying
+                    // it come out of the next poll. Without this a pong waited for
+                    // the next timer or inbound packet (often 100-200 ms).
+                    if write_pending(
+                        &mut rtc,
+                        channel,
+                        &mut pongs,
+                        &mut unsent_pongs,
+                        &mut queue,
+                        &mut queued,
+                    ) {
+                        continue;
+                    }
+                    break at;
+                }
                 Ok(Output::Event(event)) => match event {
                     Event::ChannelOpen(id, label)
                         if label == CHANNEL_LABEL && channel.is_none() =>
@@ -262,8 +285,7 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
                             if let Some(pong) =
                                 std::str::from_utf8(&data.data).ok().and_then(frame::pong)
                             {
-                                queued += pong.len();
-                                queue.push_back((false, pong.into_bytes()));
+                                pongs.push_back((received_at, pong.into_bytes()));
                             }
                         } else if let Ok((header, payload)) = frame::decode(&data.data) {
                             service.handle(header, payload);
@@ -274,8 +296,7 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
                 Err(_) => return,
             }
         };
-        flush(&mut rtc, channel, &mut queue, &mut queued);
-        if queued > MAX_QUEUED_BYTES {
+        if queued > MAX_QUEUED_BYTES || pongs.len() > 64 {
             return;
         }
         let wake = tokio::time::Instant::from_std(deadline);
@@ -303,7 +324,8 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
                     continue;
                 }
                 if let Ok(receive) = Receive::new(Protocol::Udp, source, destination, packet) {
-                    let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
+                    received_at = Instant::now();
+                    let _ = rtc.handle_input(Input::Receive(received_at, receive));
                 }
             }
             _ = tokio::time::sleep_until(wake) => {
@@ -337,24 +359,40 @@ pub async fn run(offer: String, config: Config, mut link: Link) {
     }
 }
 
-/// Moves queued frames into the SCTP send buffer while there is room.
-fn flush(
+/// Moves pongs, then queued frames, into the SCTP send buffer while there is
+/// room. Returns whether anything was written.
+fn write_pending(
     rtc: &mut Rtc,
     channel: Option<ChannelId>,
+    pongs: &mut VecDeque<(Instant, Vec<u8>)>,
+    unsent_pongs: &mut Vec<(Instant, Instant)>,
     queue: &mut VecDeque<(bool, Vec<u8>)>,
     queued: &mut usize,
-) {
-    let Some(id) = channel else { return };
+) -> bool {
+    let Some(id) = channel else { return false };
     let Some(mut open) = rtc.channel(id) else {
-        return;
+        return false;
     };
+    let mut wrote = false;
+    while let Some((received, data)) = pongs.front() {
+        match open.write(false, data) {
+            Ok(true) => {
+                unsent_pongs.push((*received, Instant::now()));
+                pongs.pop_front();
+                wrote = true;
+            }
+            _ => return wrote,
+        }
+    }
     while let Some((binary, data)) = queue.front() {
         match open.write(*binary, data) {
             Ok(true) => {
                 *queued = queued.saturating_sub(data.len());
                 queue.pop_front();
+                wrote = true;
             }
             _ => break,
         }
     }
+    wrote
 }
