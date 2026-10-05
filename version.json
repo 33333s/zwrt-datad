@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.65",
+    "version": "0.10.66",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 QCI/AMBR：LTE APN-AMBR 扩展-2 按 TS 24.301 解码（厂商日志把 8.64 Mbps 基值算进去，500 Mbps 曾显示为 508.640、上行 100 Mbps 显示为 0）；切到 5G 后以最新 PDU 会话为准，不再停留在旧的 LTE 承载"
+    "notes": "TopFlow 的 4G1/4G2（外挂 V3E 模块）短信发送暂标记为不支持：直接返回明确的“不支持”错误，不再请求模块网页接口后报 send failed；5G 主卡短信不受影响"
   }
 }
