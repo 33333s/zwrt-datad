@@ -53,6 +53,69 @@ class SourceTests(unittest.TestCase):
         self.assertEqual((cell['pci'], cell['arfcn'], cell['band']), (123, 640000, 78))
         self.assertEqual(cell['rsrp_dbm'], -85)
 
+    def test_flymodem_b29_identity_frequency_and_signal(self):
+        # Captured on BD_FLYMODEMMU5250V1.0.0B29. These are build-shifted
+        # aliases of the already supported QTrace records, not a new schema.
+        data = qsh(0xd8fc6390, [1, 422910, 219, 3])
+        data += snapshot(0xda0267d4, pci=219, dbm=-98)
+        data += qsh(0xda020604, [1, 1, 235, 0, 422910, 0])
+        data += snapshot(0xda0267d4, pci=235, dbm=-106)
+        cells = self.parse(data)['cells']
+        self.assertEqual(
+            [(c['pci'], c['arfcn'], c['rsrp_dbm']) for c in cells],
+            [(219, 422910, -98), (235, 422910, -106)],
+        )
+        self.assertEqual(cells[0]['band'], 1)
+
+    def test_flymodem_b29_uses_unique_capture_frequency_when_short_anchor_is_far(self):
+        data = qsh(0xd8fc6390, [1, 422910, 219, 3])
+        data += qsh(0x12345678, []) * 257
+        data += snapshot(0xda0267d4, pci=219, dbm=-97)
+        cells = self.parse(data)['cells']
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(
+            (cells[0]['pci'], cells[0]['arfcn'], cells[0]['rsrp_dbm']),
+            (219, 422910, -97),
+        )
+
+    def test_flymodem_b29_does_not_guess_when_capture_has_two_frequencies(self):
+        data = qsh(0xd8fc6390, [1, 422910, 219, 3])
+        data += qsh(0xd8fc6390, [78, 640000, 219, 3])
+        data += qsh(0x12345678, []) * 257
+        data += snapshot(0xda0267d4, pci=219, dbm=-97)
+        result = self.parse(data)
+        measured = [c for c in result['cells'] if c['rsrp_dbm'] is not None]
+        self.assertEqual(len(measured), 1)
+        self.assertIsNone(measured[0]['arfcn'])
+        self.assertEqual(result['ambiguous'], 1)
+
+    def test_flymodem_b29_unmeasured_sentinel_is_not_a_signal(self):
+        data = qsh(0xd8fc6390, [1, 422910, 235, 3])
+        data += snapshot(0xda0267d4, pci=235, dbm=-156)
+        cells = self.parse(data)['cells']
+        self.assertEqual(
+            [(c['pci'], c['arfcn'], c['rsrp_dbm'], c['direct_hits']) for c in cells],
+            [(235, 422910, None, 1)],
+        )
+
+    def test_flymodem_b29_aliases_keep_strict_shapes(self):
+        direct_layouts = [
+            (0xd9fb7e18, [0, 0, 219, 0, 422910, 0, 0]),
+            (0xf93dacf8, [0, 0, 219, 0, 422910, 0, 0]),
+            (0xd9fb5434, [0, 219, 0, 422910, 0, 0]),
+            (0xf93db1b2, [0, 219, 0, 422910, 0, 0]),
+            (0xf9ad3b01, [422910, 219, 0, 0, 0]),
+            (0xbcbb26d0, [422910, 219, 0]),
+            (0xf9ad3d23, [422910, 219, 0]),
+        ]
+        for signature, args in direct_layouts:
+            with self.subTest(signature=hex(signature)):
+                cell = self.parse(qsh(signature, args))['cells'][0]
+                self.assertEqual((cell['pci'], cell['arfcn']), (219, 422910))
+        for signature in (0xda011bb8, 0xf9469e38):
+            with self.subTest(signature=hex(signature)):
+                self.assertEqual(self.parse(snapshot(signature))['cells'], [])
+
     def test_known_firmware_layouts(self):
         layouts = [
             (0xd8facf74, 0xda019f14, 12),
