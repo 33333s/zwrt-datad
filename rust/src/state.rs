@@ -2113,6 +2113,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         -1
     };
     fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":cpu_usage,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
+    #[cfg(feature = "mesh")]
+    if let Some(ping) = crate::mesh::ping_stats() {
+        fields.insert("mesh".into(), json!({"ping":ping}));
+    }
     fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
     fields.insert("usb".into(), crate::usb::snapshot());
     fields.insert("runtime".into(), runtime);

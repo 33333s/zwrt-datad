@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.67",
+    "version": "0.10.68",
     "asset": "zwrt-datad-aarch64",
-    "notes": "TopFlow 降低采样开销：不再每轮调用 mwan3 status（单次约 1.1 秒）和读取 mwan3 配置；承载链路与多 WAN 配置改由新的只读控制动作 multiwan.status 在打开聚合详情/多 WAN 配置时按需读取，/state 的 aggregation 不再带 paths，multiwan 只保留 mode/active/service_running"
+    "notes": "修复网页直连（P2P 数据通道）ping 往返偏大：pong 写入 SCTP 后要等下一个定时器或来包才发出，局域网约 200 ms、外网多出 50–150 ms；现在立即发出，并优先于排队的 HTTP 帧。/state 新增 mesh.ping，记录设备侧最近 32 次 ping 处理耗时"
   }
 }
