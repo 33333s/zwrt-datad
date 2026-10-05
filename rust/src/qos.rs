@@ -19,7 +19,6 @@ struct Candidate {
     current: bool,
     mcc: Option<i64>,
     mnc: Option<i64>,
-    rank: i32,
     seq: usize,
     qci: Option<i64>,
     dl: Option<f64>,
@@ -301,14 +300,6 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
             if data_context {
                 let cmcc = digits_after_ci(&lower, "mcc");
                 let cmnc = digits_after_ci(&lower, "mnc");
-                let has_plmn = cmcc.is_some() && cmnc.is_some();
-                let rank = if has_plmn {
-                    30
-                } else if lower.contains("access_point=") {
-                    20
-                } else {
-                    10
-                };
                 let idx = candidates
                     .iter()
                     .position(|c| c.mcc == cmcc && c.mnc == cmnc)
@@ -317,7 +308,6 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
                             current: *current,
                             mcc: cmcc,
                             mnc: cmnc,
-                            rank,
                             seq,
                             ..Default::default()
                         });
@@ -325,7 +315,6 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
                     });
                 let c = &mut candidates[idx];
                 c.current |= *current;
-                c.rank = c.rank.max(rank);
                 c.seq = seq;
                 if let Some(qci) = pending_qci.take() {
                     c.qci = Some(qci);
@@ -369,15 +358,14 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
             }
         }
     }
+    // The newest data bearer in the newest log wins. An EPS bearer names its
+    // PLMN and an NR PDU session does not, so a PLMN match must not let an old
+    // LTE bearer outrank a later 5G session; only another PLMN's bearer loses.
+    let known_plmn = mcc > 0;
     let score = |c: &Candidate| {
         let base = if c.current { 1000 } else { 0 };
-        base + if c.mcc == Some(mcc) && c.mnc == Some(mnc) {
-            300 + c.rank
-        } else if c.mcc.is_none() {
-            100 + c.rank
-        } else {
-            10 + c.rank
-        }
+        let foreign = known_plmn && c.mcc.is_some() && (c.mcc != Some(mcc) || c.mnc != Some(mnc));
+        base + if foreign { 0 } else { 100 }
     };
     candidates.sort_by_key(|c| (score(c), c.seq));
     let mut selected = candidates.last().cloned().unwrap_or_default();
@@ -422,10 +410,22 @@ fn number_after(s: &str, key: &str) -> Option<f64> {
         .collect();
     token.parse().ok()
 }
+/// APN-AMBR from an EPS bearer line. TS 24.301 says a non-zero extended-2
+/// octet adds N x 256 Mbps to the extended value, and the extended value
+/// replaces the 8640 kbps base. The vendor log prints `_ext2` with the base
+/// added on top (244 + 256 + 8.64 = `508.640Mbps` for 500 Mbps) and `0.000`
+/// when the octet is absent, so the base is taken back out and a zero
+/// `_ext2` falls through to `_ext`.
 fn apn_ambr(s: &str, key: &str) -> Option<f64> {
-    number_after(s, &format!("{key}_ext2="))
-        .or_else(|| number_after(s, &format!("{key}_ext=")))
-        .or_else(|| number_after(s, &format!("{key}=")).map(|v| v / 1000.0))
+    let positive = |v: f64| (v > 0.0).then_some(v);
+    let base = number_after(s, &format!("{key}=")).map(|v| v / 1000.0);
+    let ext = number_after(s, &format!("{key}_ext=")).and_then(positive);
+    let ext2 = number_after(s, &format!("{key}_ext2=")).and_then(positive);
+    match (ext2, base) {
+        (Some(v), Some(b)) if v > b + ext.unwrap_or(0.0) => Some(v - b),
+        (Some(v), _) => Some(v),
+        _ => ext.or(base),
+    }
 }
 fn session_ambr(s: &str, value_key: &str, unit_key: &str) -> Option<f64> {
     let value = number_after(s, value_key)?;
@@ -476,6 +476,20 @@ mod tests {
     fn parses_helpers() {
         assert_eq!(integer_after_ci("default bearer qci = 9", "qci"), Some(9));
         assert_eq!(apn_ambr("apn_ambr_dl=64000", "apn_ambr_dl"), Some(64.0));
+        let lte = "apn_ambr_dl=8640kbps apn_ambr_ul=8640kbps apn_ambr_dl_ext=244.000mbps apn_ambr_ul_ext=100.000mbps apn_ambr_dl_ext2=508.640mbps apn_ambr_ul_ext2=0.000mbps";
+        assert_eq!(
+            apn_ambr(lte, "apn_ambr_dl").map(format_mbps),
+            Some("500.000".into())
+        );
+        assert_eq!(
+            apn_ambr(lte, "apn_ambr_ul").map(format_mbps),
+            Some("100.000".into())
+        );
+        let lte = "apn_ambr_dl=8640kbps apn_ambr_dl_ext=208.000mbps apn_ambr_dl_ext2=2008.640mbps";
+        assert_eq!(
+            apn_ambr(lte, "apn_ambr_dl").map(format_mbps),
+            Some("2000.000".into())
+        );
         assert_eq!(
             session_ambr(
                 "session_ambr_dl=2 session_ambr_dl_unit=(100Mbps)",
@@ -492,6 +506,33 @@ mod tests {
                 ambr_ul: "75.000".into()
             })
         );
+    }
+
+    #[test]
+    fn newer_nr_session_beats_older_lte_bearer() {
+        let log = "[DATA] cid1 LTE default bearer qci = 8
+[DATA] eps_bearer_id=5 msg_type=193 access_point=3gnet.MNC001.MCC460.GPRS apn_ambr_dl=8640kbps apn_ambr_ul=8640kbps apn_ambr_dl_ext=244.000Mbps apn_ambr_ul_ext=100.000Mbps apn_ambr_dl_ext2=508.640Mbps apn_ambr_ul_ext2=0.000Mbps
+[DATA] qci = 8 8
+[DATA] pdu_session_id=1 msg_type=194 dnn=IMS session_ambr_dl=30000 session_ambr_dl_unit=1(1Kbps) session_ambr_ul=30000 session_ambr_ul_unit=1(1Kbps)
+[DATA] pdu_session_id=2 msg_type=194 dnn=3gnet session_ambr_dl=2000 session_ambr_dl_unit=6(1Mbps) session_ambr_ul=200 session_ambr_ul_unit=6(1Mbps)
+[DATA] qci = 6 6
+";
+        let v = parse_texts(&[(log, true)], 460, 1);
+        assert_eq!(
+            (v.qci, v.ambr_dl.as_str(), v.ambr_ul.as_str()),
+            (6, "2000.000", "200.000")
+        );
+        let lte_only = log.lines().take(3).collect::<Vec<_>>().join("\n");
+        let v = parse_texts(&[(&lte_only, true)], 460, 1);
+        assert_eq!(
+            (v.qci, v.ambr_dl.as_str(), v.ambr_ul.as_str()),
+            (8, "500.000", "100.000")
+        );
+        // Another PLMN's newer bearer still loses to the serving one.
+        let roamed = format!(
+            "{log}[DATA] eps_bearer_id=6 access_point=x.MNC012.MCC454.GPRS apn_ambr_dl_ext=64.000Mbps apn_ambr_ul_ext=32.000Mbps\n"
+        );
+        assert_eq!(parse_texts(&[(&roamed, true)], 460, 1).ambr_dl, "2000.000");
     }
 
     #[test]
