@@ -5,12 +5,9 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PORT=${RUST_CONTROL_PORT:-19460}
 TMP=$(mktemp -d)
 PID=
-SMS_PID=
 cleanup() {
     [ -z "$PID" ] || kill "$PID" 2>/dev/null || true
-    [ -z "$SMS_PID" ] || kill "$SMS_PID" 2>/dev/null || true
     [ -z "$PID" ] || wait "$PID" 2>/dev/null || true
-    [ -z "$SMS_PID" ] || wait "$SMS_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -63,10 +60,6 @@ export ZWRT_DATAD_BOOT_ID_PATH="$TMP/boot-id"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/web-private.pem" 2>/dev/null
 openssl pkey -in "$TMP/web-private.pem" -pubout -out "$TMP/web-public.pem" 2>/dev/null
 export MOCK_WEB_PUBLIC_KEY_FILE="$TMP/web-public.pem"
-SMS_PORT=$((PORT + 1))
-"$ROOT/tests/mock_sms_server.py" "$SMS_PORT" "$TMP/sms-http.log" &
-SMS_PID=$!
-export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:$SMS_PORT/goform/goform_set_cmd_process"
 for base in wlan0 wlan1; do
     cat >"$ZWRT_DATAD_VENDOR_WIFI_DIR/hostapd-$base.conf" <<'EOF'
 driver=nl80211
@@ -173,8 +166,13 @@ PY
 post '{"action":"nfc.set","params":{"enabled":true}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True; assert d["result"]=={"supported":True,"enabled":True,"switch":1,"flag":2,"changed":True,"verified":True},d'
 [ "$(cat "$MOCK_NFC_STATE_FILE")" = '1 2' ]
-post '{"action":"sms.send_raw","params":{"sender":"4G2","number":"+8613800000000","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
-grep -F 'goformId=SEND_SMS&Number=%2B8613800000000&MessageBody=6D4B8BD5&ID=-1&encode_type=UNICODE&sms_time=26;08;27;04;00;00;%2B;0' "$TMP/sms-http.log" >/dev/null
+for sender in 4G1 4G2 v3e1; do
+    code=$(curl -sS -o "$TMP/last-control.json" -w '%{http_code}' -H 'content-type: application/json' \
+        --data-binary '{"action":"sms.send_raw","params":{"sender":"'"$sender"'","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' \
+        "http://127.0.0.1:$PORT/control")
+    [ "$code" = 400 ] || { printf '%s SMS: HTTP %s\n' "$sender" "$code" >&2; exit 1; }
+    grep -F 'SMS sending is not supported' "$TMP/last-control.json" >/dev/null
+done
 post '{"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 post '{"action":"sms.send_raw","params":{"sender":"sim2","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}' >/dev/null
 [ "$(cat "$MOCK_SIM_SLOT_FILE")" = 2 ]

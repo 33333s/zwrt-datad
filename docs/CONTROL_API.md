@@ -210,7 +210,7 @@ datad 校验后把它翻译成设备接口的 `slotId`：
 | `sms.delete` | `ids`，使用设备要求的分号格式 |
 | `sms.mark_read` | `ids`, `tag?` |
 
-`sms.send_raw` 接受已经编码的 UCS-2 hex。主卡发送是否加密由固件决定：UCI `zwrt_wms.config.sms_no_need_encryption_flag` 为 `0`（MU5252）时按原厂网页的方式用 AES-GCM 信封加密号码和正文；没有这个标志的固件（MU5250、MC7523、MC8532B）其短信服务接收明文，datad 直接发送明文号码和正文（0.10.56 及以前在这些机型上误发了加密信封，短信无法发出）。`sender` 为空或 `host` 时使用当前主卡；TopFlow 可选 `5G`（即主卡）、`4G1`（V3E2）、`4G2`（V3E1），其中 4G1/4G2 通过各自内网管理接口发送，不区分大小写；0.10.52 前的 `x75`/`v3e1`/`v3e2` 仍作为别名接受；普通双卡机型可选 `sim1`、`sim2`，datad 会先用原厂 provisioning 接口激活目标卡槽并等待切换完成。主机 WMS 发送会使用 datad 已注册的厂商 AES-GCM Web 会话加密号码和正文，并轮询 `sms_cmd=4`，只有状态 3 才返回成功。文本编码、转发、黑名单和业务去重继续由 UFI 负责。
+`sms.send_raw` 接受已经编码的 UCS-2 hex。主卡发送是否加密由固件决定：UCI `zwrt_wms.config.sms_no_need_encryption_flag` 为 `0`（MU5252）时按原厂网页的方式用 AES-GCM 信封加密号码和正文；没有这个标志的固件（MU5250、MC7523、MC8532B）其短信服务接收明文，datad 直接发送明文号码和正文（0.10.56 及以前在这些机型上误发了加密信封，短信无法发出）。`sender` 为空或 `host` 时使用当前主卡；TopFlow 可选 `5G`（即主卡），不区分大小写；`4G1`（V3E2）、`4G2`（V3E1）及 0.10.52 前的别名 `v3e1`/`v3e2` 暂不支持发送，datad 直接返回参数错误（HTTP 400，`4G1 SMS sending is not supported`），不会发出任何请求——外挂模块的网页接口需要 datad 不持有的厂商登录，AT 通道又由模块自身守护进程占用；`x75` 仍作为 `5G` 的别名接受；普通双卡机型可选 `sim1`、`sim2`，datad 会先用原厂 provisioning 接口激活目标卡槽并等待切换完成。主机 WMS 发送会使用 datad 已注册的厂商 AES-GCM Web 会话加密号码和正文，并轮询 `sms_cmd=4`，只有状态 3 才返回成功。文本编码、转发、黑名单和业务去重继续由 UFI 负责。
 
 ## MU5252 Aggregation And Cooling
 

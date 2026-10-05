@@ -36,6 +36,7 @@ struct Sample {
     band: Option<u32>,
     rsrp: Option<f64>,
     require_anchor: bool,
+    capture_unique_anchor: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, PartialOrd, Ord)]
 enum Rat {
@@ -184,6 +185,11 @@ impl Parser {
                 band,
             });
         }
+        // FLYMODEM B29 emits the frequency-bearing identity much less often
+        // than its signal snapshots. If the normal short-range anchor misses,
+        // a B29 snapshot may use a frequency that is unique for the same PCI
+        // within this capture file. Conflicting frequencies stay unresolved.
+        let capture_unique_anchor = matches!(hash, 0xda0267d4 | 0xda022508 | 0xf9487071);
         let mut add = |rat, pci, arfcn, band, rsrp, require_anchor| {
             self.push_sample(Sample {
                 seq,
@@ -195,10 +201,14 @@ impl Parser {
                 band,
                 rsrp,
                 require_anchor,
+                capture_unique_anchor,
             });
         };
+        // -19968 (-156 dBm in Q7) is the "not measured" sentinel; the cell
+        // still shows through its identity records, without a signal value.
         let paired = |sizes: &[u32]| {
             sizes.contains(&hash)
+                && args.get(4) != Some(&((-19968i32) as u32))
                 && args.len()
                     >= if matches!(hash, 0xda01af24 | 0xda06ba1c | 0xda054a0c) {
                         11
@@ -210,7 +220,11 @@ impl Parser {
                 && plausible_q7(args[4])
                 && plausible_q7(args[6])
         };
-        if paired(&[3657540452, 3657523352, 4182273084]) {
+        if paired(&[
+            3657540452, 3657523352, 4182273084,
+            // FLYMODEM B29 aliases of the same |f4799b21 QTrace record.
+            0xda0267d4, 0xda022508, 0xf9487071,
+        ]) {
             add(Rat::Nr, args[3], None, None, Some(q7(args[4])), false);
         } else if paired(&[0xda0539fc, 0xda054a0c]) {
             add(Rat::Nr, args[3], None, None, Some(q7(args[4])), true);
@@ -232,7 +246,12 @@ impl Parser {
                 Some(q7(args[4])),
                 hash == 0xda06ba1c,
             );
-        } else if [3657934788, 3657937792, 3657920232].contains(&hash)
+        } else if [
+            3657934788, 3657937792, 3657920232,
+            // FLYMODEM B29 aliases of the same |f604cd73 QTrace record.
+            0xda011bb8, 0xf9469e38,
+        ]
+        .contains(&hash)
             && args.len() == 12
             && args[4] != (-19968i32) as u32
             && args[6] != (-19968i32) as u32
@@ -310,6 +329,24 @@ impl Parser {
                         ambiguous = true;
                     }
                     found = Some(d.arfcn);
+                }
+                if found.is_none() && !ambiguous && sample.capture_unique_anchor {
+                    comparisons = 0;
+                    for d in self
+                        .directs
+                        .iter()
+                        .filter(|d| d.pci == sample.pci && d.capture == sample.capture)
+                    {
+                        comparisons += 1;
+                        if comparisons > 512 {
+                            ambiguous = true;
+                            break;
+                        }
+                        if found.is_some() && found != Some(d.arfcn) {
+                            ambiguous = true;
+                        }
+                        found = Some(d.arfcn);
+                    }
                 }
                 if ambiguous {
                     self.ambiguous += 1;
@@ -411,12 +448,12 @@ impl Parser {
 
 fn direct(hash: u32, a: &[u32]) -> Option<(u32, u32, Option<u32>)> {
     let (pci, arfcn, band) = match hash {
-        3640397572 if a.len() >= 4 => (a[2], a[1], Some(a[0])),
-        3657515396 if a.len() >= 6 => (a[2], a[4], None),
-        3657212968 | 4181705066 if a.len() >= 7 => (a[2], a[4], None),
-        3657202244 | 4181706276 if a.len() >= 6 => (a[1], a[3], None),
-        4188869441 if a.len() >= 5 => (a[1], a[0], None),
-        3166370540 if a.len() >= 3 => (a[1], a[0], None),
+        3640397572 | 0xd8fc6390 if a.len() >= 4 => (a[2], a[1], Some(a[0])),
+        3657515396 | 0xda020604 if a.len() >= 6 => (a[2], a[4], None),
+        3657212968 | 4181705066 | 0xd9fb7e18 | 0xf93dacf8 if a.len() >= 7 => (a[2], a[4], None),
+        3657202244 | 4181706276 | 0xd9fb5434 | 0xf93db1b2 if a.len() >= 6 => (a[1], a[3], None),
+        4188869441 | 0xf9ad3b01 if a.len() >= 5 => (a[1], a[0], None),
+        3166370540 | 0xbcbb26d0 | 0xf9ad3d23 if a.len() >= 3 => (a[1], a[0], None),
         0xd8facf74 | 0xd8f773e8 | 0xd8fc5cc0 | 0xd8fb8ad0 | 0xd8f82d98 | 0xd8f84514
             if a.len() >= 4 =>
         {

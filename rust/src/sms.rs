@@ -5,7 +5,6 @@ use aes_gcm::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
-use reqwest::redirect::Policy;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey};
 use serde_json::{Value, json};
 use std::{
@@ -406,65 +405,6 @@ fn canonical_sender(sender: &str) -> &str {
     }
 }
 
-async fn send_external(
-    sender: &str,
-    number: &str,
-    message: &str,
-    sms_time: &str,
-) -> Result<Value, String> {
-    let default = if sender == "4G2" {
-        "http://192.168.56.1/goform/goform_set_cmd_process"
-    } else {
-        "http://192.168.57.1/goform/goform_set_cmd_process"
-    };
-    let variable = if sender == "4G2" {
-        "ZWRT_DATAD_SMS_V3E1_URL"
-    } else {
-        "ZWRT_DATAD_SMS_V3E2_URL"
-    };
-    let url = std::env::var(variable).unwrap_or_else(|_| default.into());
-    let encode_plus = |value: &str| value.replace('+', "%2B");
-    let form = format!(
-        "goformId=SEND_SMS&Number={}&MessageBody={message}&ID=-1&encode_type=UNICODE&sms_time={}",
-        encode_plus(number),
-        encode_plus(sms_time)
-    );
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .post(url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form)
-        .send()
-        .await
-        .map_err(|_| format!("{sender} SMS endpoint unavailable"))?;
-    if !response.status().is_success() || response.content_length().is_some_and(|v| v > 4096) {
-        return Err(format!("{sender} SMS send failed"));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| format!("{sender} SMS send failed"))?;
-    if bytes.len() > 4096
-        || serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            != Some("success")
-    {
-        return Err(format!("{sender} SMS send failed"));
-    }
-    Ok(json!({"sender":sender,"status":3}))
-}
-
 async fn current_slot() -> i64 {
     state::ubus("zwrt_zte_mdm.api", "get_sim_info", json!({}))
         .await
@@ -551,7 +491,9 @@ pub async fn send(params: &Value) -> Result<Value, (bool, String)> {
         return Err((true, "invalid SMS parameters".into()));
     }
     let result = match sender {
-        "4G1" | "4G2" => send_external(sender, number, message, sms_time).await,
+        // The V3E modules' web API needs a vendor login datad does not hold,
+        // and their AT channel is owned by the module's own daemons.
+        "4G1" | "4G2" => return Err((true, format!("{sender} SMS sending is not supported"))),
         "host" => send_host(number, message, sms_time).await,
         "sim1" | "sim2" => {
             let slot = if sender == "sim1" { 1 } else { 2 };
