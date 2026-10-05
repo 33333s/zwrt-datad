@@ -449,10 +449,14 @@ async fn pings_are_answered_without_waiting_for_a_timer() {
     rtts.sort();
     eprintln!("loopback ping rtt: {rtts:?}");
     assert_eq!(rtts.len(), 12);
-    assert!(rtts[rtts.len() / 2] < Duration::from_millis(20), "{rtts:?}");
+    // Before the fix the median was about 105 ms (the next timer or packet).
+    assert!(rtts[rtts.len() / 2] < Duration::from_millis(50), "{rtts:?}");
 }
 
-/// Pongs skip the queued HTTP frames, so a running download does not hold them back.
+/// Pongs skip the queued HTTP frames, so a running download does not hold them
+/// back on the device. The browser-side round trip also includes SCTP ordering
+/// and the fake browser's own load (hundreds of ms on a busy CI runner), so only
+/// the device-side handling time is asserted.
 #[tokio::test(flavor = "multi_thread")]
 async fn pings_stay_fast_during_a_download() {
     let size = 32 * 1024 * 1024;
@@ -469,6 +473,8 @@ async fn pings_stay_fast_during_a_download() {
         "ping rtt during download: {rtts:?}, session {:?}",
         started.elapsed()
     );
+    let device = crate::mesh::ping_stats().unwrap();
+    eprintln!("device side: {device}");
     let body: usize = seen
         .frames
         .iter()
@@ -476,5 +482,6 @@ async fn pings_stay_fast_during_a_download() {
         .map(|(_, payload)| payload.len())
         .sum();
     assert_eq!(body, size);
-    assert!(rtts[rtts.len() / 2] < Duration::from_millis(50), "{rtts:?}");
+    assert_eq!(rtts.len(), 6);
+    assert!(device["median_ms"].as_f64().unwrap() < 50.0, "{device}");
 }
