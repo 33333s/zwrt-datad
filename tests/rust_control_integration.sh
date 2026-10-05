@@ -5,8 +5,11 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PORT=${RUST_CONTROL_PORT:-19460}
 TMP=$(mktemp -d)
 PID=
+TOPFLOW_PID=
 cleanup() {
     [ -z "$PID" ] || kill "$PID" 2>/dev/null || true
+    [ -z "$TOPFLOW_PID" ] || kill "$TOPFLOW_PID" 2>/dev/null || true
+    [ -z "$TOPFLOW_PID" ] || wait "$TOPFLOW_PID" 2>/dev/null || true
     [ -z "$PID" ] || wait "$PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -179,6 +182,9 @@ post '{"action":"sms.send_raw","params":{"sender":"sim2","number":"10086","messa
 post '{"action":"client.rename","params":{"mac":"00:11:22:33:44:55","hostname":"fixture"}}' >/dev/null
 post '{"action":"wifi.configure","params":{"section":"main_2g","ssid":"Fixture New","enabled":true}}' >/dev/null
 post '{"action":"client.block","params":{"mac":"00:11:22:33:44:55"}}' >/dev/null
+code=$(curl -sS -o "$TMP/last-control.json" -w '%{http_code}' -H 'content-type: application/json' \
+    --data-binary '{"action":"multiwan.status","params":{}}' "http://127.0.0.1:$PORT/control")
+[ "$code" = 400 ] || { echo "multiwan.status outside MU5252: HTTP $code" >&2; exit 1; }
 post '{"action":"multiwan.interface.set","params":{"section":"zte_mwan2","enabled":1,"track_ip":"1.1.1.1,8.8.8.8","timeout":5}}' >/dev/null
 post '{"action":"multiwan.member.set","params":{"section":"zte_mwan2_m1","metric":20,"weight":4}}' >/dev/null
 post '{"action":"multiwan.policy.set","params":{"section":"balanced","last_resort":"default","use_member":"zte_mwan2_m1"}}' >/dev/null
@@ -262,7 +268,7 @@ done
 curl -fsS "http://127.0.0.1:$PORT/state" | python3 -c 'import json,sys; assert "hosts_config" not in json.load(sys.stdin)'
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==87+3+3+2, d["control"]; assert {"time.status","time.config.set","time.sync","hosts.status","hosts.save","hosts.restore","device.session.login","datad.ota.set"} <= set(d["control"]); assert "sms.forward.set" in d["control"] and "sms.forward.test" in d["control"]; assert "schedule.task.put" in d["control"] and "schedule.task.remove" in d["control"]; assert "cloud.remote_features.set" in d["control"]; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==88+3+3+2, d["control"]; assert {"time.status","time.config.set","time.sync","hosts.status","hosts.save","hosts.restore","device.session.login","datad.ota.set"} <= set(d["control"]); assert "sms.forward.set" in d["control"] and "sms.forward.test" in d["control"]; assert "schedule.task.put" in d["control"] and "schedule.task.remove" in d["control"]; assert "cloud.remote_features.set" in d["control"]; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "multiwan.status" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"webhook","webhook_url":"https://example.com/hook"}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["enabled"] is False and d["result"]["webhook_configured"] is True; assert "webhook_url" not in d["result"]'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
@@ -400,5 +406,38 @@ grep -F 'delete datad_wifi.datad_ssid_1' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'fan_mode=1' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'custom_pwm_5=255' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'liquid_always_on=0' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
+
+# TopFlow: mwan3 is read only on an explicit multiwan.status request.
+TOPFLOW_PORT=$((PORT + 2))
+TOPFLOW_LOG="$TMP/topflow-calls.log"
+MOCK_MODEL_NAME=MU5252 MOCK_CALL_LOG="$TOPFLOW_LOG" \
+    "$ROOT/rust/target/debug/zwrt-datad" --bind 127.0.0.1 --port "$TOPFLOW_PORT" \
+    --data-dir "$TMP/topflow-data" -i 500 >"$TMP/topflow.log" 2>&1 &
+TOPFLOW_PID=$!
+i=0
+until curl -fsS "http://127.0.0.1:$TOPFLOW_PORT/state" 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("modems") and d["sample_interval_ms"]' 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 400 ] || { cat "$TMP/topflow.log"; exit 1; }
+    sleep 0.05
+done
+sleep 1.5
+curl -fsS "http://127.0.0.1:$TOPFLOW_PORT/state" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert set(d["multiwan"]) == {"mode", "active", "service_running"}, d["multiwan"]
+assert not {"paths", "path_count", "online_path_count"} & set(d["aggregation"]), d["aggregation"]'
+# `! cmd` does not trip `set -e`, so fail explicitly.
+if grep -q -e "^$(printf 'mwan3\tstatus')" -e "$(printf '^uci\t-q show mwan3')" "$TOPFLOW_LOG"; then
+    echo 'periodic sampling read mwan3' >&2
+    exit 1
+fi
+curl -fsS -H 'content-type: application/json' --data-binary '{"action":"multiwan.status","params":{}}' \
+    "http://127.0.0.1:$TOPFLOW_PORT/control" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["result"]
+assert {s["id"]: s["type"] for s in r["sections"]}["balanced"] == "policy", r["sections"]
+assert r["paths"][0]["label"] == "5G" and r["paths"][0]["latency_ms"] == 18.5, r["paths"]
+assert r["path_count"] == len(r["paths"]) and r["online_path_count"] >= 1'
+[ "$(grep -c "^$(printf 'mwan3\tstatus')" "$TOPFLOW_LOG")" = 1 ]
 
 echo 'rust control HTTP fixture: PASS'

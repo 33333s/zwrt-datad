@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.66",
+    "version": "0.10.67",
     "asset": "zwrt-datad-aarch64",
-    "notes": "TopFlow 的 4G1/4G2（外挂 V3E 模块）短信发送暂标记为不支持：直接返回明确的“不支持”错误，不再请求模块网页接口后报 send failed；5G 主卡短信不受影响；MU5250 B29 固件（BD_FLYMODEMMU5250V1.0.0B29）5G 邻区支持：频点补全，不再出现同 PCI 空频点重复行，未测量的 -156 dBm 不再显示为信号值"
+    "notes": "TopFlow 降低采样开销：不再每轮调用 mwan3 status（单次约 1.1 秒）和读取 mwan3 配置；承载链路与多 WAN 配置改由新的只读控制动作 multiwan.status 在打开聚合详情/多 WAN 配置时按需读取，/state 的 aggregation 不再带 paths，multiwan 只保留 mode/active/service_running"
   }
 }
