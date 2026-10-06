@@ -198,6 +198,26 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 ]}}
 ```
 
+## Signaling Stream (U50)
+
+信令采集流由 datad 内嵌的 diag-streamer 提供（`--u50-signaling` 运行时），
+按需启停；状态同时出现在 `state.u50_signaling.stream`。
+
+| action | params | 说明 |
+|---|---|---|
+| `signal.stream.start` | 无 | 启动流转发器，监听 `0.0.0.0:9483`（内网直连，无需 adb）；幂等 |
+| `signal.stream.stop` | 无 | SIGTERM 优雅停止（注销 DCI 订阅后退出）；幂等 |
+| `signal.stream.status` | 无 | 返回 `{available, running, port, bind, clients, subscribed, total, sent, uptime, state, reason}` |
+
+流帧格式与传输特性：
+
+- 每包一帧：`[len u32][code u32][原始 DIAG 日志包]`，单 `writev` 系统调用发送
+- 最多 4 个消费者；TCP_NODELAY、发送超时 2 s、keepalive（30 s 空闲探测）
+- **无消费者时自动取消 DIAG 订阅**（154 码），首个消费者接入即恢复——空闲零开销，
+  无需主动 stop；实测空闲与 ~1800 包/秒转发均低于单核 4%
+- 消费端示例：`build/sigweb-js/relay.py`（`STREAM_HOST=192.168.0.1 python relay.py`
+  走内网；浏览器负责全部解码，设备零解析成本）
+
 ## Safety
 
 - 所有动作必须存在于编译期白名单。
@@ -305,12 +325,13 @@ U50 的 Wi-Fi 动作与主线（U60pro）同名同形：
   无变化不写（`changed:false`）；仅开关变化时只发 `AccessPointSwitchStatus`（官方 WebUI 同款
   最小写）；写后有界回读重试（最长 25 秒）等 AP 自重启。加密名映射：`psk2→WPA2PSK`、
   `psk-mixed→WPAPSKWPA2PSK`、`sae→WPA3PSK`、`sae-mixed→WPA2PSKWPA3PSK`；`none` 清空密码。
-- `wifi.configure` 额外接受 **`channel`（仅 `section:"main_5g"`）**：`"0"` 恢复自动选信道，
-  或标准 5G 信道号（36–165）。写入走官方 `setWiFiChipAdvancedInfo`，重发当前无线模式/
+- `wifi.configure` 额外接受 **`channel`**（`main_5g` 与 `main_2g`）：`"0"` 恢复自动选信道，
+  5G 为标准信道号（36–165），2.4G 为 1–13。写入走官方 `setWiFiChipAdvancedInfo`，重发当前无线模式/
   国家码/带宽仅改信道，回读校验。**DFS 信道（52–64、100–144）开台前有法规强制的
   约 60 秒 CAC 静默**——自动模式挤到 DFS 信道就是 5G 开得慢的根源；钉死
-  36–48 或 149–165 等**非 DFS 信道**即可秒开。信道是整颗射频的设置，只在 5G 主段暴露
-  （2.4G 写入还依赖未经验证的 rate 参数，明确拒绝）。
+  36–48 或 149–165 等**非 DFS 信道**即可秒开。信道是整颗射频的设置，只在主段（`main_2g`/`main_5g`）暴露，访客段拒绝；
+  `wifi.status` 的主段 `channel` 返回 `queryWiFiChipAdvancedInfo` 里的固定信道（`0` 表示自动）。
+  `band.set_lte`/`band.set_nr_*` 传空列表（解锁）改为写入完整工厂频段表，因为 U50 Pro 固件的掩码 `0` 表示“不允许任何频段”。
 - `wifi.set_dual_band`：官方双频合一开关走 `switchWiFiModule` 携带当前开关与 LAN 标志，
   仅写 `wifi_lbd_enable`，回读校验；无变化 `changed:false`。
 - `wifi.set_module`：Wi-Fi 总开关（`switchWiFiModule` + `SwitchOption`），与主线动作名一致。

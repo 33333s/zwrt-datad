@@ -67,6 +67,9 @@ const CFG_KEYS: &[&str] = &[
     "wifi_lbd_enable",
     "wan_connect_status",
     "nr5g_action_band",
+    "nr5g_cell_lock",
+    "lte_pci_lock",
+    "lte_earfcn_lock",
     "nr5g_action_channel",
     "nr5g_pci",
     "Z5g_rsrp",
@@ -448,7 +451,7 @@ fn from_sources(
         net.insert("wan_status".into(), json!(value));
     }
     if let Some(value) = cfg.get("wan_active_band") {
-        net.insert("band".into(), json!(value));
+        net.insert("band".into(), json!(normalize_lte_band(value)));
     }
     if let Some(value) = cfg_number(cfg, "wan_active_channel", 0, 1_000_000) {
         net.insert("lte_channel".into(), json!(value));
@@ -467,6 +470,34 @@ fn from_sources(
     }
     if let Some(value) = cfg.get("nr5g_pci").and_then(|v| hex_number(v, 1007)) {
         net.insert("nr_pci".into(), json!(value));
+    }
+    // Cell-lock readback so clients can show "locked": NR is
+    // "pci,arfcn,band,scs" (unlock sentinel `1,1,1,1`), LTE is the
+    // pci/earfcn pair (0 = unlocked).
+    if let Some(lock) = cfg
+        .get("nr5g_cell_lock")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty() && *v != "1,1,1,1")
+    {
+        let parts: Vec<i64> = lock
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if parts.len() == 4 {
+            net.insert(
+                "nr_cell_lock".into(),
+                json!({"pci": parts[0], "arfcn": parts[1], "band": parts[2], "scs": parts[3]}),
+            );
+        }
+    }
+    if let (Some(pci), Some(earfcn)) = (
+        cfg_number(cfg, "lte_pci_lock", 1, 1007),
+        cfg_number(cfg, "lte_earfcn_lock", 1, 262_143),
+    ) {
+        net.insert(
+            "lte_cell_lock".into(),
+            json!({"pci": pci, "earfcn": earfcn}),
+        );
     }
     if let Some(value) = cfg_number(cfg, "Z5g_rsrp", -160, -20) {
         net.insert("nr_rsrp".into(), json!(value));
@@ -594,6 +625,20 @@ fn hex_number(value: &str, max: u64) -> Option<i64> {
         .and_then(|v| i64::try_from(v).ok())
 }
 
+/// `wan_active_band` arrives from cfg either already normalized ("B3") or as
+/// the firmware's verbose form ("LTE BAND 8"); reduce both to the "B8" form
+/// the state schema documents so clients can parse one shape.
+fn normalize_lte_band(value: &str) -> String {
+    let text = value.trim();
+    text.rsplit(' ')
+        .find(|token| {
+            let digits = token.trim_start_matches(['b', 'B']);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map(|token| format!("B{}", token.trim_start_matches(['b', 'B'])))
+        .unwrap_or_else(|| text.to_owned())
+}
+
 /// Bands from a `0x…` bitmask where bit 0 is band `offset + 1`.
 fn band_mask(value: &str, offset: u32) -> Vec<u32> {
     let digits = value.trim().trim_start_matches("0x");
@@ -687,7 +732,25 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
             net.insert("roaming_allowed".into(), json!(i64::from(value == "on")));
         }
         insert_text(net, "net_select", cfg, "net_select");
-        insert_text(net, "nr_bw", cfg, "bandwidth");
+        // The firmware's `bandwidth` key follows the active RAT: LTE bandwidth
+        // while camped on LTE, NR bandwidth on NR. Route it to the matching
+        // field so LTE mode never labels its bandwidth as `nr_bw`.
+        // network_type reports "SA"/"ENDC" style labels as well as "NR5G".
+        let nr_active = net
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|t| {
+                let t = t.to_ascii_uppercase();
+                t.contains("5G") || t.contains("NR") || t == "SA"
+            })
+            .unwrap_or(false);
+        if let Some(value) = cfg.get("bandwidth").filter(|v| !v.trim().is_empty()) {
+            if nr_active {
+                net.insert("nr_bw".into(), json!(value));
+            } else {
+                net.insert("lte_bw".into(), json!(value));
+            }
+        }
         if let Some(value) = cfg_number(cfg, "Z5g_rsrq", -50, 0) {
             net.insert("nr_rsrq".into(), json!(value));
         }
@@ -1244,6 +1307,9 @@ mod tests {
             ("data_volume_limit_switch".into(), "0".into()),
             ("wifi_5g_enable".into(), "0".into()),
             ("nr5g_action_band".into(), "n78".into()),
+            ("nr5g_cell_lock".into(), "393,627264,78,30".into()),
+            ("lte_pci_lock".into(), "0".into()),
+            ("lte_earfcn_lock".into(), "0".into()),
             ("nr5g_action_channel".into(), "633984".into()),
             ("Z5g_rsrp".into(), "-84".into()),
             ("Z5g_SINR".into(), "2.5".into()),
@@ -1264,6 +1330,9 @@ mod tests {
         assert_eq!(value.fields["clients"]["total"], 2);
         assert_eq!(value.fields["sim"]["current_slot"], 1);
         assert_eq!(value.fields["net"]["band"], "B3");
+        assert_eq!(normalize_lte_band("LTE BAND 8"), "B8");
+        assert_eq!(normalize_lte_band("LTE BAND 41"), "B41");
+        assert_eq!(normalize_lte_band("B3"), "B3");
         assert_eq!(value.fields["net"]["lte_channel"], 1650);
         assert_eq!(value.fields["net"]["nr_band"], "n78");
         assert_eq!(value.fields["net"]["nr_channel"], 633984);
@@ -1279,6 +1348,10 @@ mod tests {
     fn maps_extended_cfg_like_a_real_u50s_on_sa() {
         let cfg: BTreeMap<String, String> = [
             ("model_name", "ZTE U50S"),
+            ("network_type", "SA"),
+            ("nr5g_cell_lock", "393,627264,78,30"),
+            ("lte_pci_lock", "0"),
+            ("lte_earfcn_lock", "0"),
             ("rmcc", "460"),
             ("rmnc", "1"),
             ("rplmn_num", "46001"),
@@ -1327,6 +1400,9 @@ mod tests {
         assert_eq!(state["device"]["api_template_supported"], 1);
         assert_eq!(net["nr_rssi"], -71);
         assert_eq!(net["nr_bw"], "100MHz");
+        assert_eq!(net["nr_cell_lock"]["pci"], 393);
+        assert_eq!(net["nr_cell_lock"]["arfcn"], 627264);
+        assert!(net.get("lte_cell_lock").is_none());
         assert_eq!(net["sa_bands"], "5,7,78,257,258");
         assert_eq!(net["nr5g_sa_band_lock"], "5,7,78,257,258");
         assert_eq!(state["dhcp"]["leasetime"], "24h");

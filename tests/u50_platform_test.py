@@ -454,6 +454,9 @@ esac
 
         status, result = control(port, "network.set_mode", {"mode": "Only_5G"})
         assert status == 200 and result["result"] == {"result":"success", "mode": "Only_5G", "verified": True}, result
+        status, result = control(port, "network.set_mode", {"mode": "NSA"})
+        assert status == 200 and result["result"] == {"result":"success", "mode": "LTE_AND_5G", "verified": True}, result
+        assert writes()[-1][2]["BearerPreference"] == "LTE_AND_5G"
         assert control(port, "network.set_mode", {"mode": "rm -rf"})[0] == 400
         # U50 Pro: the input alias maps to 4G_AND_5G and the WL_AND_5G readback
         # still counts as verified.
@@ -510,7 +513,7 @@ esac
         # auto = factory bands (U50 Pro: mask 0 = no service, not auto)
         assert STORE["lte_band_lock"] == "0x000001c200000095"  # factory mask
         assert control(port, "band.set_nr_sa", {"bands": []})[0] == 200
-        assert STORE["nr5g_sa_band_lock"] == "5,7,78"  # factory list
+        assert STORE["nr5g_sa_band_lock"] == "1,3,5,8,28,41,77,78"  # factory list
         # Bands outside the modem's factory tables are refused before any
         # write reaches the firmware (it would store them verbatim and the
         # modem would go offline hunting an unsupported band).
@@ -563,6 +566,12 @@ esac
             {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": 28}], cells
         assert cells["sa"] == [
             {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
+        STORE["network_type"] = "NR5G"
+        status, result = control(port, "neighbor.list", {})
+        assert status == 200, result
+        assert result["result"]["sa"] == [
+            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
+        STORE["network_type"] = "LTE"
 
         # SA neighbor scan: switch to Only_5G (the firmware precondition),
         # scan, poll m_netselect_status, harvest, and restore the mode —
@@ -621,6 +630,11 @@ esac
         # 2.4G accepts 1-13 (and 0=auto); 5G-only channels refuse on 2.4G.
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "36"})[0] == 400
         assert control(port, "wifi.configure", {"section": "main_2g", "channel": "6"})[0] == 200
+        # Guest sections never set the radio channel (a 2.4G value must not reach the 5G radio).
+        for guest in ("guest_2g", "guest_5g"):
+            for channel in ("6", "36", "0"):
+                assert control(port, "wifi.configure", {"section": guest, "channel": channel})[0] == 400, (guest, channel)
+        assert control(port, "wifi.configure", {"section": "main_5g", "channel": "6"})[0] == 400
 
         # 5G channel pinning: the per-radio write re-sends the current
         # advanced set with only the channel moved.
