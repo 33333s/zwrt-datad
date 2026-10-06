@@ -32,6 +32,7 @@ jobs:
       - run: python3 ../tests/u50_candidate_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_platform_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_installer_test.py
+      - run: python3 ../tests/u50pro_deploy_test.py
       - name: Prepare isolated Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/datad-python"

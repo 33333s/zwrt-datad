@@ -441,7 +441,14 @@ impl Ota {
             }
             let staged = self.dir.join("zwrt-datad.new");
             atomic_write(&staged, &data, 0o700)?;
-            format!("DATAD_BINARY_FILE={}", shell_quote(&staged))
+            // DATAD_DIR keeps the installer's binary path correct on layouts
+            // where the data directory is not the /etc_rw default (the U50 Pro
+            // runs everything from /cache/zwrt-datad).
+            format!(
+                "DATAD_DIR={} DATAD_BINARY_FILE={}",
+                shell_quote(&self.dir),
+                shell_quote(&staged)
+            )
         } else {
             format!("DATAD_DOWNLOAD_URL={}", shell_quote(binary_url))
         };
@@ -1085,6 +1092,10 @@ mod tests {
         assert!(
             script.contains("DATAD_BINARY_FILE=") && !script.contains("DATAD_DOWNLOAD_URL"),
             "{script}"
+        );
+        assert!(
+            script.contains("DATAD_DIR="),
+            "the installer must receive the data dir for non-/etc_rw layouts: {script}"
         );
         let _ = fs::remove_file(dir.join("zwrt-datad.new"));
 
