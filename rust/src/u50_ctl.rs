@@ -102,6 +102,10 @@ pub const CONTROLS: &[&str] = &[
     "wifi.set_module",
     "wifi.set_dual_band",
     "wifi.configure",
+    // Daemon-local signaling supervision (not OEM-backed).
+    "signal.stream.start",
+    "signal.stream.stop",
+    "signal.stream.status",
 ];
 
 pub const READ_ACTIONS: &[&str] = &[
@@ -379,11 +383,44 @@ fn neighbor_cells(raw: &str, rat: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Remove serving-cell echoes by RAT, PCI and channel, regardless of row
+/// position. The current network type alone cannot establish whether an
+/// inter-RAT neighbor record is stale; preserve other reported cells.
+fn neighbor_collect(lists: &Value, net: Option<&Value>) -> Vec<Value> {
+    let text = |key: &str| lists.get(key).and_then(Value::as_str).unwrap_or("");
+    // `net` is the state snapshot's net block: pcis/channels arrive there as
+    // validated plain numbers.
+    let serving = |key: &str| net.and_then(|n| n.get(key)).and_then(Value::as_i64);
+    let lte_serving = serving("lte_pci").zip(serving("lte_channel"));
+    let nr_serving = serving("nr_pci").zip(serving("nr_channel"));
+
+    let mut cells = neighbor_cells(text("lte_ngbr_cell_info_ext"), "LTE");
+    cells.extend(neighbor_cells(
+        text("sa_ngbr_cell_manual_result_ext"),
+        "NR5G",
+    ));
+    let is_serving = |cell: &Value, serving: Option<(i64, i64)>| {
+        serving.is_some_and(|(pci, arfcn)| {
+            cell.get("pci").and_then(Value::as_i64) == Some(pci)
+                && cell.get("arfcn").and_then(Value::as_i64) == Some(arfcn)
+        })
+    };
+    cells.retain(|cell| match cell.get("rat").and_then(Value::as_str) {
+        Some("LTE") => !is_serving(cell, lte_serving),
+        Some("NR5G") => !is_serving(cell, nr_serving),
+        _ => true,
+    });
+    cells
+}
+
 fn network_mode(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_uppercase().as_str() {
-        "4G_AND_5G" | "LTE_AND_5G" | "WL_AND_5G" | "AUTO" | "4G/5G" | "4G_5G" => Some("4G_AND_5G"),
+        "4G_AND_5G" | "WL_AND_5G" | "AUTO" | "4G/5G" | "4G_5G" => Some("4G_AND_5G"),
         "ONLY_LTE" | "ONLY_4G" | "4G_ONLY" | "LTE" | "4G" => Some("Only_LTE"),
         "ONLY_5G" | "5G_ONLY" | "NR" | "5G" => Some("Only_5G"),
+        // 仅 NSA 档：LTE 锚点 + NR NSA（与 ZTE WebUI/其他机型的 BearerPreference
+        // 取值一致；OEM 值表中的 NSA_PREFERRED 实测被 modem 拒绝，不可用）
+        "LTE_AND_5G" | "ONLY_NSA" | "NSA" | "5G_NSA" => Some("LTE_AND_5G"),
         _ => None,
     }
 }
@@ -477,7 +514,7 @@ impl Ctl {
         if let Some(sms) = crate::sms::snapshot().await {
             fresh.fields.insert("sms".into(), sms);
         }
-        if let Some(neighbor) = self.neighbor_sample().await {
+        if let Some(neighbor) = self.neighbor_sample(fresh.fields.get("net")).await {
             fresh.fields.insert("neighbor".into(), neighbor);
         }
         *self.last.lock().await = Some(fresh.clone());
@@ -486,26 +523,18 @@ impl Ctl {
 
     /// One neighbor sample when the monitor is enabled: reads both OEM lists,
     /// bumps the generation on change and returns the mainline-shaped object.
-    async fn neighbor_sample(&self) -> Option<Value> {
+    async fn neighbor_sample(&self, net: Option<&Value>) -> Option<Value> {
         let mut state = self.neighbor.lock().await;
         if !state.enabled {
             return Some(self.neighbor_status_locked(&state));
         }
-        let raw = self
+        // One combined batch is refused by the OEM goform reader, so the two
+        // groups are read separately (both key sets are proven accepted).
+        let lists = self
             .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
             .await
             .ok()?;
-        let text = |key: &str| {
-            raw.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned()
-        };
-        let mut cells = neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE");
-        cells.extend(neighbor_cells(
-            &text("sa_ngbr_cell_manual_result_ext"),
-            "NR5G",
-        ));
+        let cells = neighbor_collect(&lists, net);
         let fingerprint = serde_json::to_string(&cells).ok().map_or(0, |text| {
             text.bytes().fold(0u64, |hash, byte| {
                 hash.wrapping_mul(31).wrapping_add(byte as u64)
@@ -560,23 +589,21 @@ impl Ctl {
 
     /// One OEM read of both neighbor lists into the shared state.
     async fn neighbor_refresh(&self, state: &mut NeighborState) {
-        let Ok(raw) = self
+        let Ok(lists) = self
             .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
             .await
         else {
             return;
         };
-        let text = |key: &str| {
-            raw.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned()
-        };
-        let mut cells = neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE");
-        cells.extend(neighbor_cells(
-            &text("sa_ngbr_cell_manual_result_ext"),
-            "NR5G",
-        ));
+        // Serving filter inputs come from the collector snapshot (the same
+        // keys the state exposes), not a second OEM read batch.
+        let net = self
+            .collector
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|snap| snap.fields.get("net").cloned());
+        let cells = neighbor_collect(&lists, net.as_ref());
         let fingerprint = serde_json::to_string(&cells).ok().map_or(0, |text| {
             text.bytes().fold(0u64, |hash, byte| {
                 hash.wrapping_mul(31).wrapping_add(byte as u64)
@@ -588,6 +615,37 @@ impl Ctl {
         }
         state.cells = cells;
         state.sampled_ms = Some(now_ms());
+    }
+
+    /// `neighbor.list` 读模型：两表 + 服务回声过滤（与监视/扫描同规则）。
+    async fn neighbor_list(&self) -> Result<Value, String> {
+        let raw = self
+            .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
+            .await?;
+        let net = self
+            .collector
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|snap| snap.fields.get("net").cloned());
+        let cells = neighbor_collect(&raw, net.as_ref());
+        let network_type = raw
+            .get("network_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        // The firmware refreshes the LTE/NSA list by itself while registered
+        // there; the SA list only changes after a manual scan (scan_sa).
+        let primary = if network_type == "SA" { "sa" } else { "lte" };
+        let (lte, sa): (Vec<&Value>, Vec<&Value>) = cells
+            .iter()
+            .partition(|c| c.get("rat").and_then(Value::as_str) == Some("LTE"));
+        Ok(json!({
+            "network_type": network_type,
+            "primary": primary,
+            "lte": lte,
+            "sa": sa,
+        }))
     }
 
     pub async fn neighbor_status(&self) -> Result<Value, String> {
@@ -1157,28 +1215,7 @@ impl Ctl {
                     "WiFiDualBandSupported":"1","WiFiDualBandEnabled":if enabled {"1"} else {"0"},
                     "BandSteeringSwitch":if enabled {"1"} else {"0"}}))
             }),
-            "neighbor.list" => self
-                .read("network_type,lte_ngbr_cell_info_ext,sa_ngbr_cell_manual_result_ext")
-                .await
-                .map(|raw| {
-                    let text = |key: &str| {
-                        raw.get(key)
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned()
-                    };
-                    let network_type = text("network_type");
-                    // The firmware refreshes the LTE/NSA list by itself while
-                    // registered there; the SA list only changes after a manual
-                    // scan (neighbor.scan_sa).
-                    let primary = if network_type == "SA" { "sa" } else { "lte" };
-                    json!({
-                        "network_type": network_type,
-                        "primary": primary,
-                        "lte": neighbor_cells(&text("lte_ngbr_cell_info_ext"), "LTE"),
-                        "sa": neighbor_cells(&text("sa_ngbr_cell_manual_result_ext"), "NR5G"),
-                    })
-                }),
+            "neighbor.list" => self.neighbor_list().await,
             "apn.list" => self.apn_panel_config().await.map(|config| {
                 let profiles = |key: &str| {
                     let items = config[key].as_array().into_iter().flatten().map(|row|json!({
@@ -1724,7 +1761,20 @@ impl Ctl {
         if !failure.is_empty() {
             return Outcome::Failed(failure);
         }
-        let list = neighbor_cells(&cells, "NR5G");
+        // The scan table's first row is the serving cell itself — the signal
+        // page shows scan results, so apply the same serving-echo filter as
+        // the neighbor monitor (network_type from the same read cycle).
+        let lists = json!({
+            "network_type": "NR5G",
+            "sa_ngbr_cell_manual_result_ext": cells,
+        });
+        let net = self
+            .collector
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|snap| snap.fields.get("net").cloned());
+        let list = neighbor_collect(&lists, net.as_ref());
         Outcome::Ok(json!({
             "result": "success",
             "cells": list,
@@ -2303,7 +2353,7 @@ impl Ctl {
             Some(mode) => mode,
             None => {
                 return Outcome::Invalid(
-                    "mode must be 4G_AND_5G/auto, Only_LTE/4G or Only_5G/5G".into(),
+                    "mode must be 4G_AND_5G/auto, Only_LTE/4G, Only_5G/5G or LTE_AND_5G/nsa".into(),
                 );
             }
         };
@@ -2380,6 +2430,73 @@ mod tests {
         assert!(integer(&json!({"a":"x"}), "a").is_err());
         assert!(integer(&json!({"a":1.5}), "a").is_err());
     }
+
+    #[test]
+    fn neighbor_collect_drops_only_matching_serving_cells() {
+        // LTE 服务小区被过滤；没有 NR 服务信息时，不按驻网制式丢弃 NR 表。
+        let lte = "3740,36,-87,-10,8;3740,434,-93,-16,8;3740,161,-98,-20,8";
+        let nr = "36,633984,-85,12,78;501,432410,-101,4,78";
+        // NR 列表：首行 = NR 服务小区（pci 36 / 633984），次行 = 真邻区 501
+        let lists = json!({
+            "network_type": "LTE",
+            "lte_ngbr_cell_info_ext": lte,
+            "sa_ngbr_cell_manual_result_ext": nr,
+        });
+        let net = json!({
+            "type": "LTE",
+            "lte_pci": 36,
+            "lte_channel": 3740,
+        });
+        let cells = neighbor_collect(&lists, Some(&net));
+        assert_eq!(cells.len(), 4, "{cells:?}");
+        assert_eq!(cells.iter().filter(|c| c["rat"] == "NR5G").count(), 2);
+        assert!(
+            cells
+                .iter()
+                .any(|c| c["rat"] == "NR5G" && c["pci"] == json!(36))
+        );
+        assert!(
+            !cells
+                .iter()
+                .any(|c| c["rat"] == "LTE" && c["pci"] == json!(36))
+        );
+        assert_eq!(neighbor_collect(&lists, None).len(), 5);
+
+        // NR 模式：NR 列表首行 = NR 服务小区（pci 36 / 633984）被过滤，
+        // 真邻区保留，LTE 锚点也按 LTE 服务键过滤。
+        let lists = json!({
+            "network_type": "NR5G",
+            "lte_ngbr_cell_info_ext": lte,
+            "sa_ngbr_cell_manual_result_ext": nr,
+        });
+        let net = json!({
+            "type": "NR5G",
+            "lte_pci": 36,
+            "lte_channel": 3740,
+            "nr_pci": 36,
+            "nr_channel": 633984,
+            "nr_band": "n78",
+        });
+        let cells = neighbor_collect(&lists, Some(&net));
+        // LTE 剩 434/161 + NR 剩 501，服务回声 36 全部消失
+        assert_eq!(cells.len(), 3, "{cells:?}");
+        assert!(
+            cells
+                .iter()
+                .any(|c| c["rat"] == "NR5G" && c["pci"] == json!(501))
+        );
+        assert!(cells.iter().all(|c| c["pci"] != json!(36)));
+
+        // 第一行可是真邻区；同 PCI 不同频道也必须保留。
+        let lists = json!({
+            "lte_ngbr_cell_info_ext": "3741,36,-93,-16,8;3740,36,-87,-10,8",
+            "sa_ngbr_cell_manual_result_ext": "36,633985,-101,4,78;36,633984,-85,12,78",
+        });
+        let cells = neighbor_collect(&lists, Some(&net));
+        assert_eq!(cells.len(), 2, "{cells:?}");
+        assert_eq!(cells[0]["arfcn"], 3741);
+        assert_eq!(cells[1]["arfcn"], 633985);
+    }
 }
 
 #[cfg(test)]
@@ -2426,7 +2543,10 @@ mod band_mode_tests {
         for value in ["Only_5G", "5G", "NR"] {
             assert_eq!(network_mode(value), Some("Only_5G"));
         }
-        for value in ["5G_NSA", "garbage", "rm -rf"] {
+        for value in ["LTE_AND_5G", "ONLY_NSA", "NSA", "5G_NSA"] {
+            assert_eq!(network_mode(value), Some("LTE_AND_5G"));
+        }
+        for value in ["garbage", "rm -rf"] {
             assert_eq!(network_mode(value), None);
         }
     }

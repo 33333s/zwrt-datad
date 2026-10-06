@@ -1,0 +1,32 @@
+#!/bin/sh
+# Generated, pinned U50 Pro bootstrap. No curl/wget required.
+(
+set -eu
+umask 077
+base=${DATAD_BASE_URL:-${1:-@BASE_URL@}}
+base=${base%/}
+case "$base" in http://?*|https://?*) ;; *) echo 'Set DATAD_BASE_URL to the release directory' >&2; exit 1 ;; esac
+case "${DATAD_TLS_INSECURE:-0}" in 0|1) ;; *) echo 'DATAD_TLS_INSECURE must be 0 or 1' >&2; exit 1 ;; esac
+[ "$(uname -m)" = armv7l ] && [ "$(cfg get model_name)" = MU5120 ] || exit 1
+d=$(mktemp -d /tmp/ug.XXXXXX)
+trap 'rm -f "$d/g" "$d/out"; rmdir "$d"' EXIT
+printf %s '@PAYLOAD@' | base64 -d | gzip -d > "$d/g"
+printf '%s  %s\n' '@TINY_SHA@' "$d/g" | sha256sum -c - >/dev/null
+chmod 700 "$d/g"
+fetch() {
+    if [ "${DATAD_TLS_INSECURE:-0}" = 1 ]; then "$d/g" "$1" --insecure
+    elif [ -n "${DATAD_CA_FILE:-}" ]; then "$d/g" "$1" "$DATAD_CA_FILE"
+    else "$d/g" "$1"; fi
+}
+attempt=1
+while :; do
+    echo "Downloading checked installer ($attempt/3)..."
+    if fetch "$base/install-datad.sh" > "$d/out"; then break; else rc=$?; fi
+    echo "Download failed (libcurl exit $rc)" >&2
+    [ "$attempt" -lt 3 ] || exit "$rc"
+    attempt=$((attempt + 1))
+done
+printf '%s  %s\n' '@INSTALLER_SHA@' "$d/out" | sha256sum -c - || exit 1
+# Keep the helper alive until the installer has downloaded the pinned daemon.
+DATAD_BASE_URL="$base" DATAD_DOWNLOADER="$d/g" sh "$d/out"
+)

@@ -1,0 +1,123 @@
+#!/bin/sh
+# Generated U50 Pro / MU5120 installer. Run on the modem as root.
+# Helpers and binary digest are pinned together by package-u50pro.py.
+set -eu
+umask 077
+DEFAULT_BASE_URL='@BASE_URL@'
+EXPECTED_SHA='@SHA256@'
+EXPECTED_BYTES=@BYTES@
+EXPECTED_VERSION='@VERSION@'
+DIR=/cache/zwrt-datad
+BASE_URL=${DATAD_BASE_URL:-${1:-$DEFAULT_BASE_URL}}
+BASE_URL=${BASE_URL%/}
+die() { echo "install-datad: $*" >&2; exit 1; }
+
+case "$BASE_URL" in http://?*|https://?*) ;; *) die 'set DATAD_BASE_URL to your HTTP(S) release directory' ;; esac
+case "${DATAD_TLS_INSECURE:-0}" in 0|1) ;; *) die 'DATAD_TLS_INSECURE must be 0 or 1' ;; esac
+if [ -n "${DATAD_DOWNLOADER:-}" ]; then
+    case "$DATAD_DOWNLOADER" in /*) ;; *) die 'DATAD_DOWNLOADER must be an absolute path' ;; esac
+    [ -x "$DATAD_DOWNLOADER" ] || die 'download helper is not executable'
+else
+    command -v curl >/dev/null 2>&1 || die 'curl missing; use bootstrap-u50pro.sh, or the offline Go installer'
+fi
+for tool in sha256sum od tr awk df tail wc mktemp timeout nohup cfg uname id; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing command: $tool"
+done
+[ "$(id -u)" = 0 ] || die 'root is required'
+[ "$(uname -m)" = armv7l ] || die 'this installer is for ARMv7 only'
+[ "$(cfg get model_name)" = MU5120 ] || die 'this installer is for U50 Pro / MU5120 only'
+[ ! -L "$DIR" ] || die 'refusing a symlinked installation directory'
+mkdir -p "$DIR"
+[ ! -e "$DIR/.deploy-lock" ] || die 'another deployment holds the lock; inspect it before retrying'
+required_kb=$(( (EXPECTED_BYTES * 3 + 4194304 + 1023) / 1024 ))
+free_kb=$(df -Pk "$DIR" | tail -1 | awk '{print $4}')
+case "$free_kb" in ''|*[!0-9]*) die 'cannot determine free space' ;; esac
+[ "$free_kb" -ge "$required_kb" ] || die "need at least $required_kb KiB free in /cache"
+STAGE=$(mktemp -d "$DIR/.deploy.XXXXXX")
+echo "[1/4] Downloading zwrt-datad $EXPECTED_VERSION"
+echo "Deployment logs: $STAGE"
+download_binary() {
+    url=$BASE_URL/zwrt-datad-armv7
+    if [ -n "${DATAD_DOWNLOADER:-}" ]; then
+        attempt=1
+        while :; do
+            echo "Download attempt $attempt/3"
+            if [ "${DATAD_TLS_INSECURE:-0}" = 1 ]; then
+                set -- "$url" --insecure
+            elif [ -n "${DATAD_CA_FILE:-}" ]; then
+                set -- "$url" "$DATAD_CA_FILE"
+            else set -- "$url"; fi
+            if "$DATAD_DOWNLOADER" "$@" > "$STAGE/zwrt-datad.download"; then return 0; else rc=$?; fi
+            echo "Download failed (libcurl exit $rc)" >&2
+            [ "$attempt" -lt 3 ] || return "$rc"
+            attempt=$((attempt + 1))
+        done
+    else
+        set -- -4fL --retry 3 --connect-timeout 15 --max-time 600 --proto '=http,https' --proto-redir '=http,https'
+        if [ "${DATAD_TLS_INSECURE:-0}" = 1 ]; then set -- "$@" --insecure
+        elif [ -n "${DATAD_CA_FILE:-}" ]; then set -- "$@" --cacert "$DATAD_CA_FILE"; fi
+        curl "$@" "$url" -o "$STAGE/zwrt-datad.download"
+    fi
+}
+if ! download_binary; then
+    rm -f "$STAGE/zwrt-datad.download"
+    die 'download failed; installed service unchanged'
+fi
+echo '[2/4] Checking size, SHA-256, architecture and version'
+[ "$(wc -c < "$STAGE/zwrt-datad.download" | tr -d ' ')" = "$EXPECTED_BYTES" ] || die 'binary size mismatch; installed service unchanged'
+printf '%s  %s\n' "$EXPECTED_SHA" "$STAGE/zwrt-datad.download" | sha256sum -c - || die 'SHA-256 mismatch; installed service unchanged'
+[ "$(od -An -tx1 -N6 "$STAGE/zwrt-datad.download" | tr -d ' \n\r')" = 7f454c460101 ] || die 'expected ELF32 little-endian'
+[ "$(od -An -tx1 -j18 -N2 "$STAGE/zwrt-datad.download" | tr -d ' \n\r')" = 2800 ] || die 'expected ARM binary'
+mv "$STAGE/zwrt-datad.download" "$STAGE/zwrt-datad"
+chmod 700 "$STAGE/zwrt-datad"
+version=$(timeout 10 "$STAGE/zwrt-datad" --version) || die 'binary cannot run; installed service unchanged'
+[ "$version" = "zwrt-datad $EXPECTED_VERSION" ] || die 'unexpected binary version; installed service unchanged'
+
+cat > "$STAGE/service-control.sh" <<'U50_SERVICE_EOF'
+@SERVICE@
+U50_SERVICE_EOF
+cat > "$STAGE/deploy-transaction.sh" <<'U50_TRANSACTION_EOF'
+@TRANSACTION@
+U50_TRANSACTION_EOF
+cat > "$STAGE/start.sh" <<'U50_START_EOF'
+#!/bin/sh
+. /cache/zwrt-datad/service-control.sh
+start_service
+U50_START_EOF
+cat > "$STAGE/zwrt-datad.service" <<'U50_UNIT_EOF'
+[Unit]
+Description=zwrt-datad (ZWRT backend daemon, U50 Pro)
+RequiresMountsFor=/cache
+After=local-fs.target
+
+[Service]
+ExecStart=/cache/zwrt-datad/zwrt-datad --u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling --bind 127.0.0.1 --port 9460
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+U50_UNIT_EOF
+(cd "$STAGE" && sha256sum zwrt-datad start.sh zwrt-datad.service service-control.sh deploy-transaction.sh > SHA256SUMS)
+echo '[3/4] Installing and checking service health (usually 10-30 seconds)'
+# Survives loss of SSH/ADB; the transaction, not this launcher, owns rollback.
+nohup sh "$STAGE/deploy-transaction.sh" "$STAGE" > "$STAGE/deploy.log" 2>&1 < /dev/null &
+i=0
+while [ "$i" -lt 90 ]; do
+    result=$(cat "$STAGE/result" 2>/dev/null || true)
+    case "$result" in
+        SUCCESS*)
+            echo "[4/4] $result"
+            echo 'App: ZWRT mode, device LAN IP, port 9461, admin + device web password'
+            case "$result" in
+                'SUCCESS: session;'*) echo 'No boot autostart: after reboot run sh /cache/zwrt-datad/start.sh' ;;
+            esac
+            exit 0 ;;
+        FAILED*)
+            cat "$STAGE/deploy.log" >&2 || true
+            die "$result" ;;
+    esac
+    sleep 2
+    i=$((i + 1))
+done
+die "transaction still unconfirmed; inspect $STAGE/result and deploy.log before retrying"

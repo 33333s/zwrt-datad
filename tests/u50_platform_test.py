@@ -454,6 +454,9 @@ esac
 
         status, result = control(port, "network.set_mode", {"mode": "Only_5G"})
         assert status == 200 and result["result"] == {"result":"success", "mode": "Only_5G", "verified": True}, result
+        status, result = control(port, "network.set_mode", {"mode": "NSA"})
+        assert status == 200 and result["result"] == {"result":"success", "mode": "LTE_AND_5G", "verified": True}, result
+        assert writes()[-1][2]["BearerPreference"] == "LTE_AND_5G"
         assert control(port, "network.set_mode", {"mode": "rm -rf"})[0] == 400
         # U50 Pro: the input alias maps to 4G_AND_5G and the WL_AND_5G readback
         # still counts as verified.
@@ -563,6 +566,12 @@ esac
             {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": 28}], cells
         assert cells["sa"] == [
             {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
+        STORE["network_type"] = "NR5G"
+        status, result = control(port, "neighbor.list", {})
+        assert status == 200, result
+        assert result["result"]["sa"] == [
+            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
+        STORE["network_type"] = "LTE"
 
         # SA neighbor scan: switch to Only_5G (the firmware precondition),
         # scan, poll m_netselect_status, harvest, and restore the mode —

@@ -57,6 +57,7 @@ pub(crate) struct Inner {
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
     sse_slots: Arc<Semaphore>,
+    signal_slots: Arc<Semaphore>,
     cloud: RwLock<Cloud>,
     pub(crate) ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
@@ -316,6 +317,7 @@ impl App {
                 sessions: Mutex::new(Sessions::default()),
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
+                signal_slots: Arc::new(Semaphore::new(4)),
                 webshell: WebShell::new(webshell_enabled),
                 history: Mutex::new(history),
                 history_tx,
@@ -602,6 +604,7 @@ impl App {
                 post(identity_sign).layer(RequestBodyLimitLayer::new(2048)),
             )
             .route("/events", get(events))
+            .route("/signal/stream", get(signal_stream))
             .route("/capabilities", get(capabilities))
             .route("/ubus", get(ubus_list))
             .route("/ubus/list", get(ubus_list))
@@ -1219,6 +1222,108 @@ async fn events(State(app): State<App>) -> Response {
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response()
+}
+
+/// DIAG never leaves loopback until the caller's login token is validated.
+/// This explicit check also covers the normally trusted local HTTP listener.
+async fn signal_stream(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !signal_token_valid(&app, &token).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(permit) = app.inner.signal_slots.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    // Startup/materialization are synchronous and must not block Tokio workers.
+    match tokio::task::spawn_blocking(crate::u50_signal::stream_start).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "signal streamer unavailable",
+            )
+                .into_response();
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let socket = loop {
+        match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, crate::u50_signal::STREAM_PORT))
+            .await
+        {
+            Ok(s) => break s,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(_) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "signal streamer not ready")
+                    .into_response();
+            }
+        }
+    };
+    let stream = signal_body(socket, permit, move || {
+        let app = app.clone();
+        let token = token.clone();
+        async move { signal_token_valid(&app, &token).await }
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::HeaderName::from_static("x-signal-framing"),
+                "diag-le32-v1",
+            ),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn signal_token_valid(app: &App, token: &str) -> bool {
+    static_token_valid(app.inner.token.as_deref(), Some(token))
+        || app.inner.sessions.lock().await.validate(token)
+}
+
+fn signal_body<F, V>(
+    socket: tokio::net::TcpStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    validate: F,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> + Send
+where
+    F: FnMut() -> V + Send,
+    V: std::future::Future<Output = bool> + Send,
+{
+    use tokio::io::AsyncReadExt;
+    futures_util::stream::unfold(
+        (socket, permit, validate, tokio::time::Instant::now()),
+        |(mut socket, permit, mut validate, mut checked)| async move {
+            let mut buffer = vec![0u8; 32 * 1024];
+            loop {
+                if checked.elapsed() >= Duration::from_secs(10) {
+                    if !validate().await {
+                        return None;
+                    }
+                    checked = tokio::time::Instant::now();
+                }
+                match tokio::time::timeout(Duration::from_secs(1), socket.read(&mut buffer)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => return None,
+                    Ok(Ok(n)) => {
+                        buffer.truncate(n);
+                        return Some((Ok(buffer), (socket, permit, validate, checked)));
+                    }
+                    Err(_) => continue,
+                }
+            }
+        },
+    )
 }
 #[derive(Deserialize)]
 struct ListQuery {
@@ -1871,6 +1976,77 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn signal_stream_preserves_frames_without_per_packet_auth_and_releases_slot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut producer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (consumer, _) = listener.accept().await.unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = validations.clone();
+        let mut body = Box::pin(signal_body(consumer, permit, move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(true)
+        }));
+        let frame = [4, 0, 0, 0, 0x21, 0xb8, 0, 0, 1, 2, 3, 4];
+        // Real TCP with many records: auth runs at connection/time boundaries,
+        // never once per record. HTTP chunk boundaries may split DIAG frames.
+        for _ in 0..100 {
+            producer.write_all(&frame).await.unwrap();
+            let mut received = Vec::new();
+            while received.len() < frame.len() {
+                received.extend(
+                    tokio::time::timeout(Duration::from_secs(2), body.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            assert_eq!(received, frame);
+        }
+        assert_eq!(validations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(slots.available_permits(), 0);
+        drop(body);
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), producer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_stream_closes_when_token_becomes_invalid_even_while_idle() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let _producer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (consumer, _) = listener.accept().await.unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let mut body = Box::pin(signal_body(consumer, permit, || std::future::ready(false)));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(13), body.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slots.available_permits(), 1);
+    }
+
     #[test]
     fn cors_origins_are_limited_to_the_local_network() {
         for allowed in [
@@ -1914,8 +2090,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 87);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 87);
+        assert_eq!(controls.len(), 90);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 90);
     }
 
     #[test]

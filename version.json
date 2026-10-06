@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.67",
+    "version": "0.10.68",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro OEM 会话过期自动重登 + /state.traffic 当日流量（day_rx/day_tx + today_rx/today_tx）"
+    "notes": "U50 Pro 解锁频段=写完整工厂频段表（修掩码0导致无服务）；信道钉选 5G+2.4G；OEM 自动重登；当日流量"
   }
 }

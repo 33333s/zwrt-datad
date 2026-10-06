@@ -198,6 +198,32 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 ]}}
 ```
 
+## Signaling Stream (U50)
+
+信令采集流由 datad 内嵌的 diag-streamer 提供（`--u50-signaling` 运行时），
+按需启停；状态同时出现在 `state.u50_signaling.stream`。
+
+| action | params | 说明 |
+|---|---|---|
+| `signal.stream.start` | 无 | 启动内部流转发器，仅监听 `127.0.0.1:9483`；幂等；返回鉴权接口路径 |
+| `signal.stream.stop` | 无 | SIGTERM 优雅停止（注销 DCI 订阅后退出）；幂等 |
+| `signal.stream.status` | 无 | 返回 `{available, running, transport, path, auth_required, port, bind, clients, subscribed, total, sent, uptime, state, reason}`；port 为内部端口 |
+
+流帧格式与传输特性：
+
+- 对外入口：datad HTTP 端口（通常 9461）的 `GET /signal/stream`，必须带
+  `Authorization: Bearer <登录令牌>`。本机 HTTP 入口也必须鉴权；不支持 URL 令牌。
+  连接时自动启动采集，无须先调用 start。未登录返回 401，连接数满返回 429，采集不可用返回 503。
+- 一条 HTTP 长连接持续传输二进制，每包一帧：`[len u32 LE][code u32 LE][原始 DIAG 日志包]`。
+  响应头为 `Content-Type: application/octet-stream`、`X-Signal-Framing: diag-le32-v1`，
+  `Cache-Control: no-store`；HTTP chunk 边界不等于信令帧边界。
+- 连接时验证令牌，之后每 10 秒内存复查一次，不按信令逐包鉴权；令牌失效则断开。
+  最多 4 个消费者；客户端断开会释放对应内部连接。
+- **无消费者时自动取消 DIAG 订阅**（154 码），首个消费者接入即恢复，无需主动 stop。
+  所有信令解码仍在客户端进行。
+- App 和 datad 必须配套升级；旧版直连 LAN 9483 的客户端需要改用上述接口。
+  旧设备端在升级前仍有裸 TCP 暴露问题，修改 App 本身不能修复设备端。
+
 ## Safety
 
 - 所有动作必须存在于编译期白名单。

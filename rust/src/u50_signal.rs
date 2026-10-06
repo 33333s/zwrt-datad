@@ -69,6 +69,15 @@ pub fn configure(data_dir: &Path) {
 
 /// The `signaling` state block; refreshed on every state sample.
 pub fn block() -> Value {
+    let mut out = match worker_block() {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    out.insert("stream".into(), stream_status());
+    Value::Object(out)
+}
+
+fn worker_block() -> Value {
     if !ENABLED.get().copied().unwrap_or(false) {
         return json!({"available": false, "enabled": false,
                        "reason": "disabled"});
@@ -190,6 +199,39 @@ fn touch_heartbeat(path: &Path) {
 
 /// Read and age-check the status file; keeps the worker's bounded fields.
 fn read_status(path: &Path, now: SystemTime) -> Option<Map<String, Value>> {
+    read_status_keep(path, now, WORKER_KEEP)
+}
+
+const WORKER_KEEP: &[&str] = &[
+    "state",
+    "reason",
+    "total",
+    "dropped",
+    "rate",
+    "cell",
+    "codes",
+    "pdu_types",
+    "five_qi",
+    "ambr",
+    "nas_last",
+    "nas_ts",
+];
+
+const STREAM_KEEP: &[&str] = &[
+    "state",
+    "reason",
+    "client_id",
+    "pid",
+    "port",
+    "bind",
+    "clients",
+    "subscribed",
+    "total",
+    "sent",
+    "codes",
+];
+
+fn read_status_keep(path: &Path, now: SystemTime, keep: &[&str]) -> Option<Map<String, Value>> {
     let text = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let object = value.as_object()?;
@@ -203,22 +245,8 @@ fn read_status(path: &Path, now: SystemTime) -> Option<Map<String, Value>> {
         return None;
     }
     // Bounded copy: never trust the file with unbounded content.
-    const KEEP: &[&str] = &[
-        "state",
-        "reason",
-        "total",
-        "dropped",
-        "rate",
-        "cell",
-        "codes",
-        "pdu_types",
-        "five_qi",
-        "ambr",
-        "nas_last",
-        "nas_ts",
-    ];
     let mut out = Map::new();
-    for key in KEEP {
+    for key in keep {
         if let Some(v) = object.get(*key) {
             out.insert((*key).into(), bounded(v, 0));
         }
@@ -253,6 +281,7 @@ fn bounded(value: &Value, depth: usize) -> Value {
 /// Stop the worker when the daemon shuts down: SIGTERM first so it can
 /// deregister its DCI client cleanly, then reap.
 pub fn shutdown() {
+    stream_stop().ok();
     if let Ok(mut run) = supervisor().lock()
         && let Some(mut child) = run.child.take()
     {
@@ -263,6 +292,165 @@ pub fn shutdown() {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/* ---- Optional packet streamer (signal.stream.* controls) ----
+ *
+ * The streamer is the same embed-and-supervise scheme as the collector
+ * worker, but on demand: `signal.stream.start` spawns it, `stop` reaps it,
+ * and forwards packets only to the local authenticated HTTP relay. */
+
+const STREAMER_NAME: &str = "diag-streamer";
+const STREAM_STATUS_NAME: &str = "diag-stream-status.json";
+/// Internal loopback transport. Never expose this unauthenticated port to LAN.
+pub const STREAM_PORT: u16 = 9483;
+
+fn streamer_blob() -> Option<&'static [u8]> {
+    (option_env!("DATAD_DIAG_STREAMER_EMBEDDED").unwrap_or("0") == "1")
+        .then(|| include_bytes!(concat!(env!("OUT_DIR"), "/diag-streamer")).as_slice())
+}
+
+struct StreamSupervisor {
+    child: Option<Child>,
+    started_at: Option<std::time::Instant>,
+}
+
+static STREAM_RUN: OnceLock<Mutex<StreamSupervisor>> = OnceLock::new();
+
+fn stream_supervisor() -> &'static Mutex<StreamSupervisor> {
+    STREAM_RUN.get_or_init(|| {
+        Mutex::new(StreamSupervisor {
+            child: None,
+            started_at: None,
+        })
+    })
+}
+
+fn stream_paths(run: &Supervisor) -> Result<(PathBuf, PathBuf, PathBuf), &'static str> {
+    if !ENABLED.get().copied().unwrap_or(false) {
+        return Err("signaling disabled (start with --u50-signaling)");
+    }
+    if run.data_dir.as_os_str().is_empty() {
+        return Err("not_configured");
+    }
+    if streamer_blob().is_none() {
+        return Err("worker_not_built");
+    }
+    Ok((
+        run.data_dir.join(STREAMER_NAME),
+        run.data_dir.join(STREAM_STATUS_NAME),
+        run.data_dir.join(HEARTBEAT_NAME),
+    ))
+}
+
+fn stream_child_alive(srun: &mut StreamSupervisor) -> bool {
+    srun.child
+        .as_mut()
+        .is_some_and(|c| c.try_wait().map(|w| w.is_none()).unwrap_or(false))
+}
+
+/// Current streamer state; shares the supervisor heartbeat so the child can
+/// detect daemon death, and reads its bounded status JSON when running.
+pub fn stream_status() -> Value {
+    let Ok(run) = supervisor().lock() else {
+        return json!({"available": false, "reason": "lock_poisoned"});
+    };
+    match stream_paths(&run) {
+        Ok((worker, status, heartbeat)) => {
+            let mut srun = stream_supervisor()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut out = Map::new();
+            out.insert("available".into(), json!(true));
+            out.insert("port".into(), json!(STREAM_PORT));
+            out.insert("transport".into(), json!("authenticated_http"));
+            out.insert("path".into(), json!("/signal/stream"));
+            out.insert("auth_required".into(), json!(true));
+            if stream_child_alive(&mut srun) {
+                touch_heartbeat(&heartbeat);
+                let uptime = srun
+                    .started_at
+                    .and_then(|at| at.elapsed().as_secs().try_into().ok())
+                    .unwrap_or(0);
+                out.insert("running".into(), json!(true));
+                out.insert("uptime".into(), json!(uptime));
+                if let Some(status) = read_status_keep(&status, SystemTime::now(), STREAM_KEEP) {
+                    for (key, value) in status {
+                        out.insert(key, value);
+                    }
+                }
+            } else {
+                srun.child = None;
+                out.insert("running".into(), json!(false));
+                // A stale status file still explains the last run's outcome.
+                if let Some(status) = read_status_keep(&status, SystemTime::now(), STREAM_KEEP)
+                    && let Some(state) = status.get("state")
+                {
+                    out.insert("last_state".into(), state.clone());
+                }
+            }
+            let _ = worker; // materialized lazily on start
+            Value::Object(out)
+        }
+        Err(reason) => json!({"available": false, "enabled": false, "reason": reason}),
+    }
+}
+
+/// Spawn the streamer on demand. Idempotent: a live child is reported back.
+pub fn stream_start() -> Result<Value, String> {
+    let Ok(run) = supervisor().lock() else {
+        return Err("lock_poisoned".into());
+    };
+    let (worker, status, heartbeat) = stream_paths(&run).map_err(String::from)?;
+    let blob = streamer_blob().expect("checked in stream_paths");
+    materialize_worker(&worker, blob).map_err(String::from)?;
+    let mut srun = stream_supervisor()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if stream_child_alive(&mut srun) {
+        return Ok(
+            json!({"started": true, "already": true, "path":"/signal/stream", "auth_required":true}),
+        );
+    }
+    srun.child = None;
+    match Command::new(&worker)
+        .arg(&status)
+        .arg(&heartbeat)
+        .arg(STREAM_PORT.to_string())
+        // Only the authenticated HTTP handler may relay packets to LAN.
+        .arg("127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            srun.started_at = Some(std::time::Instant::now());
+            srun.child = Some(child);
+            touch_heartbeat(&heartbeat);
+            Ok(json!({"started": true, "path":"/signal/stream", "auth_required":true}))
+        }
+        Err(e) => Err(format!("spawn_failed: {e}")),
+    }
+}
+
+/// Terminate the streamer: SIGTERM for a clean DCI deregistration, then reap.
+pub fn stream_stop() -> Result<Value, String> {
+    let mut srun = stream_supervisor()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some(mut child) = srun.child.take() else {
+        srun.started_at = None;
+        return Ok(json!({"stopped": true, "already": true}));
+    };
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = child.kill();
+    let _ = child.wait();
+    srun.started_at = None;
+    Ok(json!({"stopped": true}))
 }
 
 #[cfg(test)]
@@ -299,6 +487,33 @@ mod tests {
         let old = body.replace(&format!(r#""ts":{now}"#), r#""ts":1000"#);
         let p = write_status_file(&dir, &old);
         assert!(read_status(&p, SystemTime::now()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_status_parse_keeps_stream_fields() {
+        let dir = std::env::temp_dir().join(format!("u50sig-stream-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let body = format!(
+            r#"{{"state":"running","reason":"","client_id":3,"ts":{now},"pid":123,
+            "port":9483,"clients":2,"total":100,"sent":90,"codes":154,"junk":"x"}}"#
+        );
+        let p = dir.join(STREAM_STATUS_NAME);
+        fs::write(&p, &body).unwrap();
+        let st = read_status_keep(&p, SystemTime::now(), STREAM_KEEP).expect("parse");
+        assert_eq!(st["state"], json!("running"));
+        assert_eq!(st["port"], json!(9483));
+        assert_eq!(st["clients"], json!(2));
+        assert_eq!(st["sent"], json!(90));
+        assert!(st.get("junk").is_none(), "unknown fields must be dropped");
+        // stale stream status must not be reported as current
+        let old = body.replace(&format!(r#""ts":{now}"#), r#""ts":1000"#);
+        fs::write(&p, old).unwrap();
+        assert!(read_status_keep(&p, SystemTime::now(), STREAM_KEEP).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

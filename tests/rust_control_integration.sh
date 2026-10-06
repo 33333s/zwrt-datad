@@ -254,7 +254,24 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==87; assert "sms.forward.set" in d["control"] and "sms.forward.test" in d["control"]; assert "schedule.task.put" in d["control"] and "schedule.task.remove" in d["control"]; assert "cloud.remote_features.set" in d["control"]; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+controls = d["controls"]
+assert d["control"] == controls
+assert len(controls) == 90, ("unexpected control count", len(controls))
+assert len(set(controls)) == len(controls), "duplicate control names"
+required = {
+    "sms.forward.set", "sms.forward.test", "schedule.task.put", "schedule.task.remove",
+    "cloud.remote_features.set", "schedule.reboot.set", "speedtest.start", "speedtest.stop",
+    "network.set_mode", "sms.send_raw",
+    "signal.stream.start", "signal.stream.stop", "signal.stream.status",
+}
+assert required <= set(controls), ("missing controls", sorted(required - set(controls)))
+assert d["discovery"] == ["ubus.list", "ubus.list_verbose"]
+assert d["passthrough"] == ["ubus.call"]
+assert d["transport"] == ["http", "sse"]
+'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"webhook","webhook_url":"https://example.com/hook"}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["enabled"] is False and d["result"]["webhook_configured"] is True; assert "webhook_url" not in d["result"]'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]

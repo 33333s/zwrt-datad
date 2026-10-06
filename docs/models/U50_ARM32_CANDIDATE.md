@@ -186,7 +186,123 @@ Firmware differences found on the device and fixed for it:
 - **Battery.** The `battery` node reports current **positive while charging** (the U50S node was negative), so `bat_ua` is normalised against the recognized charging state instead of unconditionally negated. `capacity_mah` falls back to `battery/charge_full` (9532 mAh here) because the U50 Pro has no `battery_zte/nominal_capacity_mah_mbb`; its `charger_connect` is served by the `usb` fallback.
 - **Network mode readback.** The firmware stores the 4G+5G preference as `net_select=WL_AND_5G` while `SET_BEARER_PREFERENCE` still takes `4G_AND_5G`; `network.set_mode` now treats that readback as verified.
 
-**Storage constraint (unresolved).** The U50 Pro `/etc_rw` is only ~5.5 MiB total (the U50S has ~15 MiB) and `/data` is a 2 MiB OEM volume. With the ~4.6 MiB binary installed, the 7 MiB OTA free-space gate can never pass and the staged `zwrt-datad.new` does not fit either, so self-update cannot install on the U50 Pro as provisioned. Deployment needs a maintainer decision (different volume, lower gate with `/tmp` staging, or manual-only updates); the checks in this verification all ran from `/tmp`.
+**Storage and deployment (resolved 2026-10: `/cache` layout).** The U50 Pro `/etc_rw` is only ~5.5 MiB total (the U50S has ~15 MiB) and `/data` is a 2 MiB OEM volume, so neither can hold the binary plus OTA staging. The persistent home is `/cache/zwrt-datad` (cachefs, ~100 MiB free): it survives reboots and factory restore (`rcS-zte` only restores individual config files, it does not format the volume), no FOTA staging uses it (`fota`/`recoveryfs` are dedicated partitions; `qcc.service` only owns `/cache/recovery`), and `/persist` stays untouched because it holds calibration data.
+
+**Autostart on the U50 Pro (persistent unit; factory-diag unlocks the root filesystem).** In normal boots the firmware mounts the root filesystem read-only and the whole UBI device stays in read-only mode (`/sys/class/ubi/ubi0/ro_mode` is 1 and the sysfs attribute is 0444, so a `mount -o remount,rw /` fails at the first flash write with `ubi_eba_write_leb → switch to read-only mode`), and the firmware has no `rc.local` and executes nothing from any writable volume. With the OEM factory-diag mode enabled, UBI attaches read-write and the remount succeeds. `scripts/deploy-u50pro.sh` deploys over adb: it stages the binary with a SHA-256 check into `/cache/zwrt-datad` together with an idempotent `start.sh` and a unit file, then installs the persistent unit into `/etc/systemd/system` (unit plus `multi-user.target.wants` symlink, read-back verified, root filesystem restored to its previous mount state) when writable — verified to auto-start datad on boot — and otherwise falls back to a supervised transient unit via `systemd-run` (`Restart=on-failure`), so an unmodified device still runs after `adb shell sh /cache/zwrt-datad/start.sh`. The service runs with `--u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling`, so the diag collector worker is supervised and the packet streamer is on demand via `signal.stream.start`. Self-update works in this layout because the OTA wrapper now passes `DATAD_DIR` to the installer (its `/etc_rw` default would otherwise misplace the binary); the 7 MiB free-space gate passes trivially on `/cache`. A firmware upgrade rewrites the root filesystem and drops the unit while `/cache` survives — re-running the deploy script (with factory diag enabled) is the documented recovery path.
+
+### Deployment failure handling
+
+Run the host script from the repository, with an explicit modem serial when a
+phone is also attached:
+
+```sh
+bash scripts/deploy-u50pro.sh --serial <modem-adb-serial> build/zwrt-datad-armv7-candidate
+```
+
+The host verifies ELF32/ARM, root access, `MU5120`, `armv7l`, and available cache
+space before staging. The payload includes `u50pro-service.sh` and
+`u50pro-deploy-transaction.sh`; keep these beside the host script. Files are
+hash-checked and the candidate must answer `--version` before the old service
+is stopped. The device runs the transaction under `nohup`, independently of the
+ADB connection. A deployment lock refuses concurrent invocations.
+
+Success requires the running `/proc/<pid>/exe` SHA-256 to match the candidate,
+that same process to own the loopback API listening socket, and an unchanged
+PID/start time for ten seconds. Failed replacement restores the previous binary,
+starter, helper and unit, then verifies the old service. One previous successful
+binary remains at `/cache/zwrt-datad/zwrt-datad.prev`. Other processes are not
+stopped by name; an unrelated listener on port 9460 causes deployment to abort.
+
+Root writes are skipped when UBI is read-only. Otherwise the script restores
+and verifies the original root mount mode, including error exits. It never
+enables factory-diag, modifies calibration partitions, or reboots the device.
+If the kernel refuses mount restoration or service recovery, deployment reports
+failure and retains the backups instead of claiming success.
+
+The host prints the transaction directory `/cache/zwrt-datad/.deploy.<id>`;
+`result` and `deploy.log` remain there. If ADB disconnects, reconnect and inspect
+those files before retrying. A stale `.deploy-lock` is deliberately not removed
+automatically: check its PID and the retained transaction before manual recovery.
+Sudden power loss or SIGKILL cannot run shell cleanup; backups remain available,
+but automatic recovery across those events is not guaranteed.
+
+Offline verification (temporary files and mocked device commands only):
+
+```sh
+python3 tests/u50pro_deploy_test.py
+python3 tests/u50pro_download_test.py
+python3 tests/u50_installer_test.py
+```
+
+These cover successful deployment, first installation, hash/architecture
+rejection, locked UBI, original rw/ro mounts, unrelated ports, socket ownership,
+copy/unit/reload/start/health/remount failures, restart loops, termination,
+concurrent deployment and a detached launcher. The hardened deployment flow has
+not been used to reinstall or reboot the live modem during this review.
+
+### Self-hosted U50 Pro installer
+
+Stock MU5120 firmware may have neither curl nor wget. In that case use the
+native Go installer: [source and build instructions](../../tools/u50pro-installer/README.md).
+It includes HTTPS/CA verification and the same deployment transaction. From
+Windows CMD in `build/deploy_kano` (root ADB already enabled):
+
+```bat
+adb push install-datad-armv7 /cache/install-datad-armv7
+adb shell chmod 700 /cache/install-datad-armv7
+adb shell /cache/install-datad-armv7
+```
+
+Use `--file /cache/zwrt-datad-armv7` for an already pushed binary, or
+`--preflight` for a read-only device check. Download progress and transaction
+output are displayed. After the worker starts, ADB disconnection does not cancel
+installation; inspect the printed staging directory's `worker.log`, `result`
+and `worker-result.json` if reconnecting. Do not launch a second installer while
+the first worker still holds the deployment lock. An unpacked fallback is
+included for firmware that cannot execute the UPX-compressed binary.
+
+The shell-based alternative below uses curl, or the optional tiny downloader.
+
+After building the current ARMv7 candidate, package a self-contained installer
+and its pinned binary (no device configuration is included):
+
+```sh
+python3 scripts/package-u50pro.py --base-url https://YOUR-SERVER/datad/u50pro
+```
+
+Upload `build/deploy_kano/install-datad.sh` and `zwrt-datad-armv7` together to
+that HTTPS directory. Run on the MU5120 itself, in a root shell:
+
+```sh
+curl -4fL --retry 3 https://YOUR-SERVER/datad/u50pro/install-datad.sh -o /tmp/install-datad.sh &&
+sh /tmp/install-datad.sh
+```
+
+Without `--base-url` when packaging, supply the directory at installation time
+with `DATAD_BASE_URL=https://YOUR-SERVER/datad/u50pro sh /tmp/install-datad.sh`.
+The installer embeds the deployment helpers, expected version, size and SHA-256;
+regenerate it whenever the binary changes. It uses the same detached transaction
+and rollback as the ADB deployer. `SUCCESS: session` explicitly means there is
+no boot autostart; it does not unlock root or enable factory-diag.
+
+For U50 Pro firmware with libcurl but no curl/wget command, build the tiny
+ARM downloader and generate the optional pinned bootstrap:
+
+```sh
+sh tools/u50get/build.sh
+python3 scripts/package-u50pro.py --output build/u50pro-tiny \
+  --tiny-downloader build/u50get/u50get-tiny
+```
+
+Upload `install-datad.sh` and `zwrt-datad-armv7` together. Copy the generated
+`bootstrap-u50pro.sh` to the device through ADB, or paste its contents into a
+root shell after setting `export DATAD_BASE_URL='https://YOUR-SERVER/datad/u50pro'`.
+It embeds the downloader and pins both the entry script and daemon hashes;
+rebuild all three files together on updates. No URL is embedded by default.
+HTTP is also supported; HTTPS verifies certificates by default. Optional
+`DATAD_CA_FILE` chooses a CA bundle, or `DATAD_TLS_INSECURE=1` explicitly skips
+certificate checks while retaining the pinned content checks.
+See [tiny downloader instructions](../../tools/u50get/README.md).
 
 ## On-device modem DIAG transport (v0.10.55)
 
@@ -234,3 +350,43 @@ documented-as-unused fourth parameter is dereferenced by the library, so an
 (`[len][code][timestamp][payload]`); decoding RRC reconfigurations into QoS
 identifiers (5QI) is the next milestone — the messages are already captured,
 with the serving cell verified from the log header (PCI/ARFCN).
+
+### On-demand packet streamer (`signal.stream.*`, v0.10.67)
+
+A second embedded worker, `rust/u50_diag_streamer.c` (`DATAD_DIAG_STREAMER`),
+forwards the raw log packets to TCP consumers on demand. It is spawned and
+reaped by the same supervisor through daemon-local control actions (handled
+before the U50 OEM gate in `control::execute`, because they are not
+OEM-backed): `signal.stream.start` / `signal.stream.stop` /
+`signal.stream.status`; `/state` mirrors the status as
+`u50_signaling.stream` and the actions are listed in the U50 `CONTROLS`
+capability set.
+
+Transport and resource profile:
+
+- The raw worker binds **only `127.0.0.1:9483`** and rejects other bind addresses.
+  LAN clients use **`GET /signal/stream`** on the datad HTTP port (normally
+  `9461`), with `Authorization: Bearer <login token>`. This route requires
+  Bearer auth even on the trusted loopback HTTP listener; query tokens and
+  alternative auth headers are rejected. It starts the worker on demand.
+  No unauthenticated raw TCP fallback is provided.
+- A single HTTP connection carries the continuous binary stream, with
+  `Content-Type: application/octet-stream`, `Cache-Control: no-store` and
+  `X-Signal-Framing: diag-le32-v1`. Body framing remains
+  `[len u32 LE][code u32 LE][payload]`; HTTP chunks need not match record boundaries.
+  Auth is checked at connection time and every 10 seconds in memory, not per
+  packet. Invalid sessions close the stream. At most four HTTP streams are
+  allowed; dropping a response releases its loopback socket and slot.
+  The native socket retains `TCP_NODELAY`, a 2 s send timeout and keepalive.
+- Upgrade **both datad and the App**: old Apps using LAN TCP 9483 cannot
+  connect, and the updated App refuses old servers without the authenticated
+  endpoint. Already deployed old datad remains exposed until upgraded.
+- **Idle auto-unsubscribe.** With the last consumer gone the streamer
+  disables the 154-code DIAG subscription and re-enables it on the next
+  accept: a parked streamer dispatches no callbacks at all (its `total`
+  counter freezes). The former direct TCP implementation measured under 4%
+  of one core at idle and ~1800 pkt/s; this is not a performance measurement
+  of the authenticated HTTP relay. Payload decoding stays on the client.
+- Same safety contract as the collector worker: supervisor heartbeat with
+  self-exit, SIGTERM-then-reap on daemon shutdown, atomic bounded status
+  JSON (`subscribed`, `bind`, `clients`, counters) refreshed every second.

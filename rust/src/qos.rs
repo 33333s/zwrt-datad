@@ -302,24 +302,37 @@ impl Cache {
 
 fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
     let mut candidates = Vec::<Candidate>::new();
-    let mut fallback = Candidate::default();
     let mut seq = 0usize;
     for (text, current) in texts {
         let mut context: Option<usize> = None;
         let mut context_left: u8 = 0;
-        let mut pending_qci = None;
+        let mut pending_qci: Option<(i64, Option<i64>)> = None;
         let mut pending_left: u8 = 0;
         for line in text.lines().filter(|line| line.contains("[DATA]")) {
             seq += 1;
             let lower = line.to_ascii_lowercase();
-            let data_context = !["dnn=ims", "dnn=sos", "dnn=emergency", "access_point=ims"]
-                .iter()
-                .any(|v| lower.contains(v))
-                && (lower.contains("dnn=") || lower.contains("access_point="));
+            let network = network_name(&lower);
+            let named_context = lower.contains("dnn") || lower.contains("access_point");
+            if named_context && network.as_deref().is_none_or(|n| !is_data_network(n)) {
+                // IMS/emergency is a boundary, not a line to skip while keeping
+                // the previous internet bearer as the active parsing context.
+                context = None;
+                context_left = 0;
+                pending_qci = None;
+                pending_left = 0;
+                continue;
+            }
+            // OEM default-bearer headers precede their APN record. Never assign
+            // the next header (often IMS QCI 5) to the preceding data APN.
+            let header = network.is_none() && lower.contains("default bearer qci");
+            if header {
+                context = None;
+                context_left = 0;
+            }
             let mut line_candidate = None;
-            if data_context {
-                let cmcc = digits_after_ci(&lower, "mcc");
-                let cmnc = digits_after_ci(&lower, "mnc");
+            if let Some(network) = network {
+                let cmcc = digits_after_ci(&network, "mcc");
+                let cmnc = digits_after_ci(&network, "mnc");
                 let has_plmn = cmcc.is_some() && cmnc.is_some();
                 let rank = if has_plmn {
                     30
@@ -328,26 +341,26 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
                 } else {
                     10
                 };
-                let idx = candidates
-                    .iter()
-                    .position(|c| c.mcc == cmcc && c.mnc == cmnc)
-                    .unwrap_or_else(|| {
-                        candidates.push(Candidate {
-                            current: *current,
-                            mcc: cmcc,
-                            mnc: cmnc,
-                            rank,
-                            seq,
-                            ..Default::default()
-                        });
-                        candidates.len() - 1
-                    });
+                // One record per APN/bearer observation. Equal PLMN does not
+                // mean equal APN; missing fields must not be filled from it.
+                let idx = candidates.len();
+                candidates.push(Candidate {
+                    current: *current,
+                    mcc: cmcc,
+                    mnc: cmnc,
+                    rank,
+                    seq,
+                    ..Default::default()
+                });
                 let c = &mut candidates[idx];
                 c.current |= *current;
                 c.rank = c.rank.max(rank);
                 c.seq = seq;
-                if let Some(qci) = pending_qci.take() {
-                    c.qci = Some(qci);
+                if let Some((qci, cid)) = pending_qci.take() {
+                    let this_cid = digits_after_ci(&lower, "cid");
+                    if cid.is_none() || this_cid.is_none() || cid == this_cid {
+                        c.qci = Some(qci);
+                    }
                 }
                 context = Some(idx);
                 context_left = 4;
@@ -355,16 +368,13 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
                 line_candidate = Some(idx);
             }
             if lower.contains("qci")
-                && let Some(qci) = integer_after_ci(&lower, "qci")
+                && let Some(qci) = integer_after_ci(&lower, "qci").filter(|q| (1..=255).contains(q))
             {
                 if let Some(idx) = context.filter(|_| context_left > 0) {
                     candidates[idx].qci = Some(qci);
-                } else if lower.contains("default bearer qci") {
-                    pending_qci = Some(qci);
-                    pending_left = 4;
-                    fallback.qci.get_or_insert(qci);
-                } else {
-                    fallback.qci.get_or_insert(qci);
+                } else if header {
+                    pending_qci = Some((qci, digits_after_ci(&lower, "cid")));
+                    pending_left = 2;
                 }
             }
             if let Some(idx) = line_candidate {
@@ -399,23 +409,49 @@ fn parse_texts(texts: &[(&str, bool)], mcc: i64, mnc: i64) -> Values {
         }
     };
     candidates.sort_by_key(|c| (score(c), c.seq));
-    let mut selected = candidates.last().cloned().unwrap_or_default();
-    for c in candidates.iter().rev() {
-        if selected.qci.is_none() {
-            selected.qci = c.qci;
-        }
-        if selected.dl.is_none() {
-            selected.dl = c.dl;
-        }
-        if selected.ul.is_none() {
-            selected.ul = c.ul;
-        }
-    }
+    let selected = candidates.last().cloned().unwrap_or_default();
     Values {
-        qci: selected.qci.or(fallback.qci).unwrap_or(0),
+        qci: selected.qci.unwrap_or(0),
         ambr_dl: selected.dl.map(format_mbps).unwrap_or_default(),
         ambr_ul: selected.ul.map(format_mbps).unwrap_or_default(),
     }
+}
+
+fn network_name(line: &str) -> Option<String> {
+    for key in ["dnn", "access_point"] {
+        let Some((_, rest)) = line.split_once(key) else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let name = rest
+            .trim_start()
+            .trim_start_matches(['\'', '"'])
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '\'' | '"'))
+            .next()?
+            .trim_end_matches('.');
+        if !name.is_empty()
+            && name.len() <= 100
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Some(name.into());
+        }
+    }
+    None
+}
+
+fn is_data_network(name: &str) -> bool {
+    !matches!(
+        name.split('.').next().unwrap_or(""),
+        "ims" | "sos" | "emergency" | "xcap" | "mms"
+    )
 }
 
 fn digits_after_ci(s: &str, tag: &str) -> Option<i64> {
@@ -477,6 +513,45 @@ fn format_mbps(v: f64) -> String {
 mod tests {
     use super::*;
     use std::{fs, io::Write};
+
+    #[test]
+    fn internet_and_ims_headers_do_not_overwrite_each_other() {
+        let internet = "[DATA] cid1 LTE default bearer qci = 9\n[DATA] access_point=internet.mnc001.mcc460.gprs apn_ambr_dl_ext=1000.000Mbps apn_ambr_ul_ext=200.000Mbps\n";
+        let ims = "[DATA] cid2 LTE default bearer qci = 5\n[DATA] access_point = \"IMS.mnc001.mcc460.gprs\" apn_ambr_dl_ext=100.000Mbps apn_ambr_ul_ext=100.000Mbps\n[DATA] qci=5\n";
+        for text in [format!("{internet}{ims}"), format!("{ims}{internet}")] {
+            let result = parse_texts(&[(&text, true)], 460, 1);
+            assert_eq!(result.qci, 9);
+            assert_eq!(result.ambr_dl, "1000.000");
+            assert_eq!(result.ambr_ul, "200.000");
+        }
+        assert_eq!(parse_texts(&[(ims, true)], 460, 1), Values::default());
+        assert_eq!(
+            parse_texts(&[("[DATA] default bearer qci = 5\n", true)], 0, 0),
+            Values::default()
+        );
+    }
+
+    #[test]
+    fn qos_fields_are_not_filled_from_other_apns_or_voice_records() {
+        let text = "[DATA] default bearer qci = 9\n[DATA] dnn=internet session_ambr_dl=10 session_ambr_dl_unit=1(100Mbps) session_ambr_ul=2 session_ambr_ul_unit=1(100Mbps)\n[DATA] default bearer qci = 8\n[DATA] dnn=private-data session_ambr_dl=3 session_ambr_dl_unit=1(100Mbps)\n[DATA] dnn = 'ims' qci=5 session_ambr_ul=1 session_ambr_ul_unit=1(100Mbps)\n";
+        let result = parse_texts(&[(text, true)], 0, 0);
+        assert_eq!(result.qci, 8);
+        assert_eq!(result.ambr_dl, "300.000");
+        assert_eq!(result.ambr_ul, "");
+        for name in [
+            "ims",
+            "ims.mnc001.mcc460.gprs",
+            "sos",
+            "emergency",
+            "xcap",
+            "mms",
+        ] {
+            let text = format!(
+                "[DATA] dnn={name} qci=5 session_ambr_dl=1 session_ambr_dl_unit=1(100Mbps)\n"
+            );
+            assert_eq!(parse_texts(&[(&text, true)], 0, 0), Values::default());
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

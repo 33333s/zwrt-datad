@@ -2,6 +2,8 @@
 /zwrt-datad-aarch64
 /build/
 /rust/target/
+__pycache__/
+*.py[cod]
 
 # transient helper scripts
 scripts/_*.sh
