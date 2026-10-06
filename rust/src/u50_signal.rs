@@ -298,12 +298,11 @@ pub fn shutdown() {
  *
  * The streamer is the same embed-and-supervise scheme as the collector
  * worker, but on demand: `signal.stream.start` spawns it, `stop` reaps it,
- * and while it runs it forwards every subscribed log packet to LAN TCP
- * consumers (or a local relay through an adb forward). */
+ * and forwards packets only to the local authenticated HTTP relay. */
 
 const STREAMER_NAME: &str = "diag-streamer";
 const STREAM_STATUS_NAME: &str = "diag-stream-status.json";
-/// The fixed TCP port for LAN consumers and adb-forwarded relays.
+/// Internal loopback transport. Never expose this unauthenticated port to LAN.
 pub const STREAM_PORT: u16 = 9483;
 
 fn streamer_blob() -> Option<&'static [u8]> {
@@ -364,6 +363,9 @@ pub fn stream_status() -> Value {
             let mut out = Map::new();
             out.insert("available".into(), json!(true));
             out.insert("port".into(), json!(STREAM_PORT));
+            out.insert("transport".into(), json!("authenticated_http"));
+            out.insert("path".into(), json!("/signal/stream"));
+            out.insert("auth_required".into(), json!(true));
             if stream_child_alive(&mut srun) {
                 touch_heartbeat(&heartbeat);
                 let uptime = srun
@@ -406,16 +408,17 @@ pub fn stream_start() -> Result<Value, String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     if stream_child_alive(&mut srun) {
-        return Ok(json!({"started": true, "already": true, "port": STREAM_PORT}));
+        return Ok(
+            json!({"started": true, "already": true, "path":"/signal/stream", "auth_required":true}),
+        );
     }
     srun.child = None;
     match Command::new(&worker)
         .arg(&status)
         .arg(&heartbeat)
         .arg(STREAM_PORT.to_string())
-        // LAN consumers connect directly (no adb forward); the streamer
-        // auto-unsubscribes from DIAG while no client is connected.
-        .arg("0.0.0.0")
+        // Only the authenticated HTTP handler may relay packets to LAN.
+        .arg("127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -425,7 +428,7 @@ pub fn stream_start() -> Result<Value, String> {
             srun.started_at = Some(std::time::Instant::now());
             srun.child = Some(child);
             touch_heartbeat(&heartbeat);
-            Ok(json!({"started": true, "port": STREAM_PORT}))
+            Ok(json!({"started": true, "path":"/signal/stream", "auth_required":true}))
         }
         Err(e) => Err(format!("spawn_failed: {e}")),
     }

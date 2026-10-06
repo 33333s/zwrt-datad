@@ -64,7 +64,7 @@ restore_unit() {
     if [ "$had_link" = 1 ]; then
         ln -sfn "$(cat "$STAGE/old.link")" "$WANTS" || return 1
     else rm -f "$WANTS" || return 1; fi
-    systemctl daemon-reload || return 1
+    ctl daemon-reload || return 1
     restore_root || return 1
     unit_changed=0
 }
@@ -75,6 +75,7 @@ finish() {
     set +e
     recovery=ok
     if [ "$committed" != 1 ]; then
+        echo 'Deployment failed; checking/restoring previous installation...'
         if [ "$replacing" = 1 ]; then
             if stop_service; then
                 for file in zwrt-datad start.sh service-control.sh zwrt-datad.service; do
@@ -112,6 +113,7 @@ trap finish EXIT
 trap 'exit 1' HUP INT TERM
 
 cd "$STAGE"
+echo 'Verifying staged files and existing installation...'
 sha256sum -c SHA256SUMS
 . "$STAGE/service-control.sh"
 new_sha=$(binary_sha "$STAGE/zwrt-datad")
@@ -133,8 +135,10 @@ if [ -L "$WANTS" ]; then had_link=1; readlink "$WANTS" > "$STAGE/old.link"
 elif [ -e "$WANTS" ]; then echo 'unexpected regular file at wants link' >&2; exit 1; fi
 
 stopping=1
+echo 'Stopping the owned datad service...'
 stop_service
 replacing=1
+echo 'Installing verified files (previous files backed up)...'
 for file in zwrt-datad start.sh service-control.sh zwrt-datad.service; do
     # Keep the verified staging copy until health is confirmed. Rename on the
     # same volume is atomic; no live executable is truncated in place.
@@ -143,6 +147,7 @@ for file in zwrt-datad start.sh service-control.sh zwrt-datad.service; do
     mv -f "$DIR/$file.deploy-new" "$DIR/$file"
 done
 
+echo 'Configuring startup and restoring original root mount mode...'
 if open_root; then
     unit_changed=1
     cp "$DIR/zwrt-datad.service" "$UNIT_PATH.deploy-new"
@@ -152,7 +157,7 @@ if open_root; then
     ln -sfn ../zwrt-datad.service "$WANTS"
     cmp -s "$DIR/zwrt-datad.service" "$UNIT_PATH"
     [ "$(readlink "$WANTS")" = ../zwrt-datad.service ]
-    systemctl daemon-reload
+    ctl daemon-reload
     restore_root
     mode='persistent boot autostart'
 else
@@ -161,7 +166,9 @@ else
     restore_root
     if [ "$had_unit" = 1 ] && [ "$had_link" = 1 ]; then mode='existing persistent unit'; fi
 fi
+echo 'Starting datad...'
 start_service
+echo "Checking executable and socket ownership; must stay healthy for $STABLE_SECONDS seconds..."
 wait_healthy "$new_sha"
 if [ "$old_binary" = 1 ]; then
     cp -p "$STAGE/old.zwrt-datad" "$DIR/zwrt-datad.prev.new"

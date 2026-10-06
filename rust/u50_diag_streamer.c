@@ -96,7 +96,11 @@ int main(int argc, char **argv) {
     if (port <= 0 || port > 65535) port = 9483;
     const char *bind_addr = argc >= 5 ? argv[4] : "127.0.0.1";
     struct in_addr in;
-    if (!inet_aton(bind_addr, &in)) { write_status(status_path, -1, "error", "bad_bind", port); return 64; }
+    /* Raw DIAG is an internal transport only. Public access is through datad's
+     * authenticated HTTP endpoint; even a stale launcher cannot expose it. */
+    if (!inet_aton(bind_addr, &in) || in.s_addr != htonl(INADDR_LOOPBACK)) {
+        write_status(status_path, -1, "error", "loopback_required", port); return 64;
+    }
     snprintf(g_bind, sizeof(g_bind), "%s", bind_addr);
     signal(SIGINT, on_stop);
     signal(SIGTERM, on_stop);

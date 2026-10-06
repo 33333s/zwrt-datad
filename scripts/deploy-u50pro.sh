@@ -50,7 +50,7 @@ cat > "$stage_dir/zwrt-datad.service" <<'UNIT'
 [Unit]
 Description=zwrt-datad (ZWRT backend daemon, U50 Pro)
 RequiresMountsFor=/cache
-After=multi-user.target
+After=local-fs.target
 
 [Service]
 ExecStart=/cache/zwrt-datad/zwrt-datad --u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling --bind 127.0.0.1 --port 9460

@@ -34,11 +34,12 @@ def start():
  (p/'exe').unlink(missing_ok=True); (p/'exe').symlink_to(data/'zwrt-datad')
  (p/'fd/5').unlink(missing_ok=True); (p/'fd/5').symlink_to('socket:[111]')
  (p/'stat').write_text('4242 (zwrt-datad) S '+'0 '*18+'123\n')
- (proc/'net/tcp').write_text('0: 0100007F:24E4 00000000:0000 0A 0 0 0 0 0 111\n' if fault!='health' or not is_new() else '')
+ (proc/'net/tcp').write_text(f'0: 0100007F:{9460:04X} 00000000:0000 0A 0 0 0 0 0 111\n' if fault!='health' or not is_new() else '')
  state.write_text('active')
 if name in ('systemctl','systemd-run'):
  if name=='systemd-run': (base/'transient').touch(); start(); sys.exit(0)
  cmd=next((x for x in args if x in ('cat','show','stop','start','reset-failed','daemon-reload')), '')
+ if fault=='ctl-timeout' and cmd=='cat': sys.exit(124)
  if cmd=='cat':
   if not unit.exists() and not (base/'transient').exists(): sys.exit(1)
   print('[Service]\nExecStart='+str(data/'zwrt-datad')+' --u50-model u50pro'); sys.exit(0)
@@ -46,7 +47,9 @@ if name in ('systemctl','systemd-run'):
   active=state.read_text() if state.exists() else 'inactive'
   print(('4242' if active=='active' else '0') if 'MainPID' in args else active); sys.exit(0)
  if cmd=='stop': stop()
- if cmd=='start': start()
+ if cmd=='start':
+  if fault=='queued-start' and '--no-block' not in args: sys.exit(1)
+  start()
  if cmd=='daemon-reload' and fault=='reload' and once('reload-failed'): sys.exit(1)
 elif name=='mount':
  readonly='remount,ro' in args
@@ -67,6 +70,7 @@ elif name=='cp':
  if args[-1]==str(data/'zwrt-datad.deploy-new') and fault=='copy' and once('copy-failed'): sys.exit(1)
  src,dst=args[-2:]; shutil.copy2(src,dst)
 elif name=='sleep':
+ p=proc/'uptime'; now=float(p.read_text().split()[0]); p.write_text(f'{now+1:.2f} 0.00\n')
  if fault=='restart-loop' and is_new() and (proc/'4242/stat').exists():
   p=proc/'4242/stat'; fields=p.read_text().split(); fields[21]=str(int(fields[21])+1); p.write_text(' '.join(fields))
 elif name=='sync': pass
@@ -87,6 +91,7 @@ class DeployTest(unittest.TestCase):
         for directory in (self.stage, self.proc/'net', self.system/'multi-user.target.wants', self.tools):
             directory.mkdir(parents=True)
         for name in ('tcp', 'tcp6'): (self.proc/'net'/name).write_text('')
+        (self.proc/'uptime').write_text('0.00 0.00\n')
         (self.base/'mounts').write_text('ubi0:rootfs / ubifs ro,relatime 0 0\n')
         (self.base/'ubi_ro').write_text('0\n')
         for name in ('systemctl', 'systemd-run', 'mount', 'cp', 'sleep', 'sync'):
@@ -139,6 +144,50 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((self.data/'zwrt-datad.prev').read_text(),self.binary('0.0.1'))
         self.assertEqual(self.unit.read_text(),'new unit\n')
         self.assertIn(' ubifs ro,',(self.base/'mounts').read_text())
+
+    def test_systemctl_timeout_never_treated_as_missing_service(self):
+        result = self.run_deploy('ctl-timeout', success=False)
+        self.assertIn('systemctl timed out', result.stderr)
+        self.assert_restored()
+        self.assertNotIn("'stop'", (self.base/'calls').read_text())
+
+    def test_start_does_not_wait_for_unrelated_systemd_jobs(self):
+        self.run_deploy('queued-start')
+        self.assertIn("'--no-block', 'start'", (self.base/'calls').read_text())
+
+    def test_health_uses_elapsed_time_including_probe_cost(self):
+        helper = self.stage/'service-control.sh'
+        # Every probe costs two simulated seconds; sleep advances one more.
+        # A four-second deadline must stop after two probes, not four sleeps.
+        harness = r'''
+. "$1"
+healthy_token() {
+    n=$(cat "$SANDBOX/probes" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$SANDBOX/probes"
+    now=$(awk '{print int($1)}' "$PROC/uptime")
+    echo "$((now + 2)).00 0.00" > "$PROC/uptime"
+    return 1
+}
+wait_healthy unused
+'''
+        p = subprocess.run(['sh', '-c', harness, 'test', str(helper)], env=self.env,
+                           capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual((self.base/'probes').read_text().strip(), '2')
+        self.assertIn('within 4 seconds', p.stderr)
+
+    def test_cached_health_pid_avoids_full_process_rescan(self):
+        digest = hashlib.sha256((self.data/'zwrt-datad').read_bytes()).hexdigest()
+        harness = r'''
+. "$1"
+owned_pids() { echo unexpected-scan >&2; return 1; }
+healthy_token "$2" '4242:123'
+'''
+        p = subprocess.run(['sh', '-c', harness, 'test', str(self.stage/'service-control.sh'), digest],
+                           env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), '4242:123')
+        self.assertNotIn('unexpected-scan', p.stderr)
 
     def test_failures_restore_files_service_and_mount(self):
         for fault in ('start','health','restart-loop','unit-write','reload','copy','remount-ro','interrupt'):
@@ -202,7 +251,7 @@ class DeployTest(unittest.TestCase):
     def test_foreign_listener_does_not_stop_anything(self):
         subprocess.run(['systemctl','stop','zwrt-datad.service'],env=self.env,check=True)
         (self.base/'calls').write_text('')
-        (self.proc/'net/tcp').write_text('0: 0100007F:24E4 00000000:0000 0A 0 0 0 0 0 999\n')
+        (self.proc/'net/tcp').write_text(f'0: 0100007F:{9460:04X} 00000000:0000 0A 0 0 0 0 0 999\n')
         self.run_deploy(success=False)
         self.assertNotIn("'stop'",(self.base/'calls').read_text())
         self.assertEqual((self.data/'zwrt-datad').read_text(),self.binary('0.0.1'))
@@ -248,6 +297,50 @@ elif 'cat /cache/zwrt-datad/.deploy.ABC123/result' in cmd: print('SUCCESS: simul
         free=next(args[1] for args in calls if args[0]=='shell' and 'free=' in args[1])
         self.assertIn('test "$free" -ge ',free)
         self.assertIn("awk '{print $4}'",free)
+
+
+class RealSocketHealthTest(unittest.TestCase):
+    """Use real Linux procfs/socket ownership, independent of the fake tables."""
+
+    def test_actual_port_9460_and_ten_second_stability(self):
+        import select
+        import sys
+        import time
+        with tempfile.TemporaryDirectory(prefix='u50pro-real-socket-') as tmp:
+            data = Path(tmp)
+            binary = data/'zwrt-datad'
+            shutil.copy2(Path(sys.executable).resolve(), binary)
+            helper = data/'service-control.sh'
+            helper.write_text((ROOT/'scripts/u50pro-service.sh').read_text().replace(
+                'DIR=/cache/zwrt-datad', f'DIR={data}'))
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            # Port numbers deliberately come from the datad CLI contract, not
+            # the helper's implementation or a copied hexadecimal constant.
+            for port in (9444, 9460):
+                with self.subTest(port=port):
+                    code = ('import socket,time; s=socket.socket(); '
+                            's.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); '
+                            f's.bind(("127.0.0.1",{port})); s.listen(); '
+                            'print("READY",flush=True); time.sleep(30)')
+                    proc = subprocess.Popen([str(binary), '-c', code], stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True)
+                    try:
+                        self.assertTrue(select.select([proc.stdout], [], [], 5)[0], 'listener failed to start')
+                        self.assertEqual(proc.stdout.readline().strip(), 'READY', 'test port unavailable')
+                        command = 'healthy_token "$2"' if port == 9444 else 'wait_healthy "$2"'
+                        began = time.monotonic()
+                        result = subprocess.run(['sh', '-c', '. "$1"; ' + command,
+                                                 'test', str(helper), digest],
+                                                capture_output=True, text=True, timeout=20)
+                        elapsed = time.monotonic() - began
+                        self.assertEqual(result.returncode == 0, port == 9460, (result.stdout, result.stderr))
+                        if port == 9460:
+                            self.assertGreaterEqual(elapsed, 9.98)
+                            self.assertLess(elapsed, 15)
+                            self.assertIn('Healthy: 10/10 seconds', result.stdout)
+                    finally:
+                        proc.terminate()
+                        proc.communicate(timeout=5)
 
 
 if __name__=='__main__': unittest.main(verbosity=2)

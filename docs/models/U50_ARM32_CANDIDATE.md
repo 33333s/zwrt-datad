@@ -230,6 +230,7 @@ Offline verification (temporary files and mocked device commands only):
 
 ```sh
 python3 tests/u50pro_deploy_test.py
+python3 tests/u50pro_download_test.py
 python3 tests/u50_installer_test.py
 ```
 
@@ -238,6 +239,70 @@ rejection, locked UBI, original rw/ro mounts, unrelated ports, socket ownership,
 copy/unit/reload/start/health/remount failures, restart loops, termination,
 concurrent deployment and a detached launcher. The hardened deployment flow has
 not been used to reinstall or reboot the live modem during this review.
+
+### Self-hosted U50 Pro installer
+
+Stock MU5120 firmware may have neither curl nor wget. In that case use the
+native Go installer: [source and build instructions](../../tools/u50pro-installer/README.md).
+It includes HTTPS/CA verification and the same deployment transaction. From
+Windows CMD in `build/deploy_kano` (root ADB already enabled):
+
+```bat
+adb push install-datad-armv7 /cache/install-datad-armv7
+adb shell chmod 700 /cache/install-datad-armv7
+adb shell /cache/install-datad-armv7
+```
+
+Use `--file /cache/zwrt-datad-armv7` for an already pushed binary, or
+`--preflight` for a read-only device check. Download progress and transaction
+output are displayed. After the worker starts, ADB disconnection does not cancel
+installation; inspect the printed staging directory's `worker.log`, `result`
+and `worker-result.json` if reconnecting. Do not launch a second installer while
+the first worker still holds the deployment lock. An unpacked fallback is
+included for firmware that cannot execute the UPX-compressed binary.
+
+The shell-based alternative below uses curl, or the optional tiny downloader.
+
+After building the current ARMv7 candidate, package a self-contained installer
+and its pinned binary (no device configuration is included):
+
+```sh
+python3 scripts/package-u50pro.py --base-url https://YOUR-SERVER/datad/u50pro
+```
+
+Upload `build/deploy_kano/install-datad.sh` and `zwrt-datad-armv7` together to
+that HTTPS directory. Run on the MU5120 itself, in a root shell:
+
+```sh
+curl -4fL --retry 3 https://YOUR-SERVER/datad/u50pro/install-datad.sh -o /tmp/install-datad.sh &&
+sh /tmp/install-datad.sh
+```
+
+Without `--base-url` when packaging, supply the directory at installation time
+with `DATAD_BASE_URL=https://YOUR-SERVER/datad/u50pro sh /tmp/install-datad.sh`.
+The installer embeds the deployment helpers, expected version, size and SHA-256;
+regenerate it whenever the binary changes. It uses the same detached transaction
+and rollback as the ADB deployer. `SUCCESS: session` explicitly means there is
+no boot autostart; it does not unlock root or enable factory-diag.
+
+For U50 Pro firmware with libcurl but no curl/wget command, build the tiny
+ARM downloader and generate the optional pinned bootstrap:
+
+```sh
+sh tools/u50get/build.sh
+python3 scripts/package-u50pro.py --output build/u50pro-tiny \
+  --tiny-downloader build/u50get/u50get-tiny
+```
+
+Upload `install-datad.sh` and `zwrt-datad-armv7` together. Copy the generated
+`bootstrap-u50pro.sh` to the device through ADB, or paste its contents into a
+root shell after setting `export DATAD_BASE_URL='https://YOUR-SERVER/datad/u50pro'`.
+It embeds the downloader and pins both the entry script and daemon hashes;
+rebuild all three files together on updates. No URL is embedded by default.
+HTTP is also supported; HTTPS verifies certificates by default. Optional
+`DATAD_CA_FILE` chooses a CA bundle, or `DATAD_TLS_INSECURE=1` explicitly skips
+certificate checks while retaining the pinned content checks.
+See [tiny downloader instructions](../../tools/u50get/README.md).
 
 ## On-device modem DIAG transport (v0.10.55)
 
@@ -297,19 +362,31 @@ OEM-backed): `signal.stream.start` / `signal.stream.stop` /
 `u50_signaling.stream` and the actions are listed in the U50 `CONTROLS`
 capability set.
 
-Transport and resource profile, measured on a U50 Pro:
+Transport and resource profile:
 
-- Listens on `0.0.0.0:9483` — LAN consumers connect directly to the router's
-  LAN address (e.g. `192.168.0.1:9483`), no adb/USB involvement. Each packet
-  goes out as one `writev` (`[len u32][code u32][payload]`), at most 4
-  consumers, `TCP_NODELAY`, 2 s send timeout, and 30 s TCP keepalive so
-  vanished consumers release their slot within a minute.
+- The raw worker binds **only `127.0.0.1:9483`** and rejects other bind addresses.
+  LAN clients use **`GET /signal/stream`** on the datad HTTP port (normally
+  `9461`), with `Authorization: Bearer <login token>`. This route requires
+  Bearer auth even on the trusted loopback HTTP listener; query tokens and
+  alternative auth headers are rejected. It starts the worker on demand.
+  No unauthenticated raw TCP fallback is provided.
+- A single HTTP connection carries the continuous binary stream, with
+  `Content-Type: application/octet-stream`, `Cache-Control: no-store` and
+  `X-Signal-Framing: diag-le32-v1`. Body framing remains
+  `[len u32 LE][code u32 LE][payload]`; HTTP chunks need not match record boundaries.
+  Auth is checked at connection time and every 10 seconds in memory, not per
+  packet. Invalid sessions close the stream. At most four HTTP streams are
+  allowed; dropping a response releases its loopback socket and slot.
+  The native socket retains `TCP_NODELAY`, a 2 s send timeout and keepalive.
+- Upgrade **both datad and the App**: old Apps using LAN TCP 9483 cannot
+  connect, and the updated App refuses old servers without the authenticated
+  endpoint. Already deployed old datad remains exposed until upgraded.
 - **Idle auto-unsubscribe.** With the last consumer gone the streamer
   disables the 154-code DIAG subscription and re-enables it on the next
   accept: a parked streamer dispatches no callbacks at all (its `total`
-  counter freezes). Idle and ~1800 pkt/s LAN forwarding both measured under
-  4% of the single core; the payload is raw logs — all decoding happens in
-  the browser (sigweb-js), zero parse cost on the device.
+  counter freezes). The former direct TCP implementation measured under 4%
+  of one core at idle and ~1800 pkt/s; this is not a performance measurement
+  of the authenticated HTTP relay. Payload decoding stays on the client.
 - Same safety contract as the collector worker: supervisor heartbeat with
   self-exit, SIGTERM-then-reap on daemon shutdown, atomic bounded status
   JSON (`subscribed`, `bind`, `clients`, counters) refreshed every second.
