@@ -564,7 +564,8 @@ esac
         assert cells["lte"] == [
             {"rat": "LTE", "pci": 57, "arfcn": 3725, "rsrp_dbm": -96, "sinr_db": -13, "band": 3},
             {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": 28}], cells
-        assert cells["sa"] == [], cells  # Drop the cached NR table on LTE.
+        assert cells["sa"] == [
+            {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
         STORE["network_type"] = "NR5G"
         status, result = control(port, "neighbor.list", {})
         assert status == 200, result
@@ -672,7 +673,6 @@ esac
         status, result = control(port, "neighbor.status", {})
         assert status == 200 and result["result"]["enabled"] is False, result
         assert control(port, "neighbor.set", {"enabled": "yes"})[0] == 400
-        STORE["network_type"] = "NR5G"
         status, result = control(port, "neighbor.set", {"enabled": True})
         assert status == 200 and result["result"]["status"] == "ready", result
         assert result["result"]["source"] == "oem_goform"
@@ -684,14 +684,6 @@ esac
         lte, nr = state["cells"][0], next(c for c in state["cells"] if c["rat"] == "NR5G")
         assert (lte["rat"], lte["pci"], lte["arfcn"], lte["band"], lte["rsrp_dbm"]) == ("LTE", 57, 3725, 3, -96)
         assert (nr["rat"], nr["band"]) == ("NR5G", 78)
-        STORE["network_type"] = "LTE"
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            state = call(port, "/state")[1]["neighbor"]
-            if len(state["cells"]) == 2 and all(c["rat"] == "LTE" for c in state["cells"]):
-                break
-            time.sleep(0.1)  # A network transition is picked up by the sampler.
-        assert len(state["cells"]) == 2 and all(c["rat"] == "LTE" for c in state["cells"]), state
         assert control(port, "neighbor.set", {"enabled": False})[1]["result"]["status"] == "disabled"
         assert call(port, "/state")[1]["neighbor"]["enabled"] is False
 

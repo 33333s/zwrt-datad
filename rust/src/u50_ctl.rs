@@ -383,11 +383,9 @@ fn neighbor_cells(raw: &str, rat: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Both OEM neighbor lists plus the serving echo filter: each list carries
-/// the serving cell as its first row (the NR list echoes the NR serving, the
-/// LTE list the LTE serving), and with NR gone the NR list still reports the
-/// stale NSA anchor — neither is a neighbor, so drop them by (pci, arfcn)
-/// against the serving keys read in the same batch.
+/// Remove serving-cell echoes by RAT, PCI and channel, regardless of row
+/// position. The current network type alone cannot establish whether an
+/// inter-RAT neighbor record is stale; preserve other reported cells.
 fn neighbor_collect(lists: &Value, net: Option<&Value>) -> Vec<Value> {
     let text = |key: &str| lists.get(key).and_then(Value::as_str).unwrap_or("");
     // `net` is the state snapshot's net block: pcis/channels arrive there as
@@ -395,12 +393,6 @@ fn neighbor_collect(lists: &Value, net: Option<&Value>) -> Vec<Value> {
     let serving = |key: &str| net.and_then(|n| n.get(key)).and_then(Value::as_i64);
     let lte_serving = serving("lte_pci").zip(serving("lte_channel"));
     let nr_serving = serving("nr_pci").zip(serving("nr_channel"));
-    let nr_active = text("network_type").to_ascii_uppercase().contains("5G")
-        || net
-            .and_then(|n| n.get("nr_band"))
-            .and_then(Value::as_str)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
 
     let mut cells = neighbor_cells(text("lte_ngbr_cell_info_ext"), "LTE");
     cells.extend(neighbor_cells(
@@ -415,7 +407,7 @@ fn neighbor_collect(lists: &Value, net: Option<&Value>) -> Vec<Value> {
     };
     cells.retain(|cell| match cell.get("rat").and_then(Value::as_str) {
         Some("LTE") => !is_serving(cell, lte_serving),
-        Some("NR5G") => nr_active && !is_serving(cell, nr_serving),
+        Some("NR5G") => !is_serving(cell, nr_serving),
         _ => true,
     });
     cells
@@ -2440,9 +2432,8 @@ mod tests {
     }
 
     #[test]
-    fn neighbor_collect_drops_serving_echo_and_stale_nr() {
-        // LTE 列表首行 = 服务小区（pci 36 / earfcn 3740），NR 列表在纯 4G
-        // 下仍回传 NSA 残留锚点 —— 都不是邻区。
+    fn neighbor_collect_drops_only_matching_serving_cells() {
+        // LTE 服务小区被过滤；没有 NR 服务信息时，不按驻网制式丢弃 NR 表。
         let lte = "3740,36,-87,-10,8;3740,434,-93,-16,8;3740,161,-98,-20,8";
         let nr = "36,633984,-85,12,78;501,432410,-101,4,78";
         // NR 列表：首行 = NR 服务小区（pci 36 / 633984），次行 = 真邻区 501
@@ -2457,9 +2448,19 @@ mod tests {
             "lte_channel": 3740,
         });
         let cells = neighbor_collect(&lists, Some(&net));
-        assert_eq!(cells.len(), 2, "{cells:?}");
-        assert!(cells.iter().all(|c| c["rat"] == "LTE"));
-        assert!(cells.iter().all(|c| c["pci"] != json!(36)));
+        assert_eq!(cells.len(), 4, "{cells:?}");
+        assert_eq!(cells.iter().filter(|c| c["rat"] == "NR5G").count(), 2);
+        assert!(
+            cells
+                .iter()
+                .any(|c| c["rat"] == "NR5G" && c["pci"] == json!(36))
+        );
+        assert!(
+            !cells
+                .iter()
+                .any(|c| c["rat"] == "LTE" && c["pci"] == json!(36))
+        );
+        assert_eq!(neighbor_collect(&lists, None).len(), 5);
 
         // NR 模式：NR 列表首行 = NR 服务小区（pci 36 / 633984）被过滤，
         // 真邻区保留，LTE 锚点也按 LTE 服务键过滤。
@@ -2485,6 +2486,16 @@ mod tests {
                 .any(|c| c["rat"] == "NR5G" && c["pci"] == json!(501))
         );
         assert!(cells.iter().all(|c| c["pci"] != json!(36)));
+
+        // 第一行可是真邻区；同 PCI 不同频道也必须保留。
+        let lists = json!({
+            "lte_ngbr_cell_info_ext": "3741,36,-93,-16,8;3740,36,-87,-10,8",
+            "sa_ngbr_cell_manual_result_ext": "36,633985,-101,4,78;36,633984,-85,12,78",
+        });
+        let cells = neighbor_collect(&lists, Some(&net));
+        assert_eq!(cells.len(), 2, "{cells:?}");
+        assert_eq!(cells[0]["arfcn"], 3741);
+        assert_eq!(cells[1]["arfcn"], 633985);
     }
 }
 
