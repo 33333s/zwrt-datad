@@ -49,6 +49,8 @@ const CFG_KEYS: &[&str] = &[
     "modem_main_state",
     "pin_status",
     "simcard_active_slot",
+    "support_dual_sim",
+    "dual_sim_support",
     "lte_rsrp",
     "lte_rsrq",
     "lte_snr",
@@ -593,6 +595,17 @@ fn from_sources(
     }
     if let Some(value) = cfg_number(cfg, "simcard_active_slot", 0, 4) {
         sim.insert("current_slot".into(), json!(value));
+    }
+    // Capability flag for clients: physical SIM slot count. Only emitted
+    // when the OEM actually reports it — an absent key lets clients decide
+    // on their own instead of mistaking a default for real information.
+    if let Some(dual) = cfg
+        .get("support_dual_sim")
+        .or_else(|| cfg.get("dual_sim_support"))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| (1..=2).contains(v))
+    {
+        sim.insert("dual_sim".into(), json!(dual));
     }
     if !sim.is_empty() {
         fields.insert("sim".into(), Value::Object(sim));
@@ -1462,6 +1475,33 @@ mod tests {
         assert_eq!(hex_number("0x1F", 100), Some(31));
         assert_eq!(hex_number("zz", 100), None);
         assert_eq!(hex_number("ffff", 100), None);
+    }
+
+    #[test]
+    fn sim_capability_requires_valid_oem_evidence() {
+        let mut cfg = BTreeMap::from([("model_name".into(), "U50S".into())]);
+        let state = from_sources(Model::U50S, &cfg, None).unwrap();
+        assert!(!state.fields.contains_key("sim"));
+        for key in ["support_dual_sim", "dual_sim_support"] {
+            for (raw, expected) in [
+                ("1", Some(1)),
+                ("2", Some(2)),
+                ("", None),
+                ("0", None),
+                ("3", None),
+                ("unknown", None),
+            ] {
+                cfg.insert(key.into(), raw.into());
+                let state = from_sources(Model::U50S, &cfg, None).unwrap();
+                let actual = state
+                    .fields
+                    .get("sim")
+                    .and_then(|sim| sim.get("dual_sim"))
+                    .and_then(Value::as_i64);
+                assert_eq!(actual, expected, "{key}={raw}");
+                cfg.remove(key);
+            }
+        }
     }
 
     #[test]
