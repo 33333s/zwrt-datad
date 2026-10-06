@@ -454,6 +454,9 @@ esac
 
         status, result = control(port, "network.set_mode", {"mode": "Only_5G"})
         assert status == 200 and result["result"] == {"result":"success", "mode": "Only_5G", "verified": True}, result
+        status, result = control(port, "network.set_mode", {"mode": "NSA"})
+        assert status == 200 and result["result"] == {"result":"success", "mode": "LTE_AND_5G", "verified": True}, result
+        assert writes()[-1][2]["BearerPreference"] == "LTE_AND_5G"
         assert control(port, "network.set_mode", {"mode": "rm -rf"})[0] == 400
         # U50 Pro: the input alias maps to 4G_AND_5G and the WL_AND_5G readback
         # still counts as verified.
@@ -561,8 +564,13 @@ esac
         assert cells["lte"] == [
             {"rat": "LTE", "pci": 57, "arfcn": 3725, "rsrp_dbm": -96, "sinr_db": -13, "band": 3},
             {"rat": "LTE", "pci": 973, "arfcn": 3650, "rsrp_dbm": -101, "sinr_db": -11, "band": 28}], cells
-        assert cells["sa"] == [
+        assert cells["sa"] == [], cells  # Drop the cached NR table on LTE.
+        STORE["network_type"] = "NR5G"
+        status, result = control(port, "neighbor.list", {})
+        assert status == 200, result
+        assert result["result"]["sa"] == [
             {"rat": "NR5G", "pci": 973, "arfcn": 627264, "rsrp_dbm": -103, "sinr_db": -14, "band": 78}], cells
+        STORE["network_type"] = "LTE"
 
         # SA neighbor scan: switch to Only_5G (the firmware precondition),
         # scan, poll m_netselect_status, harvest, and restore the mode —
@@ -664,6 +672,7 @@ esac
         status, result = control(port, "neighbor.status", {})
         assert status == 200 and result["result"]["enabled"] is False, result
         assert control(port, "neighbor.set", {"enabled": "yes"})[0] == 400
+        STORE["network_type"] = "NR5G"
         status, result = control(port, "neighbor.set", {"enabled": True})
         assert status == 200 and result["result"]["status"] == "ready", result
         assert result["result"]["source"] == "oem_goform"
@@ -675,6 +684,14 @@ esac
         lte, nr = state["cells"][0], next(c for c in state["cells"] if c["rat"] == "NR5G")
         assert (lte["rat"], lte["pci"], lte["arfcn"], lte["band"], lte["rsrp_dbm"]) == ("LTE", 57, 3725, 3, -96)
         assert (nr["rat"], nr["band"]) == ("NR5G", 78)
+        STORE["network_type"] = "LTE"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = call(port, "/state")[1]["neighbor"]
+            if len(state["cells"]) == 2 and all(c["rat"] == "LTE" for c in state["cells"]):
+                break
+            time.sleep(0.1)  # A network transition is picked up by the sampler.
+        assert len(state["cells"]) == 2 and all(c["rat"] == "LTE" for c in state["cells"]), state
         assert control(port, "neighbor.set", {"enabled": False})[1]["result"]["status"] == "disabled"
         assert call(port, "/state")[1]["neighbor"]["enabled"] is False
 

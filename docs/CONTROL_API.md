@@ -198,6 +198,26 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 ]}}
 ```
 
+## Signaling Stream (U50)
+
+信令采集流由 datad 内嵌的 diag-streamer 提供（`--u50-signaling` 运行时），
+按需启停；状态同时出现在 `state.u50_signaling.stream`。
+
+| action | params | 说明 |
+|---|---|---|
+| `signal.stream.start` | 无 | 启动流转发器，监听 `0.0.0.0:9483`（内网直连，无需 adb）；幂等 |
+| `signal.stream.stop` | 无 | SIGTERM 优雅停止（注销 DCI 订阅后退出）；幂等 |
+| `signal.stream.status` | 无 | 返回 `{available, running, port, bind, clients, subscribed, total, sent, uptime, state, reason}` |
+
+流帧格式与传输特性：
+
+- 每包一帧：`[len u32][code u32][原始 DIAG 日志包]`，单 `writev` 系统调用发送
+- 最多 4 个消费者；TCP_NODELAY、发送超时 2 s、keepalive（30 s 空闲探测）
+- **无消费者时自动取消 DIAG 订阅**（154 码），首个消费者接入即恢复——空闲零开销，
+  无需主动 stop；实测空闲与 ~1800 包/秒转发均低于单核 4%
+- 消费端示例：`build/sigweb-js/relay.py`（`STREAM_HOST=192.168.0.1 python relay.py`
+  走内网；浏览器负责全部解码，设备零解析成本）
+
 ## Safety
 
 - 所有动作必须存在于编译期白名单。

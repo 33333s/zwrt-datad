@@ -78,6 +78,9 @@ pub const ACTIONS: &[&str] = &[
     "cooling.fan.set_curve",
     "cooling.liquid.set_enabled",
     "cooling.liquid.set_mode",
+    "signal.stream.start",
+    "signal.stream.stop",
+    "signal.stream.status",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -154,6 +157,24 @@ async fn mapped_call(
 }
 
 pub async fn execute(action: &str, params: &Value) -> Outcome {
+    // Daemon-local signaling supervision: not OEM-backed, so it must run on
+    // every runtime (the U50 gate below reroutes everything else to Ctl).
+    match action {
+        "signal.stream.start" => {
+            return match crate::u50_signal::stream_start() {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Failed(error),
+            };
+        }
+        "signal.stream.stop" => {
+            return match crate::u50_signal::stream_stop() {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Failed(error),
+            };
+        }
+        "signal.stream.status" => return Outcome::Ok(crate::u50_signal::stream_status()),
+        _ => {}
+    }
     if let Some(ctl) = crate::u50_ctl::get() {
         return ctl.execute(action, params).await;
     }

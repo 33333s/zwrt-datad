@@ -188,7 +188,7 @@ Firmware differences found on the device and fixed for it:
 
 **Storage and deployment (resolved 2026-10: `/cache` layout).** The U50 Pro `/etc_rw` is only ~5.5 MiB total (the U50S has ~15 MiB) and `/data` is a 2 MiB OEM volume, so neither can hold the binary plus OTA staging. The persistent home is `/cache/zwrt-datad` (cachefs, ~100 MiB free): it survives reboots and factory restore (`rcS-zte` only restores individual config files, it does not format the volume), no FOTA staging uses it (`fota`/`recoveryfs` are dedicated partitions; `qcc.service` only owns `/cache/recovery`), and `/persist` stays untouched because it holds calibration data.
 
-**Autostart on the U50 Pro (persistent unit; factory-diag unlocks the root filesystem).** In normal boots the firmware mounts the root filesystem read-only and the whole UBI device stays in read-only mode (`/sys/class/ubi/ubi0/ro_mode` is 1 and the sysfs attribute is 0444, so a `mount -o remount,rw /` fails at the first flash write with `ubi_eba_write_leb → switch to read-only mode`), and the firmware has no `rc.local` and executes nothing from any writable volume. With the OEM factory-diag mode enabled, UBI attaches read-write and the remount succeeds. `scripts/deploy-u50pro.sh` deploys over adb: it stages the binary with a SHA-256 check into `/cache/zwrt-datad` together with an idempotent `start.sh` and a unit file, then installs the persistent unit into `/etc/systemd/system` (unit plus `multi-user.target.wants` symlink, read-back verified, root filesystem restored to its previous mount state) when writable — verified to auto-start datad on boot — and otherwise falls back to a supervised transient unit via `systemd-run` (`Restart=on-failure`), so an unmodified device still runs after `adb shell sh /cache/zwrt-datad/start.sh`. The service runs with `--u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling`, so the diag collector worker is supervised. Self-update works in this layout because the OTA wrapper now passes `DATAD_DIR` to the installer (its `/etc_rw` default would otherwise misplace the binary); the 7 MiB free-space gate passes trivially on `/cache`. A firmware upgrade rewrites the root filesystem and drops the unit while `/cache` survives — re-running the deploy script (with factory diag enabled) is the documented recovery path.
+**Autostart on the U50 Pro (persistent unit; factory-diag unlocks the root filesystem).** In normal boots the firmware mounts the root filesystem read-only and the whole UBI device stays in read-only mode (`/sys/class/ubi/ubi0/ro_mode` is 1 and the sysfs attribute is 0444, so a `mount -o remount,rw /` fails at the first flash write with `ubi_eba_write_leb → switch to read-only mode`), and the firmware has no `rc.local` and executes nothing from any writable volume. With the OEM factory-diag mode enabled, UBI attaches read-write and the remount succeeds. `scripts/deploy-u50pro.sh` deploys over adb: it stages the binary with a SHA-256 check into `/cache/zwrt-datad` together with an idempotent `start.sh` and a unit file, then installs the persistent unit into `/etc/systemd/system` (unit plus `multi-user.target.wants` symlink, read-back verified, root filesystem restored to its previous mount state) when writable — verified to auto-start datad on boot — and otherwise falls back to a supervised transient unit via `systemd-run` (`Restart=on-failure`), so an unmodified device still runs after `adb shell sh /cache/zwrt-datad/start.sh`. The service runs with `--u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling`, so the diag collector worker is supervised and the packet streamer is on demand via `signal.stream.start`. Self-update works in this layout because the OTA wrapper now passes `DATAD_DIR` to the installer (its `/etc_rw` default would otherwise misplace the binary); the 7 MiB free-space gate passes trivially on `/cache`. A firmware upgrade rewrites the root filesystem and drops the unit while `/cache` survives — re-running the deploy script (with factory diag enabled) is the documented recovery path.
 
 ### Deployment failure handling
 
@@ -285,3 +285,31 @@ documented-as-unused fourth parameter is dereferenced by the library, so an
 (`[len][code][timestamp][payload]`); decoding RRC reconfigurations into QoS
 identifiers (5QI) is the next milestone — the messages are already captured,
 with the serving cell verified from the log header (PCI/ARFCN).
+
+### On-demand packet streamer (`signal.stream.*`, v0.10.67)
+
+A second embedded worker, `rust/u50_diag_streamer.c` (`DATAD_DIAG_STREAMER`),
+forwards the raw log packets to TCP consumers on demand. It is spawned and
+reaped by the same supervisor through daemon-local control actions (handled
+before the U50 OEM gate in `control::execute`, because they are not
+OEM-backed): `signal.stream.start` / `signal.stream.stop` /
+`signal.stream.status`; `/state` mirrors the status as
+`u50_signaling.stream` and the actions are listed in the U50 `CONTROLS`
+capability set.
+
+Transport and resource profile, measured on a U50 Pro:
+
+- Listens on `0.0.0.0:9483` — LAN consumers connect directly to the router's
+  LAN address (e.g. `192.168.0.1:9483`), no adb/USB involvement. Each packet
+  goes out as one `writev` (`[len u32][code u32][payload]`), at most 4
+  consumers, `TCP_NODELAY`, 2 s send timeout, and 30 s TCP keepalive so
+  vanished consumers release their slot within a minute.
+- **Idle auto-unsubscribe.** With the last consumer gone the streamer
+  disables the 154-code DIAG subscription and re-enables it on the next
+  accept: a parked streamer dispatches no callbacks at all (its `total`
+  counter freezes). Idle and ~1800 pkt/s LAN forwarding both measured under
+  4% of the single core; the payload is raw logs — all decoding happens in
+  the browser (sigweb-js), zero parse cost on the device.
+- Same safety contract as the collector worker: supervisor heartbeat with
+  self-exit, SIGTERM-then-reap on daemon shutdown, atomic bounded status
+  JSON (`subscribed`, `bind`, `clients`, counters) refreshed every second.

@@ -2,8 +2,10 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=DATAD_KEYMASTER_WORKER");
     println!("cargo:rerun-if-env-changed=DATAD_DIAG_WORKER");
+    println!("cargo:rerun-if-env-changed=DATAD_DIAG_STREAMER");
     println!("cargo:rerun-if-changed=keymaster_worker.rs");
     println!("cargo:rerun-if-changed=u50_diag_worker.c");
+    println!("cargo:rerun-if-changed=u50_diag_streamer.c");
     let worker = if env::var_os("CARGO_FEATURE_KEYMASTER_WORKER").is_some() {
         Vec::new()
     } else {
@@ -60,6 +62,35 @@ fn main() {
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("diag-worker"),
         diag_worker,
+    )
+    .unwrap();
+
+    /* Optional U50 signaling streamer: same embed scheme as the workers. It
+     * adds a loopback TCP fan-out to the collector so raw log packets reach
+     * PC consumers; supervised on demand via the signal.stream.* controls. */
+    let diag_streamer = match env::var_os("DATAD_DIAG_STREAMER") {
+        Some(path) => {
+            println!("cargo:rerun-if-changed={}", PathBuf::from(&path).display());
+            let bytes = fs::read(path).expect("read diag streamer");
+            assert!(
+                bytes.len() > 64 && bytes.len() < 2 * 1024 * 1024,
+                "diag streamer size out of range"
+            );
+            assert_eq!(
+                &bytes[..6],
+                b"\x7fELF\x01\x01",
+                "diag streamer must be ELF32 LE"
+            );
+            assert_eq!(&bytes[18..20], &[40, 0], "diag streamer must be ARM EABI5");
+            bytes
+        }
+        None => Vec::new(),
+    };
+    let embedded = if diag_streamer.is_empty() { "0" } else { "1" };
+    println!("cargo:rustc-env=DATAD_DIAG_STREAMER_EMBEDDED={embedded}");
+    fs::write(
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("diag-streamer"),
+        diag_streamer,
     )
     .unwrap();
     let path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../version.json");
