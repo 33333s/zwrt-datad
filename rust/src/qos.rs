@@ -415,14 +415,24 @@ fn number_after(s: &str, key: &str) -> Option<f64> {
 /// replaces the 8640 kbps base. The vendor log prints `_ext2` with the base
 /// added on top (244 + 256 + 8.64 = `508.640Mbps` for 500 Mbps) and `0.000`
 /// when the octet is absent, so the base is taken back out and a zero
-/// `_ext2` falls through to `_ext`.
+/// `_ext2` falls through to `_ext`. The printed sum is not always exact
+/// (`20008.641Mbps` for 32 + 78 x 256 = 20000 Mbps), so a value that lands
+/// within 0.01 of a whole number of 256 Mbps steps is snapped to it.
 fn apn_ambr(s: &str, key: &str) -> Option<f64> {
     let positive = |v: f64| (v > 0.0).then_some(v);
     let base = number_after(s, &format!("{key}=")).map(|v| v / 1000.0);
     let ext = number_after(s, &format!("{key}_ext=")).and_then(positive);
     let ext2 = number_after(s, &format!("{key}_ext2=")).and_then(positive);
     match (ext2, base) {
-        (Some(v), Some(b)) if v > b + ext.unwrap_or(0.0) => Some(v - b),
+        (Some(v), Some(b)) if v > b + ext.unwrap_or(0.0) => {
+            let steps = (v - b - ext.unwrap_or(0.0)) / 256.0;
+            let whole = steps.round();
+            Some(if whole >= 1.0 && (steps - whole).abs() < 0.01 {
+                ext.unwrap_or(b) + whole * 256.0
+            } else {
+                v - b
+            })
+        }
         (Some(v), _) => Some(v),
         _ => ext.or(base),
     }
@@ -489,6 +499,18 @@ mod tests {
         assert_eq!(
             apn_ambr(lte, "apn_ambr_dl").map(format_mbps),
             Some("2000.000".into())
+        );
+        // TopFlow / CMHK: the vendor sum is 0.001 off (32 + 78 x 256 = 20000).
+        let lte = "apn_ambr_dl=8640kbps apn_ambr_dl_ext=32.000Mbps apn_ambr_dl_ext2=20008.641Mbps";
+        assert_eq!(
+            apn_ambr(lte, "apn_ambr_dl").map(format_mbps),
+            Some("20000.000".into())
+        );
+        // Without the extended octet the steps add to the base.
+        let lte = "apn_ambr_dl=8640kbps apn_ambr_dl_ext2=520.640Mbps";
+        assert_eq!(
+            apn_ambr(lte, "apn_ambr_dl").map(format_mbps),
+            Some("520.640".into())
         );
         assert_eq!(
             session_ambr(
