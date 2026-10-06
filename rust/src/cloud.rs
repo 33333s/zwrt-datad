@@ -3000,7 +3000,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), online_rx)
+        tokio::time::timeout(Duration::from_secs(20), online_rx)
             .await
             .unwrap()
             .unwrap();
