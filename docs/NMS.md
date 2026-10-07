@@ -36,3 +36,33 @@
 
 设备立即断开该会话的 WebSocket 通道，不等 TTL；其他会话不受影响，重复关闭无副作用，没有应答。收到尚未见过的 `target_session_id` 时只记录该编号，之后重发的 `remote.open` 会被当作已处理而忽略，不会重新打开已结束的会话。字段格式不对或协议版本不是 1 的关闭请求被丢弃。
 
+## `remote.nodes.set`：平台下发的中转节点（0.10.70）
+
+遥测声明 `datad.remote_nodes` 后，NMS 可以通过 `command/request` 下发一份中转节点列表，设备在 `command/result` 应答：
+
+```json
+{"protocol_version":1,"request_id":"nodes-1","action":"remote.nodes.set","nodes":["https://nmg.services.ericsfj.com:8443"],"revision":3}
+```
+
+- 每项必须是 HTTPS origin：主机是域名（不接受 IP、`localhost`），不带路径、查询串、片段、用户信息，端口可选；最多 8 项，空列表表示清空。任何一项不合格或超过 8 项，整条拒绝，原列表不变。
+- 整表替换；`revision` 必须大于当前值才生效，相同或更小的被确认但忽略（`applied:false`）。列表和 revision 保存在数据目录的 `remote-nodes.json`，重启后仍然有效；它与用户本地的 `remote_origins`（`cloud.json`）分开存放。
+- 列表记下下发它的平台（`platform_url` 的 origin）。设备改接其他平台后，旧平台的节点不再被信任，新平台从 revision 0 重新下发。
+- 只有 MQTT 命令通道能写这份列表。本机 `POST /cloud/config` 只能用 `platform_nodes_enabled` 开关整个列表（默认开），不能增删节点。
+
+应答：
+
+```json
+{"request_id":"nodes-1","action":"remote.nodes.set","status":"ok","ok":true,"applied":true,"revision":3,"enabled":true,"nodes":["https://nmg.services.ericsfj.com:8443"],"protocol_version":1,"timestamp":1791300000}
+{"request_id":"nodes-2","action":"remote.nodes.set","status":"rejected","ok":false,"error":{"code":"invalid_node"},"revision":3,"enabled":true,"nodes":["https://nmg.services.ericsfj.com:8443"],"protocol_version":1,"timestamp":1791300001}
+```
+
+`nodes` 是当前**生效**的列表（本地开关关闭时为空，`enabled:false`）。错误码：`invalid_request`（协议版本、`request_id` 不合格）、`too_many_nodes`、`invalid_node`、`platform_unset`、`save_failed`。
+
+信任判断：`remote.open` 的 `remote_url` 和 `mesh.rendezvous_url` 的主机与端口只要是主平台、本地 `remote_origins` 或生效的节点之一即可连接。其余规则不变：`wss` 与会话路径、Bearer 令牌、不带 Origin 头、TLS 证书校验（内置 Mozilla 根证书，Let's Encrypt 可用）、TTL、`remote.close`、`target_ports` 单端口与服务白名单。WebSocket 不跟随重定向。MQTT 与心跳仍只连主平台，STUN 仍按 `remote.open` 下发的列表使用。
+
+`telemetry/device` 增加 `remote_node_origins`（当前生效的节点列表）和 `remote_nodes_revision`：
+
+```json
+{"remote_origins":["https://nms.ericsfj.com","https://a.ericsfj.com:16001"],"remote_node_origins":["https://nmg.services.ericsfj.com:8443"],"remote_nodes_revision":3}
+```
+

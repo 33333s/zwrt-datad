@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.69",
+    "version": "0.10.70",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 LTE APN-AMBR 小数误差：厂商日志的扩展-2 总和有时多出 0.001（如 TopFlow 中国移动香港 32 + 78×256 Mbps 记成 20008.641），原来显示 20000.001 M，现在按 256 Mbps 整档还原为 20000"
+    "notes": "支持平台下发的中转节点：新增 MQTT 命令 remote.nodes.set（最多 8 个 HTTPS 域名 origin，整表替换，按 revision 幂等，持久保存），remote.open 可连接这些节点；本地可用 platform_nodes_enabled 开关关闭。遥测增加 remote_node_origins、remote_nodes_revision 并声明 datad.remote_nodes"
   }
 }

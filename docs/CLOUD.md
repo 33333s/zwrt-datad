@@ -53,6 +53,8 @@ OTA 更新来源（`ota.sources`）按列表顺序依次尝试：默认是 `cust
 
 `remote.open` 可连接主地址或已配置备用地址对应的 WSS，其他主机、端口和会话路径仍被拒绝。遥测声明 `datad.remote_origins` 并上报规范化后的全部允许地址。空列表保持旧版只允许主平台的行为。保存配置会关闭旧会话并重新上报；原有本地认证、WebShell 开关、资源上限和签名更新规则保持不变。
 
+平台另外可以通过 MQTT `remote.nodes.set` 下发最多 8 个中转节点（0.10.70，见 NMS.md），与 `remote_origins` 分开保存在 `remote-nodes.json`，只能由平台写入。`GET /cloud/config` 的 `remote_nodes` 只读显示 `enabled`、`revision`、`nodes` 和当前生效的 `active`；`POST /cloud/config` 可带 `platform_nodes_enabled: false` 关闭全部平台节点（主平台和本地 `remote_origins` 不受影响），带 `true` 重新启用。
+
 NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将设备 WebUI/WebShell 数据通道切换至已授权中转。两个远程地址都在设备白名单中时，会员过期后可以回到免费入口，无需重新修改设备配置。会员资格和限速由 NMS 执行，设备备用地址本身不是付费凭据。
 
 ## 按需远程面板状态通道
