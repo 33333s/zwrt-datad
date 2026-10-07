@@ -19,7 +19,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const CMD: &str = "model_name,wa_inner_version,network_type,network_provider_fullname,network_provider,battery_value,battery_temp,battery_status,battery_vol_percent,battery_charging,signalbar,simcard_status,realtime_tx_thrpt,realtime_rx_thrpt,realtime_tx_bytes,realtime_rx_bytes,monthly_tx_bytes,monthly_rx_bytes,wifi_onoff_state,wifi_access_sta_num,modem_main_state,pin_status,simcard_active_slot,lte_rsrp,lte_rsrq,lte_snr";
+const CMD: &str = concat!(
+    "model_name,wa_inner_version,network_type,network_provider_fullname,network_provider,battery_value,battery_temp,battery_status,battery_vol_percent,battery_charging,signalbar,simcard_status,realtime_tx_thrpt,realtime_rx_thrpt,realtime_tx_bytes,realtime_rx_bytes,monthly_tx_bytes,monthly_rx_bytes,wifi_onoff_state,wifi_access_sta_num,modem_main_state,pin_status,simcard_active_slot,lte_rsrp,lte_rsrq,lte_snr,",
+    "nr5g_pci,nr5g_action_channel,nr_multi_ca_scell_info,nr_ca_dl_state,nr_ca_ul_state,nr5g_nsa_bandwidth,",
+    "lte_pci,wan_active_channel,wan_lte_ca,lte_multi_ca_scell_info,lte_multi_ca_scell_sig_info,lte_ca_pcell_band,lte_ca_pcell_bandwidth"
+);
 const MAX_RESPONSE: usize = 64 * 1024;
 const CFG_KEYS: &[&str] = &[
     "model_name",
@@ -57,6 +61,13 @@ const CFG_KEYS: &[&str] = &[
     "wan_active_band",
     "wan_active_channel",
     "wan_lte_ca",
+    "lte_multi_ca_scell_info",
+    "lte_multi_ca_scell_sig_info",
+    "lte_ca_pcell_band",
+    "lte_ca_pcell_bandwidth",
+    "nr_multi_ca_scell_info",
+    "nr_ca_dl_state",
+    "nr_ca_ul_state",
     "lte_pci",
     "wifi_chip_temp",
     "pm_sensor_mdm",
@@ -79,6 +90,7 @@ const CFG_KEYS: &[&str] = &[
     "Z5g_rsrq",
     "Z5g_rssi",
     "bandwidth",
+    "nr5g_nsa_bandwidth",
     "rmcc",
     "rmnc",
     "rplmn_num",
@@ -291,10 +303,22 @@ pub async fn enroll(model: Model, dir: &Path, input: QuickConnect) -> Result<()>
     Ok(())
 }
 
-fn accept_cfg_value(raw: &str) -> Option<&str> {
+// Lists grow with configured carriers. Never truncate a CA table.
+fn cfg_value_limit(key: &str) -> usize {
+    match key {
+        "nr_multi_ca_scell_info" | "lte_multi_ca_scell_info" | "lte_multi_ca_scell_sig_info" => {
+            16 * 1024
+        }
+        _ => 512,
+    }
+}
+
+fn accept_cfg_value<'a>(key: &str, raw: &'a str) -> Option<&'a str> {
     let value = raw.trim();
-    (!value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control))
-        .then_some(value)
+    ((!value.is_empty() || cfg_value_limit(key) > 512)
+        && value.len() <= cfg_value_limit(key)
+        && !value.chars().any(char::is_control))
+    .then_some(value)
 }
 
 /// One `cfg show` replaces ~100 `cfg get` forks per sample. Only the keys this
@@ -304,7 +328,7 @@ fn cfg_from_show(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter_map(|line| line.split_once('='))
         .filter(|(key, _)| CFG_KEYS.contains(key))
-        .filter_map(|(key, value)| Some((key.to_owned(), accept_cfg_value(value)?.to_owned())))
+        .filter_map(|(key, value)| Some((key.to_owned(), accept_cfg_value(key, value)?.to_owned())))
         .collect()
 }
 
@@ -321,9 +345,12 @@ async fn cfg_values() -> Result<BTreeMap<String, String>> {
             let Ok(raw) = command::run(&program, ["get", key], Duration::from_secs(2)).await else {
                 continue;
             };
-            ensure!(raw.len() <= 512, "U50 cfg output too large for {key}");
+            ensure!(
+                raw.len() <= cfg_value_limit(key) + 2,
+                "U50 cfg output too large for {key}"
+            );
             let value = String::from_utf8(raw).context("U50 cfg returned invalid UTF-8")?;
-            if let Some(value) = accept_cfg_value(&value) {
+            if let Some(value) = accept_cfg_value(key, &value) {
                 values.insert((*key).into(), value.into());
             }
         }
@@ -437,16 +464,43 @@ fn from_sources(
             fields.insert("u50_unverified".into(), Value::Object(candidate));
         }
     }
+    let radio_batch = |pci_key: &str, channel_key: &str, max_pci: u64| {
+        goform.filter(|raw| {
+            string_field(raw, "network_type") == cfg.get("network_type").map(String::as_str)
+                && string_field(raw, pci_key)
+                    .and_then(|v| hex_number(v, max_pci))
+                    .is_some_and(|pci| {
+                        cfg.get(pci_key).and_then(|v| hex_number(v, max_pci)) == Some(pci)
+                    })
+                && string_field(raw, channel_key)
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .is_some_and(|channel| {
+                        cfg.get(channel_key).and_then(|v| v.parse::<i64>().ok()) == Some(channel)
+                    })
+        })
+    };
+    let lte_batch = radio_batch("lte_pci", "wan_active_channel", 503);
+    let nr_batch = radio_batch("nr5g_pci", "nr5g_action_channel", 1007);
     for (source, target, min, max) in [
         ("signalbar", "bars", 0, 5),
         ("lte_rsrp", "lte_rsrp", -160, -20),
         ("lte_rsrq", "lte_rsrq", -50, 0),
     ] {
-        if let Some(value) = source_number(cfg, goform, source, min, max) {
+        if let Some(value) = source_number(
+            cfg,
+            if source == "signalbar" {
+                goform
+            } else {
+                lte_batch
+            },
+            source,
+            min,
+            max,
+        ) {
             net.insert(target.into(), json!(value));
         }
     }
-    if let Some(value) = source_snr(cfg, goform, "lte_snr") {
+    if let Some(value) = source_snr(cfg, lte_batch, "lte_snr") {
         net.insert("lte_snr".into(), json!(value));
     }
     if let Some(value) = cfg.get("ppp_status") {
@@ -504,7 +558,7 @@ fn from_sources(
     if let Some(value) = cfg_number(cfg, "Z5g_rsrp", -160, -20) {
         net.insert("nr_rsrp".into(), json!(value));
     }
-    if let Some(value) = source_snr(cfg, goform, "Z5g_SINR") {
+    if let Some(value) = source_snr(cfg, nr_batch, "Z5g_SINR") {
         net.insert("nr_snr".into(), json!(value));
     }
     // The firmware has no high-speed-rail source, so `HSR` is omitted (unknown)
@@ -611,6 +665,7 @@ fn from_sources(
         fields.insert("sim".into(), Value::Object(sim));
     }
     extend_from_cfg(&mut fields, cfg);
+    extend_carrier_aggregation(block(&mut fields, "net"), cfg, goform);
     fields.insert(
         "u50_sources".into(),
         json!({"cfg":"ok", "goform":if goform.is_some() {"ok"} else {"unavailable"}}),
@@ -697,6 +752,162 @@ fn insert_text(
     }
 }
 
+/// Preserve OEM secondary-only rows, including band/unit suffixes. Activation
+/// keeps the per-carrier state and UL-configuration columns separate from global CA status.
+fn extend_carrier_aggregation(
+    net: &mut Map<String, Value>,
+    cfg: &BTreeMap<String, String>,
+    goform: Option<&Value>,
+) {
+    let rat = net
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    net.insert("ca_format".into(), json!("u50_oem"));
+    // cfg and GoAhead are sampled consecutively. Don't join across a RAT switch.
+    if cfg
+        .get("network_type")
+        .is_some_and(|t| t.to_ascii_uppercase() != rat)
+    {
+        // Wait for a coherent snapshot rather than attach old PCC/SCC fields to a new RAT.
+        for key in [
+            "lte_pci",
+            "lte_channel",
+            "band",
+            "lte_bw",
+            "lte_rsrp",
+            "lte_rsrq",
+            "lte_snr",
+            "lte_rssi",
+            "nr_pci",
+            "nr_channel",
+            "nr_band",
+            "nr_bw",
+            "nr_rsrp",
+            "nr_rsrq",
+            "nr_snr",
+            "nr_rssi",
+            "lteca",
+            "ltecasig",
+            "nrca",
+            "lte_ca_state",
+            "nr_ca_dl_state",
+            "nr_ca_ul_state",
+        ] {
+            net.remove(key);
+        }
+        return;
+    }
+    if matches!(
+        rat.as_str(),
+        "LTE" | "LTE_CA" | "LTE_A" | "ENDC" | "LTE-NSA" | "NSA"
+    ) {
+        let live = goform.filter(|raw| {
+            [
+                "wan_lte_ca",
+                "lte_multi_ca_scell_info",
+                "lte_multi_ca_scell_sig_info",
+            ]
+            .iter()
+            .all(|k| raw.get(*k).is_some_and(Value::is_string))
+                && string_field(raw, "lte_pci")
+                    .and_then(|v| hex_number(v, 503))
+                    .is_some_and(|pci| net.get("lte_pci").and_then(Value::as_i64) == Some(pci))
+                && string_field(raw, "wan_active_channel")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .is_some_and(|ch| net.get("lte_channel").and_then(Value::as_i64) == Some(ch))
+        });
+        let value = |key: &str| match live {
+            Some(raw) => raw.get(key).and_then(Value::as_str),
+            None => cfg.get(key).map(String::as_str),
+        };
+        let state = value("wan_lte_ca").unwrap_or("");
+        if matches!(state, "ca_activated" | "ca_deactivated" | "ca_deconfigured") {
+            net.insert("lte_ca_state".into(), json!(state));
+        }
+        // Activity is independent of the currently reported descriptor list.
+        // Keep inactive SCC identities when firmware still reports them.
+        if state == "ca_deconfigured"
+            && value("lte_multi_ca_scell_info").is_none_or(|rows| rows.trim().is_empty())
+        {
+            net.insert("lteca".into(), json!(state));
+            net.remove("ltecasig");
+        } else {
+            for (source, target) in [
+                ("lte_multi_ca_scell_info", "lteca"),
+                ("lte_multi_ca_scell_sig_info", "ltecasig"),
+            ] {
+                if let Some(rows) = value(source).filter(|s| {
+                    s.len() <= cfg_value_limit(source) && !s.chars().any(char::is_control)
+                }) {
+                    net.insert(target.into(), json!(rows));
+                }
+            }
+        }
+        // The official LTE PCC row uses dedicated CA band/bandwidth when CA
+        // is configured. NR PSCell has its own nr5g_nsa_bandwidth key.
+        if matches!(state, "ca_activated" | "ca_deactivated") {
+            if let Some(band) = value("lte_ca_pcell_band")
+                .and_then(|s| s.parse::<u16>().ok())
+                .filter(|b| (1..=256).contains(b))
+            {
+                net.insert("band".into(), json!(format!("B{band}")));
+            }
+            if let Some(bw) = value("lte_ca_pcell_bandwidth")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|bw| [1.4, 3.0, 5.0, 10.0, 15.0, 20.0].contains(bw))
+            {
+                net.insert("lte_bw".into(), json!(format!("{bw}MHz")));
+            }
+        }
+    }
+    if !matches!(
+        rat.as_str(),
+        "SA" | "NR" | "NR5G" | "5G" | "ENDC" | "LTE-NSA" | "NSA"
+    ) {
+        return;
+    }
+    // Prefer a live OEM batch only if its primary matches this snapshot. An
+    // explicitly empty live list clears cfg rows instead of restoring stale CA.
+    let live = goform.filter(|raw| {
+        raw.get("nr_multi_ca_scell_info")
+            .is_some_and(Value::is_string)
+            && string_field(raw, "nr5g_pci")
+                .and_then(|v| hex_number(v, 1007))
+                .is_some_and(|pci| net.get("nr_pci").and_then(Value::as_i64) == Some(pci))
+            && string_field(raw, "nr5g_action_channel")
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_some_and(|ch| net.get("nr_channel").and_then(Value::as_i64) == Some(ch))
+    });
+    if matches!(rat.as_str(), "ENDC" | "LTE-NSA" | "NSA")
+        && let Some(raw) = live
+    {
+        net.remove("nr_bw");
+        if let Some(value) = string_field(raw, "nr5g_nsa_bandwidth")
+            .and_then(|v| accept_cfg_value("nr5g_nsa_bandwidth", v))
+        {
+            net.insert("nr_bw".into(), json!(value));
+        }
+    }
+    for (source, target) in [
+        ("nr_multi_ca_scell_info", "nrca"),
+        ("nr_ca_dl_state", "nr_ca_dl_state"),
+        ("nr_ca_ul_state", "nr_ca_ul_state"),
+    ] {
+        let value = if let Some(raw) = live {
+            raw.get(source).and_then(Value::as_str)
+        } else {
+            cfg.get(source).map(String::as_str)
+        };
+        if let Some(value) =
+            value.filter(|v| v.len() <= cfg_value_limit(source) && !v.chars().any(char::is_control))
+        {
+            net.insert(target.into(), json!(value.trim()));
+        }
+    }
+}
+
 fn insert_number(
     map: &mut Map<String, Value>,
     target: &str,
@@ -745,24 +956,28 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
             net.insert("roaming_allowed".into(), json!(i64::from(value == "on")));
         }
         insert_text(net, "net_select", cfg, "net_select");
-        // The firmware's `bandwidth` key follows the active RAT: LTE bandwidth
-        // while camped on LTE, NR bandwidth on NR. Route it to the matching
-        // field so LTE mode never labels its bandwidth as `nr_bw`.
-        // network_type reports "SA"/"ENDC" style labels as well as "NR5G".
-        let nr_active = net
+        // OEM network_info.js: SA PCC uses bandwidth; ENDC LTE PCC uses
+        // bandwidth and NR PSCell uses the independent nr5g_nsa_bandwidth.
+        let rat = net
             .get("type")
             .and_then(Value::as_str)
-            .map(|t| {
-                let t = t.to_ascii_uppercase();
-                t.contains("5G") || t.contains("NR") || t == "SA"
-            })
-            .unwrap_or(false);
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let nr_sa = matches!(rat.as_str(), "SA" | "NR" | "NR5G" | "5G");
+        let nsa = matches!(rat.as_str(), "ENDC" | "LTE-NSA" | "NSA");
         if let Some(value) = cfg.get("bandwidth").filter(|v| !v.trim().is_empty()) {
-            if nr_active {
+            if nr_sa {
                 net.insert("nr_bw".into(), json!(value));
-            } else {
+            } else if nsa || matches!(rat.as_str(), "LTE" | "LTE_CA" | "LTE_A") {
                 net.insert("lte_bw".into(), json!(value));
             }
+        }
+        if nsa
+            && let Some(value) = cfg
+                .get("nr5g_nsa_bandwidth")
+                .filter(|v| !v.trim().is_empty())
+        {
+            net.insert("nr_bw".into(), json!(value));
         }
         if let Some(value) = cfg_number(cfg, "Z5g_rsrq", -50, 0) {
             net.insert("nr_rsrq".into(), json!(value));
@@ -1461,6 +1676,184 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed["rmcc"], "460");
         assert!(!parsed.values().any(|v| v == "secret"));
+    }
+
+    #[test]
+    fn lte_ca_preserves_split_tables_and_dedicated_pcc_bandwidth_on_nsa() {
+        let cfg = cfg_from_show(concat!(
+            "model_name=U50Pro\nnetwork_type=ENDC\nlte_pci=df\nwan_active_channel=1650\n",
+            "bandwidth=100MHz\nlte_ca_pcell_band=3\nlte_ca_pcell_bandwidth=20\nwan_lte_ca=ca_activated\n",
+            "lte_multi_ca_scell_info=0,224,2,1,300,20;\nlte_multi_ca_scell_sig_info=-98,-12,8,-65,1;\n"
+        ));
+        let state = from_sources(Model::U50Pro, &cfg, None).unwrap();
+        let net = &state.fields["net"];
+        assert_eq!(net["lte_pci"], 223);
+        assert_eq!(net["band"], "B3");
+        assert_eq!(net["lte_bw"], "20MHz");
+        assert_eq!(net["lteca"], "0,224,2,1,300,20;");
+        assert_eq!(net["ltecasig"], "-98,-12,8,-65,1;");
+        assert_eq!(net["lte_ca_state"], "ca_activated");
+    }
+
+    #[test]
+    fn lte_ca_live_release_clears_stale_cfg_rows_and_mismatch_is_not_joined() {
+        let cfg = cfg_from_show(concat!(
+            "model_name=U50Pro\nnetwork_type=LTE\nlte_pci=df\nwan_active_channel=1650\nwan_lte_ca=ca_activated\n",
+            "lte_multi_ca_scell_info=0,224,2,1,300,20;\nlte_multi_ca_scell_sig_info=-98,-12,8,-65,1;\n"
+        ));
+        let mut live = json!({"network_type":"LTE","lte_pci":"df","wan_active_channel":"1650",
+            "wan_lte_ca":"ca_deconfigured","lte_multi_ca_scell_info":"","lte_multi_ca_scell_sig_info":""});
+        let state = from_sources(Model::U50Pro, &cfg, Some(&live)).unwrap();
+        assert_eq!(state.fields["net"]["lte_ca_state"], "ca_deconfigured");
+        assert_eq!(state.fields["net"]["lteca"], "ca_deconfigured");
+        assert!(state.fields["net"].get("ltecasig").is_none());
+        live["lte_pci"] = json!("e0");
+        let state = from_sources(Model::U50Pro, &cfg, Some(&live)).unwrap();
+        assert_eq!(state.fields["net"]["lteca"], cfg["lte_multi_ca_scell_info"]);
+        assert_eq!(state.fields["net"]["lte_ca_state"], "ca_activated");
+    }
+
+    #[test]
+    fn lte_ca_inactive_state_does_not_erase_reported_secondary_rows() {
+        for status in ["ca_deconfigured", "ca_deactivated"] {
+            let cfg = cfg_from_show(&format!(
+                "model_name=U50Pro\nnetwork_type=LTE\nlte_pci=df\nwan_active_channel=1650\nwan_lte_ca={status}\nlte_multi_ca_scell_info=0,224,1,1,300,20;\nlte_multi_ca_scell_sig_info=-98,-12,8,-65,0;\n"
+            ));
+            let state = from_sources(Model::U50Pro, &cfg, None).unwrap();
+            assert_eq!(state.fields["net"]["lte_ca_state"], status);
+            assert_eq!(state.fields["net"]["lteca"], "0,224,1,1,300,20;");
+            assert_eq!(state.fields["net"]["ltecasig"], "-98,-12,8,-65,0;");
+        }
+    }
+
+    #[test]
+    fn u50_ca_exports_secondary_rows_and_raw_activation_without_private_data() {
+        let cfg = cfg_from_show(concat!(
+            "model_name=U50Pro\nnetwork_type=SA\nnr5g_pci=19f\nnr5g_action_channel=633984\nnr5g_action_band=n78\n",
+            "nr_multi_ca_scell_info=0,801,2,n1,427210,20MHz,1,-69.9,-10.4,32.0,-59.6;\n",
+            "nr_ca_dl_state=2\nnr_ca_ul_state=2\nadmin_password=private\n"
+        ));
+        let snapshot = from_sources(Model::U50Pro, &cfg, None).unwrap();
+        let net = &snapshot.fields["net"];
+        assert_eq!(net["nr_pci"], 415);
+        assert_eq!(net["nrca"], cfg["nr_multi_ca_scell_info"]);
+        assert_eq!(net["nr_ca_dl_state"], "2");
+        assert_eq!(net["nr_ca_ul_state"], "2");
+        assert!(
+            !serde_json::to_string(&snapshot.fields)
+                .unwrap()
+                .contains("private")
+        );
+        for key in [
+            "nr_multi_ca_scell_info",
+            "nr_ca_dl_state",
+            "nr_ca_ul_state",
+            "nr5g_pci",
+            "nr5g_action_channel",
+        ] {
+            assert!(CMD.split(',').any(|v| v == key));
+        }
+    }
+
+    #[test]
+    fn u50_ca_live_clear_wins_but_different_primary_is_not_joined() {
+        let cfg = cfg_from_show(concat!(
+            "model_name=U50Pro\nnetwork_type=SA\nnr5g_pci=19f\nnr5g_action_channel=633984\n",
+            "nr_multi_ca_scell_info=0,801,2,n1,427210,20MHz,1,-69.9,-10.4,32.0,-59.6;\n",
+            "nr_ca_dl_state=2\nnr_ca_ul_state=2\n"
+        ));
+        let live = json!({"network_type":"SA","nr5g_pci":"19f","nr5g_action_channel":"633984",
+            "nr_multi_ca_scell_info":"","nr_ca_dl_state":"","nr_ca_ul_state":""});
+        let snapshot = from_sources(Model::U50Pro, &cfg, Some(&live)).unwrap();
+        assert_eq!(snapshot.fields["net"]["nrca"], "");
+        assert_eq!(snapshot.fields["net"]["nr_ca_dl_state"], "");
+        let other_primary = json!({"network_type":"SA","nr5g_pci":"321","nr5g_action_channel":"427210",
+            "nr_multi_ca_scell_info":"other-snapshot"});
+        let snapshot = from_sources(Model::U50Pro, &cfg, Some(&other_primary)).unwrap();
+        assert_eq!(
+            snapshot.fields["net"]["nrca"],
+            cfg["nr_multi_ca_scell_info"]
+        );
+        let lte = json!({"network_type":"LTE"});
+        let snapshot = from_sources(Model::U50Pro, &cfg, Some(&lte)).unwrap();
+        assert!(snapshot.fields["net"].get("nrca").is_none());
+    }
+
+    #[test]
+    fn ca_lists_above_512_bytes_are_preserved_for_both_sources() {
+        let nr: String = (0..31)
+            .map(|i| {
+                format!(
+                    "{i},{},2,n78,{},100MHz,1,-90,-10,20,-65;",
+                    500 + i,
+                    640001 + i
+                )
+            })
+            .collect();
+        let lte: String = (0..31)
+            .map(|i| format!("{i},{},2,3,{},20;", 300 + i, 1651 + i))
+            .collect();
+        let sig = "-90,-10,20,-65,1;".repeat(31);
+        assert!(nr.len() > 512 && lte.len() > 512);
+        let cfg = cfg_from_show(&format!(
+            "model_name=U50Pro\nnetwork_type=ENDC\nlte_pci=df\nwan_active_channel=1650\nnr5g_pci=19f\nnr5g_action_channel=633984\nwan_lte_ca=ca_activated\nnr_multi_ca_scell_info={nr}\nlte_multi_ca_scell_info={lte}\nlte_multi_ca_scell_sig_info={sig}\n"
+        ));
+        let live = json!({"network_type":"ENDC","lte_pci":"df","wan_active_channel":"1650",
+            "nr5g_pci":"19f","nr5g_action_channel":"633984","wan_lte_ca":"ca_activated",
+            "nr_multi_ca_scell_info":nr,"lte_multi_ca_scell_info":lte,"lte_multi_ca_scell_sig_info":sig});
+        for goform in [None, Some(&live)] {
+            let state = from_sources(Model::U50Pro, &cfg, goform).unwrap();
+            let net = &state.fields["net"];
+            assert_eq!(net["nrca"], nr);
+            assert_eq!(net["lteca"], lte);
+            assert_eq!(net["ltecasig"], sig);
+            assert_eq!(net["ca_format"], "u50_oem");
+        }
+        assert!(accept_cfg_value("nr_multi_ca_scell_info", &"x".repeat(16385)).is_none());
+        assert!(accept_cfg_value("model_name", &"x".repeat(513)).is_none());
+        assert!(accept_cfg_value("nr_multi_ca_scell_info", "x\ny").is_none());
+        assert_eq!(
+            cfg_from_show("nr_multi_ca_scell_info=\n")["nr_multi_ca_scell_info"],
+            ""
+        );
+    }
+
+    #[test]
+    fn nsa_bandwidth_is_independent_and_unknown_is_not_lte_bandwidth() {
+        for rat in ["ENDC", "NSA", "LTE-NSA"] {
+            let mut cfg = cfg_from_show(&format!(
+                "model_name=U50Pro\nnetwork_type={rat}\nbandwidth=20MHz\nnr5g_nsa_bandwidth=100MHz\n"
+            ));
+            let state = from_sources(Model::U50Pro, &cfg, None).unwrap();
+            assert_eq!(state.fields["net"]["lte_bw"], "20MHz");
+            assert_eq!(state.fields["net"]["nr_bw"], "100MHz");
+            cfg.remove("nr5g_nsa_bandwidth");
+            let state = from_sources(Model::U50Pro, &cfg, None).unwrap();
+            assert!(state.fields["net"].get("nr_bw").is_none());
+        }
+    }
+
+    #[test]
+    fn radio_switch_does_not_join_signals_or_stale_carriers() {
+        let cfg = cfg_from_show(
+            "model_name=U50Pro\nnetwork_type=LTE\nlte_pci=df\nwan_active_channel=1650\nlte_rsrp=-90\nlte_snr=10\nwan_lte_ca=ca_activated\nlte_multi_ca_scell_info=0,224,2,1,300,20;\n",
+        );
+        let mut live = json!({"network_type":"LTE","lte_pci":"e0","wan_active_channel":"300","lte_rsrp":"-60","lte_snr":"30"});
+        let state = from_sources(Model::U50Pro, &cfg, Some(&live)).unwrap();
+        assert_eq!(state.fields["net"]["lte_rsrp"], -90);
+        assert_eq!(state.fields["net"]["lte_snr"], "10");
+        live["network_type"] = json!("SA");
+        let state = from_sources(Model::U50Pro, &cfg, Some(&live)).unwrap();
+        for key in [
+            "lte_pci",
+            "lte_channel",
+            "lte_rsrp",
+            "lteca",
+            "ltecasig",
+            "nrca",
+        ] {
+            assert!(state.fields["net"].get(key).is_none(), "{key}");
+        }
     }
 
     #[test]
