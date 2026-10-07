@@ -132,7 +132,7 @@ SSE  /events
   },
   "sms": {
     "unread": 2,
-    "list": [ { "id": 53, "num": "10086", "date": "06-15 14:57", "unread": 0, "text": "正文…" } ]
+    "list": [ { "id": 53, "num": "10086", "date": "06-15 14:57", "received_at": 1781506620, "unread": 0, "text": "正文…" } ]
   },
   "nfc": { "switch": 1, "enabled": true, "flag": 2 },
   "interfaces": {
@@ -337,7 +337,7 @@ SSE  /events
 - `speedtest`：设备到 Cloudflare 边缘的有界下载测试状态，包含 `supported/state/provider/route_interface/requested_bytes/received_bytes/threads/runs/completed_runs/failed_requests/elapsed_ms/average_mbps`。`received_bytes` 统计已返回的请求；取消时，正在进行的请求可能已消耗流量但不计入该值。只在用户经控制通道显式启动时联网；下载体不进入 datad 内存、NMS 面板流或普通 MQTT。
 - `cloud_management`：只在已授权的按需远程面板帧中出现，含非秘密云端配置、连接状态、已配置密码/CA 的布尔值及远程后台列表；不进入普通 `/state`、SSE 或 MQTT，且绝不含 MQTT 密码或 CA PEM。
 - `scheduled_tasks`：只在已授权的按需远程面板帧中出现，含设备本地时间/时区、最多 16 项受限任务与最后尝试日期/结果；0.10.39 起 `cell_lock_supported=true` 表示支持受限定时锁基站，0.10.40 起 `sms_send_supported=true` 表示支持受限定时短信。定时短信的号码和正文在任务参数中，仅向有设备控制权限的按需面板会话展示，不进入普通 `/state`、SSE 或 MQTT。一次性任务执行前标记 `has_triggered=true`，每日任务按设备本地日期至多尝试一次。`last_result=requested` 仅表示执行请求已持久化，不证明设备动作成功。
-- `sms_forward`：只在已授权的按需远程面板帧中出现，仅含 `supported/enabled/method`、Webhook/钉钉/本机短信/SMTP 目标及加签密钥的配置布尔值、`smtp_supported`、`power_supported/power_forward_enabled`、`rules_supported` 能力/开关、黑名单条数、`nickname_supported/nickname` 设备别名、`device_info_supported` 及 SMTP/钉钉/本机短信三个独立设备信息开关、两种当日剩余额度及有限结果码；不包含目标 URL、手机号、邮箱地址、密码、黑名单内容、设备信息正文或短信正文，不进入普通 `/state`、SSE 或 MQTT。开启后仅转发新增且未命中号码/关键词黑名单的短信；命中的短信也记为已处理，不会在清空规则后补发。Webhook/钉钉发往公网 HTTPS，本机短信方式调用原厂接口，SMTP 方式以证书验证的 TLS 向公网邮件服务器提交邮件。电源通知只在设备电池读数有效且总开关与独立开关均开启时，按充电状态或电量变化投递；首次启用记录当前基线，投递前持久化事件状态和每日上限。
+- `sms_forward`：只在已授权的按需远程面板帧中出现，仅含 `supported/enabled/method`、Webhook/钉钉/本机短信/SMTP 目标及加签密钥的配置布尔值、`smtp_supported`、`power_supported/power_forward_enabled`、`rules_supported` 能力/开关、黑名单条数、`nickname_supported/nickname` 设备别名、`device_info_supported` 及 SMTP/钉钉/本机短信三个独立设备信息开关、本机短信当日剩余额度及有限结果码；不包含目标 URL、手机号、邮箱地址、密码、黑名单内容、设备信息正文或短信正文，不进入普通 `/state`、SSE 或 MQTT。开启后仅转发新增且未命中号码/关键词黑名单的短信；命中的短信也记为已处理，不会在清空规则后补发。Webhook/钉钉发往公网 HTTPS，本机短信方式调用原厂接口，SMTP 方式以证书验证的 TLS 向公网邮件服务器提交邮件。电源通知只在设备电池读数有效且总开关与独立开关均开启时，按充电状态变化或电量升降到达、跨过 5%、20%、40%、60%、80%、100% 投递，所有提供有效电池状态的机型共用此逻辑；首次启用记录当前基线，投递前持久化事件状态，无电源通知每日上限，状态中不再返回 `power_daily_remaining`。
 - `interfaces.wan4/wan6` 的地址：蜂窝拨号不经 netifd 的机型（如 G5 Pro）其 WAN 接口为 `proto:none` 且无地址，此时 datad 用 `interfaces.cellular` 的 `ipv4_address`/`ipv6_address`（可解析且非 0 才用，IPv4 同时按掩码给出 `mask`）补全空的地址列表，只补地址，不改 `up`/`proto`；netifd 已有地址时一律以 netifd 为准。云遥测的上游 IP 和面板 `interfaces` 因此在这些机型上也有值。0.10.55 起再加最后一级兜底：两者都没有有效地址时，读内核默认路由所在接口（`/proc/net/route`、`/proc/net/ipv6_route`，忽略 `lo`、`br-*` 和 reject 路由）的地址；IPv4 经 `getifaddrs`，IPv6 取 `/proc/net/if_inet6` 中全局、非临时的地址，均排除链路本地、回环和组播。优先级：netifd > 蜂窝数据服务 > 内核。
 - `apn_targets`：只在已授权的按需远程面板帧中出现，且只在带外挂基带的机型（MU5252）。`targets` 最多 3 项 `{slot_id, config}`，`1` → 5G、`101` → 4G2、`201` → 4G1，整块不超过 24 KiB（超出时先裁自动列表）。`config` 与 `apn_config` 同为脱敏格式（不含用户名、密码），另有 `writable`：该目标全部读取成功才为 `true`，读不到的目标为 `false` 且列表为空。
 - `device_session`：只在已授权的按需远程面板帧中出现，`{supported, reauth_supported, active}`。`active` 为 `true`/`false`/`null`：`null` 表示不是由本进程建立或无法确认，不能当作已登录或未登录；`false` 表示由 `device.session.login` 建立的会话已被替换或过期。
@@ -350,6 +350,7 @@ SSE  /events
 - `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时完整流式扫描两份日志，只缓存 `[DATA]` 解析材料；当前日志追加时增量读取，检测到 rename 轮转、截断或原地重写时完整重扫两份日志。当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内采用最新的数据承载（LTE EPS 承载或 NR PDU 会话），只有写明了其他 PLMN（`access_point=*.mncXXX.mccYYY.*` 与当前 `net.mcc/net.mnc` 不符）的承载降级。LTE APN-AMBR 按 TS 24.301 解码：厂商日志的 `_ext2` 把 8640 kbps 基值也加了进去（如 500 Mbps 打印成 `508.640Mbps`），解析时扣回；`_ext2=0.000` 表示没有扩展-2 字节，改用 `_ext`。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；`qos.reload` 会主动失效缓存并重读。
 - `clients.list` 只包含固件无线/有线访问列表确认在线的设备，无线设备排列在有线设备之前；DHCP 租约只补全主机名和 IP，不决定在线状态。列表上限 32 条，消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms.unread` 默认每 5 秒读取一次；`sms.list` 启动、容量/未读统计变化、缓存失效及最长每 30 秒进行有界同步：NV/SIM 分别每页 64 条、最多 4 页，按消息 ID 去重，总上限 512 条。达到分页上限或设备重复返回整页时 `sms.truncated=true`。发送尝试结束、删除或标记已读成功后使缓存失效。读取/解密失败保留最近成功列表并设置 `sms.stale=true`、`sms.error`，不把失败伪装成成功的空列表；无历史数据时列表仍为空，但有明确错误。正常时 `stale=false` 且不含 `error`。厂商密文由 Rust RSA/AES-GCM 实现处理，兼容单行 PEM 公钥；解密失败最多重建一次会话并重新读取，不自动重发短信。号码和正文输出为 UTF-8 明文；消费者不应再实现厂商会话密钥或解密逻辑。相关写操作通过 [`CONTROL_API.md`](CONTROL_API.md) 执行。
+- `sms.list[].received_at`（0.10.71 起）：短信中心时间戳（含时区和秒）换算出的 UTC 秒数，时间格式无法识别时为 `null`。`date` 仍是给人看的 `MM-DD HH:MM` 本地时间。
 
 
 ## Neighbor and charger direct supply
