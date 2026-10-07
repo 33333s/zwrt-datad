@@ -1458,11 +1458,10 @@ mod tests {
             ..Default::default()
         };
         assert!(!valid_config(&invalid));
-        let legacy: Config = serde_json::from_value(json!({
-            "schema":1,"enabled":false,"method":"webhook","webhook_url":"",
-            "seen":[],"power_quota_used":60,"power_quota_date":"2026-10-01"
-        }))
-        .unwrap();
+        let mut stored = serde_json::to_value(Config::default()).unwrap();
+        stored["power_quota_used"] = json!(60);
+        stored["power_quota_date"] = json!("2026-10-01");
+        let legacy: Config = serde_json::from_value(stored).unwrap();
         assert!(valid_config(&legacy));
         fs::remove_dir_all(dir).unwrap();
     }
