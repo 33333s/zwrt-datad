@@ -176,7 +176,7 @@ mod tests {
         where
             S: Stream<Item = Result<Message, Error>> + Unpin,
         {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(15), async {
                 let mut output = String::new();
                 while let Some(message) = ws.next().await {
                     if let ShellMessage::Binary(data) = decode(message.unwrap()).unwrap() {

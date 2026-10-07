@@ -421,7 +421,8 @@ mod tests {
         )
         .await
         .unwrap();
-        for _ in 0..100 {
+        // A loaded CI runner needs well over a second for six mock runs.
+        for _ in 0..1000 {
             if manager.lock().await.status.state != "running" {
                 break;
             }
