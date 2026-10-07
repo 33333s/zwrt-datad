@@ -135,7 +135,7 @@ impl RemoteNodes {
     /// The owner's local switch. It never touches the list itself.
     pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
         let mut next = self.saved();
-        if next.disabled == !enabled {
+        if next.disabled != enabled {
             return Ok(());
         }
         next.disabled = !enabled;
