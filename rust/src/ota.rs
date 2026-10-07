@@ -16,7 +16,17 @@ use tokio::process::Command;
 
 const NETDISK: &str = "https://pan.ericsfj.com/sd/wN2PJUK8";
 const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/download";
-const PUBLIC_KEY: &str = include_str!("../ota_public.pem");
+/// Every key an update manifest may be signed with, by name. A manifest is
+/// accepted when any one of them verifies it. `shared` is the key the ARM64
+/// line also uses; `arm32` is this line's own key. To trust another signer,
+/// add their public key here in a release signed with a key already trusted.
+const PUBLIC_KEYS: &[(&str, &str)] = &[
+    ("shared", include_str!("../ota_public.pem")),
+    ("arm32", ARM32_PUBLIC_KEY),
+];
+/// The ARM32 line's own signing key (public half; the private key stays with
+/// the release signer).
+const ARM32_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAzW4lBGa8AOdKTjXPfUeasFs64B81w2UiUfmuIvFd/nQ=\n-----END PUBLIC KEY-----\n";
 const IDLE_FOR: Duration = Duration::from_secs(120);
 
 /// Platform-specific update behaviour. The ZWRT ARM64 devices keep the defaults;
@@ -131,6 +141,9 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wait_reasons: Vec<String>,
     pub signature_verified: bool,
+    /// Name of the key in `PUBLIC_KEYS` that verified the current manifest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature_key: String,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -153,6 +166,7 @@ impl Default for Status {
             failure_count: 0,
             wait_reasons: Vec::new(),
             signature_verified: false,
+            signature_key: String::new(),
         }
     }
 }
@@ -160,6 +174,8 @@ impl Default for Status {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub manifest: Manifest,
+    /// Which trusted key signed the manifest.
+    pub signer: &'static str,
     pub base_url: String,
 }
 
@@ -248,7 +264,7 @@ pub struct Ota {
     idle_since: Option<i64>,
     pub busy: bool,
     client: Client,
-    key: VerifyingKey,
+    keys: Vec<(&'static str, VerifyingKey)>,
     last_auto_check: i64,
 }
 
@@ -259,7 +275,10 @@ impl Ota {
     }
 
     pub fn load_with(dir: &Path, profile: Profile) -> Result<Self, String> {
-        let key = parse_public_key(PUBLIC_KEY)?;
+        let keys = PUBLIC_KEYS
+            .iter()
+            .map(|(name, pem)| parse_public_key(pem).map(|key| (*name, key)))
+            .collect::<Result<Vec<_>, _>>()?;
         let config = read_json::<Config>(&dir.join("ota.json"))
             .filter(|value| validate_config(value).is_ok())
             .unwrap_or_default();
@@ -270,6 +289,7 @@ impl Ota {
             status.state = "error".into();
             status.error = "上次更新检查或下载被中断，请重新检查".into();
             status.signature_verified = false;
+            status.signature_key.clear();
             status.latest_version.clear();
             status.source.clear();
             status.wait_reasons.clear();
@@ -284,6 +304,7 @@ impl Ota {
             status.state = "idle".into();
             status.latest_version = env!("DATAD_VERSION").into();
             status.signature_verified = false;
+            status.signature_key.clear();
             status.source.clear();
             status.wait_reasons.clear();
             status.error.clear();
@@ -304,7 +325,7 @@ impl Ota {
             idle_since: None,
             busy: false,
             client,
-            key,
+            keys,
             last_auto_check: 0,
         };
         result.publish();
@@ -380,6 +401,7 @@ impl Ota {
         self.config = config;
         self.candidate = None;
         self.status.signature_verified = false;
+        self.status.signature_key.clear();
         self.status.latest_version.clear();
         self.status.source.clear();
         self.status.wait_reasons.clear();
@@ -419,6 +441,7 @@ impl Ota {
         self.status.error.clear();
         self.candidate = None;
         self.status.signature_verified = false;
+        self.status.signature_key.clear();
         self.status.latest_version.clear();
         self.status.source.clear();
         self.status.wait_reasons.clear();
@@ -446,10 +469,10 @@ impl Ota {
                     continue;
                 }
             };
-            if verify(&self.key, &raw, &encoded).is_err() {
+            let Ok(signer) = verify_any(&self.keys, &raw, &encoded) else {
                 errors.push(format!("{base}: 签名校验失败"));
                 continue;
-            }
+            };
             let manifest: Manifest = match serde_json::from_slice(&raw) {
                 Ok(value) if validate_manifest(&value).is_ok() => value,
                 _ => {
@@ -459,6 +482,7 @@ impl Ota {
             };
             let candidate = Candidate {
                 manifest,
+                signer,
                 base_url: base,
             };
             if !has_update(&candidate) {
@@ -475,6 +499,7 @@ impl Ota {
             self.status.latest_version = candidate.manifest.version.clone();
             self.status.source = source_name(&candidate.base_url).into();
             self.status.signature_verified = true;
+            self.status.signature_key = candidate.signer.into();
             self.status.wait_reasons.clear();
             self.status.state = "available".into();
             self.candidate = Some(candidate.clone());
@@ -490,6 +515,7 @@ impl Ota {
                 };
             self.status.source = source_name(&candidate.base_url).into();
             self.status.signature_verified = true;
+            self.status.signature_key = candidate.signer.into();
             self.status.wait_reasons.clear();
             self.status.state = "idle".into();
             self.candidate = Some(candidate.clone());
@@ -500,6 +526,7 @@ impl Ota {
         self.status.state = "error".into();
         self.status.error = error.clone();
         self.status.signature_verified = false;
+        self.status.signature_key.clear();
         self.save_status();
         Err(error)
     }
@@ -998,6 +1025,18 @@ fn verify(key: &VerifyingKey, message: &[u8], encoded: &[u8]) -> Result<(), Stri
         .map_err(|_| "签名校验失败".into())
 }
 
+/// The name of the first trusted key that verifies `message`.
+fn verify_any(
+    keys: &[(&'static str, VerifyingKey)],
+    message: &[u8],
+    encoded: &[u8],
+) -> Result<&'static str, String> {
+    keys.iter()
+        .find(|(_, key)| verify(key, message, encoded).is_ok())
+        .map(|(name, _)| *name)
+        .ok_or_else(|| "签名校验失败".into())
+}
+
 fn source_url(base: &str, name: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), name)
 }
@@ -1101,7 +1140,14 @@ mod tests {
 
     #[test]
     fn public_key_and_defaults_are_valid() {
-        parse_public_key(PUBLIC_KEY).unwrap();
+        let keys: Vec<_> = PUBLIC_KEYS
+            .iter()
+            .map(|(_, pem)| parse_public_key(pem).unwrap())
+            .collect();
+        assert!(keys.len() >= 2);
+        for (i, a) in keys.iter().enumerate() {
+            assert!(keys[i + 1..].iter().all(|b| b != a), "duplicate OTA key");
+        }
         validate_config(&Config::default()).unwrap();
         assert_eq!(
             source_url(NETDISK, "update.json"),
@@ -1148,6 +1194,26 @@ mod tests {
         let encoded = STANDARD.encode(signing.sign(raw).to_bytes());
         verify(&signing.verifying_key(), raw, encoded.as_bytes()).unwrap();
         assert!(verify(&signing.verifying_key(), b"tampered", encoded.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn any_trusted_key_verifies_and_is_named() {
+        let mine = SigningKey::from_bytes(&[3; 32]);
+        let theirs = SigningKey::from_bytes(&[4; 32]);
+        let stranger = SigningKey::from_bytes(&[5; 32]);
+        let keys = vec![
+            ("arm32", mine.verifying_key()),
+            ("kanoqwq", theirs.verifying_key()),
+        ];
+        let raw = br#"{"schema":1}"#;
+        let sign = |key: &SigningKey| STANDARD.encode(key.sign(raw).to_bytes());
+        assert_eq!(verify_any(&keys, raw, sign(&mine).as_bytes()), Ok("arm32"));
+        assert_eq!(
+            verify_any(&keys, raw, sign(&theirs).as_bytes()),
+            Ok("kanoqwq")
+        );
+        assert!(verify_any(&keys, raw, sign(&stranger).as_bytes()).is_err());
+        assert!(verify_any(&keys, b"tampered", sign(&mine).as_bytes()).is_err());
     }
 
     #[tokio::test]
@@ -1231,7 +1297,7 @@ mod tests {
             std::env::temp_dir().join(format!("zwrt-datad-ota-http-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut ota = Ota::load(&dir).unwrap();
-        ota.key = signing.verifying_key();
+        ota.keys = vec![("test", signing.verifying_key())];
         ota.config.servers = vec![
             format!("http://{address}/stale"),
             format!("http://{address}/bad"),
@@ -1242,6 +1308,7 @@ mod tests {
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");
         assert!(ota.status.signature_verified);
+        assert_eq!(ota.status.signature_key, "test");
         let id = Ota::candidate_id(&candidate);
         assert!(ota.approved_candidate(&id).is_ok());
         let mut changed = candidate.clone();
@@ -1376,7 +1443,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut ota = Ota::load_with(&dir, Profile::U50).unwrap();
-        ota.key = signing.verifying_key();
+        ota.keys = vec![("test", signing.verifying_key())];
         ota.config.sources = vec!["custom".into()];
         let roomy = json!({"runtime":{"storage":{"available":1.0e9}}});
 
