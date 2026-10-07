@@ -123,7 +123,10 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         assert state["u50_cfg"]["wan_ipaddr"] == "10.0.0.2"
         assert state["net"]["type"] == "NR5G"
         assert state["net"]["bars"] == 5
-        assert state["net"]["lte_snr"] == "4.4"
+        # cfg is still LTE while the live response is NR: do not attach stale
+        # LTE readings to the new RAT. Verify coherent LTE separately below.
+        for key in ("lte_snr", "lte_rsrp", "lteca", "ltecasig", "nrca"):
+            assert key not in state["net"], key
         assert state["qos"]["qci"] == 9
         assert state["qos"]["ambr_dl"] == "64.000" and state["qos"]["ambr_ul"] == "32.000"
         assert state["qos"]["available"] is True
@@ -152,6 +155,18 @@ printf 'Station b8:d4:bc:00:00:01 (on wlan0)\\nStation aa:bb:cc:00:11:22 (on wla
         assert Handler.host == "192.168.0.1"
         assert Handler.referer == "http://192.168.0.1/"
         assert "model_name" in Handler.query[1]["cmd"][0]
+        original_reply = Handler.reply
+        try:
+            lte_reply = json.loads(original_reply)
+            lte_reply["network_type"] = "LTE"
+            Handler.reply = json.dumps(lte_reply).encode()
+            coherent = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15, check=True)
+            lte_state = json.loads(coherent.stdout)
+            assert lte_state["net"]["type"] == "LTE"
+            assert lte_state["net"]["lte_snr"] == "4.4"
+            assert lte_state["net"]["lte_rsrp"] == -83
+        finally:
+            Handler.reply = original_reply
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
