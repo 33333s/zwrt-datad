@@ -332,3 +332,137 @@ State is refreshed after uncertain writes as the hardware may have changed.
 `verified` confirms the firmware setting, not an electrical current measurement.
 No extra datad startup policy rewrites the mode; reboot persistence is whatever
 the device firmware provides. Both actions use the existing token authentication.
+
+
+### App forwarding settings
+
+Both listeners expose the following routes with an explicit Bearer token check,
+including the loopback listener. Query-string tokens are not accepted.
+
+- `GET /sms/forward/config`: private editor response `{config,status}` with
+  `Cache-Control: no-store`. Targets and filter rules are included; SMTP passwords
+  and DingTalk signing secrets are replaced by `password_configured` (inside
+  `smtp`) and `dingtalk_secret_configured`. Internal fingerprints are excluded.
+- `POST /sms/forward/config`: the same validated payload as `sms.forward.set`;
+  returns status. Omitted secrets retain their previous values. An explicit empty
+  DingTalk secret clears signing. To clear SMTP, disable/switch away from SMTP and
+  submit empty host/username/password/to and port 0. Body limit: 32 KiB.
+- `GET /sms/forward/status`: destination-free capabilities and delivery status.
+- `POST /sms/forward/test` with `{}`: sends the existing fixed test message to the
+  saved destination, including any applicable SIM charges. It does not accept
+  an arbitrary recipient or body. Body limit: 1 KiB.
+
+These editor fields are not added to `/state`, SSE or ordinary MQTT telemetry.
+App edits do not require enabling NMS. DingTalk signing still uses the configured
+NMS platform's HTTPS Date source for its trusted timestamp.
+
+
+## App 定时任务
+
+`GET /tasks` 返回任务列表、设备本地时间、`max_tasks`、当前支持的 `actions` 与 `network_modes`。
+`POST /tasks` 使用与 `schedule.task.put` 相同的 `id/time/repeat_daily/action/params`，按任务名新增或更新；
+`POST /tasks/remove` 仅接受 `{"id":"任务名"}`。三者在 9460、9461 均要求请求头中的有效令牌，
+不接受查询字符串令牌；响应标记 `Cache-Control: no-store`。短信正文只进入此鉴权接口和设备私有文件，
+不进入 `/state` 或普通 SSE。客户端应按返回的动作、网络模式和卡槽能力提供选项，不能默认设备支持双卡。
+
+任务按设备本地 `HH:MM` 执行；`repeat_daily=false` 为下次到达该时间执行一次，`true` 为每日执行。
+关机期间错过的时刻不补执行。结果 `requested` 表示已提交执行，`ok/failed` 为执行成功/失败；
+一次性任务在执行前持久化触发标记，重启不重放。原有 NMS 与 App 共用同一任务库。
+
+
+# App history and LAN settings
+
+These routes require a Bearer token in the `Authorization` header on both
+listeners (including loopback). Query-string tokens are not accepted. Successful
+and application-error replies use `Cache-Control: no-store`.
+
+- `GET /traffic/history`: returns `days: [{date, bytes}]`, `device_date`,
+  `oldest_date`, `sample_interval_seconds: 300`, and `max_days: 400`.
+  Optional inclusive `start` and `end` use `YYYY-MM-DD` in the device's local
+  calendar. Only observed days are returned. Bytes combine cellular upload and
+  download; today's total is provisional. History persists across datad restarts
+  and cannot reconstruct days before collection. Daily counter resets accumulate
+  within the day; a new day starts from its own daily counter, never yesterday's.
+- `GET /lan`: normalized current settings and limits. Unknown values are `null`.
+  `dhcp_enabled`, `dhcp_start`, `dhcp_end`, `lease_seconds`, and `mtu` are
+  exposed separately. MTU is the device network/WAN MTU, not a client-specific MTU.
+- `POST /lan`: optional `ip`, `netmask`, `dhcp_enabled`, `dhcp_start`, `dhcp_end`,
+  `lease_seconds`; unspecified fields use the current settings. Enabled DHCP
+  requires a valid same-subnet pool excluding the network, broadcast and gateway
+  addresses, and a whole-hour lease from 1 to 720 hours. Disabling DHCP preserves
+  the saved pool and lease. Existing firmware validation and readback remain authoritative.
+- `POST /lan/mtu`: `{ "mtu": 1400 }`, integer 576 through 1500. Saved separately
+  from DHCP to avoid partially applying two unrelated settings.
+
+LAN writes return `{settings, changed, verified}`. Identical settings avoid OEM
+writes. `verified` requires matching readback after the control operation; a
+successful submission alone does not mean verified. Changing LAN settings may
+disconnect clients. Clients must not automatically retry writes after a timeout
+or report an unconfirmed change as successful.
+# Local activity history and network recovery
+
+All routes below require a Bearer header on both listeners and return private,
+`no-store` responses. They are independent of NMS enrollment and the App staying
+open. Recovery is disabled by default and never runs an unrestricted command.
+
+- `GET /activity`: newest-first execution history, up to 100 entries per page.
+  Optional `before` (exclusive ID), `category` (`notification`, `task`, `recovery`)
+  and `failed=true` filter the result. `next_before` is the next-page cursor.
+  `max_entries` is 300. `storage_ok=false` means persistence failed.
+- `POST /activity/clear` with `{}` clears all categories without changing tasks,
+  forwarding configuration or recovery limits. IDs do not reset.
+- `GET /network/recovery`: saved configuration plus runtime status, consecutive
+  failure count, redial count, next permissible action time and manual-pause state.
+- `POST /network/recovery`: saves `enabled` (default false), `interval_seconds`
+  (30/60/120, default 60), `failure_threshold` (3–10, default 3),
+  `cooldown_seconds` (180–3600, default 300), `max_redials` (1–5, default 3), and
+  `reboot_after_failures` (default false). Unknown properties are rejected.
+- `POST /network/recovery/resume` with `{}` explicitly releases a manual pause
+  and starts a new redial round after a grace period. Hourly/reboot limits remain.
+- `POST /network/recovery/check` with `{}` performs one read-only connectivity
+  check and returns `online` and `checked_at`. It does not increment failure
+  counters, enable recovery or perform recovery actions; limited to once per 10s.
+
+Detection uses bounded HTTPS HEAD requests to two fixed, independent hosts
+(`www.baidu.com`, `www.qq.com`), with normal certificate validation, no proxy and
+no redirect following. Any authenticated HTTPS response proves reachability (including HTTP errors,
+which must not be mistaken for a broken cellular connection).
+Both failing for the configured number of rounds triggers a bearer reconnect;
+optional reboot follows exhausted redials. DNS/TLS/remote-host failures can affect
+this check; it measures reachability, not bandwidth. It does not change bands,
+cell locks, APNs or network mode. A submitted action is recorded as such; only a
+later successful connectivity check reports network recovery.
+
+Recovery requires a fresh, recognized cellular snapshot, excludes explicitly
+disabled radio, and waits at least 120 seconds on startup/configuration changes.
+Network-changing controls through datad (including scheduled/NMS controls) cancel
+in-flight recovery plans and reset the failure streak. Explicit disconnect and
+poweroff persist a manual pause; explicit connect or `/resume` releases it.
+Changes made entirely outside datad cannot always be attributed to user intent;
+disable recovery before intentionally disconnecting through the original UI.
+
+Attempts are reserved on disk before device actions: maximum five actions in a
+rolling hour and one automatic reboot per six hours, including after restarts.
+Two successful checks reset the current outage's redial count, but do not reset
+hourly/reboot budgets. Invalid storage, stale snapshots or a regressed clock stop
+recovery. Saving or probing never bypasses those limits.
+
+History is stored privately in `activity.json`; recovery intent and budgets in
+`network-recovery.json` (0600, atomic replacement). History records bounded reason
+codes and task names, never message bodies, recipients, control parameters,
+authentication headers or credentials. Identical repeated failure events are
+coalesced for five minutes. Existing history cannot be reconstructed retroactively.
+
+
+### App datad updates (private on 9460 and 9461)
+
+All routes require an Authorization header; query tokens are not accepted. Responses are `Cache-Control: no-store`.
+
+- `GET /ota/app`: `{status, config, busy, platform, candidate}`. Status remains readable during network downloads. `candidate` is null or `{id, manifest}`; manifest optionally contains signed plaintext `notes`.
+- `POST /ota/app/config`: existing OTA `{enabled, servers, sources}` configuration. `enabled` controls automatic idle installation. Custom directories require HTTPS and the **same official Ed25519 signature** as built-in sources; this is mirror selection, not arbitrary binary installation. Configuration changes invalidate the previous candidate.
+- `POST /ota/app/check` with `{}`: 202 schedules a check; poll status. 409 indicates another job is running.
+- `POST /ota/app/install` with `{candidate_id: "<id returned above>"}`: 202 schedules installation of exactly that checked manifest and source. Stale/missing candidates or concurrent jobs return 409. No URL, hash or shell command is accepted from the App.
+
+App updates use the existing signed `update.json` and `update.json.sig`, sources, installer and built-in verification key. Publish artifacts before the signed manifest. `scripts/sign-update.py --notes release-notes.txt` adds signed plaintext release notes.
+
+`installing`/95% means the installer is running, not success. After service restart, `succeeded` requires the installer success marker and the expected running datad version. A missing result after 30 minutes is reported as unconfirmed. The App refreshes its saved ZWRT credentials when the daemon loses in-memory sessions; without saved credentials, reconnect manually. Older daemons require one manual upgrade to expose these routes.

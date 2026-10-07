@@ -145,6 +145,31 @@ pub struct QuickConnect {
     pub password: String,
 }
 
+/// Local authenticated App editor. Terminal permissions are deliberately absent.
+/// Omitted fields retain the latest stored value under the cloud write lock.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUpdate {
+    pub enabled: Option<bool>,
+    pub broker: Option<String>,
+    pub platform_url: Option<String>,
+    pub remote_origins: Option<Vec<String>>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default)]
+    pub clear_password: bool,
+    pub ca_pem: Option<String>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    pub identity_type: Option<String>,
+    pub identity: Option<String>,
+    pub platform: Option<String>,
+    pub report_interval_seconds: Option<u16>,
+    pub remote_enabled: Option<bool>,
+    pub remote_panel_control_enabled: Option<bool>,
+    pub web_services: Option<Vec<Service>>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct Status {
     state: String,
@@ -353,10 +378,66 @@ impl Cloud {
         Ok(self.public_config())
     }
 
+    pub fn app_update(&mut self, input: AppUpdate) -> Result<Value, String> {
+        let mut next = self.config.clone();
+        macro_rules! assign {
+            ($($field:ident),* $(,)?) => { $(if let Some(value) = input.$field { next.$field = value; })* };
+        }
+        assign!(
+            enabled,
+            broker,
+            platform_url,
+            remote_origins,
+            username,
+            password,
+            ca_pem,
+            vendor,
+            model,
+            identity_type,
+            identity,
+            platform,
+            report_interval_seconds,
+            remote_enabled,
+            remote_panel_control_enabled
+        );
+        if let Some(services) = input.web_services {
+            if services
+                .iter()
+                .any(|s| s.kind != "web" || s.port == 0 || s.name.chars().any(char::is_control))
+            {
+                return Err("这里只能配置有效的网页后台".into());
+            }
+            next.services.retain(|s| s.kind == "terminal");
+            next.services.extend(services);
+        }
+        self.update(Update {
+            config: next,
+            clear_password: input.clear_password,
+            platform_nodes_enabled: None,
+        })
+    }
+
     pub fn quick_connect(
         &mut self,
         input: QuickConnect,
         snapshot: &Snapshot,
+    ) -> Result<Value, String> {
+        self.quick_connect_inner(input, snapshot, false)
+    }
+
+    pub fn app_quick_connect(
+        &mut self,
+        input: QuickConnect,
+        snapshot: &Snapshot,
+    ) -> Result<Value, String> {
+        self.quick_connect_inner(input, snapshot, true)
+    }
+
+    fn quick_connect_inner(
+        &mut self,
+        input: QuickConnect,
+        snapshot: &Snapshot,
+        preserve_terminal: bool,
     ) -> Result<Value, String> {
         if self.config.enabled && !self.config.username.is_empty() {
             return Err("已配置云端连接；如需更换账户，请使用高级配置".into());
@@ -435,11 +516,13 @@ impl Cloud {
         config.password = input.password;
         config.enabled = true;
         config.remote_enabled = true;
-        // Joining cloud management turns the panel and cloud terminal on. NMS
-        // still needs the owner's time-limited consent before any operator
-        // can open them, and the owner can switch either off again locally.
-        config.remote_panel_control_enabled = true;
-        config.remote_webshell_enabled = true;
+        if preserve_terminal {
+            config.remote_panel_control_enabled = false;
+        } else {
+            // Preserve main's local quick-connect defaults.
+            config.remote_panel_control_enabled = true;
+            config.remote_webshell_enabled = true;
+        }
         self.update(Update {
             config,
             clear_password: false,
@@ -1896,6 +1979,104 @@ mod tests {
                 assert!(state.seen.is_empty());
             });
         }
+    }
+
+    #[test]
+    fn app_updates_preserve_terminal_and_password_and_reject_terminal_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-app-config-{}-{}", std::process::id(), now()));
+        let mut cloud = Cloud::load(&dir);
+        cloud.nodes.set_enabled(false).unwrap();
+        cloud.config.password = "saved-fixture-secret".into();
+        cloud.config.remote_webshell_enabled = true;
+        let terminals: Vec<_> = cloud
+            .config
+            .services
+            .iter()
+            .filter(|s| s.kind == "terminal")
+            .cloned()
+            .collect();
+        let input: AppUpdate = serde_json::from_value(json!({
+            "password":"", "broker":"wss://example.test/mqtt",
+            "web_services":[{"name":"Web","port":8080,"kind":"web"}]
+        }))
+        .unwrap();
+        let view = cloud.app_update(input).unwrap();
+        assert_eq!(view["config"]["remote_webshell_enabled"], true);
+        assert!(!view.to_string().contains("saved-fixture-secret"));
+        assert_eq!(cloud.config.password, "saved-fixture-secret");
+        assert_eq!(view["remote_nodes"]["enabled"], false);
+        assert_eq!(
+            cloud
+                .config
+                .services
+                .iter()
+                .filter(|s| s.kind == "terminal")
+                .cloned()
+                .collect::<Vec<_>>(),
+            terminals
+        );
+        for input in [
+            json!({"remote_webshell_enabled":false}),
+            json!({"services":[]}),
+        ] {
+            assert!(serde_json::from_value::<AppUpdate>(input).is_err());
+        }
+        let before = fs::read(dir.join("cloud.json")).unwrap();
+        for service in [
+            json!({"name":"Shell","port":22,"kind":"terminal"}),
+            json!({"name":"Bad","port":9461,"kind":"web"}),
+            json!({"name":"Bad","port":0,"kind":"web"}),
+            json!({"name":"Duplicate terminal","port":8899,"kind":"web"}),
+        ] {
+            assert!(
+                cloud
+                    .app_update(serde_json::from_value(json!({"web_services":[service]})).unwrap())
+                    .is_err()
+            );
+            assert_eq!(fs::read(dir.join("cloud.json")).unwrap(), before);
+        }
+        cloud
+            .app_update(serde_json::from_value(json!({"clear_password":true})).unwrap())
+            .unwrap();
+        assert!(cloud.config.password.is_empty());
+        assert!(cloud.config.remote_webshell_enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn app_enrollment_keeps_terminal_permissions_and_services() {
+        let dir = std::env::temp_dir().join(format!(
+            "datad-app-enrollment-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let snapshot = Snapshot {
+            ts: 1,
+            datad: crate::model::DatadVersion::default(),
+            fields: serde_json::from_value(json!({
+                "device":{"api_template":"MU5120","vendor":"ZTE"},
+                "uci_device_info":{"modem_msn":"APP-fixture"}
+            }))
+            .unwrap(),
+        };
+        let mut cloud = Cloud::load(&dir);
+        cloud.config.remote_webshell_enabled = true;
+        let services = cloud.config.services.clone();
+        cloud
+            .app_quick_connect(
+                QuickConnect {
+                    username: format!("enr_{}", "a".repeat(32)),
+                    password: "fixture-password".into(),
+                },
+                &snapshot,
+            )
+            .unwrap();
+        assert!(cloud.config.remote_webshell_enabled);
+        assert_eq!(cloud.config.services, services);
+        assert!(!cloud.config.identity.is_empty());
+        assert!(!cloud.config.remote_panel_control_enabled);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub struct History {
     allow_relabel: bool,
 }
 
-fn valid_date(value: &str) -> bool {
+pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10
         || bytes[4] != b'-'
@@ -98,7 +98,7 @@ fn valid_date(value: &str) -> bool {
     (1..=days[usize::from(month - 1)]).contains(&day)
 }
 
-fn local_date() -> Option<String> {
+pub(crate) fn local_date() -> Option<String> {
     // A fixed executable and argument follow the router's own local clock and
     // timezone. Do not silently relabel local traffic as UTC if this fails.
     let output = Command::new("/bin/date").arg("+%Y-%m-%d").output().ok()?;
@@ -238,6 +238,17 @@ impl History {
         }
         // Counters belong to the latest observation, not whichever date is
         // lexically greatest. A corrected calendar can revisit an older day.
+        let crossed_day = self
+            .stored
+            .active_day
+            .as_deref()
+            .or_else(|| {
+                self.stored
+                    .days
+                    .last_key_value()
+                    .map(|(day, _)| day.as_str())
+            })
+            .is_some_and(|previous| previous != date);
         let previous_counter = self
             .stored
             .active_day
@@ -249,13 +260,19 @@ impl History {
             bytes: 0,
             last_counter: 0,
         });
-        let increment = previous_counter.map_or(counter, |previous| {
-            if counter >= previous {
-                counter - previous
-            } else {
-                counter
-            }
-        });
+        // A normal midnight starts a fresh daily counter. Clock relabeling
+        // retains main's delta behavior so timezone corrections do not duplicate traffic.
+        let increment = if crossed_day && !self.allow_relabel {
+            counter
+        } else {
+            previous_counter.map_or(counter, |previous| {
+                if counter >= previous {
+                    counter - previous
+                } else {
+                    counter
+                }
+            })
+        };
         let next = day.bytes.saturating_add(increment);
         if next > MAX_DAILY_BYTES {
             return false;
@@ -396,7 +413,7 @@ mod tests {
 
         let mut midnight = History::load(&dir);
         assert!(midnight.apply_sample("2025-01-03", start + 1400, 40));
-        assert_eq!(midnight.days()[2].bytes, 10);
+        assert_eq!(midnight.days()[2].bytes, 40);
         assert_eq!(
             fs::metadata(dir.join("traffic-history.json"))
                 .unwrap()

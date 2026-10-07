@@ -12,6 +12,23 @@ datad 优先使用 modem MSN 生成与 UFI 相同的稳定 UUID；若没有 MSN�
 
 UFI 通过本机 9460 的 GET/POST /cloud/config 和 GET /cloud/status 管理；9461 禁止访问。请求由 datad 进程内直接处理。配置原子保存为 0600 的 cloud.json，GET 不返回密码。POST 提交完整配置，空密码保留，clear_password:true 清除。保存后取消旧连接/会话并重新连接；关闭不影响本地管理。
 
+### App 配置入口
+
+App 使用独立的 `GET/POST /cloud/app/config`、`GET /cloud/app/status` 和
+`POST /cloud/app/quick-connect`。9460/9461 上都要求有效的登录 Bearer Token，
+不接受 URL 查询参数鉴权；原 `/cloud/config` 等接口仍只在回环监听器提供。
+
+GET 配置继续返回 `{config, password_configured}`，不返回 MQTT 密码。POST 为部分
+更新，省略字段保留设备最新值；支持连接开关、MQTT/平台地址、备用来源、用户名、
+密码、CA、设备身份、上报间隔、远程访问和远程面板控制。空密码保留原密码，
+`clear_password:true` 显式清除。配置请求限制 64 KiB，快速接入限制 4 KiB。
+
+网页后台通过 `web_services:[{name,port,kind:"web"}]` 更新；原有 `terminal` 条目
+在设备端原样保留。App 接口不接受 `services` 或 `remote_webshell_enabled`，
+快速接入也保留已有终端权限。保存其他配置仍会重新建立云端连接，因此会终止
+旧连接上的会话。网页与保留的终端后台合计最多 8 项，端口不可重复或使用 9460/9461。
+App 状态中的 `connected` 只表示 MQTT 已连接，绑定结果仍需在 NMS 确认。
+
 配置字段：enabled、broker（`ssl://主机:端口` 或 `wss://主机[:端口]/mqtt`，WSS 默认 443）、platform_url（https://主机:端口）、username/password（设备 MQTT 凭据）、ca_pem（可选 CA）、vendor/model/identity_type/identity/platform、report_interval_seconds（10–3600）、remote_enabled、services:[{name,port,kind}]（kind=web/terminal）。默认后台端口 80/2333/8899，最多 8 项，禁止 9460/9461。UFI 传入已有持久 UUID，不能每次启用生成新身份。
 
 发布协议 v1 非 retained 的 telemetry/device、telemetry/system、telemetry/network、status（含离线遗嘱），订阅本设备 command/request，只接受 `remote.open` 和已签名的 datad 自更新命令（见 `docs/NMS.md`）。拒绝 retained、重复会话、非平台 WSS、未授权端口和超限会话，只连接 127.0.0.1。保留后台认证，不执行免密 handoff 或额外端口。最多 4 会话，每个 4 流；到期、配置关闭或平台拒绝后退出。不开放云端 ubus 或系统固件 OTA；可选原生终端另需下文的独立授权。
