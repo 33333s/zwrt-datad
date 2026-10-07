@@ -24,6 +24,9 @@ const MAX_SEEN: usize = 1024;
 const MAX_SMS_TARGETS: usize = 3;
 const MAX_SMS_DAILY_SENDS: u16 = 60;
 const MAX_SMS_UNITS: usize = 280;
+const POWER_THRESHOLDS: [i64; 6] = [5, 20, 40, 60, 80, 100];
+/// A reading that wobbles around a threshold (39 <-> 40) reports it once.
+const POWER_REARM_PERCENT: i64 = 3;
 const MAX_BLACKLIST_PHONES: usize = 64;
 const MAX_BLACKLIST_KEYWORDS: usize = 32;
 const MAX_KEYWORD_BYTES: usize = 128;
@@ -69,6 +72,10 @@ struct Config {
     #[serde(default)]
     sms_forward_device_info: bool,
     seen: Vec<String>,
+    /// The last battery threshold notified. The same point is not reported
+    /// again until the level has moved `POWER_REARM_PERCENT` away from it.
+    #[serde(default)]
+    power_last_point: Option<i64>,
     #[serde(default)]
     fingerprint_version: u8,
     #[serde(default)]
@@ -100,6 +107,7 @@ impl Default for Config {
             dingtalk_forward_device_info: false,
             sms_forward_device_info: false,
             seen: Vec::new(),
+            power_last_point: None,
             fingerprint_version: 0,
             forwarding_since: 0,
         }
@@ -483,14 +491,13 @@ fn charge_label(charging: i64) -> &'static str {
 /// Common policy for every platform with normalized battery telemetry.
 /// A jump across several thresholds produces one notification for the last crossed point.
 fn crossed_power_threshold(previous: i64, current: i64) -> Option<i64> {
-    const THRESHOLDS: [i64; 6] = [5, 20, 40, 60, 80, 100];
     if current > previous {
-        THRESHOLDS
+        POWER_THRESHOLDS
             .into_iter()
             .rev()
             .find(|&point| previous < point && current >= point)
     } else {
-        THRESHOLDS
+        POWER_THRESHOLDS
             .into_iter()
             .find(|&point| previous > point && current <= point)
     }
@@ -538,6 +545,9 @@ fn valid_config(config: &Config) -> bool {
             .len()
             == config.blacklist_keywords.len()
         && valid_nickname(&config.nickname)
+        && config
+            .power_last_point
+            .is_none_or(|point| POWER_THRESHOLDS.contains(&point))
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
         && match (config.power_last_percent, config.power_last_charging) {
             (None, None) => true,
@@ -915,21 +925,33 @@ impl Forwarder {
             return Ok(None);
         }
         let now = forwarding_clock()?;
+        self.next_at(snapshot, now)
+    }
+
+    /// One pass over the inbox against the device clock `now`.
+    fn next_at(&mut self, snapshot: &Value, now: u64) -> Result<Option<Message>, String> {
         let mut seen: HashSet<_> = self.config.seen.iter().cloned().collect();
         let mut next = self.config.clone();
         let mut deliverable = None;
         for (hash, message, received_at) in messages(snapshot)? {
-            if !seen.insert(hash.clone()) {
+            if seen.contains(&hash) {
                 continue;
             }
+            // A receipt stamp ahead of the device clock usually means the
+            // clock is still behind the network (for example right after
+            // boot). Leave the message unseen so it is judged again once the
+            // clock catches up instead of dropping a real new SMS for good.
+            if received_at.is_some_and(|t| t > now.saturating_add(300)) {
+                continue;
+            }
+            seen.insert(hash.clone());
             next.seen.push(hash);
             if next.seen.len() > MAX_SEEN {
                 next.seen.drain(..next.seen.len() - MAX_SEEN);
             }
             // History arriving after boot/SIM sync is not a new SMS. Unknown
             // timestamps are also skipped rather than risking a bulk replay.
-            let recent = received_at
-                .is_some_and(|t| t >= next.forwarding_since && t <= now.saturating_add(300));
+            let recent = received_at.is_some_and(|t| t >= next.forwarding_since);
             if recent && !blacklisted(&next, &message) {
                 deliverable = Some(message);
                 break;
@@ -1041,7 +1063,17 @@ impl Forwarder {
             return Ok(None);
         }
         let (old_percent, old_charging) = previous.expect("checked above");
-        let threshold = crossed_power_threshold(old_percent, percent);
+        if next
+            .power_last_point
+            .is_some_and(|point| (percent - point).abs() >= POWER_REARM_PERCENT)
+        {
+            next.power_last_point = None;
+        }
+        let threshold = crossed_power_threshold(old_percent, percent)
+            .filter(|point| next.power_last_point != Some(*point));
+        if threshold.is_some() {
+            next.power_last_point = threshold;
+        }
         if old_charging == charging && threshold.is_none() {
             // Keep the observed baseline across reboots even between notification points.
             self.save(&next)?;
@@ -2071,18 +2103,34 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // 20 was just reported; wobbling back to it after a restart is not news.
         let mut restarted = Forwarder::load(&dir);
         assert!(
             restarted
                 .observe_power(Some(&json!({"percent":20,"charging":2})))
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         assert!(
             restarted
                 .observe_power(Some(&json!({"percent":19,"charging":2})))
                 .unwrap()
                 .is_none()
+        );
+        // Moving three points away re-arms it.
+        for percent in [17, 18, 19] {
+            assert!(
+                restarted
+                    .observe_power(Some(&json!({"percent":percent,"charging":2})))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            restarted
+                .observe_power(Some(&json!({"percent":20,"charging":2})))
+                .unwrap()
+                .is_some()
         );
         assert_eq!(crossed_power_threshold(81, 4), Some(5));
         assert_eq!(crossed_power_threshold(4, 81), Some(80));
@@ -2291,6 +2339,84 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_sms_stamped_ahead_of_a_lagging_clock_waits_instead_of_being_dropped() {
+        let dir = std::env::temp_dir().join(format!("forward-lag-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        let change: Update = serde_json::from_value(
+            json!({"enabled":true,"method":"webhook","webhook_url":"https://example.com/hook"}),
+        )
+        .unwrap();
+        manager
+            .update(
+                change,
+                Some(&json!({"stale":false,"truncated":false,"list":[]})),
+                None,
+            )
+            .unwrap();
+        let since = manager.config.forwarding_since;
+        // The network stamped the SMS 10 minutes after the (lagging) device clock.
+        let stamp = since + 600;
+        let inbox = json!({"stale":false,"truncated":false,"list":[
+            {"id":7,"num":"10086","date":"10-08 10:00","received_at":stamp,"tag":1,"text":"real new sms"}
+        ]});
+        assert!(manager.next_at(&inbox, since).unwrap().is_none());
+        assert!(manager.config.seen.is_empty(), "not marked as handled");
+        assert!(
+            Forwarder::load(&dir).config.seen.is_empty(),
+            "nothing persisted"
+        );
+        // Once the clock has caught up the same SMS is delivered, exactly once.
+        let mut restarted = Forwarder::load(&dir);
+        let delivered = restarted.next_at(&inbox, stamp).unwrap().unwrap();
+        assert_eq!(delivered.text, "real new sms");
+        assert!(restarted.next_at(&inbox, stamp + 60).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reading_wobbling_around_a_threshold_reports_it_once() {
+        let dir = std::env::temp_dir().join(format!("forward-wobble-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.power_forward_enabled = true;
+        manager
+            .observe_power(Some(&json!({"percent":41,"charging":2})))
+            .unwrap();
+        let mut sent = 0;
+        for i in 0..20 {
+            let percent = if i % 2 == 0 { 39 } else { 40 };
+            sent += usize::from(
+                manager
+                    .observe_power(Some(&json!({"percent":percent,"charging":2})))
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+        assert_eq!(sent, 1);
+        // A charging change is always reported.
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":40,"charging":1})))
+                .unwrap()
+                .is_some()
+        );
+        // The next point is not held back by the last one.
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":20,"charging":1})))
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("电量提醒：20%")
+        );
+        let mut invalid = manager.config.clone();
+        invalid.power_last_point = Some(33);
+        assert!(!valid_config(&invalid));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.70",
+    "version": "0.10.71",
     "asset": "zwrt-datad-aarch64",
-    "notes": "支持平台下发的中转节点：新增 MQTT 命令 remote.nodes.set（最多 8 个 HTTPS 域名 origin，整表替换，按 revision 幂等，持久保存），remote.open 可连接这些节点；本地可用 platform_nodes_enabled 开关关闭。遥测增加 remote_node_origins、remote_nodes_revision 并声明 datad.remote_nodes"
+    "notes": "短信转发不再因短信在 SIM 与设备存储间搬动或已读状态变化而重复转发，只转发开启后收到的新短信，设备时钟偏慢时不会丢短信；电量通知改为 5/20/40/60/80/100% 提醒点，附近波动只报一次；SMTP 认证兼容服务器二次询问并区分临时失败"
   }
 }

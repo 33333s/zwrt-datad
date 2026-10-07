@@ -67,6 +67,8 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 从 0.10.34 起，有有效电池读数的设备可单独开启电源状态通知。所有提供有效电池状态的机型共用提醒逻辑：充电状态变化，或电量升降到达、跨过 5%、20%、40%、60%、80%、100% 时，通过当前短信转发目的地投递；中间电量变化不通知，一次跨过多个提醒点仅发一条；首次启用只记录基线，总开关关闭期间继续更新基线，不补发旧变化。原厂 `charge_status` 的 1/2/3/4 分别视为充电中/放电中/未在充电/已充满，未知读数不产生通知；MU5250 的状态 4 已由设备 `/sys/class/power_supply/battery/status=Full` 对照。事件基线在投递前以 0600 文件持久化，失败不自动重发；电源通知不设每日次数上限，旧配置中的电源额度会在保存时移除；本机短信方式仍同时受自身每日 60 条限制。此功能默认关闭，发送到外部目的地前需由设备 Owner 或授权管理员在 NMS 二次确认。
 
+0.10.71 起：短信转发以“发件人 + 原始接收时间（UTC，精确到秒）+ 正文”识别同一条短信，短信在 SIM 与设备存储间搬动或已读状态变化都不会重复转发；只转发开启转发之后收到的短信。接收时间比设备时钟晚 5 分钟以上的短信（通常是开机后设备尚未对时）暂不处理、也不记为已处理，等时钟追上后再判断，不会因此丢失。电量提醒在同一个提醒点附近来回波动时只报一次，电量离开该点 3% 以上后才会再次提醒；充电状态变化总会通知。
+
 Forwarding also persists an enable-time cutoff and uses sender, full original UTC receipt timestamp (including seconds), and content as the message fingerprint. Moving an SMS between SIM/device storage or changing its read state does not trigger another delivery. Delayed historical messages and messages without a valid OEM receipt timestamp are not forwarded. On upgrade from ID-based fingerprints, the first complete inbox snapshot is baselined before new deliveries resume. Inconsistent complete inbox/capacity reads are marked stale, never treated as an empty inbox. Clock-change gates and the separate SIM sending allowance remain in force.
 
 SMTP AUTH PLAIN supports a server's 334 challenge after the initial response. Authentication 4xx responses report `smtp_auth_temporary`; permanent rejection reports `smtp_auth_failed`. Neither result is evidence that the saved password was lost. Forwarding still records delivery intent before sending and does not automatically replay failed attempts.
