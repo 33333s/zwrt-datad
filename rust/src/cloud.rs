@@ -124,6 +124,10 @@ pub struct Update {
     pub config: Config,
     #[serde(default)]
     pub clear_password: bool,
+    /// The owner's switch for platform-managed relay nodes. The node list
+    /// itself is never writable here.
+    #[serde(default)]
+    pub platform_nodes_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +163,7 @@ pub struct Cloud {
     config: Config,
     status: Arc<Mutex<Status>>,
     tx: watch::Sender<Option<Config>>,
+    nodes: crate::cloud_nodes::RemoteNodes,
 }
 
 impl Cloud {
@@ -218,6 +223,7 @@ impl Cloud {
             config,
             status: Arc::new(Mutex::new(status)),
             tx,
+            nodes: crate::cloud_nodes::RemoteNodes::load(data_dir),
         };
         cloud.apply_cloud_feature_defaults(data_dir);
         cloud
@@ -252,14 +258,16 @@ impl Cloud {
     pub fn start(&self, state: watch::Receiver<Snapshot>, app: crate::server::App) {
         let config = self.tx.subscribe();
         let status = self.status.clone();
-        tokio::spawn(async move { supervisor(config, state, status, Some(app)).await });
+        let nodes = self.nodes.clone();
+        tokio::spawn(async move { supervisor(config, state, status, Some(app), nodes).await });
     }
 
     pub fn public_config(&self) -> Value {
         let mut config = self.config.clone();
         let configured = !config.password.is_empty();
         config.password.clear();
-        json!({"config":config,"password_configured":configured})
+        json!({"config":config,"password_configured":configured,
+            "remote_nodes":self.nodes.public_view(&self.config)})
     }
 
     /// Only fields needed by the authorized NMS-hosted UFI settings panel.
@@ -335,6 +343,9 @@ impl Cloud {
             update.config.password.clear();
         }
         validate(&update.config)?;
+        if let Some(enabled) = update.platform_nodes_enabled {
+            self.nodes.set_enabled(enabled)?;
+        }
         atomic_json(&self.file, &update.config)?;
         self.config = update.config;
         set_status(&self.status, "reconfiguring", "");
@@ -432,6 +443,7 @@ impl Cloud {
         self.update(Update {
             config,
             clear_password: false,
+            platform_nodes_enabled: None,
         })
     }
 }
@@ -465,6 +477,7 @@ async fn supervisor(
     state_rx: watch::Receiver<Snapshot>,
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
+    nodes: crate::cloud_nodes::RemoteNodes,
 ) {
     let mut started = false;
     loop {
@@ -497,6 +510,7 @@ async fn supervisor(
                 config_rx.clone(),
                 status.clone(),
                 app.clone(),
+                nodes.clone(),
             )
             .await
             {
@@ -636,6 +650,7 @@ async fn session(
     mut config_rx: watch::Receiver<Option<Config>>,
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
+    nodes: crate::cloud_nodes::RemoteNodes,
 ) -> SessionEnd {
     let pending = pending_username(&config.username);
     let enrollment_root = format!("onboard/{}", config.username);
@@ -669,7 +684,7 @@ async fn session(
     {
         return SessionEnd::Failed;
     }
-    let bridge = BridgeManager::new(config.clone(), app.clone());
+    let bridge = BridgeManager::new(config.clone(), app.clone(), nodes.clone());
     let webshell_available = app
         .as_ref()
         .is_some_and(|app| app.cloud_webshell_available());
@@ -725,7 +740,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &snapshot, &status, webshell_available, app.is_some(), &mut cache, true).await.is_err() {
+                    if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, true).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -748,7 +763,7 @@ async fn session(
                             set_status(&status,"connected","");
                             crate::update_status::runtime("connected");
                             let snapshot=state_rx.borrow().clone();
-                            if report(&client,config,&snapshot,&status,webshell_available,app.is_some(),&mut cache,true).await.is_err() {
+                            if report(&client,config,&nodes,&snapshot,&status,webshell_available,app.is_some(),&mut cache,true).await.is_err() {
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
                             }
                         } else {
@@ -773,6 +788,22 @@ async fn session(
                         bridge.close(close).await;
                         continue;
                     }
+                    if let Ok(set) = serde_json::from_slice::<crate::cloud_nodes::SetCommand>(&message.payload)
+                        && set.is_nodes_set()
+                    {
+                        let result = nodes.apply(config, &set);
+                        let applied = result["applied"] == true;
+                        let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                        if applied {
+                            // Report the new list now instead of at the next tick.
+                            let snapshot = state_rx.borrow().clone();
+                            if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
+                                bridge.shutdown(); updates.detach_all();
+                                return SessionEnd::Failed;
+                            }
+                        }
+                        continue;
+                    }
                     if let Ok(command) = serde_json::from_slice::<RemoteCommand>(&message.payload)
                             && let Some(result) = bridge.receive(command).await {
                                 let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
@@ -795,7 +826,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
+                if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -856,6 +887,7 @@ fn hardware_model(state: &Value) -> Option<String> {
 async fn report(
     client: &AsyncClient,
     config: &Config,
+    nodes: &crate::cloud_nodes::RemoteNodes,
     snapshot: &Snapshot,
     status: &Arc<Mutex<Status>>,
     webshell_available: bool,
@@ -869,6 +901,7 @@ async fn report(
         "datad.remote",
         "datad.remote_origins",
         "datad.remote_close",
+        "datad.remote_nodes",
     ];
     // The direct data path: web UI proxy now; files stay on the relay.
     #[cfg(feature = "mesh")]
@@ -894,6 +927,8 @@ async fn report(
         "agent_version":env!("DATAD_VERSION"),"firmware_version":firmware,
         "capabilities":capabilities,"remote_services":config.services,"remote_enabled":config.remote_enabled,
         "remote_origins":reported_remote_origins(config),
+        "remote_node_origins":nodes.origins(config),
+        "remote_nodes_revision":nodes.revision(),
         "remote_panel_control_enabled":config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     });
@@ -1115,6 +1150,8 @@ impl BridgeState {
 struct BridgeManager {
     config: Config,
     app: Option<crate::server::App>,
+    /// Read at each `remote.open`, so a new list applies without reconnecting.
+    nodes: crate::cloud_nodes::RemoteNodes,
     state: Arc<AsyncMutex<BridgeState>>,
     shutdown: watch::Sender<bool>,
     /// Per-session stop signals, so one session can be closed on its own.
@@ -1122,11 +1159,16 @@ struct BridgeManager {
 }
 
 impl BridgeManager {
-    fn new(config: Config, app: Option<crate::server::App>) -> Self {
+    fn new(
+        config: Config,
+        app: Option<crate::server::App>,
+        nodes: crate::cloud_nodes::RemoteNodes,
+    ) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             config,
             app,
+            nodes,
             state: Arc::new(AsyncMutex::new(BridgeState::default())),
             shutdown,
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1173,7 +1215,8 @@ impl BridgeManager {
 
     async fn receive(&self, command: RemoteCommand) -> Option<Value> {
         let reject = |code: String| json!({"request_id":command.request_id,"status":"rejected","error":{"code":code}});
-        if let Err(error) = validate_remote(&self.config, &command) {
+        let nodes = self.nodes.active(&self.config);
+        if let Err(error) = validate_remote(&self.config, &nodes, &command) {
             return Some(reject(error));
         }
         let mut state = self.state.lock().await;
@@ -1359,7 +1402,11 @@ impl BridgeManager {
 
 /// Only `transport:"mesh"` exists. It needs the `mesh` build feature, a
 /// well-formed `mesh` object and a rendezvous URL on an approved origin.
-fn validate_transport(config: &Config, command: &RemoteCommand) -> Result<(), String> {
+fn validate_transport(
+    config: &Config,
+    nodes: &[Url],
+    command: &RemoteCommand,
+) -> Result<(), String> {
     let Some(transport) = &command.transport else {
         return if command.mesh.is_some() {
             Err("invalid_request".into())
@@ -1372,7 +1419,7 @@ fn validate_transport(config: &Config, command: &RemoteCommand) -> Result<(), St
     }
     #[cfg(not(feature = "mesh"))]
     {
-        let _ = config;
+        let _ = (config, nodes);
         Err("mesh_unsupported".into())
     }
     #[cfg(feature = "mesh")]
@@ -1393,10 +1440,7 @@ fn validate_transport(config: &Config, command: &RemoteCommand) -> Result<(), St
             return Err("invalid_mesh".into());
         }
         let url = Url::parse(&mesh.rendezvous_url).map_err(|_| "invalid_mesh")?;
-        let approved = effective_remote_origins(config).iter().any(|origin| {
-            url.host_str() == origin.host_str()
-                && url.port_or_known_default() == origin.port_or_known_default()
-        });
+        let approved = approved_origin(config, nodes, &url);
         if url.scheme() != "wss"
             || !approved
             || !url.username().is_empty()
@@ -1411,7 +1455,20 @@ fn validate_transport(config: &Config, command: &RemoteCommand) -> Result<(), St
     }
 }
 
-fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), String> {
+/// The platform, the owner's `remote_origins` and active platform nodes are
+/// the only hosts a session may connect to; scheme and path are checked by the
+/// caller.
+fn approved_origin(config: &Config, nodes: &[Url], url: &Url) -> bool {
+    effective_remote_origins(config)
+        .iter()
+        .chain(nodes)
+        .any(|origin| {
+            url.host_str() == origin.host_str()
+                && url.port_or_known_default() == origin.port_or_known_default()
+        })
+}
+
+fn validate_remote(config: &Config, nodes: &[Url], command: &RemoteCommand) -> Result<(), String> {
     if !config.enabled || !config.remote_enabled {
         return Err("remote_disabled".into());
     }
@@ -1433,10 +1490,7 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
     }
     let remote = Url::parse(&command.remote_url).map_err(|_| "invalid_remote_url")?;
     https_origin(&config.platform_url).map_err(|_| "invalid_remote_url")?;
-    let approved = effective_remote_origins(config).iter().any(|origin| {
-        remote.host_str() == origin.host_str()
-            && remote.port_or_known_default() == origin.port_or_known_default()
-    });
+    let approved = approved_origin(config, nodes, &remote);
     if remote.scheme() != "wss"
         || !approved
         || !remote.username().is_empty()
@@ -1455,7 +1509,7 @@ fn validate_remote(config: &Config, command: &RemoteCommand) -> Result<(), Strin
     {
         return Err("multiple_ports_unsupported".into());
     }
-    validate_transport(config, command)?;
+    validate_transport(config, nodes, command)?;
     if command.target_service == "webshell" {
         if !config.remote_webshell_enabled {
             return Err("webshell_disabled".into());
@@ -1643,7 +1697,7 @@ fn bootstrap_report(config: &Config) -> Value {
         "proof":bootstrap_proof(config)})
 }
 
-fn topic(value: &str) -> bool {
+pub(crate) fn topic(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -1651,7 +1705,7 @@ fn topic(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_. -".contains(&byte))
 }
 
-fn https_origin(raw: &str) -> Result<Url, String> {
+pub(crate) fn https_origin(raw: &str) -> Result<Url, String> {
     let invalid = || "NMS 地址必须是 HTTPS 站点地址".to_owned();
     if raw.len() > 512
         || raw
@@ -1783,7 +1837,7 @@ fn number_at(value: &Value, path: &[&str]) -> Option<f64> {
         .and_then(Value::as_f64)
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| "保存配置失败")?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
@@ -2155,7 +2209,13 @@ mod tests {
             fields: serde_json::Map::new(),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None));
+        let task = tokio::spawn(supervisor(
+            config_rx,
+            state_rx,
+            status,
+            None,
+            Default::default(),
+        ));
         let topic = tokio::time::timeout(Duration::from_secs(10), reports_rx.recv())
             .await
             .unwrap()
@@ -2163,6 +2223,309 @@ mod tests {
         assert!(topic.starts_with(&root));
         task.abort();
         broker.await.unwrap();
+    }
+
+    /// `remote.nodes.set` over the real MQTT session: the reply, the device
+    /// payload fields, and a `remote.open` to an unlisted origin refused.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite callback requires its HTTP error response type.
+    async fn remote_nodes_set_over_mqtt_replies_and_reports() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = Config {
+            enabled: true,
+            remote_enabled: true,
+            broker: format!("wss://{address}/mqtt"),
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+            ca_pem,
+            model: "MU5250".into(),
+            identity: "nodes-fixture".into(),
+            ..Default::default()
+        };
+        let request_topic = format!("{}/command/request", root(&config));
+        let (seen_tx, mut seen_rx) = mpsc::channel::<(String, Value)>(32);
+        let broker = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            let mut ws = accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static("mqtt"));
+                Ok(response)
+            }).await.unwrap();
+            let mut pending = Vec::new();
+            let mut sent = 0;
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Binary(data) = message {
+                    pending.extend_from_slice(&data);
+                }
+                while let Some((header, payload)) = take_mqtt_packet(&mut pending) {
+                    match header >> 4 {
+                        1 => ws
+                            .send(Message::Binary(vec![0x20, 2, 0, 0].into()))
+                            .await
+                            .unwrap(),
+                        8 => ws
+                            .send(Message::Binary(
+                                vec![0x90, 3, payload[0], payload[1], 1].into(),
+                            ))
+                            .await
+                            .unwrap(),
+                        3 => {
+                            let topic_len =
+                                usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                            let topic =
+                                String::from_utf8_lossy(&payload[2..2 + topic_len]).into_owned();
+                            let mut offset = 2 + topic_len;
+                            if (header >> 1) & 3 == 1 {
+                                ws.send(Message::Binary(
+                                    vec![0x40, 2, payload[offset], payload[offset + 1]].into(),
+                                ))
+                                .await
+                                .unwrap();
+                                offset += 2;
+                            }
+                            let value: Value =
+                                serde_json::from_slice(&payload[offset..]).unwrap_or(Value::Null);
+                            let next = if topic.ends_with("/telemetry/device") && sent == 0 {
+                                Some(
+                                    json!({"protocol_version":1,"request_id":"nodes-1","action":"remote.nodes.set","nodes":["https://nmg.services.ericsfj.com:8443"],"revision":3}),
+                                )
+                            } else if topic.ends_with("/command/result") && sent == 1 {
+                                Some(
+                                    json!({"protocol_version":1,"request_id":"nodes-2","action":"remote.nodes.set","nodes":["http://bad.example.com"],"revision":4}),
+                                )
+                            } else if topic.ends_with("/command/result") && sent == 2 {
+                                Some(
+                                    json!({"protocol_version":1,"request_id":"open-1","action":"remote.open",
+                                    "remote_url":"wss://unlisted.example.com/api/remote/device/open-1",
+                                    "token":"a".repeat(64),"target_service":"router_web","target_port":80,"ttl_seconds":60}),
+                                )
+                            } else {
+                                None
+                            };
+                            seen_tx.send((topic, value)).await.unwrap();
+                            if let Some(command) = next {
+                                sent += 1;
+                                ws.send(Message::Binary(
+                                    mqtt_publish(&request_topic, &command).into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                        }
+                        12 => ws
+                            .send(Message::Binary(vec![0xd0, 0].into()))
+                            .await
+                            .unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let (_config_tx, config_rx) = watch::channel(Some(config));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: serde_json::Map::new(),
+        });
+        let nodes = crate::cloud_nodes::RemoteNodes::default();
+        let task = tokio::spawn(supervisor(
+            config_rx,
+            state_rx,
+            Arc::new(Mutex::new(Status::default())),
+            None,
+            nodes.clone(),
+        ));
+        let mut results = Vec::new();
+        let mut devices = Vec::new();
+        while results.len() < 3 || devices.len() < 2 {
+            let (topic, value) = tokio::time::timeout(Duration::from_secs(20), seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if topic.ends_with("/telemetry/device") {
+                devices.push(value);
+            } else if topic.ends_with("/command/result") {
+                results.push(value);
+            }
+        }
+        let device = devices[0].clone();
+        assert_eq!(
+            (
+                devices[1]["remote_node_origins"].clone(),
+                devices[1]["remote_nodes_revision"].clone()
+            ),
+            (json!(["https://nmg.services.ericsfj.com:8443"]), json!(3)),
+            "an applied list is reported at once"
+        );
+        assert!(
+            device["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("datad.remote_nodes"))
+        );
+        assert_eq!(device["remote_node_origins"], json!([]));
+        assert_eq!(device["remote_nodes_revision"], 0);
+        let strip = |mut value: Value| {
+            let object = value.as_object_mut().unwrap();
+            object.remove("timestamp");
+            object.remove("protocol_version");
+            value
+        };
+        assert_eq!(
+            strip(results[0].clone()),
+            json!({"request_id":"nodes-1","action":"remote.nodes.set","status":"ok","ok":true,"applied":true,
+                "revision":3,"enabled":true,"nodes":["https://nmg.services.ericsfj.com:8443"]})
+        );
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[1]["error"]["code"], "invalid_node");
+        assert_eq!(results[1]["revision"], 3);
+        assert_eq!(results[2]["request_id"], "open-1");
+        assert_eq!(results[2]["error"]["code"], "invalid_remote_url");
+        assert_eq!(nodes.revision(), 3);
+        task.abort();
+        broker.abort();
+    }
+
+    #[test]
+    fn platform_nodes_widen_hosts_but_nothing_else() {
+        let mut config = Config {
+            enabled: true,
+            remote_enabled: true,
+            remote_webshell_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            remote_origins: vec!["https://relay.example.com:16001".into()],
+            ..Default::default()
+        };
+        let nodes = crate::cloud_nodes::RemoteNodes::default();
+        let reply = nodes.apply(
+            &config,
+            &serde_json::from_value(
+                json!({"protocol_version":1,"request_id":"n","action":"remote.nodes.set",
+                "nodes":["https://nmg.services.ericsfj.com:8443"],"revision":1}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(reply["ok"], true);
+        let open = |url: &str, service: &str, port: u16| RemoteCommand {
+            protocol_version: 1,
+            request_id: "node-session".into(),
+            action: "remote.open".into(),
+            remote_url: url.replace("ID", "node-session"),
+            token: "a".repeat(64),
+            target_service: service.into(),
+            target_port: port,
+            target_ports: vec![],
+            ttl_seconds: 900,
+            transport: None,
+            mesh: None,
+        };
+        let node = "wss://nmg.services.ericsfj.com:8443/api/remote/device/ID";
+        let active = nodes.active(&config);
+        // A listed node carries router_web and webshell sessions.
+        validate_remote(&config, &active, &open(node, "router_web", 80)).unwrap();
+        validate_remote(&config, &active, &open(node, "webshell", 0)).unwrap();
+        // Without the list the same address is refused.
+        assert_eq!(
+            validate_remote(&config, &[], &open(node, "router_web", 80)).unwrap_err(),
+            "invalid_remote_url"
+        );
+        // Only that exact host and port; the usual URL and port rules still apply.
+        for url in [
+            "wss://nmg.services.ericsfj.com/api/remote/device/ID",
+            "wss://nmg.services.ericsfj.com:8444/api/remote/device/ID",
+            "wss://evil.nmg.services.ericsfj.com:8443/api/remote/device/ID",
+            "ws://nmg.services.ericsfj.com:8443/api/remote/device/ID",
+            "wss://nmg.services.ericsfj.com:8443/api/remote/device/other",
+            "wss://nmg.services.ericsfj.com:8443/api/remote/device/ID?x=1",
+            "wss://unlisted.example.com/api/remote/device/ID",
+        ] {
+            assert!(
+                validate_remote(&config, &active, &open(url, "router_web", 80)).is_err(),
+                "accepted {url}"
+            );
+        }
+        assert!(validate_remote(&config, &active, &open(node, "webshell", 22)).is_err());
+        let mut many = open(node, "router_web", 80);
+        many.target_ports = vec![80, 22];
+        assert_eq!(
+            validate_remote(&config, &active, &many).unwrap_err(),
+            "multiple_ports_unsupported"
+        );
+        // The owner's switch withdraws the nodes; the platform and the
+        // owner's own remote_origins keep working.
+        nodes.set_enabled(false).unwrap();
+        let active = nodes.active(&config);
+        assert!(validate_remote(&config, &active, &open(node, "router_web", 80)).is_err());
+        validate_remote(
+            &config,
+            &active,
+            &open(
+                "wss://nms.example.com/api/remote/device/ID",
+                "router_web",
+                80,
+            ),
+        )
+        .unwrap();
+        validate_remote(
+            &config,
+            &active,
+            &open(
+                "wss://relay.example.com:16001/api/remote/device/ID",
+                "router_web",
+                80,
+            ),
+        )
+        .unwrap();
+        // Remote access off overrides any list.
+        nodes.set_enabled(true).unwrap();
+        config.remote_enabled = false;
+        assert_eq!(
+            validate_remote(
+                &config,
+                &nodes.active(&config),
+                &open(node, "router_web", 80)
+            )
+            .unwrap_err(),
+            "remote_disabled"
+        );
+    }
+
+    #[cfg(feature = "mesh")]
+    #[test]
+    fn mesh_rendezvous_may_use_a_platform_node() {
+        let config = Config {
+            enabled: true,
+            remote_enabled: true,
+            platform_url: "https://nms.example.com".into(),
+            ..Default::default()
+        };
+        let nodes = crate::cloud_nodes::RemoteNodes::default();
+        nodes.apply(
+            &config,
+            &serde_json::from_value(
+                json!({"protocol_version":1,"request_id":"n","action":"remote.nodes.set",
+                "nodes":["https://nmg.services.ericsfj.com:8443"],"revision":1}),
+            )
+            .unwrap(),
+        );
+        let mut command: RemoteCommand = serde_json::from_value(json!({
+            "protocol_version":1,"request_id":"mesh-node","action":"remote.open",
+            "remote_url":"wss://nmg.services.ericsfj.com:8443/api/remote/device/mesh-node",
+            "token":"a".repeat(64),"target_service":"router_web","target_port":80,"ttl_seconds":600,
+            "transport":"mesh","mesh":{"v":1,"stun":["stun:nmg.services.ericsfj.com:8444"],"udp_ports":"40000-40100","ttl_seconds":600,
+                "rendezvous_url":"wss://nmg.services.ericsfj.com:8443/api/remote/device/mesh-node?transport=mesh"}
+        }))
+        .unwrap();
+        validate_remote(&config, &nodes.active(&config), &command).unwrap();
+        assert!(validate_remote(&config, &[], &command).is_err());
+        command.mesh.as_mut().unwrap().rendezvous_url =
+            "wss://unlisted.example.com/api/remote/device/mesh-node?transport=mesh".into();
+        assert_eq!(
+            validate_remote(&config, &nodes.active(&config), &command).unwrap_err(),
+            "invalid_mesh"
+        );
     }
 
     #[tokio::test]
@@ -2252,7 +2615,13 @@ mod tests {
             fields: serde_json::Map::from_iter([("password".into(), json!("do-not-upload"))]),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status, None));
+        let task = tokio::spawn(supervisor(
+            config_rx,
+            state_rx,
+            status,
+            None,
+            Default::default(),
+        ));
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut connections = HashSet::new();
             while connections.len() < 2 {
@@ -2313,6 +2682,7 @@ mod tests {
                     config_rx,
                     Arc::new(Mutex::new(Status::default())),
                     None,
+                    Default::default(),
                 ),
             )
             .await
@@ -2354,6 +2724,7 @@ mod tests {
             .update(Update {
                 config,
                 clear_password: false,
+                platform_nodes_enabled: None,
             })
             .unwrap();
         let before = cloud.config.clone();
@@ -2443,22 +2814,22 @@ mod tests {
             mesh: None,
         };
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "remote_disabled"
         );
         config.enabled = true;
         config.remote_enabled = true;
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
 
         config.broker = "wss://custom.example/mqtt".into();
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         assert_eq!(reported_remote_origins(&config), vec![DEFAULT_PLATFORM_URL]);
         config.remote_origins = vec![DEFAULT_MEMBER_ORIGIN.into()];
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         config.remote_origins.clear();
         config.broker = DEFAULT_BROKER.into();
         config.platform_url = "https://custom.example".into();
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         assert_eq!(
             reported_remote_origins(&config),
             vec!["https://custom.example"]
@@ -2643,10 +3014,10 @@ mod tests {
             transport: None,
             mesh: None,
         };
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         command.target_ports = vec![2333, 80];
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "multiple_ports_unsupported"
         );
     }
@@ -2672,38 +3043,38 @@ mod tests {
             transport: None,
             mesh: None,
         };
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         command.target_port = 9460;
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "invalid_panel_request"
         );
         command.target_port = 0;
         command.target_ports = vec![0];
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.target_ports.clear();
         command.ttl_seconds = 3601;
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.ttl_seconds = 60;
         command.token = "z".repeat(64);
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.token = "a".repeat(64);
         command.target_service = "datad_panel_control".into();
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "panel_control_disabled"
         );
         config.remote_panel_control_enabled = true;
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         command.target_port = 9460;
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "invalid_panel_request"
         );
         command.target_port = 0;
         config.remote_enabled = false;
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "remote_disabled"
         );
     }
@@ -2730,24 +3101,24 @@ mod tests {
             mesh: None,
         };
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "panel_control_disabled"
         );
         config.remote_panel_control_enabled = true;
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         for port in [80, 2333, 9460, 9461] {
             command.target_port = port;
             assert_eq!(
-                validate_remote(&config, &command).unwrap_err(),
+                validate_remote(&config, &[], &command).unwrap_err(),
                 "invalid_files_request"
             );
         }
         command.target_port = 0;
         command.ttl_seconds = 3601;
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.ttl_seconds = 3600;
         command.target_ports = vec![0];
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
     }
 
     #[test]
@@ -2771,11 +3142,11 @@ mod tests {
             transport: None,
             mesh: None,
         };
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         config.remote_origins = vec!["https://relay.example.com:16001".into()];
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         command.remote_url = "wss://nms.example.com/api/remote/device/route-fixture".into();
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         for address in [
             "wss://relay.example.com/api/remote/device/route-fixture",
             "wss://relay.example.com:16002/api/remote/device/route-fixture",
@@ -2789,7 +3160,7 @@ mod tests {
         ] {
             command.remote_url = address.into();
             assert!(
-                validate_remote(&config, &command).is_err(),
+                validate_remote(&config, &[], &command).is_err(),
                 "accepted {address}"
             );
         }
@@ -2878,27 +3249,27 @@ mod tests {
             mesh: None,
         };
         assert_eq!(
-            validate_remote(&config, &command).unwrap_err(),
+            validate_remote(&config, &[], &command).unwrap_err(),
             "webshell_disabled"
         );
         config.remote_webshell_enabled = true;
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         command.target_port = 22;
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.target_port = 0;
         command.target_ports = vec![0];
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.target_ports.clear();
         command.ttl_seconds = 1801;
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.ttl_seconds = 1800;
         command.token = "!".repeat(64);
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.token = "a".repeat(64);
         command.remote_url = "wss://other.example.com/api/remote/device/native-session".into();
-        assert!(validate_remote(&config, &command).is_err());
+        assert!(validate_remote(&config, &[], &command).is_err());
         command.remote_url = "wss://nms.example.com/api/remote/device/native-session".into();
-        let manager = BridgeManager::new(config, None);
+        let manager = BridgeManager::new(config, None, Default::default());
         assert_eq!(
             manager.receive(command).await.unwrap()["error"]["code"],
             "webshell_disabled"
@@ -2987,7 +3358,13 @@ mod tests {
             fields: Default::default(),
         });
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = tokio::spawn(supervisor(config_rx, state_rx, status.clone(), None));
+        let task = tokio::spawn(supervisor(
+            config_rx,
+            state_rx,
+            status.clone(),
+            None,
+            Default::default(),
+        ));
         tokio::task::yield_now().await;
         config_tx
             .send(Some(Config {
@@ -3084,7 +3461,17 @@ mod tests {
         let status = Arc::new(Mutex::new(Status::default()));
         let session_task = tokio::spawn({
             let status = status.clone();
-            async move { session(&config, state_rx, config_rx, status, None).await }
+            async move {
+                session(
+                    &config,
+                    state_rx,
+                    config_rx,
+                    status,
+                    None,
+                    Default::default(),
+                )
+                .await
+            }
         });
         let mut found = HashSet::new();
         while found.len() < 4 {
@@ -3294,7 +3681,7 @@ mod tests {
             transport: None,
             mesh: None,
         };
-        validate_remote(&config, &command).unwrap();
+        validate_remote(&config, &[], &command).unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let pipe = tokio::spawn(async move { bridge_pipe(&config, &command, shutdown_rx).await });
         assert_eq!(
@@ -3374,7 +3761,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_close_ends_one_session_and_blocks_a_late_open_of_a_closed_one() {
-        let manager = BridgeManager::new(Config::default(), None);
+        let manager = BridgeManager::new(Config::default(), None, Default::default());
         let (first, first_rx) = watch::channel(false);
         let (second, second_rx) = watch::channel(false);
         manager
@@ -3469,11 +3856,11 @@ mod tests {
                 .unwrap(),
             ),
         };
-        validate_remote(&config, &base()).unwrap();
+        validate_remote(&config, &[], &base()).unwrap();
         let mutate = |change: &dyn Fn(&mut RemoteCommand)| {
             let mut command = base();
             change(&mut command);
-            validate_remote(&config, &command)
+            validate_remote(&config, &[], &command)
         };
         let with_mesh = |change: &dyn Fn(&mut crate::mesh::Params)| {
             mutate(&|command| change(command.mesh.as_mut().unwrap()))
@@ -3545,13 +3932,13 @@ mod tests {
         command.remote_url = "wss://relay.example/api/remote/device/mesh-1".into();
         command.mesh.as_mut().unwrap().rendezvous_url =
             "wss://relay.example/api/remote/device/mesh-1?transport=mesh".into();
-        validate_remote(&other, &command).unwrap();
+        validate_remote(&other, &[], &command).unwrap();
         command.mesh.as_mut().unwrap().rendezvous_url = format!(
             "{}/api/remote/device/mesh-1?transport=mesh",
             DEFAULT_PLATFORM_URL.replace("https://", "wss://")
         );
         assert_eq!(
-            validate_remote(&other, &command).unwrap_err(),
+            validate_remote(&other, &[], &command).unwrap_err(),
             "invalid_mesh"
         );
     }
