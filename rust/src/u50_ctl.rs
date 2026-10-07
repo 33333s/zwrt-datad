@@ -41,6 +41,23 @@ struct NeighborState {
 
 static CTL: OnceLock<Ctl> = OnceLock::new();
 
+fn sms_clock_offset(zone: &Value, os_zone: Option<&str>) -> Option<i64> {
+    let os_zone = os_zone?;
+    if os_zone != "+0000" && os_zone != "-0000" {
+        return Some(0);
+    }
+    let hours: f64 = zone.get("sntp_timezone")?.as_str()?.parse().ok()?;
+    let dst = match zone.get("sntp_dst_enable")?.as_str()? {
+        "0" => 0,
+        "1" => 3600,
+        _ => return None,
+    };
+    if !hours.is_finite() || !(-12.0..=14.0).contains(&hours) || (hours * 4.0).fract() != 0.0 {
+        return None;
+    }
+    Some(-(hours * 3600.0) as i64 - dst)
+}
+
 pub fn install(collector: Collector, oem: Bridge) {
     let _ = CTL.set(Ctl {
         collector,
@@ -1237,8 +1254,36 @@ impl Ctl {
 
     /// Counts used for the unread badge and change detection.
     pub async fn sms_capacity(&self) -> Result<Value, String> {
-        self.read("sms_unread_num,sms_dev_unread_num,sms_sim_unread_num,sms_nv_num_total,sms_sim_num_total")
-            .await
+        // U50 GoAhead exposes counts through a single-command resource, not
+        // the ARM64 UBus field names (which return empty strings on MU5120).
+        let value = self
+            .oem
+            .local_read_single("sms_capacity_info", &BTreeMap::new())
+            .await?;
+        let used = |store: &str| -> Result<u64, String> {
+            ["rev", "send", "draftbox"]
+                .iter()
+                .try_fold(0u64, |sum, kind| {
+                    let count = value
+                        .get(format!("sms_{store}_{kind}_total"))
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                        .filter(|n| *n <= 10_000)
+                        .ok_or("invalid OEM SMS capacity")?;
+                    Ok(sum + count)
+                })
+        };
+        let mut result = json!({"sms_nv_num_total":used("nv")?,"sms_sim_num_total":used("sim")?});
+        if self.collector.model == crate::u50::Model::U50Pro {
+            // MU5120 stock firmware stores local wall time in the kernel while
+            // /bin/date reports UTC. Its SNTP timezone is the missing offset.
+            // Do not subtract it again when the OS already has a local zone.
+            let zone = json!({"sntp_timezone":self.field("sntp_timezone").await,
+                "sntp_dst_enable":self.field("sntp_dst_enable").await});
+            let os_zone = crate::reboot_schedule::local_clock().map(|c| c.offset);
+            result["forward_clock_offset_seconds"] =
+                json!(sms_clock_offset(&zone, os_zone.as_deref()));
+        }
+        Ok(result)
     }
 
     /// One page of the message store (`mem_store`: 1 = device NV, 0 = SIM).
@@ -2404,6 +2449,38 @@ impl Ctl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mu5120_wall_clock_uses_oem_zone_without_double_offset() {
+        assert_eq!(
+            sms_clock_offset(
+                &json!({"sntp_timezone":"8","sntp_dst_enable":"0"}),
+                Some("+0000")
+            ),
+            Some(-28800)
+        );
+        assert_eq!(
+            sms_clock_offset(
+                &json!({"sntp_timezone":"8","sntp_dst_enable":"0"}),
+                Some("+0800")
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            sms_clock_offset(
+                &json!({"sntp_timezone":"-3.5","sntp_dst_enable":"1"}),
+                Some("+0000")
+            ),
+            Some(9000)
+        );
+        assert_eq!(
+            sms_clock_offset(
+                &json!({"sntp_timezone":"","sntp_dst_enable":"0"}),
+                Some("+0000")
+            ),
+            None
+        );
+    }
 
     #[test]
     fn message_ids_use_the_oem_semicolon_list() {

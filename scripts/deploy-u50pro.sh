@@ -53,7 +53,7 @@ RequiresMountsFor=/cache
 After=local-fs.target
 
 [Service]
-ExecStart=/cache/zwrt-datad/zwrt-datad --u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling --bind 127.0.0.1 --port 9460
+ExecStart=/cache/zwrt-datad/zwrt-datad --u50-model u50pro --u50-data-dir /cache/zwrt-datad --u50-signaling --u50-enable-webshell --bind 127.0.0.1 --port 9460
 Restart=on-failure
 RestartSec=3
 

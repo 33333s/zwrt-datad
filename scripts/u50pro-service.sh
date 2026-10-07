@@ -152,9 +152,9 @@ start_service() {
         timeout 30 systemd-run --unit="$UNIT" --description='zwrt-datad ZWRT backend' \
             --property=Restart=on-failure --property=RestartSec=3 \
             "$DIR/zwrt-datad" --u50-model u50pro --u50-data-dir "$DIR" \
-            --u50-signaling --bind 127.0.0.1 --port 9460
+            --u50-signaling --u50-enable-webshell --bind 127.0.0.1 --port 9460
     else
         nohup "$DIR/zwrt-datad" --u50-model u50pro --u50-data-dir "$DIR" \
-            --u50-signaling --bind 127.0.0.1 --port 9460 >> "$DIR/zwrt-datad.log" 2>&1 < /dev/null &
+            --u50-signaling --u50-enable-webshell --bind 127.0.0.1 --port 9460 >> "$DIR/zwrt-datad.log" 2>&1 < /dev/null &
     fi
 }

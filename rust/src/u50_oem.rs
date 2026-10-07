@@ -560,6 +560,24 @@ impl Bridge {
         for attempt in 0..2 {
             let token = self.local_token().await?;
             let cookie = self.authorized_cookie(&token).await?;
+            // GoAhead can return a successful empty SMS list after its cookie
+            // was replaced by another WebUI login. Never baseline that as an
+            // empty inbox: verify the OEM session and renew once before reads.
+            if cmd.starts_with("sms_")
+                && self
+                    .get("loginfo", &cookie)
+                    .await?
+                    .0
+                    .get("loginfo")
+                    .and_then(Value::as_str)
+                    != Some("ok")
+            {
+                self.drop_session().await;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err("OEM SMS session unavailable".into());
+            }
             match self.get_query(cmd, &cookie, params, false).await {
                 Ok((value, _)) => return Ok(value),
                 Err(error) if attempt == 0 => {

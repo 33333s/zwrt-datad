@@ -24,7 +24,6 @@ const MAX_SEEN: usize = 1024;
 const MAX_SMS_TARGETS: usize = 3;
 const MAX_SMS_DAILY_SENDS: u16 = 60;
 const MAX_SMS_UNITS: usize = 280;
-const MAX_POWER_DAILY_SENDS: u16 = 60;
 const MAX_BLACKLIST_PHONES: usize = 64;
 const MAX_BLACKLIST_KEYWORDS: usize = 32;
 const MAX_KEYWORD_BYTES: usize = 128;
@@ -52,10 +51,11 @@ struct Config {
     power_last_percent: Option<i64>,
     #[serde(default)]
     power_last_charging: Option<i64>,
-    #[serde(default)]
-    power_quota_date: String,
-    #[serde(default)]
-    power_quota_used: u16,
+    // Accept old saved quotas during upgrades; discard them on the next save.
+    #[serde(default, skip_serializing, rename = "power_quota_date")]
+    _legacy_power_quota_date: String,
+    #[serde(default, skip_serializing, rename = "power_quota_used")]
+    _legacy_power_quota_used: u16,
     #[serde(default)]
     blacklist_phone: Vec<String>,
     #[serde(default)]
@@ -69,6 +69,10 @@ struct Config {
     #[serde(default)]
     sms_forward_device_info: bool,
     seen: Vec<String>,
+    #[serde(default)]
+    fingerprint_version: u8,
+    #[serde(default)]
+    forwarding_since: u64,
 }
 
 impl Default for Config {
@@ -87,8 +91,8 @@ impl Default for Config {
             power_forward_enabled: false,
             power_last_percent: None,
             power_last_charging: None,
-            power_quota_date: String::new(),
-            power_quota_used: 0,
+            _legacy_power_quota_date: String::new(),
+            _legacy_power_quota_used: 0,
             blacklist_phone: Vec::new(),
             blacklist_keywords: Vec::new(),
             nickname: String::new(),
@@ -96,6 +100,8 @@ impl Default for Config {
             dingtalk_forward_device_info: false,
             sms_forward_device_info: false,
             seen: Vec::new(),
+            fingerprint_version: 0,
+            forwarding_since: 0,
         }
     }
 }
@@ -474,6 +480,22 @@ fn charge_label(charging: i64) -> &'static str {
     }
 }
 
+/// Common policy for every platform with normalized battery telemetry.
+/// A jump across several thresholds produces one notification for the last crossed point.
+fn crossed_power_threshold(previous: i64, current: i64) -> Option<i64> {
+    const THRESHOLDS: [i64; 6] = [5, 20, 40, 60, 80, 100];
+    if current > previous {
+        THRESHOLDS
+            .into_iter()
+            .rev()
+            .find(|&point| previous < point && current >= point)
+    } else {
+        THRESHOLDS
+            .into_iter()
+            .find(|&point| previous > point && current <= point)
+    }
+}
+
 fn valid_config(config: &Config) -> bool {
     config.schema == 1
         && matches!(
@@ -517,9 +539,6 @@ fn valid_config(config: &Config) -> bool {
             == config.blacklist_keywords.len()
         && valid_nickname(&config.nickname)
         && config.sms_quota_used <= MAX_SMS_DAILY_SENDS
-        && config.power_quota_used <= MAX_POWER_DAILY_SENDS
-        && (config.power_quota_date.is_empty()
-            || reboot_schedule::valid_date(&config.power_quota_date))
         && match (config.power_last_percent, config.power_last_charging) {
             (None, None) => true,
             (Some(percent), Some(charging)) => {
@@ -546,7 +565,29 @@ fn valid_config(config: &Config) -> bool {
             })
 }
 
-fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
+type IncomingMessage = (String, Message, Option<u64>);
+
+fn forwarding_clock() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .filter(|t| (946684800..4102444800).contains(t))
+        .ok_or("clock_unavailable".into())
+}
+
+fn snapshot_clock(snapshot: &Value) -> Result<u64, String> {
+    let offset = match snapshot.get("forward_clock_offset_seconds") {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .filter(|v| (-15 * 3600..=15 * 3600).contains(v))
+            .ok_or("clock_unavailable")?,
+    };
+    u64::try_from(forwarding_clock()? as i64 + offset).map_err(|_| "clock_unavailable".into())
+}
+
+fn messages(snapshot: &Value) -> Result<Vec<IncomingMessage>, String> {
     if snapshot.get("stale").and_then(Value::as_bool) != Some(false)
         || snapshot.get("truncated").and_then(Value::as_bool) != Some(false)
     {
@@ -566,7 +607,7 @@ fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
         if tag != 0 && tag != 1 {
             continue;
         }
-        let id = item
+        let _id = item
             .get("id")
             .and_then(Value::as_i64)
             .ok_or("sms_list_unavailable")?;
@@ -586,8 +627,13 @@ fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
             return Err("sms_list_unavailable".into());
         }
         let mut digest = Sha256::new();
-        digest.update(id.to_be_bytes());
-        for field in [from, date, text] {
+        // A SIM -> NV copy may get a new ID. Identity is sender + original
+        // receipt instant + content, never the modem's current storage slot.
+        let received_at = item.get("received_at").and_then(Value::as_u64);
+        let identity_date = received_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| date.to_owned());
+        for field in [from, identity_date.as_str(), text] {
             digest.update((field.len() as u32).to_be_bytes());
             digest.update(field.as_bytes());
         }
@@ -599,12 +645,13 @@ fn messages(snapshot: &Value) -> Result<Vec<(String, Message)>, String> {
                 date: date.into(),
                 kind: Kind::Sms,
             },
+            received_at,
         ));
     }
     Ok(output)
 }
 
-fn delivery_result_code(result: &Result<(), String>) -> &'static str {
+pub(crate) fn delivery_result_code(result: &Result<(), String>) -> &'static str {
     match result {
         Ok(()) => "sent",
         Err(error) if error == "clock_unavailable" => "clock_unavailable",
@@ -613,6 +660,7 @@ fn delivery_result_code(result: &Result<(), String>) -> &'static str {
         Err(error) if error == "self_forward_blocked" => "self_forward_blocked",
         Err(error) if error == "message_too_long" => "message_too_long",
         Err(error) if error == "smtp_auth_failed" => "smtp_auth_failed",
+        Err(error) if error == "smtp_auth_temporary" => "smtp_auth_temporary",
         Err(error) if error == "forward_storage_failed" => "storage_failed",
         Err(_) => "delivery_failed",
     }
@@ -650,11 +698,6 @@ impl Forwarder {
         } else {
             MAX_SMS_DAILY_SENDS
         };
-        let power_remaining = if today.as_deref() == Some(&self.config.power_quota_date) {
-            MAX_POWER_DAILY_SENDS - self.config.power_quota_used
-        } else {
-            MAX_POWER_DAILY_SENDS
-        };
         json!({"supported":true,"enabled":self.config.enabled,"method":self.config.method,
             "webhook_configured":!self.config.webhook_url.is_empty(),
             "dingtalk_configured":!self.config.dingtalk_webhook.is_empty(),
@@ -664,7 +707,6 @@ impl Forwarder {
             "smtp_configured":self.config.smtp.configured(),
             "smtp_supported":true,
             "power_forward_enabled":self.config.power_forward_enabled,
-            "power_daily_remaining":power_remaining,
             "power_last_result":self.power_last_result,
             "rules_supported":true,
             "blacklist_phone_count":self.config.blacklist_phone.len(),
@@ -678,10 +720,28 @@ impl Forwarder {
             "last_result":self.last_result})
     }
 
+    /// Private, authenticated App editor only. Never include this in telemetry.
+    /// Explicit projection keeps passwords, fingerprints and quotas out of config.
+    pub fn app_config(&self) -> Value {
+        let c = &self.config;
+        json!({"enabled":c.enabled,"method":c.method,
+            "webhook_url":c.webhook_url,"dingtalk_webhook":c.dingtalk_webhook,
+            "dingtalk_secret_configured":!c.dingtalk_secret.is_empty(),
+            "sms_to_phone":c.sms_to_phone,
+            "smtp":{"host":c.smtp.host,"port":c.smtp.port,"username":c.smtp.username,
+                "to":c.smtp.to,"password_configured":!c.smtp.password.is_empty()},
+            "power_forward_enabled":c.power_forward_enabled,
+            "blacklist_phone":c.blacklist_phone,"blacklist_keywords":c.blacklist_keywords,
+            "nickname":c.nickname,"smtp_forward_device_info":c.smtp_forward_device_info,
+            "dingtalk_forward_device_info":c.dingtalk_forward_device_info,
+            "sms_forward_device_info":c.sms_forward_device_info})
+    }
+
     pub fn requires_baseline(&self, input: &Update) -> bool {
         input.enabled
             && (!self.config.enabled
                 || input.method != self.config.method
+                || self.config.fingerprint_version != 3
                 || self.last_result == "invalid_config")
     }
 
@@ -789,11 +849,18 @@ impl Forwarder {
         if next.enabled
             && (!self.config.enabled
                 || next.method != self.config.method
+                || self.config.fingerprint_version != 3
                 || self.last_result == "invalid_config")
         {
             let current = messages(snapshot.ok_or("sms_list_unavailable")?)?;
             let mut seen: HashSet<_> = next.seen.iter().cloned().collect();
-            for (hash, _) in current {
+            next.forwarding_since = snapshot_clock(snapshot.ok_or("sms_list_unavailable")?)?;
+            if next.fingerprint_version != 3 {
+                next.seen.clear();
+                seen.clear();
+            }
+            next.fingerprint_version = 3;
+            for (hash, _, _) in current {
                 if seen.insert(hash.clone()) {
                     next.seen.push(hash);
                 }
@@ -817,10 +884,25 @@ impl Forwarder {
         if !self.config.enabled {
             return Ok(None);
         }
+        // Upgrade old ID-based state conservatively: baseline the current
+        // inbox before considering any delivery, with the same age cutoff.
+        if self.config.fingerprint_version != 3 {
+            let mut next = self.config.clone();
+            next.seen = messages(snapshot)?
+                .into_iter()
+                .map(|(hash, _, _)| hash)
+                .collect();
+            next.fingerprint_version = 3;
+            next.forwarding_since = snapshot_clock(snapshot)?;
+            self.save(&next)?;
+            self.config = next;
+            return Ok(None);
+        }
+        let now = snapshot_clock(snapshot)?;
         let mut seen: HashSet<_> = self.config.seen.iter().cloned().collect();
         let mut next = self.config.clone();
         let mut deliverable = None;
-        for (hash, message) in messages(snapshot)? {
+        for (hash, message, received_at) in messages(snapshot)? {
             if !seen.insert(hash.clone()) {
                 continue;
             }
@@ -828,7 +910,11 @@ impl Forwarder {
             if next.seen.len() > MAX_SEEN {
                 next.seen.drain(..next.seen.len() - MAX_SEEN);
             }
-            if !blacklisted(&next, &message) {
+            // History arriving after boot/SIM sync is not a new SMS. Unknown
+            // timestamps are also skipped rather than risking a bulk replay.
+            let recent = received_at
+                .is_some_and(|t| t >= next.forwarding_since && t <= now.saturating_add(300));
+            if recent && !blacklisted(&next, &message) {
                 deliverable = Some(message);
                 break;
             }
@@ -883,7 +969,7 @@ impl Forwarder {
         self.config.enabled
     }
 
-    /// Store the new battery baseline and the daily quota before any external
+    /// Store the new battery notification baseline before any external
     /// delivery. Reboots and failed sends cannot replay an old power event.
     pub fn observe_power(&mut self, battery: Option<&Value>) -> Result<Option<Message>, String> {
         let current = power_state(battery);
@@ -922,32 +1008,28 @@ impl Forwarder {
             self.power_last_result = "idle";
             return Ok(None);
         }
+        let (old_percent, old_charging) = previous.expect("checked above");
+        let threshold = crossed_power_threshold(old_percent, percent);
+        if old_charging == charging && threshold.is_none() {
+            // Keep the observed baseline across reboots even between notification points.
+            self.save(&next)?;
+            self.config = next;
+            return Ok(None);
+        }
         let Some(clock) = reboot_schedule::local_clock() else {
             self.save(&next)?;
             self.config = next;
             self.power_last_result = "clock_unavailable";
             return Ok(None);
         };
-        if next.power_quota_date != clock.date {
-            next.power_quota_date = clock.date.clone();
-            next.power_quota_used = 0;
-        }
-        if next.power_quota_used >= MAX_POWER_DAILY_SENDS {
-            self.save(&next)?;
-            self.config = next;
-            self.power_last_result = "rate_limited";
-            return Ok(None);
-        }
-        next.power_quota_used += 1;
         self.save(&next)?;
         self.config = next;
-        let (old_percent, old_charging) = previous.expect("checked above");
         let text = if old_charging != charging {
             format!("充电状态：{}\n当前电量：{percent}%", charge_label(charging))
         } else {
+            let point = threshold.expect("checked above");
             format!(
-                "电量变化：{:+}%（{old_percent}% → {percent}%）\n充电状态：{}",
-                percent - old_percent,
+                "电量提醒：{point}%\n当前电量：{percent}%\n充电状态：{}",
                 charge_label(charging)
             )
         };
@@ -1346,9 +1428,9 @@ mod tests {
         assert!(!status.to_string().contains("10086"));
         assert!(!status.to_string().contains("验证码"));
         let fresh = json!({"stale":false,"truncated":false,"list":[
-            {"id":3,"num":"10010","date":"09-29 11:03","tag":1,"text":"普通通知"},
-            {"id":2,"num":"10010","date":"09-29 11:02","tag":1,"text":"验证码123"},
-            {"id":1,"num":"10086","date":"09-29 11:01","tag":1,"text":"服务消息"}
+            {"id":3,"num":"10010","date":"09-29 11:03","received_at":forwarding_clock().unwrap(),"tag":1,"text":"普通通知"},
+            {"id":2,"num":"10010","date":"09-29 11:02","received_at":forwarding_clock().unwrap(),"tag":1,"text":"验证码123"},
+            {"id":1,"num":"10086","date":"09-29 11:01","received_at":forwarding_clock().unwrap(),"tag":1,"text":"服务消息"}
         ]});
         let message = manager.next(&fresh).unwrap().unwrap();
         assert_eq!(message.text, "普通通知");
@@ -1468,10 +1550,7 @@ mod tests {
         assert_eq!(manager.status()["sms_configured"], false);
         assert_eq!(manager.status()["smtp_configured"], false);
         assert_eq!(manager.status()["power_forward_enabled"], false);
-        assert_eq!(
-            manager.status()["power_daily_remaining"],
-            MAX_POWER_DAILY_SENDS
-        );
+        assert!(manager.status().get("power_daily_remaining").is_none());
         assert_eq!(manager.status()["last_result"], "idle");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1486,8 +1565,8 @@ mod tests {
         let mut manager = Forwarder::load(&dir);
         let first = json!({"percent":50,"charging":1});
         let second = json!({"percent":51,"charging":1});
-        let third = json!({"percent":52,"charging":1});
-        let full = json!({"percent":52,"charging":4});
+        let third = json!({"percent":61,"charging":1});
+        let full = json!({"percent":61,"charging":4});
         let sms_baseline = json!({"stale":false,"truncated":false,"list":[]});
         assert!(power_state(Some(&first)).is_some());
         assert!(power_state(Some(&json!({"percent":100,"charging":0}))).is_none());
@@ -1529,7 +1608,7 @@ mod tests {
         assert!(manager.observe_power(Some(&second)).unwrap().is_none());
         let event = manager.observe_power(Some(&third)).unwrap().unwrap();
         assert_eq!(event.kind, Kind::Power);
-        assert!(event.text.contains("+1%"));
+        assert!(event.text.contains("电量提醒：60%"));
         let (subject, body) = smtp_content(&event, None);
         assert_eq!(subject, "电源状态通知");
         assert_eq!(body, event.text);
@@ -1544,12 +1623,12 @@ mod tests {
                 .unwrap()
                 .starts_with("电源状态通知:")
         );
-        assert_eq!(manager.status()["power_daily_remaining"], 59);
+        assert!(manager.status().get("power_daily_remaining").is_none());
         let mut restarted = Forwarder::load(&dir);
         assert!(restarted.observe_power(Some(&third)).unwrap().is_none());
         let event = restarted.observe_power(Some(&full)).unwrap().unwrap();
         assert!(event.text.contains("已充满"));
-        assert_eq!(restarted.status()["power_daily_remaining"], 58);
+        assert!(restarted.status().get("power_daily_remaining").is_none());
         restarted
             .update(settings(false, None), None, Some(&full))
             .unwrap();
@@ -1571,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn power_events_fail_closed_without_battery_or_after_daily_limit() {
+    fn power_events_ignore_legacy_quota_and_fail_closed_without_battery() {
         let dir = std::env::temp_dir().join(format!(
             "datad-power-limit-{}-{}",
             std::process::id(),
@@ -1585,23 +1664,140 @@ mod tests {
         config.power_forward_enabled = true;
         config.power_last_percent = Some(90);
         config.power_last_charging = Some(2);
-        config.power_quota_date = reboot_schedule::local_clock().unwrap().date;
-        config.power_quota_used = MAX_POWER_DAILY_SENDS;
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy["power_quota_date"] = json!(reboot_schedule::local_clock().unwrap().date);
+        legacy["power_quota_used"] = json!(60);
+        // Reproduce a real upgrade from a device that already exhausted the old limit.
         manager.save(&config).unwrap();
-        manager.config = config;
-        assert!(
-            manager
-                .observe_power(Some(&json!({"percent":91,"charging":2})))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(manager.status()["power_last_result"], "rate_limited");
+        fs::write(dir.join(FILE_NAME), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        manager = Forwarder::load(&dir);
+        assert_eq!(manager.status()["enabled"], true);
+        for i in 0..70 {
+            let percent = if i % 2 == 0 { 20 } else { 90 };
+            assert!(
+                manager
+                    .observe_power(Some(&json!({"percent":percent,"charging":2})))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let saved: Value = serde_json::from_slice(&fs::read(dir.join(FILE_NAME)).unwrap()).unwrap();
+        assert!(saved.get("power_quota_date").is_none());
+        assert!(saved.get("power_quota_used").is_none());
         assert!(manager.observe_power(None).unwrap().is_none());
         assert_eq!(manager.status()["power_last_result"], "source_unavailable");
         assert!(manager.observe_power(Some(&first)).unwrap().is_none());
         assert_eq!(manager.status()["power_last_result"], "idle");
         let status = Forwarder::load(&dir).status();
-        assert_eq!(status["power_daily_remaining"], 0);
+        assert!(status.get("power_daily_remaining").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn power_thresholds_notify_on_crossings_in_both_directions_only() {
+        let dir = std::env::temp_dir().join(format!("datad-power-bands-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.power_forward_enabled = true;
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":0,"charging":1})))
+                .unwrap()
+                .is_none()
+        );
+        for percent in 1..=100 {
+            let event = manager
+                .observe_power(Some(&json!({"percent":percent,"charging":1})))
+                .unwrap();
+            assert_eq!(
+                event.is_some(),
+                [5, 20, 40, 60, 80, 100].contains(&percent),
+                "ascending {percent}"
+            );
+        }
+        for percent in (0..100).rev() {
+            let event = manager
+                .observe_power(Some(&json!({"percent":percent,"charging":1})))
+                .unwrap();
+            assert_eq!(
+                event.is_some(),
+                [5, 20, 40, 60, 80].contains(&percent),
+                "descending {percent}"
+            );
+        }
+        // A large jump creates one message; a charging transition in the same band still notifies.
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":100,"charging":1})))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":100,"charging":4})))
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("已充满")
+        );
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":101,"charging":4})))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":100,"charging":4})))
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn power_threshold_baseline_survives_restart_between_points() {
+        let dir =
+            std::env::temp_dir().join(format!("datad-power-restart-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.power_forward_enabled = true;
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":19,"charging":2})))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":20,"charging":2})))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            manager
+                .observe_power(Some(&json!({"percent":21,"charging":2})))
+                .unwrap()
+                .is_none()
+        );
+        let mut restarted = Forwarder::load(&dir);
+        assert!(
+            restarted
+                .observe_power(Some(&json!({"percent":20,"charging":2})))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            restarted
+                .observe_power(Some(&json!({"percent":19,"charging":2})))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(crossed_power_threshold(81, 4), Some(5));
+        assert_eq!(crossed_power_threshold(4, 81), Some(80));
+        assert_eq!(crossed_power_threshold(21, 21), None);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1712,7 +1908,7 @@ mod tests {
         );
         assert!(!manager.status().to_string().contains("example.com"));
         assert!(manager.next(&old).unwrap().is_none());
-        let fresh = json!({"stale":false,"truncated":false,"list":[{"id":2,"num":"10002","date":"09-29 11:01","tag":1,"text":"new"},{"id":1,"num":"10001","date":"09-29 11:00","tag":1,"text":"old"}]});
+        let fresh = json!({"stale":false,"truncated":false,"list":[{"id":2,"num":"10002","date":"09-29 11:01","received_at":forwarding_clock().unwrap(),"tag":1,"text":"new"},{"id":1,"num":"10001","date":"09-29 11:00","tag":1,"text":"old"}]});
         let next = manager.next(&fresh).unwrap().unwrap();
         assert_eq!(next.text, "new");
         assert!(manager.next(&fresh).unwrap().is_none());
@@ -1726,6 +1922,134 @@ mod tests {
                 & 0o777,
             0o600
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delayed_sim_history_and_changed_storage_ids_never_replay() {
+        let dir = std::env::temp_dir().join(format!("forward-history-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        let now = forwarding_clock().unwrap();
+        let snapshot = |rows: Value| json!({"stale":false,"truncated":false,"list":rows});
+        let message = |id, time, text| json!({"id":id,"num":"10086","date":"10-07 21:49","received_at":time,"tag":1,"text":text});
+        let change = || {
+            serde_json::from_value::<Update>(
+                json!({"enabled":true,"method":"webhook","webhook_url":"https://example.com/hook"}),
+            )
+            .unwrap()
+        };
+        let existing = message(1, now - 86400, "existing NV");
+        manager
+            .update(change(), Some(&snapshot(json!([existing]))), None)
+            .unwrap();
+        // SIM becomes visible later; old NV is also copied under another ID.
+        let old = snapshot(json!([
+            message(51, now - 86400, "existing NV"),
+            message(52, now - 7200, "late SIM")
+        ]));
+        assert!(manager.next(&old).unwrap().is_none());
+        // Unknown/future SCTS cannot prove a new arrival.
+        let unknown = json!({"id":53,"num":"10086","date":"","tag":1,"text":"unknown timestamp"});
+        assert!(
+            manager
+                .next(&snapshot(json!([
+                    unknown,
+                    message(54, now + 3600, "bad clock")
+                ])))
+                .unwrap()
+                .is_none()
+        );
+        let new = message(55, now + 1, "new incoming");
+        assert_eq!(
+            manager.next(&snapshot(json!([new]))).unwrap().unwrap().text,
+            "new incoming"
+        );
+        // Same receipt/content under a different slot and read flag is the same SMS.
+        let mut copied = message(99, now + 1, "new incoming");
+        copied["tag"] = json!(0);
+        let mut restarted = Forwarder::load(&dir);
+        assert!(
+            restarted
+                .next(&snapshot(json!([copied])))
+                .unwrap()
+                .is_none()
+        );
+        // Equal text at a different receipt second remains a distinct new SMS.
+        assert!(
+            restarted
+                .next(&snapshot(json!([message(100, now + 2, "new incoming")])))
+                .unwrap()
+                .is_some()
+        );
+        // A transient empty inbox at enable time still cannot admit old SIM history.
+        restarted
+            .update(
+                serde_json::from_value(json!({"enabled":false,"method":"webhook"})).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+        restarted
+            .update(change(), Some(&snapshot(json!([]))), None)
+            .unwrap();
+        assert!(
+            restarted
+                .next(&snapshot(json!([message(
+                    101,
+                    now - 86400,
+                    "delayed history"
+                )])))
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn u50_local_wall_clock_does_not_block_new_sms_for_eight_hours() {
+        let dir = std::env::temp_dir().join(format!("forward-clock-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        let now = forwarding_clock().unwrap() - 28800;
+        let snapshot = |rows| json!({"stale":false,"truncated":false,"forward_clock_offset_seconds":-28800,"list":rows});
+        let change = serde_json::from_value(
+            json!({"enabled":true,"method":"webhook","webhook_url":"https://example.com/hook"}),
+        )
+        .unwrap();
+        manager
+            .update(change, Some(&snapshot(json!([]))), None)
+            .unwrap();
+        assert!(manager.config.forwarding_since.abs_diff(now) <= 2);
+        let rows = json!([
+            {"id":2,"num":"10086","date":"now","received_at":now+1,"text":"new","tag":1},
+            {"id":1,"num":"10086","date":"old","received_at":now-3600,"text":"SIM history","tag":0}
+        ]);
+        assert_eq!(
+            manager.next(&snapshot(rows.clone())).unwrap().unwrap().text,
+            "new"
+        );
+        assert!(
+            Forwarder::load(&dir)
+                .next(&snapshot(rows))
+                .unwrap()
+                .is_none()
+        );
+        assert!(snapshot_clock(&json!({"forward_clock_offset_seconds":null})).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_fingerprints_migrate_without_replaying_the_inbox() {
+        let dir = std::env::temp_dir().join(format!("forward-migrate-{}", rand::random::<u64>()));
+        let mut manager = Forwarder::load(&dir);
+        manager.config.enabled = true;
+        manager.config.webhook_url = "https://example.com/hook".into();
+        manager.config.seen = vec!["a".repeat(64)];
+        manager.save(&manager.config).unwrap();
+        let mut restarted = Forwarder::load(&dir);
+        let current = json!({"stale":false,"truncated":false,"list":[{"id":1,"num":"10086","date":"10-07 21:49","received_at":forwarding_clock().unwrap(),"tag":0,"text":"existing"}]});
+        assert!(restarted.next(&current).unwrap().is_none());
+        assert_eq!(restarted.config.fingerprint_version, 3);
+        assert!(Forwarder::load(&dir).next(&current).unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

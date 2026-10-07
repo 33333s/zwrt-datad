@@ -95,6 +95,7 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual((self.data / 'zwrt-datad.prev').read_text(), self.fixture.binary('0.0.1'))
         unit = self.fixture.unit.read_text()
         self.assertIn('After=local-fs.target', unit)
+        self.assertIn('--u50-enable-webshell', unit)
         self.assertNotIn('After=multi-user.target', unit)
 
     def test_tiny_download_to_verified_install(self):

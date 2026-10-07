@@ -26,7 +26,7 @@ const IDLE_FOR: Duration = Duration::from_secs(120);
 pub struct Profile {
     /// Signed manifest file name (its signature is `<name>.sig`).
     pub manifest: &'static str,
-    /// Minimum free bytes on the data volume before an install may start.
+    /// Minimum free bytes for the legacy generic platform. U50 checks actual paths.
     pub min_free_bytes: f64,
     /// The daemon downloads and verifies the binary itself and hands the
     /// installer a local file (`DATAD_BINARY_FILE`) instead of a URL.
@@ -51,8 +51,8 @@ impl Profile {
     };
     pub const U50: Profile = Profile {
         manifest: "update-armv7.json",
-        // A 4.6 MB binary is staged next to the running one on a ~15 MB volume.
-        min_free_bytes: 7.0 * 1024.0 * 1024.0,
+        // U50 downloads use /tmp; install-volume space is checked separately.
+        min_free_bytes: 0.0,
         download_in_process: true,
         detached_systemd: true,
         // GitHub's "latest" is the ARM64 line's newest release, which has no
@@ -99,6 +99,8 @@ pub struct Artifact {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
+    #[serde(default)]
+    pub notes: String,
     pub schema: i64,
     pub version: String,
     pub tag: String,
@@ -108,6 +110,8 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub install_started_at: i64,
     pub state: String,
     pub current_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -136,6 +140,7 @@ fn is_zero(value: &i64) -> bool {
 impl Default for Status {
     fn default() -> Self {
         Self {
+            install_started_at: 0,
             state: "idle".into(),
             current_version: env!("DATAD_VERSION").into(),
             latest_version: String::new(),
@@ -158,7 +163,83 @@ pub struct Candidate {
     pub base_url: String,
 }
 
+/// Private download directory, removed on preparation failure. A successful
+/// preparation transfers ownership to the detached wrapper.
+struct DownloadStage {
+    path: PathBuf,
+    keep: bool,
+}
+impl DownloadStage {
+    fn new() -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = Path::new("/tmp").join(format!("zwrt-datad-ota-{:016x}", rand::random::<u64>()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| e.to_string())?;
+        Ok(Self { path, keep: false })
+    }
+    fn remove(path: &Path) {
+        if path.parent() == Some(Path::new("/tmp"))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("zwrt-datad-ota-"))
+        {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+impl Drop for DownloadStage {
+    fn drop(&mut self) {
+        if !self.keep {
+            Self::remove(&self.path);
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn available_bytes(path: &Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(name.as_ptr(), &mut stat) } != 0 {
+        return Err(format!("无法检查 {} 可用空间", path.display()));
+    }
+    let block = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    } as u64;
+    Ok(block.saturating_mul(stat.f_bavail as u64))
+}
+fn stage_space_reasons(
+    tmp_free: u64,
+    install_free: u64,
+    binary: u64,
+    installer: u64,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (name, free, need) in [
+        (
+            "/tmp 下载目录",
+            tmp_free,
+            binary.saturating_add(installer).saturating_add(512 * 1024),
+        ),
+        ("安装目录", install_free, binary.saturating_add(512 * 1024)),
+    ] {
+        if free < need {
+            reasons.push(format!(
+                "{name}可用空间不足，需 {} MiB",
+                need.div_ceil(1024 * 1024)
+            ));
+        }
+    }
+    reasons
+}
+
 pub struct Ota {
+    view: tokio::sync::watch::Sender<Value>,
     profile: Profile,
     dir: PathBuf,
     config: Config,
@@ -185,11 +266,36 @@ impl Ota {
         let mut status = read_json::<Status>(&dir.join("ota-state.json")).unwrap_or_default();
         status.current_version = env!("DATAD_VERSION").into();
         status.source = source_name(&status.source).into();
+        if matches!(status.state.as_str(), "checking" | "downloading") {
+            status.state = "error".into();
+            status.error = "上次更新检查或下载被中断，请重新检查".into();
+            status.signature_verified = false;
+            status.latest_version.clear();
+            status.source.clear();
+            status.wait_reasons.clear();
+            status.progress = 0;
+        }
+        // An ADB/manual upgrade can supersede a previously checked candidate.
+        // Keep an in-flight install's target intact until its result is reconciled.
+        if matches!(status.state.as_str(), "available" | "waiting_idle")
+            && !status.latest_version.is_empty()
+            && !newer(&status.latest_version, env!("DATAD_VERSION"))
+        {
+            status.state = "idle".into();
+            status.latest_version = env!("DATAD_VERSION").into();
+            status.signature_verified = false;
+            status.source.clear();
+            status.wait_reasons.clear();
+            status.error.clear();
+            status.progress = 0;
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self {
+        let (view, _) = tokio::sync::watch::channel(Value::Null);
+        let result = Self {
+            view,
             profile,
             dir: dir.to_owned(),
             config,
@@ -200,7 +306,42 @@ impl Ota {
             client,
             key,
             last_auto_check: 0,
-        })
+        };
+        result.publish();
+        Ok(result)
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Value> {
+        self.view.subscribe()
+    }
+
+    fn candidate_id(candidate: &Candidate) -> String {
+        hex_sha256(
+            &serde_json::to_vec(
+                &json!({"manifest":candidate.manifest,"source":candidate.base_url}),
+            )
+            .expect("serialize candidate"),
+        )
+    }
+
+    fn publish(&self) {
+        let candidate = self
+            .candidate
+            .as_ref()
+            .filter(|c| has_update(c) && self.status.signature_verified);
+        self.view.send_replace(json!({"status":self.status,"config":self.config,
+            "busy": self.busy || self.status.state == "installing", "platform":self.profile.manifest,
+            "candidate":candidate.map(|c| json!({"id":Self::candidate_id(c),"manifest":c.manifest}))}));
+    }
+
+    pub fn approved_candidate(&self, id: &str) -> Result<Candidate, String> {
+        self.candidate
+            .as_ref()
+            .filter(|c| {
+                has_update(c) && self.status.signature_verified && Self::candidate_id(c) == id
+            })
+            .cloned()
+            .ok_or_else(|| "更新信息已失效，请重新检查更新".into())
     }
 
     pub fn config_json(&self) -> Value {
@@ -212,7 +353,7 @@ impl Ota {
     }
 
     pub fn begin_update(&mut self) -> Result<(), String> {
-        if self.busy {
+        if self.busy || self.status.state == "installing" {
             return Err("更新任务正在运行".into());
         }
         self.busy = true;
@@ -224,15 +365,28 @@ impl Ota {
 
     pub fn finish_update(&mut self) {
         self.busy = false;
+        self.publish();
     }
 
     pub fn update_config(&mut self, mut config: Config) -> Result<Value, String> {
+        if self.busy || self.status.state == "installing" {
+            return Err("更新任务正在运行".into());
+        }
         validate_config(&config)?;
         for server in &mut config.servers {
             *server = server.trim().trim_end_matches('/').to_owned();
         }
         atomic_json(&self.dir.join("ota.json"), &config, 0o600)?;
         self.config = config;
+        self.candidate = None;
+        self.status.signature_verified = false;
+        self.status.latest_version.clear();
+        self.status.source.clear();
+        self.status.wait_reasons.clear();
+        self.status.progress = 0;
+        self.status.state = "idle".into();
+        self.status.error.clear();
+        self.save_status();
         Ok(json!({"success":true,"config":self.config}))
     }
 
@@ -258,8 +412,16 @@ impl Ota {
     }
 
     pub async fn check(&mut self) -> Result<Candidate, String> {
+        if self.status.state == "installing" {
+            return Err("更新任务正在运行".into());
+        }
         self.status.state = "checking".into();
         self.status.error.clear();
+        self.candidate = None;
+        self.status.signature_verified = false;
+        self.status.latest_version.clear();
+        self.status.source.clear();
+        self.status.wait_reasons.clear();
         self.status.last_check_at = now();
         self.status.progress = 0;
         self.save_status();
@@ -350,7 +512,8 @@ impl Ota {
     ) -> Result<(), String> {
         let wrapper = self.prepare_install(candidate, snapshot, manual).await?;
         self.status.state = "installing".into();
-        self.status.progress = 100;
+        self.status.progress = 95;
+        self.status.install_started_at = now();
         self.save_status();
         let spawned = if self.profile.detached_systemd {
             // The installer restarts this very service; a child in the
@@ -383,8 +546,11 @@ impl Ota {
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         };
-        if spawned.is_err() {
-            let _ = fs::remove_file(self.dir.join("zwrt-datad.new"));
+        if spawned.is_err()
+            && self.profile.download_in_process
+            && let Some(stage) = wrapper.parent()
+        {
+            DownloadStage::remove(stage);
         }
         spawned
     }
@@ -398,7 +564,25 @@ impl Ota {
         snapshot: &Value,
         manual: bool,
     ) -> Result<PathBuf, String> {
-        let reasons = self.safety(snapshot, manual);
+        let mut reasons = self.safety(snapshot, manual);
+        if self.profile.download_in_process {
+            let binary = candidate
+                .manifest
+                .artifacts
+                .get("binary")
+                .ok_or("缺少二进制")?;
+            let installer = candidate
+                .manifest
+                .artifacts
+                .get("installer")
+                .ok_or("缺少安装器")?;
+            reasons.extend(stage_space_reasons(
+                available_bytes(Path::new("/tmp"))?,
+                available_bytes(&self.dir)?,
+                binary.size.max(0) as u64,
+                installer.size.max(0) as u64,
+            ));
+        }
         if !reasons.is_empty() {
             self.status.state = "waiting_idle".into();
             self.status.wait_reasons = reasons.clone();
@@ -415,6 +599,15 @@ impl Ota {
             .artifacts
             .get("binary")
             .ok_or("缺少二进制")?;
+        let mut temp = if self.profile.download_in_process {
+            Some(DownloadStage::new()?)
+        } else {
+            None
+        };
+        let stage_dir = temp
+            .as_ref()
+            .map(|t| t.path.clone())
+            .unwrap_or_else(|| self.dir.clone());
         self.status.state = "downloading".into();
         self.status.progress = 5;
         self.status.wait_reasons.clear();
@@ -422,24 +615,26 @@ impl Ota {
         let raw = self
             .fetch(&source_url(&candidate.base_url, &installer.name), 16 << 20)
             .await?;
-        if hex_sha256(&raw) != installer.sha256 {
+        if raw.len() as i64 != installer.size || hex_sha256(&raw) != installer.sha256 {
             return Err("安装器 SHA-256 校验失败".into());
         }
-        let installer_path = self.dir.join("ota-installer.sh");
+        let installer_path = stage_dir.join("ota-installer.sh");
         atomic_write(&installer_path, &raw, 0o700)?;
         let binary_url = source_url(&candidate.base_url, &binary.name);
+        let install_file = self
+            .dir
+            .join(format!(".ota-new-{:016x}", rand::random::<u64>()));
         let input = if self.profile.download_in_process {
-            // Stage next to the running binary (same volume) so the installer's
-            // final step is an atomic rename.
+            // Download to tmpfs. Only the final installation copy uses the target volume.
             self.status.progress = 30;
             self.save_status();
-            let data = self.fetch(&binary_url, 16 << 20).await?;
+            let data = self.fetch_binary(&binary_url, binary.size).await?;
             if i64::try_from(data.len()).ok() != Some(binary.size)
                 || hex_sha256(&data) != binary.sha256
             {
                 return Err("二进制大小或 SHA-256 校验失败".into());
             }
-            let staged = self.dir.join("zwrt-datad.new");
+            let staged = stage_dir.join("zwrt-datad.new");
             atomic_write(&staged, &data, 0o700)?;
             // DATAD_DIR keeps the installer's binary path correct on layouts
             // where the data directory is not the /etc_rw default (the U50 Pro
@@ -447,25 +642,66 @@ impl Ota {
             format!(
                 "DATAD_DIR={} DATAD_BINARY_FILE={}",
                 shell_quote(&self.dir),
-                shell_quote(&staged)
+                shell_quote(&install_file)
             )
         } else {
             format!("DATAD_DOWNLOAD_URL={}", shell_quote(binary_url))
         };
-        let wrapper = self.dir.join("ota-run.sh");
+        // Remove an old result BEFORE publishing the installing state.
+        let _ = fs::remove_file(self.dir.join("ota-install-result"));
+        let wrapper = stage_dir.join("ota-run.sh");
         let result = self.dir.join("ota-result.log");
         let marker = self.dir.join("ota-install-result");
-        let script = format!(
-            "#!/bin/sh\nsleep 2\nrm -f {}\nif {} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
-            shell_quote(&marker),
-            input,
-            shell_quote(&installer_path),
-            shell_quote(&result),
-            shell_quote(&marker),
-            shell_quote(&marker),
-            shell_quote(&marker),
-        );
+        let script = if self.profile.download_in_process {
+            // Keep compatibility with signed older installers which require their input
+            // inside DATAD_DIR. This local installation copy is made only after the
+            // verified download is complete, immediately before the atomic swap.
+            let lock = self.dir.join(".deploy-lock");
+            format!(
+                r#"#!/bin/sh
+owned=0
+cleanup() {{
+  if [ "$owned" = 1 ]; then rm -f {new} {lock}/pid; rmdir {lock} 2>/dev/null || true; fi
+  rm -f {stage}/zwrt-datad.new {stage}/ota-installer.sh {stage}/ota-run.sh
+  rmdir {stage} 2>/dev/null || true
+}}
+trap cleanup EXIT
+sleep 2
+value=failed
+if mkdir {lock}; then
+  owned=1
+  printf '%s\n' "$$" > {lock}/pid
+  if {{ cp {stage}/zwrt-datad.new {new} && {input} sh {installer}; }} >{log} 2>&1; then value=success; fi
+else
+  echo 'Another deployment holds the lock; installed service unchanged' >{log}
+fi
+printf '%s\n' "$value" >{marker}.tmp
+mv -f {marker}.tmp {marker}
+"#,
+                new = shell_quote(&install_file),
+                lock = shell_quote(&lock),
+                stage = shell_quote(&stage_dir),
+                input = input,
+                installer = shell_quote(&installer_path),
+                log = shell_quote(&result),
+                marker = shell_quote(&marker)
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nsleep 2\nrm -f {}\nif {} sh {} >{} 2>&1; then value=success; else value=failed; fi\nprintf '%s\\n' \"$value\" >{}.tmp\nmv -f {}.tmp {}\n",
+                shell_quote(&marker),
+                input,
+                shell_quote(&installer_path),
+                shell_quote(&result),
+                shell_quote(&marker),
+                shell_quote(&marker),
+                shell_quote(&marker),
+            )
+        };
         atomic_write(&wrapper, script.as_bytes(), 0o700)?;
+        if let Some(stage) = temp.as_mut() {
+            stage.keep = true;
+        }
         Ok(wrapper)
     }
 
@@ -493,12 +729,19 @@ impl Ota {
     pub fn reconcile_install_result(&mut self) {
         let marker = self.dir.join("ota-install-result");
         let Ok(value) = fs::read_to_string(&marker) else {
+            if self.status.state == "installing"
+                && self.status.install_started_at > 0
+                && now() - self.status.install_started_at > 1800
+            {
+                self.fail(None, "安装结果未确认，请检查设备后重试".into());
+            }
             return;
         };
         let _ = fs::remove_file(marker);
-        if value.trim() == "success" {
+        if value.trim() == "success" && self.status.latest_version == env!("DATAD_VERSION") {
             self.status.state = "succeeded".into();
             self.status.current_version = env!("DATAD_VERSION").into();
+            self.status.progress = 100;
             self.status.last_success_at = now();
             self.status.error.clear();
             self.status.wait_reasons.clear();
@@ -506,14 +749,18 @@ impl Ota {
             self.status.next_retry_at = 0;
         } else {
             self.status.state = "error".into();
-            self.status.error = "安装器执行失败，已由安装器回滚".into();
+            self.status.error = "安装未完成或运行版本与目标不符，请查看设备安装日志".into();
             self.status.failure_count = self.status.failure_count.saturating_add(1);
         }
         self.save_status();
     }
 
     pub fn auto_candidate(&mut self) -> Option<Candidate> {
-        if !self.config.enabled || self.busy || self.status.next_retry_at > now() {
+        if !self.config.enabled
+            || self.busy
+            || self.status.state == "installing"
+            || self.status.next_retry_at > now()
+        {
             return None;
         }
         if self.status.state == "blocked"
@@ -532,6 +779,7 @@ impl Ota {
     pub fn should_auto_check(&self) -> bool {
         self.config.enabled
             && !self.busy
+            && self.status.state != "installing"
             && self.status.next_retry_at <= now()
             && (self.candidate.is_none() || now() - self.last_auto_check >= 6 * 3600)
     }
@@ -548,8 +796,9 @@ impl Ota {
             reasons.push("电量必须高于 10%".into());
         }
         let min_free = self.profile.min_free_bytes;
-        if number_at(snapshot, &["runtime", "storage", "available"])
-            .is_some_and(|value| value < min_free)
+        if !self.profile.download_in_process
+            && number_at(snapshot, &["runtime", "storage", "available"])
+                .is_some_and(|value| value < min_free)
         {
             reasons.push(format!(
                 "可用存储不足 {} MiB",
@@ -586,8 +835,42 @@ impl Ota {
         reasons
     }
 
+    async fn fetch_binary(&mut self, url: &str, expected: i64) -> Result<Vec<u8>, String> {
+        if !(1..=16 << 20).contains(&expected) {
+            return Err("二进制大小超出限制".into());
+        }
+        let mut response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n != expected as u64)
+        {
+            return Err("二进制大小与清单不符".into());
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if data.len().saturating_add(chunk.len()) > expected as usize {
+                return Err("二进制大小与清单不符".into());
+            }
+            data.extend_from_slice(&chunk);
+            let progress = 30 + (data.len() as u64 * 60 / expected as u64) as u8;
+            if progress != self.status.progress {
+                self.status.progress = progress;
+                self.publish();
+            }
+        }
+        Ok(data)
+    }
+
     async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
-        let response = self
+        let mut response = self
             .client
             .get(url)
             .send()
@@ -602,14 +885,18 @@ impl Ota {
         {
             return Err("响应过大".into());
         }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > max {
-            return Err("响应过大".into());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len().saturating_add(chunk.len()) > max {
+                return Err("响应过大".into());
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn save_status(&self) {
+        self.publish();
         let _ = atomic_json(&self.dir.join("ota-state.json"), &self.status, 0o600);
     }
 }
@@ -656,6 +943,9 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    if manifest.notes.len() > 32768 {
+        return Err("更新说明过长".into());
+    }
     let version_ok = manifest.version.split('.').count() == 3
         && manifest
             .version
@@ -720,6 +1010,7 @@ pub fn source_name(source: &str) -> &'static str {
         "自定义服务器" => "自定义服务器",
         NETDISK => "网盘",
         GITHUB => "GitHub",
+        value if value == Profile::U50.github => "GitHub",
         _ => "自定义服务器",
     }
 }
@@ -818,6 +1109,7 @@ mod tests {
         );
         assert_eq!(Config::default().sources, default_sources());
         assert_eq!(source_name(NETDISK), "网盘");
+        assert_eq!(source_name(Profile::U50.github), "GitHub");
         assert!(newer("9.1.0", "9.0.99"));
     }
 
@@ -862,6 +1154,7 @@ mod tests {
     async fn check_uses_order_and_rejects_bad_signature() {
         let signing = SigningKey::from_bytes(&[9; 32]);
         let manifest = Manifest {
+            notes: String::new(),
             schema: 1,
             version: "99.0.0".into(),
             tag: "v99.0.0".into(),
@@ -949,6 +1242,27 @@ mod tests {
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");
         assert!(ota.status.signature_verified);
+        let id = Ota::candidate_id(&candidate);
+        assert!(ota.approved_candidate(&id).is_ok());
+        let mut changed = candidate.clone();
+        changed.manifest.artifacts.get_mut("binary").unwrap().sha256 = "c".repeat(64);
+        assert_ne!(Ota::candidate_id(&changed), id);
+        assert!(
+            ota.approved_candidate(&Ota::candidate_id(&changed))
+                .is_err()
+        );
+        changed = candidate.clone();
+        changed.base_url.push_str("/other");
+        assert_ne!(Ota::candidate_id(&changed), id);
+        let watch = ota.subscribe();
+        assert_eq!(watch.borrow()["candidate"]["id"], id);
+        ota.config.servers = vec![format!("http://{address}/bad")];
+        assert!(ota.check().await.is_err());
+        assert!(ota.approved_candidate(&id).is_err());
+        assert!(watch.borrow()["candidate"].is_null());
+        assert_eq!(watch.borrow()["status"]["signature_verified"], false);
+        assert_eq!(watch.borrow()["status"]["latest_version"], Value::Null);
+        assert_eq!(watch.borrow()["status"]["wait_reasons"], Value::Null);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -958,6 +1272,7 @@ mod tests {
         let binary = b"pretend armv7 binary".to_vec();
         let installer = b"#!/bin/sh\nexit 0\n".to_vec();
         let manifest = Manifest {
+            notes: String::new(),
             schema: 1,
             version: "99.0.0".into(),
             tag: "v99.0.0".into(),
@@ -1069,26 +1384,23 @@ mod tests {
         let candidate = ota.check().await.unwrap();
         assert_eq!(candidate.manifest.version, "99.0.0");
 
-        let tight = json!({"runtime":{"storage":{"available":1.0e6}}});
-        let error = ota
-            .prepare_install(&candidate, &tight, true)
-            .await
-            .unwrap_err();
-        assert!(error.contains("可用存储不足 7 MiB"), "{error}");
-        assert!(!dir.join("zwrt-datad.new").exists());
-
+        // The snapshot's root filesystem may be full; U50 checks actual /tmp + install mounts.
+        assert!(
+            ota.safety(&json!({"runtime":{"storage":{"available":0}}}), true)
+                .is_empty()
+        );
         let wrapper = ota.prepare_install(&candidate, &roomy, true).await.unwrap();
-        assert_eq!(fs::read(dir.join("zwrt-datad.new")).unwrap(), binary);
+        let stage = wrapper.parent().unwrap().to_owned();
+        assert_eq!(stage.parent(), Some(Path::new("/tmp")));
+        assert!(!dir.join("zwrt-datad.new").exists());
+        assert!(!dir.join("ota-installer.sh").exists());
+        assert_eq!(fs::read(stage.join("zwrt-datad.new")).unwrap(), binary);
         assert_eq!(
-            fs::metadata(dir.join("zwrt-datad.new"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            fs::metadata(&stage).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(fs::read(dir.join("ota-installer.sh")).unwrap(), installer);
-        let script = fs::read_to_string(wrapper).unwrap();
+        assert_eq!(fs::read(stage.join("ota-installer.sh")).unwrap(), installer);
+        let script = fs::read_to_string(&wrapper).unwrap();
         assert!(
             script.contains("DATAD_BINARY_FILE=") && !script.contains("DATAD_DOWNLOAD_URL"),
             "{script}"
@@ -1097,7 +1409,49 @@ mod tests {
             script.contains("DATAD_DIR="),
             "the installer must receive the data dir for non-/etc_rw layouts: {script}"
         );
-        let _ = fs::remove_file(dir.join("zwrt-datad.new"));
+        // Execute the harmless fixture wrapper: local installation copy, marker,
+        // deployment lock and tmp download cleanup are exercised end to end.
+        let status = Command::new("sh").arg(&wrapper).status().await.unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(dir.join("ota-install-result"))
+                .unwrap()
+                .trim(),
+            "success"
+        );
+        assert!(!stage.exists());
+        assert!(!dir.join(".deploy-lock").exists());
+        assert!(!fs::read_dir(&dir).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ota-new-")
+        }));
+
+        let wrapper = ota.prepare_install(&candidate, &roomy, true).await.unwrap();
+        let stage = wrapper.parent().unwrap().to_owned();
+        fs::create_dir(dir.join(".deploy-lock")).unwrap();
+        fs::write(dir.join(".deploy-lock/pid"), "other-owner").unwrap();
+        assert!(
+            Command::new("sh")
+                .arg(&wrapper)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("ota-install-result"))
+                .unwrap()
+                .trim(),
+            "failed"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(".deploy-lock/pid")).unwrap(),
+            "other-owner"
+        );
+        assert!(!stage.exists());
+        fs::remove_dir_all(dir.join(".deploy-lock")).unwrap();
 
         // A binary that does not match the signed manifest is refused and not staged.
         ota.config.servers = vec![format!("http://{address}/tampered")];
@@ -1109,6 +1463,98 @@ mod tests {
         assert!(error.contains("校验失败"), "{error}");
         assert!(!dir.join("zwrt-datad.new").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn newer_running_build_does_not_offer_an_old_saved_candidate() {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-upgraded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load_with(&dir, Profile::U50).unwrap();
+        for state in ["available", "waiting_idle"] {
+            ota.status.state = state.into();
+            ota.status.latest_version = "0.0.1".into();
+            ota.status.signature_verified = true;
+            ota.status.wait_reasons = vec!["old storage warning".into()];
+            ota.save_status();
+            let restored = Ota::load_with(&dir, Profile::U50).unwrap();
+            assert_eq!(restored.status.state, "idle");
+            assert_eq!(restored.status.latest_version, env!("DATAD_VERSION"));
+            assert!(!restored.status.signature_verified);
+            assert!(restored.status.wait_reasons.is_empty());
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installing_survives_restart_and_result_must_match_running_version() {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-result-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load_with(&dir, Profile::U50).unwrap();
+        ota.status.state = "installing".into();
+        ota.status.install_started_at = now();
+        ota.status.latest_version = "99.0.0".into();
+        ota.save_status();
+        let mut restarted = Ota::load_with(&dir, Profile::U50).unwrap();
+        assert!(restarted.subscribe().borrow()["busy"].as_bool().unwrap());
+        assert!(restarted.begin_update().is_err());
+        assert!(restarted.update_config(Config::default()).is_err());
+        assert!(!restarted.should_auto_check());
+        fs::write(dir.join("ota-install-result"), "success").unwrap();
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "error");
+        restarted.status.latest_version = env!("DATAD_VERSION").into();
+        fs::write(dir.join("ota-install-result"), "success").unwrap();
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "succeeded");
+        assert_eq!(restarted.status.progress, 100);
+        restarted.status.state = "installing".into();
+        restarted.status.install_started_at = now() - 1801;
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "error");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn progress_snapshot_does_not_wait_for_downloader_lock_and_bounds_body() {
+        let router = Router::new().route(
+            "/binary",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                vec![1u8; 4096]
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-progress-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load_with(&dir, Profile::U50).unwrap();
+        ota.begin_update().unwrap();
+        let watch = ota.subscribe();
+        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(ota));
+        let task = manager.clone();
+        let worker = tokio::spawn(async move {
+            let mut ota = task.lock().await;
+            let url = format!("http://{address}/binary");
+            assert!(ota.fetch_binary(&url, 1024).await.is_err());
+            assert_eq!(ota.fetch_binary(&url, 4096).await.unwrap().len(), 4096);
+            ota.finish_update();
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(manager.try_lock().is_err());
+        assert_eq!(watch.borrow()["busy"], true);
+        worker.await.unwrap();
+        assert_eq!(watch.borrow()["status"]["progress"], 90);
+        assert_eq!(watch.borrow()["busy"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tmp_and_install_space_are_checked_independently() {
+        let mib = 1024 * 1024;
+        assert!(stage_space_reasons(20 * mib, 6 * mib, 5 * mib, 1024).is_empty());
+        assert!(stage_space_reasons(mib, 20 * mib, 5 * mib, 1024)[0].starts_with("/tmp 下载目录"));
+        assert!(stage_space_reasons(20 * mib, mib, 5 * mib, 1024)[0].starts_with("安装目录"));
     }
 
     #[test]

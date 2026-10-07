@@ -48,8 +48,21 @@ impl ReadCache {
                 .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
                 .unwrap_or(0)
         };
-        let mut value = json!({"unread":number("sms_dev_unread_num") + number("sms_sim_unread_num"),
+        let unread = if capacity.get("sms_dev_unread_num").is_some()
+            || capacity.get("sms_sim_unread_num").is_some()
+        {
+            number("sms_dev_unread_num") + number("sms_sim_unread_num")
+        } else {
+            self.list
+                .iter()
+                .filter(|row| row.get("tag").and_then(Value::as_i64) == Some(1))
+                .count() as i64
+        };
+        let mut value = json!({"unread":unread,
             "list":self.list,"stale":self.error.is_some(),"truncated":self.truncated});
+        if let Some(offset) = capacity.get("forward_clock_offset_seconds") {
+            value["forward_clock_offset_seconds"] = offset.clone();
+        }
         if let Some(error) = &self.error {
             value["error"] = json!(error);
         }
@@ -277,12 +290,15 @@ pub async fn snapshot() -> Option<Value> {
     if refresh {
         let _io = SMS_IO.lock().await;
         match load_messages().await {
-            Ok((list, truncated)) => {
+            Ok((list, truncated))
+                if truncated || list_count_matches(cache.capacity.as_ref(), list.len()) =>
+            {
                 cache.list = list;
                 cache.truncated = truncated;
                 cache.error = None;
                 cache.refreshed = Some(Instant::now());
             }
+            Ok(_) => cache.error = Some("vendor SMS list does not match capacity".into()),
             Err(error) => cache.error = Some(error),
         }
     }
@@ -338,6 +354,80 @@ fn utf16be_hex(value: &str) -> String {
         .filter_map(|chunk| u16::from_str_radix(chunk, 16).ok())
         .collect();
     String::from_utf16_lossy(&units)
+}
+
+fn list_count_matches(capacity: Option<&Value>, count: usize) -> bool {
+    let expected = capacity.and_then(|c| {
+        let number = |key| {
+            c.get(key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        };
+        number("sms_nv_num_total")?.checked_add(number("sms_sim_num_total")?)
+    });
+    expected.is_none_or(|n| n == count as u64)
+}
+
+/// OEM SCTS, with either `+32` or `+,32` timezone in quarter hours.
+/// Keep the full UTC instant for forwarding; the display date omits year/seconds.
+fn sms_received_at(value: &str) -> Option<u64> {
+    let f: Vec<_> = value.split(',').collect();
+    if !matches!(f.len(), 7 | 8) {
+        return None;
+    }
+    let n = |i: usize| f[i].parse::<i64>().ok();
+    let mut year = n(0)?;
+    if (0..=99).contains(&year) {
+        year += 2000;
+    }
+    let (month, day, hour, minute, second) = (n(1)?, n(2)?, n(3)?, n(4)?, n(5)?);
+    if !(2000..=2099).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days).contains(&day) {
+        return None;
+    }
+    let offset = if f.len() == 8 {
+        let sign = match f[6] {
+            "+" => 1,
+            "-" => -1,
+            _ => return None,
+        };
+        let quarters = n(7)?;
+        if quarters < 0 {
+            return None;
+        }
+        sign * quarters
+    } else {
+        n(6)?
+    };
+    if !(-48..=56).contains(&offset) {
+        return None;
+    }
+    // Gregorian civil date -> days since 1970-01-01, without host timezone.
+    let y = year - i64::from(month <= 2);
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    u64::try_from(days * 86400 + hour * 3600 + minute * 60 + second - offset * 900).ok()
 }
 
 fn sms_date(value: &str) -> String {
@@ -408,6 +498,7 @@ fn normalize_lists(replies: &[Value], key: Option<&[u8; 32]>) -> Result<Vec<Valu
             "id":id,
             "num":number,
             "date":sms_date(item.get("date").and_then(Value::as_str).unwrap_or_default()),
+            "received_at":sms_received_at(item.get("date").and_then(Value::as_str).unwrap_or_default()),
             "unread":i64::from(unread),
             "tag":tag,
             "text":text
@@ -612,6 +703,42 @@ mod tests {
         assert_eq!(list[0]["date"], "08-27 04:00");
         assert_eq!(list[0]["unread"], 1);
         assert_eq!(list[0]["tag"], 1);
+        assert_eq!(
+            list[0]["received_at"],
+            sms_received_at("26,08,27,04,00,00,+0").unwrap()
+        );
+    }
+
+    #[test]
+    fn sms_timestamp_retains_timezone_seconds_and_rejects_invalid_dates() {
+        assert_eq!(
+            sms_received_at("26,10,07,21,49,41,+32"),
+            sms_received_at("26,10,07,13,49,41,+,0")
+        );
+        assert_eq!(sms_received_at("26,10,07,21,49,41,+32"), Some(1791380981));
+        assert_eq!(sms_received_at("26,10,07,05,49,41,-32"), Some(1791380981));
+        for bad in [
+            "",
+            "10-07 21:49",
+            "26,02,29,00,00,00,+32",
+            "26,10,07,24,00,00,+32",
+            "26,10,07,00,00,00,+99",
+            "26,10,07,00,00,00,+,-32",
+        ] {
+            assert_eq!(sms_received_at(bad), None, "{bad}");
+        }
+        assert!(!list_count_matches(
+            Some(&json!({"sms_nv_num_total":5,"sms_sim_num_total":12})),
+            0
+        ));
+        assert!(!list_count_matches(
+            Some(&json!({"sms_nv_num_total":5,"sms_sim_num_total":12})),
+            5
+        ));
+        assert!(list_count_matches(
+            Some(&json!({"sms_nv_num_total":5,"sms_sim_num_total":12})),
+            17
+        ));
     }
 
     #[test]

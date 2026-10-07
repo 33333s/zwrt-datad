@@ -221,6 +221,9 @@ healthy_token "$2" '4242:123'
         (self.base/'ubi_ro').write_text('1\n')
         self.run_deploy()
         self.assertTrue((self.base/'transient').exists())
+        transient_call = next(line for line in (self.base/'calls').read_text().splitlines()
+                              if line.startswith('systemd-run '))
+        self.assertIn('--u50-enable-webshell', transient_call)
         self.assertFalse(self.unit.exists())
         self.assertFalse((self.data/'zwrt-datad.prev').exists())
 
@@ -280,7 +283,10 @@ base=Path(os.environ['SANDBOX']); args=sys.argv[1:]
 if args[:1]==['-s']: args=args[2:]
 with (base/'adb-calls').open('a') as f: f.write(json.dumps(args)+'\\n')
 if args==['get-state']: print('device\\r'); sys.exit(0)
-if args[0]=='push': sys.exit(0)
+if args[0]=='push':
+ if args[1].endswith('/zwrt-datad.service'):
+  (base/'pushed-unit').write_bytes(Path(args[1]).read_bytes())
+ sys.exit(0)
 cmd=args[1]
 subprocess.run(['sh','-n','-c',cmd],check=True)
 if 'mktemp -d' in cmd: print('/cache/zwrt-datad/.deploy.ABC123')
@@ -294,6 +300,7 @@ elif 'cat /cache/zwrt-datad/.deploy.ABC123/result' in cmd: print('SUCCESS: simul
         calls=[json.loads(line) for line in (self.base/'adb-calls').read_text().splitlines()]
         pushes=[args for args in calls if args[0]=='push']
         self.assertEqual(len(pushes),6)
+        self.assertIn('--u50-enable-webshell', (self.base/'pushed-unit').read_text())
         free=next(args[1] for args in calls if args[0]=='shell' and 'free=' in args[1])
         self.assertIn('test "$free" -ge ',free)
         self.assertIn("awk '{print $4}'",free)

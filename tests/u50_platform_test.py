@@ -35,6 +35,8 @@ def digest(value):
 
 
 ADMIN_HASH = digest("device-admin-password")
+LAN_KEYS = ("lan_netmask", "dhcpEnabled", "dhcpStart", "dhcpEnd", "dhcpLease_hour", "mtu")
+LAN_FIXTURE = None
 STORE = {
     "model_name": "U50S", "network_type": "LTE", "wa_inner_version": VERSION, "cr_version": "",
     "dial_mode": "manual_dial", "roam_setting_option": "off", "net_select": "4G_AND_5G",
@@ -116,7 +118,7 @@ class Vendor(BaseHTTPRequestHandler):
         if keys == ["LD"]:
             return self.send_json({"LD": LD}, "pre=one; Path=/")
         if keys == ["loginfo"]:
-            return self.send_json({"loginfo": "ok" if "sid=two" in self.headers.get("Cookie", "") else ""})
+            return self.send_json({"loginfo": "ok" if "sid=two" in self.headers.get("Cookie", "") and not getattr(Vendor, "sms_session_expired", False) else ""})
         if keys == ["RD"]:
             if Vendor.rotate_rd:
                 Vendor.rd_counter += 1
@@ -142,6 +144,11 @@ class Vendor(BaseHTTPRequestHandler):
             assert "sid=two" in self.headers.get("Cookie", "")
             LOG.append(("configuration_read", "apn_profiles"))
 
+        if keys == ["sms_capacity_info"]:
+            assert "multi_data" not in query
+            return self.send_json({"sms_nv_rev_total": str(len(MESSAGES)), "sms_nv_send_total": "0",
+                                   "sms_nv_draftbox_total": "0", "sms_sim_rev_total": "0",
+                                   "sms_sim_send_total": "0", "sms_sim_draftbox_total": "0"})
         if keys == ["sms_data_total"]:
             assert "multi_data" not in query, "the WebUI reads sms_data_total as a single command"
             assert query["order_by"] == ["order by id desc"] and query["tags"] == ["10"]
@@ -171,6 +178,7 @@ class Vendor(BaseHTTPRequestHandler):
         if action == "LOGIN":
             if form.get("password", [""])[0] == digest(ADMIN_HASH + LD):
                 LOG.append(("login",))
+                Vendor.sms_session_expired = False
                 return self.send_json({"result": "0"}, "sid=two; Path=/")
             return self.send_json({"result": "3"})
         authorized = ("sid=two" in self.headers.get("Cookie", "")
@@ -248,6 +256,12 @@ class Vendor(BaseHTTPRequestHandler):
                         "data_volume_alert_percent", "wan_auto_clear_flow_data_switch", "traffic_clear_date"):
                 if key in one:
                     STORE[key] = one[key]
+        if action in ("DHCP_SETTING", "SET_DEVICE_MTU") and LAN_FIXTURE:
+            for key in LAN_KEYS:
+                target = LAN_FIXTURE / key
+                temporary = target.with_suffix(".tmp")
+                temporary.write_text(STORE[key])
+                temporary.replace(target)
         return self.send_json({"result": "success"})
 
     def log_message(self, *_args):
@@ -262,7 +276,8 @@ def call(port, path, body=None, headers=None):
         with urllib.request.urlopen(request, timeout=8) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
-        return error.code, json.load(error)
+        raw = error.read()
+        return error.code, json.loads(raw) if raw else {}
 
 
 def control(port, action, params):
@@ -275,6 +290,10 @@ def writes():
 
 with tempfile.TemporaryDirectory(prefix="u50-platform-test-") as tmp:
     folder = Path(tmp)
+    LAN_FIXTURE = folder / "lan"
+    LAN_FIXTURE.mkdir()
+    for key in LAN_KEYS:
+        (LAN_FIXTURE / key).write_text(STORE[key])
     cfg = folder / "cfg"
     cfg_mode = folder / "cfg-apn-mode"
     cfg_apn = folder / "cfg-apn-name"
@@ -292,7 +311,7 @@ case "$1:$2" in
   get:data_volume_limit_switch) echo 0 ;;
   get:wan_auto_clear_flow_data_switch) echo on ;;
   get:traffic_clear_date) echo 1 ;;
-  get:dhcpLease_hour) echo 24 ;;
+  get:lan_netmask|get:dhcpEnabled|get:dhcpStart|get:dhcpEnd|get:dhcpLease_hour|get:mtu) cat "{LAN_FIXTURE}/$2" ;;
   get:admin_Password) echo {ADMIN_HASH} ;;
   get:apn_mode) cat "{cfg_mode}" ;;
   get:apn_interface_version) echo 2 ;;
@@ -439,6 +458,13 @@ esac
         assert sms["unread"] == 1 and sms["stale"] is False, sms
         assert sms["list"][0]["text"] == "测试" and sms["list"][0]["num"] == "10086" and sms["list"][0]["unread"] == 1
         assert ("login",) in LOG, "the daemon must open its own OEM session from the stored hash"
+        before_login = LOG.count(("login",))
+        Vendor.sms_session_expired = True
+        for _ in range(200):
+            time.sleep(.05)
+            if LOG.count(("login",)) > before_login:
+                break
+        assert LOG.count(("login",)) > before_login, "SMS reads must renew a replaced OEM cookie"
         assert state["net"]["roaming_allowed"] == 0
         assert state["dhcp"]["leasetime"] == "24h"
 
@@ -754,6 +780,32 @@ esac
         assert status == 200 and result["result"]["verified"] and writes()[-1][2] == {"goformId": "switchWiFiModule", "SwitchOption": "0"}
         assert control(port, "wifi.set_module", {"enabled": 1})[0] == 200
         assert control(port, "wifi.set_module", {"enabled": 5})[0] == 400
+
+        # App LAN API: authenticated on BOTH listeners, strict pool validation,
+        # no-op writes avoided, and OEM changes read back through cfg.
+        auth_headers = {"Authorization": f"Bearer {token}"}
+        for listener in (port, lan_port):
+            assert call(listener, "/lan")[0] == 401
+            assert call(listener, "/lan", {"dhcp_enabled": True})[0] == 401
+            assert call(listener, "/lan/mtu", {"mtu": 1500})[0] == 401
+        for _ in range(60):
+            status, settings = call(port, "/lan", headers=auth_headers)
+            if settings.get("mtu") == 1400:
+                break
+            time.sleep(.2)
+        assert status == 200 and settings["supported"] and not settings["address_writable"], settings
+        assert settings["lease_seconds"] == 7200 and settings["dhcp_start"] == "192.168.0.50", settings
+        before = len(writes())
+        result = call(port, "/lan", {}, auth_headers)[1]
+        assert result["verified"] and not result["changed"] and len(writes()) == before, result
+        for bad in ({"ip":"192.168.1.1"}, {"dhcp_start":"192.168.0.0"},
+                    {"dhcp_end":"192.168.0.255"}, {"lease_seconds":30}):
+            assert call(port,"/lan",bad,auth_headers)[0] == 400
+        assert len(writes()) == before
+        status, result = call(lan_port,"/lan",{"dhcp_start":"192.168.0.60","lease_seconds":10800},auth_headers)
+        assert status == 200 and result["verified"] and result["settings"]["lease_seconds"] == 10800, result
+        status, result = call(port,"/lan/mtu",{"mtu":1450},auth_headers)
+        assert status == 200 and result["verified"] and result["settings"]["mtu"] == 1450, result
 
         # Device actions and unmapped actions.
         assert control(port, "device.reboot", {})[0] == 200 and writes()[-1][1] == "REBOOT_DEVICE"

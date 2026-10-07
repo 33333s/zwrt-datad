@@ -1,3 +1,4 @@
+mod activity;
 mod auth;
 mod cloud;
 mod cloud_panel;
@@ -8,9 +9,11 @@ mod control;
 mod cooling;
 mod extra_wifi;
 mod identity;
+mod lan;
 mod model;
 mod neighbor;
 mod neighbor_manager;
+mod network_recovery;
 mod ota;
 mod qos;
 mod qtrace_mask;
