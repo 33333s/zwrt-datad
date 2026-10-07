@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.69",
+    "version": "0.10.70",
     "asset": "zwrt-datad-aarch64",
-    "notes": "U50 Pro /state 补齐 LTE/NR 载波聚合状态与副载波列表；带鉴权的信令流（HTTP /signal/stream）"
+    "notes": "新增 App 内签名更新、通知与执行记录、断网自动恢复、历史流量和 LAN 管理；完善短信转发与定时任务；U50 更新缓存使用 /tmp，修正空间检查。"
   }
 }

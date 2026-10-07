@@ -199,6 +199,13 @@ phone is also attached:
 bash scripts/deploy-u50pro.sh --serial <modem-adb-serial> build/zwrt-datad-armv7-candidate
 ```
 
+U50 Pro deployment now includes `--u50-enable-webshell` in the persistent unit
+and fallback launch commands. The online, offline ADB and Go installers share
+these defaults. WebShell on port 9461 still requires a valid login token; this
+does not enable NMS cloud terminal access. Re-deploy to update an existing unit.
+If a locked read-only root prevents replacing an old persistent unit, that unit
+retains its existing arguments.
+
 The host verifies ELF32/ARM, root access, `MU5120`, `armv7l`, and available cache
 space before staging. The payload includes `u50pro-service.sh` and
 `u50pro-deploy-transaction.sh`; keep these beside the host script. Files are

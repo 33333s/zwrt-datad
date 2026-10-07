@@ -60,8 +60,11 @@ pub(crate) struct Inner {
     signal_slots: Arc<Semaphore>,
     cloud: RwLock<Cloud>,
     pub(crate) ota: Mutex<Ota>,
+    ota_view: watch::Receiver<Value>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
+    activity: Mutex<crate::activity::Journal>,
+    recovery: Arc<Mutex<crate::network_recovery::Recovery>>,
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
     schedule: Arc<Mutex<Schedule>>,
@@ -76,6 +79,118 @@ struct DeviceSession {
 }
 
 impl App {
+    async fn record(&self, category: &str, action: &str, result: &str, reason: &str, task: &str) {
+        self.inner
+            .activity
+            .lock()
+            .await
+            .push(category, action, result, reason, task);
+    }
+    async fn record_delivery(&self, action: &str, result: &Result<(), String>) {
+        self.record(
+            "notification",
+            action,
+            if result.is_ok() { "success" } else { "failed" },
+            if result.is_ok() {
+                ""
+            } else {
+                sms_forward::delivery_result_code(result)
+            },
+            "",
+        )
+        .await;
+    }
+    fn spawn_recovery(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let interval = app.inner.recovery.lock().await.config().interval_seconds;
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                let generation = {
+                    let mut r = app.inner.recovery.lock().await;
+                    if !r.may_probe(crate::activity::now()) {
+                        continue;
+                    }
+                    r.generation
+                };
+                let snapshot = app.inner.snapshot.read().await.clone();
+                if !crate::network_recovery::eligible(&snapshot, crate::activity::now()) {
+                    app.inner.recovery.lock().await.hold();
+                    continue;
+                }
+                let online = crate::network_recovery::probe().await;
+                if !crate::network_recovery::eligible(
+                    &*app.inner.snapshot.read().await,
+                    crate::activity::now(),
+                ) {
+                    app.inner.recovery.lock().await.hold();
+                    continue;
+                }
+                let (plan, recovered) = {
+                    let mut r = app.inner.recovery.lock().await;
+                    if r.generation != generation {
+                        continue;
+                    }
+                    let recovered = online
+                        && matches!(
+                            r.status,
+                            "offline" | "cooldown" | "redialing" | "limit_reached"
+                        );
+                    (r.observe(online, crate::activity::now()), recovered)
+                };
+                if recovered {
+                    app.record("recovery", "online", "success", "", "").await;
+                }
+                let Some(plan) = plan else {
+                    continue;
+                };
+                let action = if plan.reboot { "reboot" } else { "redial" };
+                app.record("recovery", action, "requested", "", "").await;
+                let mut success = false;
+                if plan.reboot {
+                    success = matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(20),
+                            crate::control::execute_recovery("device.reboot", plan)
+                        )
+                        .await,
+                        Ok(crate::control::Outcome::Ok(_))
+                    );
+                } else {
+                    // Connect even when disconnect fails: the bearer may already be down.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        crate::control::execute_recovery("cellular.disconnect", plan),
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if app.inner.recovery.lock().await.allows(plan) {
+                        success = matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(30),
+                                crate::control::execute_recovery("cellular.connect", plan)
+                            )
+                            .await,
+                            Ok(crate::control::Outcome::Ok(_))
+                        );
+                    }
+                }
+                // Accepted control is not proof that internet connectivity is restored.
+                app.record(
+                    "recovery",
+                    action,
+                    if success { "requested" } else { "failed" },
+                    if success {
+                        "awaiting_probe"
+                    } else {
+                        "execution_failed"
+                    },
+                    "",
+                )
+                .await;
+            }
+        });
+    }
     pub(crate) fn cloud_panel_state(&self) -> watch::Receiver<Snapshot> {
         self.inner.tx.subscribe()
     }
@@ -172,10 +287,12 @@ impl App {
         let test_message = sms_forward::Message::test();
         if let Err(error) = manager.reserve_sms(&test_message) {
             manager.mark_delivery(&Err(error.clone()));
+            self.record_delivery("test", &Err(error.clone())).await;
             return Err(error);
         }
         let result = sms_forward::deliver(&details, &time_origin, &test_message).await;
         manager.mark_delivery(&result);
+        self.record_delivery("test", &result).await;
         let mut status = manager.status();
         if let Some(fields) = status.as_object_mut() {
             fields.insert(
@@ -209,10 +326,13 @@ impl App {
         let message = sms_forward::Message::device_info();
         if let Err(error) = manager.reserve_sms(&message) {
             manager.mark_delivery(&Err(error.clone()));
+            self.record_delivery("device_info", &Err(error.clone()))
+                .await;
             return Err(error);
         }
         let result = sms_forward::deliver(&details, &time_origin, &message).await;
         manager.mark_delivery(&result);
+        self.record_delivery("device_info", &result).await;
         result
     }
 
@@ -294,22 +414,28 @@ impl App {
         initial
             .fields
             .insert("speedtest".into(), speedtest.status());
+        let activity = crate::activity::Journal::load(&data_dir);
+        let recovery = Arc::new(Mutex::new(crate::network_recovery::Recovery::load(
+            &data_dir,
+        )));
+        crate::network_recovery::install(&recovery);
         let tasks = TaskSchedule::load(&data_dir);
         let sms_forward = Forwarder::load(&data_dir);
         let mut history = History::load(&data_dir);
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
         let (tx, _) = watch::channel(initial.clone());
+        let ota =
+            Ota::load_with(&data_dir, crate::u50_ctl::ota_profile()).map_err(anyhow::Error::msg)?;
+        let ota_view = ota.subscribe();
         let app = Self {
             inner: Arc::new(Inner {
                 snapshot: RwLock::new(initial),
                 tx,
                 interval_ms: AtomicU64::new(interval.as_millis() as u64),
                 cloud: RwLock::new(Cloud::load(&data_dir)),
-                ota: Mutex::new(
-                    Ota::load_with(&data_dir, crate::u50_ctl::ota_profile())
-                        .map_err(anyhow::Error::msg)?,
-                ),
+                ota: Mutex::new(ota),
+                ota_view,
                 neighbor: Mutex::new(neighbor),
                 identity: crate::identity::Identity::new(&data_dir),
                 _data_dir: data_dir,
@@ -319,6 +445,8 @@ impl App {
                 sse_slots: Arc::new(Semaphore::new(16)),
                 signal_slots: Arc::new(Semaphore::new(4)),
                 webshell: WebShell::new(webshell_enabled),
+                activity: Mutex::new(activity),
+                recovery,
                 history: Mutex::new(history),
                 history_tx,
                 schedule: Arc::new(Mutex::new(schedule)),
@@ -332,6 +460,7 @@ impl App {
             .read()
             .await
             .start(app.inner.tx.subscribe(), app.clone());
+        app.spawn_recovery();
         app.spawn_sampler();
         app.spawn_ota();
         Ok(app)
@@ -362,13 +491,23 @@ impl App {
                 let clock = reboot_schedule::local_clock();
                 let conflict = reboot_schedule::oem_conflict().await;
                 let due = app.inner.schedule.lock().await.observe(clock, conflict);
-                if due
-                    && !matches!(
+                if due {
+                    app.record("task", "device.reboot", "requested", "", "定时重启")
+                        .await;
+                    if !matches!(
                         crate::control::execute("device.reboot", &json!({})).await,
                         crate::control::Outcome::Ok(_)
-                    )
-                {
-                    app.inner.schedule.lock().await.reboot_failed();
+                    ) {
+                        app.inner.schedule.lock().await.reboot_failed();
+                        app.record(
+                            "task",
+                            "device.reboot",
+                            "failed",
+                            "execution_failed",
+                            "定时重启",
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -382,64 +521,99 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
-                let clock = reboot_schedule::local_clock();
-                let due = app.inner.tasks.lock().await.observe(clock.as_ref());
-                let (Some(task), Some(clock)) = (due, clock) else {
+                let Some(clock) = reboot_schedule::local_clock() else {
                     continue;
                 };
-                if task.action == "device.reboot" {
-                    let plan = app.inner.schedule.lock().await.status();
-                    if reboot_schedule::oem_conflict().await
-                        || plan["enabled"] == true && plan["time"] == task.time
-                    {
-                        app.inner
-                            .tasks
-                            .lock()
-                            .await
-                            .finish(&task.id, &clock.date, false);
-                        continue;
+                // Drain this minute's tasks sequentially without a ten-second gap
+                // between each one. Otherwise a full 16-task minute loses jobs.
+                for _ in 0..crate::task_schedule::MAX_TASKS {
+                    let Some(task) = app.inner.tasks.lock().await.observe(Some(&clock)) else {
+                        break;
+                    };
+                    if task.action == "device.reboot" {
+                        let plan = app.inner.schedule.lock().await.status();
+                        if reboot_schedule::oem_conflict().await
+                            || plan["enabled"] == true && plan["time"] == task.time
+                        {
+                            app.inner
+                                .tasks
+                                .lock()
+                                .await
+                                .finish(&task.id, &clock.date, false);
+                            app.record(
+                                "task",
+                                &task.action,
+                                "skipped",
+                                "reboot_schedule_conflict",
+                                &task.id,
+                            )
+                            .await;
+                            continue;
+                        }
                     }
-                }
-                let success = if task.action == "sms.forward.device_info" {
-                    matches!(
-                        tokio::time::timeout(
+                    app.record("task", &task.action, "requested", "", &task.id)
+                        .await;
+                    let result: Result<(), &str> = if task.action == "sms.forward.device_info" {
+                        match tokio::time::timeout(
                             Duration::from_secs(50),
                             app.scheduled_device_info_forward(),
                         )
-                        .await,
-                        Ok(Ok(()))
-                    )
-                } else if task.action == "sms.send_scheduled" {
-                    if let Some(params) = crate::task_schedule::scheduled_sms_params(&task, &clock)
-                    {
-                        let reserved = app.inner.sms_forward.lock().await.reserve_scheduled_sms();
-                        reserved.is_ok()
-                            && matches!(
-                                tokio::time::timeout(
+                        .await
+                        {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(e)) if e == "forward_disabled" => Err("forward_disabled"),
+                            Ok(Err(e)) => Err(sms_forward::delivery_result_code(&Err(e))),
+                            Err(_) => Err("execution_timeout"),
+                        }
+                    } else if task.action == "sms.send_scheduled" {
+                        if let Some(params) =
+                            crate::task_schedule::scheduled_sms_params(&task, &clock)
+                        {
+                            match app.inner.sms_forward.lock().await.reserve_scheduled_sms() {
+                                Err(_) => Err("rate_limited"),
+                                Ok(()) => match tokio::time::timeout(
                                     Duration::from_secs(50),
                                     crate::sms::send(&params),
                                 )
-                                .await,
-                                Ok(Ok(_))
-                            )
+                                .await
+                                {
+                                    Ok(Ok(_)) => Ok(()),
+                                    Ok(Err(_)) => Err("execution_failed"),
+                                    Err(_) => Err("execution_timeout"),
+                                },
+                            }
+                        } else {
+                            Err("invalid_parameters")
+                        }
                     } else {
-                        false
-                    }
-                } else {
-                    matches!(
-                        tokio::time::timeout(
+                        match tokio::time::timeout(
                             Duration::from_secs(20),
                             crate::control::execute(&task.action, &task.params),
                         )
-                        .await,
-                        Ok(crate::control::Outcome::Ok(_))
+                        .await
+                        {
+                            Ok(crate::control::Outcome::Ok(v)) if v["verified"] != false => Ok(()),
+                            Ok(crate::control::Outcome::Invalid(_)) => Err("invalid_parameters"),
+                            Ok(crate::control::Outcome::NotHandled) => Err("unsupported_action"),
+                            Err(_) => Err("execution_timeout"),
+                            _ => Err("execution_failed"),
+                        }
+                    };
+                    let success = result.is_ok();
+                    app.inner
+                        .tasks
+                        .lock()
+                        .await
+                        .finish(&task.id, &clock.date, success);
+                    app.record(
+                        "task",
+                        &task.action,
+                        if success { "success" } else { "failed" },
+                        result.err().unwrap_or_default(),
+                        &task.id,
                     )
-                };
-                app.inner
-                    .tasks
-                    .lock()
-                    .await
-                    .finish(&task.id, &clock.date, success);
+                    .await;
+                }
             }
         });
     }
@@ -471,9 +645,13 @@ impl App {
                                 Err(error) => Err(error),
                             };
                             manager.mark_power_delivery(&result);
+                            app.record_delivery("power", &result).await;
                         }
                         Ok(None) => {}
-                        Err(error) => manager.mark_power_delivery(&Err(error)),
+                        Err(error) => {
+                            manager.mark_power_delivery(&Err(error.clone()));
+                            app.record_delivery("power", &Err(error)).await;
+                        }
                     }
                 }
                 if app.panel_sms_forward_status().await["enabled"] != true {
@@ -483,6 +661,8 @@ impl App {
                     Ok(snapshot) => snapshot,
                     Err(_) => {
                         app.inner.sms_forward.lock().await.mark_source_unavailable();
+                        app.record_delivery("sms", &Err("source_unavailable".into()))
+                            .await;
                         continue;
                     }
                 };
@@ -508,11 +688,13 @@ impl App {
                     let mut details = manager.delivery();
                     details.attach_device_info(&device_snapshot);
                     if let Err(error) = manager.reserve_sms(&message) {
-                        manager.mark_delivery(&Err(error));
+                        manager.mark_delivery(&Err(error.clone()));
+                        app.record_delivery("sms", &Err(error)).await;
                         break;
                     }
                     let result = sms_forward::deliver(&details, &time_origin, &message).await;
                     manager.mark_delivery(&result);
+                    app.record_delivery("sms", &result).await;
                 }
             }
         });
@@ -611,8 +793,83 @@ impl App {
             .route("/ubus/call", post(ubus_call))
             .route("/control", post(control));
         router = router
+            .route("/ota/app", get(ota_app_status))
+            .route(
+                "/ota/app/config",
+                post(ota_app_config).layer(RequestBodyLimitLayer::new(8192)),
+            )
+            .route(
+                "/ota/app/check",
+                post(ota_app_check).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
+                "/ota/app/install",
+                post(ota_app_install).layer(RequestBodyLimitLayer::new(512)),
+            )
+            .route("/activity", get(activity_get))
+            .route(
+                "/network/recovery/check",
+                post(recovery_check).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
+                "/activity/clear",
+                post(activity_clear).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
+                "/network/recovery",
+                get(recovery_get)
+                    .post(recovery_put)
+                    .layer(RequestBodyLimitLayer::new(2048)),
+            )
+            .route(
+                "/network/recovery/resume",
+                post(recovery_resume).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route("/traffic/history", get(traffic_history_get))
+            .route(
+                "/lan",
+                get(lan_get)
+                    .post(lan_put)
+                    .layer(RequestBodyLimitLayer::new(2048)),
+            )
+            .route(
+                "/lan/mtu",
+                post(lan_mtu_put).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
+                "/tasks",
+                get(tasks_get)
+                    .post(tasks_put)
+                    .layer(RequestBodyLimitLayer::new(4096)),
+            )
+            .route(
+                "/tasks/remove",
+                post(tasks_remove).layer(RequestBodyLimitLayer::new(1024)),
+            )
+            .route(
+                "/sms/forward/config",
+                get(sms_forward_config_get)
+                    .post(sms_forward_config_post)
+                    .layer(RequestBodyLimitLayer::new(32 * 1024)),
+            )
+            .route("/sms/forward/status", get(sms_forward_status_get))
+            .route(
+                "/sms/forward/test",
+                post(sms_forward_test_post).layer(RequestBodyLimitLayer::new(1024)),
+            )
             .route("/webshell/status", get(webshell_status))
-            .route("/webshell", get(webshell_upgrade));
+            .route("/webshell", get(webshell_upgrade))
+            .route(
+                "/cloud/app/config",
+                get(cloud_app_config_get)
+                    .post(cloud_app_config_post)
+                    .layer(RequestBodyLimitLayer::new(64 * 1024)),
+            )
+            .route("/cloud/app/status", get(cloud_app_status))
+            .route(
+                "/cloud/app/quick-connect",
+                post(cloud_app_quick_connect).layer(RequestBodyLimitLayer::new(4096)),
+            );
         if !require_auth {
             router = router
                 .route(
@@ -1848,6 +2105,484 @@ async fn readonly_ubus(action: &str, service: &str, method: &str, args: Value) -
 async fn cloud_config_get(State(app): State<App>) -> Json<Value> {
     Json(app.inner.cloud.read().await.public_config())
 }
+
+async fn app_task_status(app: &App) -> Value {
+    let mut status = app.panel_task_status().await;
+    let controls = capability_controls();
+    let slots = app
+        .inner
+        .snapshot
+        .read()
+        .await
+        .fields
+        .get("sim")
+        .and_then(|sim| sim.get("dual_sim"))
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    status["actions"] = json!(
+        crate::task_schedule::ACTIONS
+            .iter()
+            .copied()
+            .filter(|action| {
+                match *action {
+                    "sms.send_scheduled" => controls.contains(&"sms.send_raw"),
+                    "sms.forward.device_info" => controls.contains(&"sms.forward.set"),
+                    "sim.set_slot" => slots == 2 && controls.contains(action),
+                    _ => controls.contains(action),
+                }
+            })
+            .collect::<Vec<_>>()
+    );
+    status["max_tasks"] = json!(crate::task_schedule::MAX_TASKS);
+    status["network_modes"] = if crate::u50_ctl::get().is_some() {
+        json!(["WL_AND_5G", "LTE_AND_5G", "Only_5G", "Only_LTE"])
+    } else {
+        json!([
+            "WL_AND_5G",
+            "LTE_AND_5G",
+            "Only_5G",
+            "WCDMA_AND_LTE",
+            "Only_LTE",
+            "Only_WCDMA"
+        ])
+    };
+    status
+}
+
+fn task_app_reply(status: StatusCode, value: Value) -> Response {
+    (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ActivityQuery {
+    before: Option<u64>,
+    category: Option<String>,
+    #[serde(default)]
+    failed: bool,
+}
+async fn activity_get(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<ActivityQuery>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if q.category
+        .as_deref()
+        .is_some_and(|c| !["notification", "task", "recovery"].contains(&c))
+    {
+        return task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_activity_filter"}),
+        );
+    }
+    task_app_reply(
+        StatusCode::OK,
+        app.inner
+            .activity
+            .lock()
+            .await
+            .view(q.before, q.category.as_deref(), q.failed),
+    )
+}
+async fn activity_clear(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !body.as_object().is_some_and(|v| v.is_empty()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match app.inner.activity.lock().await.clear() {
+        Ok(()) => task_app_reply(StatusCode::OK, json!({"ok":true})),
+        Err(e) => task_app_reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":e})),
+    }
+}
+async fn recovery_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    task_app_reply(StatusCode::OK, app.inner.recovery.lock().await.view())
+}
+async fn recovery_check(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !body.as_object().is_some_and(|v| v.is_empty()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !app
+        .inner
+        .recovery
+        .lock()
+        .await
+        .reserve_check(crate::activity::now())
+    {
+        return task_app_reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":"probe_rate_limited"}),
+        );
+    }
+    // Manual check never feeds recovery counters or executes recovery actions.
+    let online = crate::network_recovery::probe().await;
+    task_app_reply(
+        StatusCode::OK,
+        json!({"online":online,"checked_at":crate::activity::now()}),
+    )
+}
+async fn recovery_put(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(config): Json<crate::network_recovery::Config>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let enabled = config.enabled;
+    let mut r = app.inner.recovery.lock().await;
+    match r.update(config, crate::activity::now()) {
+        Ok(()) => {
+            let view = r.view();
+            drop(r);
+            app.record(
+                "recovery",
+                if enabled { "enable" } else { "disable" },
+                "success",
+                "",
+                "",
+            )
+            .await;
+            task_app_reply(StatusCode::OK, view)
+        }
+        Err(e) => task_app_reply(
+            if e == "storage_failed" {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({"error":e}),
+        ),
+    }
+}
+async fn recovery_resume(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !body.as_object().is_some_and(|v| v.is_empty()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let mut r = app.inner.recovery.lock().await;
+    match r.resume(crate::activity::now()) {
+        Ok(()) => {
+            let view = r.view();
+            drop(r);
+            app.record("recovery", "resume", "success", "", "").await;
+            task_app_reply(StatusCode::OK, view)
+        }
+        Err(e) => task_app_reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":e})),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    start: Option<String>,
+    end: Option<String>,
+}
+async fn traffic_history_get(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if q.start
+        .iter()
+        .chain(q.end.iter())
+        .any(|s| !crate::traffic_history::valid_date(s))
+        || matches!((&q.start, &q.end), (Some(a), Some(b)) if a > b)
+    {
+        return task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_date_range"}),
+        );
+    }
+    let history = app.inner.history.lock().await;
+    let days = history.days();
+    let oldest = days.first().map(|d| d.date.clone());
+    let selected: Vec<_> = days
+        .into_iter()
+        .filter(|d| {
+            q.start.as_ref().is_none_or(|s| &d.date >= s)
+                && q.end.as_ref().is_none_or(|s| &d.date <= s)
+        })
+        .collect();
+    task_app_reply(
+        StatusCode::OK,
+        json!({"days":selected,"device_date":crate::traffic_history::local_date(),
+        "oldest_date":oldest,"sample_interval_seconds":300,"max_days":400}),
+    )
+}
+async fn lan_view(app: &App) -> Value {
+    crate::lan::settings(
+        &*app.inner.snapshot.read().await,
+        crate::u50_ctl::get().is_some(),
+    )
+}
+async fn lan_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    task_app_reply(StatusCode::OK, lan_view(&app).await)
+}
+async fn lan_apply(app: &App, action: &str, params: Value) -> Response {
+    match crate::control::execute(action, &params).await {
+        crate::control::Outcome::Ok(_) => {
+            app.refresh_snapshot().await;
+            let current = lan_view(app).await;
+            task_app_reply(
+                StatusCode::OK,
+                json!({"verified":crate::lan::matches(&params,&current),"settings":current,"changed":true}),
+            )
+        }
+        crate::control::Outcome::Invalid(_) => task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_lan_settings"}),
+        ),
+        _ => task_app_reply(StatusCode::BAD_GATEWAY, json!({"error":"lan_apply_failed"})),
+    }
+}
+async fn lan_put(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<crate::lan::Update>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let current = lan_view(&app).await;
+    let params = match input.params(&current) {
+        Ok(p) => p,
+        Err(e) => return task_app_reply(StatusCode::BAD_REQUEST, json!({"error":e})),
+    };
+    if crate::lan::matches(&params, &current) {
+        return task_app_reply(
+            StatusCode::OK,
+            json!({"verified":true,"settings":current,"changed":false}),
+        );
+    }
+    lan_apply(&app, "lan.set", params).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MtuUpdate {
+    mtu: u64,
+}
+async fn lan_mtu_put(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<MtuUpdate>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !(576..=1500).contains(&input.mtu) {
+        return task_app_reply(StatusCode::BAD_REQUEST, json!({"error":"invalid_mtu"}));
+    }
+    let current = lan_view(&app).await;
+    if current["mtu"] == input.mtu {
+        return task_app_reply(
+            StatusCode::OK,
+            json!({"verified":true,"settings":current,"changed":false}),
+        );
+    }
+    lan_apply(&app, "lan.set_mtu", json!({"mtu":input.mtu.to_string()})).await
+}
+
+async fn tasks_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    task_app_reply(StatusCode::OK, app_task_status(&app).await)
+}
+
+async fn tasks_put(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<TaskInput>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let status = app_task_status(&app).await;
+    if !status["actions"]
+        .as_array()
+        .is_some_and(|actions| actions.iter().any(|a| a == &input.action))
+        || input.action == "network.set_mode"
+            && !status["network_modes"]
+                .as_array()
+                .is_some_and(|modes| modes.iter().any(|mode| mode == &input.params["mode"]))
+    {
+        return task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"unsupported_task_action"}),
+        );
+    }
+    match app.panel_task_upsert(input).await {
+        Ok(_) => task_app_reply(StatusCode::OK, app_task_status(&app).await),
+        Err(error) => task_app_reply(
+            if error == "task_storage_failed" {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({"error":error}),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveTask {
+    id: String,
+}
+
+async fn tasks_remove(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<RemoveTask>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match app.panel_task_remove(&input.id).await {
+        Ok(_) => task_app_reply(StatusCode::OK, app_task_status(&app).await),
+        Err(error) => task_app_reply(
+            if error == "task_storage_failed" {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({"error":error}),
+        ),
+    }
+}
+// These routes require a token on BOTH listeners; the existing loopback-only
+// /cloud/* management API and NMS remote control permissions remain unchanged.
+async fn sms_forward_config_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let config = app.inner.sms_forward.lock().await.app_config();
+    let status = app.panel_sms_forward_status().await;
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({"config":config,"status":status})),
+    )
+        .into_response()
+}
+
+async fn sms_forward_status_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(app.panel_sms_forward_status().await).into_response()
+}
+
+async fn sms_forward_config_post(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<SmsForwardUpdate>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match app.panel_sms_forward_update(input).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
+    }
+}
+
+async fn sms_forward_test_post(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !input.as_object().is_some_and(Map::is_empty) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_test_params"})),
+        )
+            .into_response();
+    }
+    match app.panel_sms_forward_test().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
+    }
+}
+
+async fn cloud_app_config_get(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(app.inner.cloud.read().await.public_config()).into_response()
+}
+async fn cloud_app_status(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(app.inner.cloud.read().await.status()).into_response()
+}
+async fn cloud_app_config_post(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<crate::cloud::AppUpdate>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match app.inner.cloud.write().await.app_update(input) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
+    }
+}
+async fn cloud_app_quick_connect(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<crate::cloud::QuickConnect>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let snapshot = app.snapshot().await;
+    match app
+        .inner
+        .cloud
+        .write()
+        .await
+        .app_quick_connect(input, &snapshot)
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
+    }
+}
 async fn cloud_status(State(app): State<App>) -> Json<Value> {
     Json(app.inner.cloud.read().await.status())
 }
@@ -1873,6 +2608,97 @@ async fn cloud_quick_connect(
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
     }
 }
+// App routes require a header credential even on the loopback listener.
+// Status uses a published snapshot so downloads never block progress polling.
+async fn ota_app_status(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Ok(mut manager) = app.inner.ota.try_lock() {
+        manager.reconcile_install_result();
+    }
+    task_app_reply(StatusCode::OK, app.inner.ota_view.borrow().clone())
+}
+async fn ota_app_config(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(config): Json<OtaConfig>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(mut manager) = app.inner.ota.try_lock() else {
+        return ota_app_busy();
+    };
+    match manager.update_config(config) {
+        Ok(_) => task_app_reply(StatusCode::OK, app.inner.ota_view.borrow().clone()),
+        Err(error) => task_app_reply(StatusCode::BAD_REQUEST, json!({"error":error})),
+    }
+}
+fn ota_app_busy() -> Response {
+    task_app_reply(StatusCode::CONFLICT, json!({"error":"更新任务正在运行"}))
+}
+async fn ota_app_check(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(_): Json<serde_json::Map<String, Value>>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    {
+        let Ok(mut manager) = app.inner.ota.try_lock() else {
+            return ota_app_busy();
+        };
+        manager.reconcile_install_result();
+        if manager.begin_update().is_err() {
+            return ota_app_busy();
+        }
+    }
+    tokio::spawn(async move {
+        let mut manager = app.inner.ota.lock().await;
+        let _ = manager.check().await;
+        manager.finish_update();
+    });
+    task_app_reply(StatusCode::ACCEPTED, json!({"started":true}))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OtaApproval {
+    candidate_id: String,
+}
+async fn ota_app_install(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<OtaApproval>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let candidate = {
+        let Ok(mut manager) = app.inner.ota.try_lock() else {
+            return ota_app_busy();
+        };
+        let candidate = match manager.approved_candidate(&input.candidate_id) {
+            Ok(c) => c,
+            Err(error) => return task_app_reply(StatusCode::CONFLICT, json!({"error":error})),
+        };
+        if manager.begin_update().is_err() {
+            return ota_app_busy();
+        }
+        candidate
+    };
+    tokio::spawn(async move {
+        let snapshot = serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null);
+        let mut manager = app.inner.ota.lock().await;
+        if let Err(error) = manager.install(&candidate, &snapshot, true).await {
+            manager.fail(Some(&candidate), error);
+        }
+        manager.finish_update();
+    });
+    task_app_reply(StatusCode::ACCEPTED, json!({"started":true}))
+}
+
 async fn ota_config_get(State(app): State<App>) -> Json<Value> {
     Json(app.inner.ota.lock().await.config_json())
 }

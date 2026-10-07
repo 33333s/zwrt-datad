@@ -56,6 +56,7 @@ jobs:
       - run: cargo build --locked
       - run: python3 ../tests/u50_candidate_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_platform_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/ota_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/u50_installer_test.py
       - run: python3 ../tests/u50pro_deploy_test.py
       - run: python3 ../tests/u50pro_download_test.py
@@ -77,6 +78,11 @@ jobs:
       - run: python3 ../tests/lan_cors_test.py target/debug/zwrt-datad
       - run: python3 ../tests/signal_auth_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_embedded_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/cloud_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/sms_forward_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/tasks_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/lan_history_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/automation_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
       - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
       - run: python3 ../tests/wifi_control_test.py target/debug/zwrt-datad

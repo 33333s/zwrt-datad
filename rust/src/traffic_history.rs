@@ -53,7 +53,7 @@ pub struct History {
     stored: Stored,
 }
 
-fn valid_date(value: &str) -> bool {
+pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10
         || bytes[4] != b'-'
@@ -92,7 +92,7 @@ fn valid_date(value: &str) -> bool {
     (1..=days[usize::from(month - 1)]).contains(&day)
 }
 
-fn local_date() -> Option<String> {
+pub(crate) fn local_date() -> Option<String> {
     // A fixed executable and argument follow the router's own local clock and
     // timezone. Do not silently relabel local traffic as UTC if this fails.
     let output = Command::new("/bin/date").arg("+%Y-%m-%d").output().ok()?;
@@ -194,26 +194,12 @@ impl History {
             return false;
         }
         let is_new_day = !self.stored.days.contains_key(date);
-        let previous_counter = if is_new_day {
-            self.stored
-                .days
-                .last_key_value()
-                .map(|(_, day)| day.last_counter)
-        } else {
-            None
-        };
         let day = self.stored.days.entry(date.to_owned()).or_insert(Day {
             bytes: 0,
             last_counter: 0,
         });
         let increment = if is_new_day {
-            previous_counter.map_or(counter, |previous| {
-                if counter >= previous {
-                    counter - previous
-                } else {
-                    counter
-                }
-            })
+            counter // Source is a daily total, never subtract yesterday.
         } else if counter >= day.last_counter {
             counter - day.last_counter
         } else {
@@ -281,7 +267,7 @@ mod tests {
 
         let mut midnight = History::load(&dir);
         assert!(midnight.apply_sample("2025-01-03", start + 1400, 40));
-        assert_eq!(midnight.days()[2].bytes, 10);
+        assert_eq!(midnight.days()[2].bytes, 40);
         assert_eq!(
             fs::metadata(dir.join("traffic-history.json"))
                 .unwrap()

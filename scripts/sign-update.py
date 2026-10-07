@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 root = Path(__file__).resolve().parent.parent
 p = argparse.ArgumentParser()
+p.add_argument("--notes", type=Path, help="UTF-8 release notes included in signed manifest")
 p.add_argument("--key", type=Path, required=True)
 p.add_argument("--profile", choices=["zwrt", "armv7"], default="zwrt")
 p.add_argument("--binary", type=Path)
@@ -30,6 +31,7 @@ def artifact(path: Path):
     data = path.read_bytes()
     return {"name": path.name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 manifest = {
+    "notes": args.notes.read_text(encoding="utf-8") if args.notes else "",
     "schema": 1,
     "version": release["version"],
     "tag": "v" + release["version"],

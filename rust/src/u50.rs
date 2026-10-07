@@ -33,6 +33,7 @@ const CFG_KEYS: &[&str] = &[
     "wan_ipaddr",
     "wan_gateway",
     "ppp_status",
+    "RadioOff",
     "network_type",
     "network_provider_fullname",
     "signalbar",
@@ -135,6 +136,7 @@ const CFG_KEYS: &[&str] = &[
     "dhcpStart",
     "dhcpEnd",
     "dhcpLease_hour",
+    "mtu",
     "prefer_dns_auto",
     "standby_dns_auto",
     "ipv6_prefer_dns_auto",
@@ -563,6 +565,9 @@ fn from_sources(
     }
     // The firmware has no high-speed-rail source, so `HSR` is omitted (unknown)
     // rather than reported as a constant "off" that the NMS panel would display.
+    if let Some(off) = cfg_number(cfg, "RadioOff", 0, 1) {
+        net.insert("radio_off".into(), json!(off == 1));
+    }
     fields.insert("net".into(), Value::Object(net));
 
     let mut battery = Map::new();
@@ -1166,6 +1171,9 @@ fn extend_from_cfg(fields: &mut Map<String, Value>, cfg: &BTreeMap<String, Strin
     }
     {
         let dhcp = block(fields, "dhcp");
+        if let Some(mtu) = cfg_number(cfg, "mtu", 576, 1500) {
+            dhcp.insert("mtu".into(), json!(mtu));
+        }
         for (source, target) in [
             ("lan_netmask", "netmask"),
             ("dhcpStart", "range_start"),
