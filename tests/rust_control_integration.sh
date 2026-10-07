@@ -284,9 +284,9 @@ post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smt
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","smtp":{"host":"","port":0,"username":"","password":"","to":""}}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["smtp_configured"] is False'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","power_forward_enabled":true}}' |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_supported"] is True and d["result"]["power_forward_enabled"] is True and d["result"]["power_daily_remaining"] == 60 and d["result"]["enabled"] is False'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_supported"] is True and d["result"]["power_forward_enabled"] is True and "power_daily_remaining" not in d["result"] and d["result"]["enabled"] is False'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","power_forward_enabled":false}}' |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_forward_enabled"] is False and d["result"]["power_daily_remaining"] == 60'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["power_forward_enabled"] is False and "power_daily_remaining" not in d["result"]'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","blacklist_phone":["10086"],"blacklist_keywords":["验证码"]}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["rules_supported"] is True and d["result"]["blacklist_phone_count"] == 1 and d["result"]["blacklist_keywords_count"] == 1 and "10086" not in json.dumps(d) and "验证码" not in json.dumps(d)'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"smtp","blacklist_phone":[],"blacklist_keywords":[]}}' |

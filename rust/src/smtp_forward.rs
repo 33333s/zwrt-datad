@@ -215,9 +215,19 @@ async fn submit<S: AsyncRead + AsyncWrite + Unpin>(
     let encoded = Zeroizing::new(STANDARD.encode(credential.as_bytes()));
     let auth_command = Zeroizing::new(format!("AUTH PLAIN {}", encoded.as_str()));
     command(stream, &auth_command).await?;
-    let (code, _) = read_reply(stream).await?;
+    let (mut code, _) = read_reply(stream).await?;
+    // Some servers defer PLAIN to a 334 challenge even with an initial response.
+    if code == 334 {
+        command(stream, &encoded).await?;
+        (code, _) = read_reply(stream).await?;
+    }
     if code != 235 {
-        return Err("smtp_auth_failed".into());
+        return Err(if (400..500).contains(&code) {
+            "smtp_auth_temporary"
+        } else {
+            "smtp_auth_failed"
+        }
+        .into());
     }
     command(stream, &format!("MAIL FROM:<{}>", settings.username)).await?;
     expect(stream, 250).await?;
@@ -487,6 +497,44 @@ mod tests {
             .unwrap()
             .unwrap();
             server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_and_temporary_rejections_are_distinguished_without_sending_mail() {
+        for (reply, expected) in [
+            ("535 Login rejected", "smtp_auth_failed"),
+            ("454 Try later", "smtp_auth_temporary"),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let settings = Settings {
+                host: "smtp.example.com".into(),
+                port: 465,
+                username: "sender@example.com".into(),
+                password: "fixture".into(),
+                to: "recipient@example.com".into(),
+            };
+            let worker = tokio::spawn(async move {
+                server.write_all(b"220 fixture\r\n").await.unwrap();
+                assert_eq!(server_line(&mut server).await, "EHLO zwrt-datad\r\n");
+                server.write_all(b"250 AUTH PLAIN\r\n").await.unwrap();
+                let first = server_line(&mut server).await;
+                let encoded = first.strip_prefix("AUTH PLAIN ").unwrap();
+                server.write_all(b"334 \r\n").await.unwrap();
+                assert_eq!(server_line(&mut server).await, encoded);
+                server
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut buf = [0; 1];
+                assert_eq!(server.read(&mut buf).await.unwrap(), 0);
+            });
+            assert_eq!(
+                submit(&mut client, &settings, "test", "body", true).await,
+                Err(expected.into())
+            );
+            drop(client);
+            worker.await.unwrap();
         }
     }
 
