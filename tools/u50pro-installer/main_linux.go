@@ -100,7 +100,7 @@ func preflight() error {
 }
 
 func install(base, local string, checkOnly bool) error {
-	fmt.Printf("U50 Pro installer r2 / datad %s\n[1/5] Checking device...\n", release.Version)
+	fmt.Printf("U50 Pro installer r3 / datad %s\n[1/5] Checking device...\n", release.Version)
 	if err := preflight(); err != nil {
 		return err
 	}

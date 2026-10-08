@@ -117,7 +117,7 @@ echo 'Verifying staged files and existing installation...'
 sha256sum -c SHA256SUMS
 . "$STAGE/service-control.sh"
 new_sha=$(binary_sha "$STAGE/zwrt-datad")
-version=$(timeout 10 "$STAGE/zwrt-datad" --version)
+version=$(run_timeout 10 "$STAGE/zwrt-datad" --version)
 case "$version" in 'zwrt-datad '*) ;; *) echo 'unexpected version response' >&2; exit 1 ;; esac
 check_unit_owner
 for file in zwrt-datad start.sh service-control.sh zwrt-datad.service; do

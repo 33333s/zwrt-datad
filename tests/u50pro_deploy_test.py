@@ -13,6 +13,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+TIMEOUT_MOCK = r'''#!/usr/bin/env python3
+import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+mode=os.environ.get('TIMEOUT_STYLE','modern')
+if mode=='unsupported': sys.exit(2)
+if mode=='legacy':
+ if args[:1]!=['-t']:
+  print("timeout: can't execute '%s': No such file or directory" % args[0], file=sys.stderr)
+  sys.exit(127)
+ args=args[1:]
+elif args[:1]==['-t']: sys.exit(125)
+with (Path(os.environ['SANDBOX'])/'timeout-calls').open('a') as f:
+ f.write(repr(args)+'\n')
+if args[-1]=='--version' and os.environ.get('TIMEOUT_VERSION'):
+ print('zwrt-datad '+os.environ['TIMEOUT_VERSION']); sys.exit(0)
+os.execv('/usr/bin/timeout', ['timeout']+args)
+'''
+
 MOCK = r'''#!/usr/bin/env python3
 import os,sys,shutil,json
 from pathlib import Path
@@ -144,6 +163,57 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((self.data/'zwrt-datad.prev').read_text(),self.binary('0.0.1'))
         self.assertEqual(self.unit.read_text(),'new unit\n')
         self.assertIn(' ubifs ro,',(self.base/'mounts').read_text())
+
+    def use_timeout(self, style):
+        path = self.tools/'timeout'
+        path.write_text(TIMEOUT_MOCK)
+        path.chmod(0o755)
+        self.env['TIMEOUT_STYLE'] = style
+
+    def test_legacy_timeout_full_deployment(self):
+        self.use_timeout('legacy')
+        self.run_deploy()
+        calls = (self.base/'timeout-calls').read_text()
+        self.assertIn("'10',", calls)
+        self.assertIn("'15', 'systemctl'", calls)
+        self.assertEqual((self.data/'zwrt-datad').read_text(), self.binary('9.9.9'))
+
+    def test_legacy_timeout_transient_service(self):
+        self.use_timeout('legacy')
+        subprocess.run(['systemctl', 'stop', 'zwrt-datad.service'], env=self.env, check=True)
+        self.unit.unlink()
+        (self.base/'ubi_ro').write_text('1\n')
+        self.run_deploy()
+        self.assertIn("'30', 'systemd-run'", (self.base/'timeout-calls').read_text())
+
+    def test_unsupported_timeout_leaves_existing_service_untouched(self):
+        self.use_timeout('unsupported')
+        result = self.run_deploy(success=False)
+        self.assertIn('unsupported timeout utility', result.stderr)
+        self.assert_restored()
+        self.assertNotIn("'stop'", (self.base/'calls').read_text())
+
+    def test_timeout_preserves_failures_without_repeating_command(self):
+        for style in ('modern', 'legacy'):
+            with self.subTest(style=style):
+                self.use_timeout(style)
+                marker = self.base/f'ran-{style}'
+                result = subprocess.run(
+                    ['sh', '-c', '. "$1"; run_timeout 2 sh -c \'echo ran >> "$1"; exit 7\' test "$2"',
+                     'test', str(self.stage/'service-control.sh'), str(marker)],
+                    env=self.env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertEqual(marker.read_text(), 'ran\n')
+
+    def test_timeout_still_enforces_deadline(self):
+        for style in ('modern', 'legacy'):
+            with self.subTest(style=style):
+                self.use_timeout(style)
+                result = subprocess.run(
+                    ['sh', '-c', '. "$1"; run_timeout 1 /bin/sleep 20',
+                     'test', str(self.stage/'service-control.sh')],
+                    env=self.env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 124, result.stderr)
 
     def test_systemctl_timeout_never_treated_as_missing_service(self):
         result = self.run_deploy('ctl-timeout', success=False)

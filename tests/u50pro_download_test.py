@@ -98,6 +98,20 @@ class DownloadTest(unittest.TestCase):
         self.assertIn('--u50-enable-webshell', unit)
         self.assertNotIn('After=multi-user.target', unit)
 
+    def test_download_and_transaction_with_legacy_timeout(self):
+        self.fixture.use_timeout('legacy')
+        self.env.update(TIMEOUT_STYLE='legacy', TIMEOUT_VERSION='9.9.9')
+        result = self.run_install()
+        self.assertIn('SUCCESS: persistent boot autostart', result.stdout)
+        self.assertEqual((self.data/'zwrt-datad').read_bytes(), self.binary)
+
+    def test_unsupported_timeout_does_not_stop_old_service(self):
+        self.fixture.use_timeout('unsupported')
+        self.env['TIMEOUT_STYLE'] = 'unsupported'
+        result = self.run_install(success=False)
+        self.assertIn('unsupported timeout utility', result.stderr)
+        self.assert_untouched()
+
     def test_tiny_download_to_verified_install(self):
         tiny = self.fixture.tools / 'tiny'
         tiny.write_text(MOCK)

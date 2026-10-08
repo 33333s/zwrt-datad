@@ -43,6 +43,7 @@ class FakeAdb {
             Console.WriteLine(mode == "stage" ? "/cache/unsafe;reboot" : "/cache/zwrt-datad/.deploy.ABC123"); return 0;
         }
         if (cmd.Contains("sha256sum -c SHA256SUMS")) {
+            if (!cmd.Contains(". ./service-control.sh && run_timeout 10")) return 95;
             if (mode == "hash") return 1;
             Console.WriteLine("zwrt-datad: OK\nzwrt-datad 0.10.68"); return 0;
         }

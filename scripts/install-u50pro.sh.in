@@ -70,12 +70,13 @@ printf '%s  %s\n' "$EXPECTED_SHA" "$STAGE/zwrt-datad.download" | sha256sum -c - 
 [ "$(od -An -tx1 -j18 -N2 "$STAGE/zwrt-datad.download" | tr -d ' \n\r')" = 2800 ] || die 'expected ARM binary'
 mv "$STAGE/zwrt-datad.download" "$STAGE/zwrt-datad"
 chmod 700 "$STAGE/zwrt-datad"
-version=$(timeout 10 "$STAGE/zwrt-datad" --version) || die 'binary cannot run; installed service unchanged'
-[ "$version" = "zwrt-datad $EXPECTED_VERSION" ] || die 'unexpected binary version; installed service unchanged'
-
 cat > "$STAGE/service-control.sh" <<'U50_SERVICE_EOF'
 @SERVICE@
 U50_SERVICE_EOF
+. "$STAGE/service-control.sh"
+version=$(run_timeout 10 "$STAGE/zwrt-datad" --version) || die 'binary cannot run; installed service unchanged'
+[ "$version" = "zwrt-datad $EXPECTED_VERSION" ] || die 'unexpected binary version; installed service unchanged'
+
 cat > "$STAGE/deploy-transaction.sh" <<'U50_TRANSACTION_EOF'
 @TRANSACTION@
 U50_TRANSACTION_EOF
