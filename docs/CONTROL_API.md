@@ -410,7 +410,29 @@ open. Recovery is disabled by default and never runs an unrestricted command.
   and `failed=true` filter the result. `next_before` is the next-page cursor.
   `max_entries` is 300. `storage_ok=false` means persistence failed.
 - `POST /activity/clear` with `{}` clears all categories without changing tasks,
-  forwarding configuration or recovery limits. IDs do not reset.
+  forwarding configuration, recovery limits or the history level. IDs do not reset.
+- `POST /activity/level` with `{"level": "off" | "basic" | "standard" | "detailed"}`
+  selects how much is recorded (below) and returns the same view as `GET /activity`.
+  `GET /activity` also reports `level`, `levels`, `flush_interval_seconds` (`null`
+  at `detailed`) and `unsaved` (entries still only in memory).
+
+History levels (default `standard`; the choice is saved and survives restarts):
+
+| level | records | written to flash |
+|---|---|---|
+| `off` | nothing | – |
+| `basic` | failures, and what recovery does to the network (redial, reboot, back online) | on an interval |
+| `standard` | `basic` plus successful deliveries, task runs and recovery settings changes | on an interval |
+| `detailed` | `standard` plus each change in the recovery probe result | every entry at once |
+
+Below `detailed`, entries are kept in memory and written together every 300 seconds
+when something changed, so a busy device makes at most one write per interval. They
+are also written when the daemon stops normally and before a reboot or poweroff
+that goes through datad. A crash or power loss can lose the entries of the last
+interval; use `detailed` while investigating something that restarts the device.
+`GET /activity` always shows what is in memory. A failed write keeps the entries
+buffered and is retried at the next interval. The recovery intent and action budgets
+are separate safety state and are always written before an action.
 - `GET /network/recovery`: saved configuration plus runtime status, consecutive
   failure count, redial count, next permissible action time and manual-pause state.
 - `POST /network/recovery`: saves `enabled` (default false), `interval_seconds`

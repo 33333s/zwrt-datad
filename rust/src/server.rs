@@ -62,7 +62,7 @@ pub(crate) struct Inner {
     ota_view: watch::Receiver<Value>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
-    activity: Mutex<crate::activity::Journal>,
+    activity: Arc<Mutex<crate::activity::Journal>>,
     recovery: Arc<Mutex<crate::network_recovery::Recovery>>,
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
@@ -123,9 +123,23 @@ impl App {
         )
         .await;
     }
+    /// Buffered history entries reach flash together, on a fixed interval.
+    fn spawn_activity_flush(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::activity::flush_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                app.inner.activity.lock().await.flush();
+            }
+        });
+    }
     fn spawn_recovery(&self) {
         let app = self.clone();
         tokio::spawn(async move {
+            let mut last_probe: Option<bool> = None;
             loop {
                 let interval = app.inner.recovery.lock().await.config().interval_seconds;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -145,6 +159,17 @@ impl App {
                     continue;
                 }
                 let online = crate::network_recovery::probe(&probe_urls).await;
+                // Only visible at the detailed level; a change, not every round.
+                if last_probe.replace(online) != Some(online) {
+                    app.record(
+                        "recovery",
+                        "probe",
+                        if online { "success" } else { "failed" },
+                        if online { "" } else { "unreachable" },
+                        "",
+                    )
+                    .await;
+                }
                 if !crate::network_recovery::eligible(
                     &*app.inner.snapshot.read().await,
                     crate::activity::now(),
@@ -448,7 +473,8 @@ impl App {
         initial
             .fields
             .insert("speedtest".into(), speedtest.status());
-        let activity = crate::activity::Journal::load(&data_dir);
+        let activity = Arc::new(Mutex::new(crate::activity::Journal::load(&data_dir)));
+        crate::activity::install(&activity);
         let recovery = Arc::new(Mutex::new(crate::network_recovery::Recovery::load(
             &data_dir,
         )));
@@ -477,7 +503,7 @@ impl App {
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
                 webshell: WebShell::new(webshell_enabled),
-                activity: Mutex::new(activity),
+                activity: activity.clone(),
                 recovery,
                 history: Mutex::new(history),
                 history_tx,
@@ -495,6 +521,7 @@ impl App {
             .await
             .start(app.inner.tx.subscribe(), app.clone());
         app.spawn_recovery();
+        app.spawn_activity_flush();
         app.spawn_sampler();
         app.spawn_ota();
         Ok(app)
@@ -885,6 +912,10 @@ impl App {
                 post(activity_clear).layer(RequestBodyLimitLayer::new(256)),
             )
             .route(
+                "/activity/level",
+                post(activity_level).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
                 "/network/recovery",
                 get(recovery_get)
                     .post(recovery_put)
@@ -984,6 +1015,7 @@ impl App {
         )
         .with_graceful_shutdown(shutdown())
         .await;
+        self.inner.activity.lock().await.flush();
         self.inner.neighbor.lock().await.shutdown().await;
         result?;
         Ok(())
@@ -2127,6 +2159,31 @@ async fn activity_get(
             .await
             .view(q.before, q.category.as_deref(), q.failed),
     )
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityLevel {
+    level: String,
+}
+async fn activity_level(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<ActivityLevel>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(level) = crate::activity::Level::parse(&body.level) else {
+        return task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_activity_level"}),
+        );
+    };
+    let mut journal = app.inner.activity.lock().await;
+    match journal.set_level(level) {
+        Ok(()) => task_app_reply(StatusCode::OK, journal.view(None, None, false)),
+        Err(e) => task_app_reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":e})),
+    }
 }
 async fn activity_clear(
     State(app): State<App>,
