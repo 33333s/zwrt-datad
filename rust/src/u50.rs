@@ -1367,7 +1367,14 @@ async fn collect(
     interval: Duration,
 ) -> Result<Snapshot> {
     let cfg = cfg_values().await?;
-    let goform = fetch_goform(client, url, &cfg).await.ok();
+    let goform = if let Some(ctl) = crate::u50_ctl::get() {
+        match ctl.oem_access_permit().await {
+            Ok(_permit) => fetch_goform(client, url, &cfg).await.ok(),
+            Err(_) => None, // Keep cfg/sysfs collection without touching WebUI.
+        }
+    } else {
+        fetch_goform(client, url, &cfg).await.ok()
+    };
     let mut snapshot = from_sources(model, &cfg, goform.as_ref())?;
     enrich(&mut snapshot.fields, &cfg, interval).await;
     Ok(snapshot)

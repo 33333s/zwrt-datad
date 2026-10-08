@@ -15,8 +15,8 @@ use crate::{
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
-    sync::OnceLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Mutex as StdMutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -25,6 +25,55 @@ pub struct Ctl {
     oem: Bridge,
     last: Mutex<Option<Snapshot>>,
     neighbor: Mutex<NeighborState>,
+    viewers: StdMutex<ViewDemand>,
+}
+
+const VIEW_GRACE: Duration = Duration::from_secs(15);
+const CLIENT_POLL: Duration = Duration::from_secs(5);
+
+/// Only foreground /state reads and actual SSE/remote-panel viewers count.
+/// MQTT telemetry's permanent state subscription must not keep OEM login alive.
+#[derive(Default)]
+struct ViewDemand {
+    readers: usize,
+    touched: Option<Instant>,
+    clients_polled: Option<Instant>,
+}
+
+impl ViewDemand {
+    fn active(&self, now: Instant) -> bool {
+        self.readers > 0
+            || self
+                .touched
+                .is_some_and(|at| now.saturating_duration_since(at) < VIEW_GRACE)
+    }
+
+    fn claim_clients(&mut self, now: Instant) -> bool {
+        if !self.active(now)
+            || self
+                .clients_polled
+                .is_some_and(|at| now.saturating_duration_since(at) < CLIENT_POLL)
+        {
+            return false;
+        }
+        self.clients_polled = Some(now);
+        true
+    }
+}
+
+pub(crate) struct ViewLease<'a>(&'a StdMutex<ViewDemand>);
+
+impl<'a> ViewLease<'a> {
+    fn new(demand: &'a StdMutex<ViewDemand>) -> Self {
+        demand.lock().unwrap_or_else(|e| e.into_inner()).readers += 1;
+        Self(demand)
+    }
+}
+
+impl Drop for ViewLease<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).readers -= 1;
+    }
 }
 
 /// Session-scoped neighbor monitor mirroring the mainline `/state.neighbor`
@@ -64,6 +113,7 @@ pub fn install(collector: Collector, oem: Bridge) {
         oem,
         last: Mutex::new(None),
         neighbor: Mutex::new(NeighborState::default()),
+        viewers: StdMutex::new(ViewDemand::default()),
     });
 }
 
@@ -76,6 +126,8 @@ pub fn get() -> Option<&'static Ctl> {
 /// forwarding, cloud features, state sampling) plus the OEM-backed actions
 /// mapped in `Ctl::execute`. Speed tests are intentionally not offered.
 pub const CONTROLS: &[&str] = &[
+    "oem.access.status",
+    "oem.access.set",
     "wifi.status",
     "wifi.dual_band_status",
     "apn.list",
@@ -126,6 +178,7 @@ pub const CONTROLS: &[&str] = &[
 ];
 
 pub const READ_ACTIONS: &[&str] = &[
+    "oem.access.status",
     "wifi.status",
     "wifi.dual_band_status",
     "apn.list",
@@ -501,6 +554,27 @@ fn outcome_from(result: Result<Value, String>) -> Outcome {
 }
 
 impl Ctl {
+    pub(crate) fn touch_view(&self) {
+        self.viewers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .touched = Some(Instant::now());
+    }
+
+    pub(crate) fn watch_view(&self) -> ViewLease<'_> {
+        ViewLease::new(&self.viewers)
+    }
+
+    pub(crate) async fn oem_access_permit(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, crate::u50_oem::AccessPause>, String> {
+        self.oem.access_permit().await
+    }
+
+    pub async fn oem_access_status(&self) -> Value {
+        self.oem.access_status().await
+    }
+
     /// Same contract as `state::collect`: always a snapshot. A failed sample
     /// keeps the last good one (refreshed timestamp) instead of blanking data.
     pub async fn collect(&self) -> Snapshot {
@@ -519,7 +593,47 @@ impl Ctl {
                 }
             }
         };
-        if let Some(Value::Object(clients)) = self.clients_block().await {
+        let access = self.oem.access_status().await;
+        fresh.fields.insert("oem_access".into(), access.clone());
+        if access["paused"] == true {
+            if let Some(previous) = self.last.lock().await.as_ref() {
+                for key in ["clients", "sms", "neighbor"] {
+                    if let Some(value) = previous.fields.get(key) {
+                        let mut cached = value.clone();
+                        if let Some(object) = cached.as_object_mut() {
+                            object.insert("stale".into(), json!(true));
+                            object.insert("paused".into(), json!(true));
+                        }
+                        fresh.fields.insert(key.into(), cached);
+                    }
+                }
+            }
+            *self.last.lock().await = Some(fresh.clone());
+            return fresh;
+        }
+        let (viewing, poll_clients) = {
+            let mut viewers = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            (viewers.active(now), viewers.claim_clients(now))
+        };
+        // Cached client data is retained between polls, never interpreted as
+        // an empty client list merely because no one is watching the App.
+        if let Some(mut clients) = self
+            .last
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| s.fields.get("clients"))
+            .cloned()
+        {
+            if let Some(object) = clients.as_object_mut() {
+                object.insert("stale".into(), json!(true));
+                object.remove("paused");
+            }
+            fresh.fields.insert("clients".into(), clients);
+        }
+        if poll_clients && let Some(Value::Object(mut clients)) = self.clients_block().await {
+            clients.insert("stale".into(), json!(false));
             let entry = fresh
                 .fields
                 .entry("clients".to_owned())
@@ -528,10 +642,22 @@ impl Ctl {
                 existing.extend(clients);
             }
         }
-        if let Some(sms) = crate::sms::snapshot().await {
+        // Forwarding has its own enabled-only 15-second source poll. An idle
+        // state sampler must not trigger an independent SMS login every 5s.
+        let sms = if viewing {
+            crate::sms::snapshot().await
+        } else {
+            crate::sms::cached_snapshot().await
+        };
+        if let Some(sms) = sms {
             fresh.fields.insert("sms".into(), sms);
         }
-        if let Some(neighbor) = self.neighbor_sample(fresh.fields.get("net")).await {
+        let neighbor = if viewing {
+            self.neighbor_sample(fresh.fields.get("net")).await
+        } else {
+            self.neighbor_status().await.ok()
+        };
+        if let Some(neighbor) = neighbor {
             fresh.fields.insert("neighbor".into(), neighbor);
         }
         *self.last.lock().await = Some(fresh.clone());
@@ -1222,6 +1348,7 @@ impl Ctl {
             return Outcome::Invalid("this read action accepts no parameters".into());
         }
         let result = match action {
+            "oem.access.status" => Ok(self.oem.access_status().await),
             "wifi.status" => self.wifi_status().await,
             "neighbor.status" => self.neighbor_status().await,
             "wifi.dual_band_status" => self.read("wifi_lbd_enable").await.and_then(|raw| {
@@ -1384,6 +1511,10 @@ impl Ctl {
 
     pub async fn execute(&self, action: &str, params: &Value) -> Outcome {
         match action {
+            "oem.access.set" => match self.oem.set_access(params).await {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Invalid(error),
+            },
             "device.reboot" => outcome_from(self.write("REBOOT_DEVICE", &[]).await),
             "device.poweroff" => outcome_from(self.write("SHUTDOWN_DEVICE", &[]).await),
             "cellular.connect" => outcome_from(self.write("CONNECT_NETWORK", &[]).await),
@@ -2626,5 +2757,41 @@ mod band_mode_tests {
         for value in ["garbage", "rm -rf"] {
             assert_eq!(network_mode(value), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod view_demand_tests {
+    use super::*;
+
+    #[test]
+    fn idle_never_polls_and_foreground_demand_expires() {
+        let now = Instant::now();
+        let mut demand = ViewDemand::default();
+        assert!(!demand.active(now));
+        assert!(!demand.claim_clients(now));
+        demand.touched = Some(now);
+        assert!(demand.active(now));
+        assert!(demand.claim_clients(now));
+        assert!(!demand.claim_clients(now + Duration::from_secs(1)));
+        assert!(demand.claim_clients(now + CLIENT_POLL));
+        assert!(!demand.active(now + VIEW_GRACE));
+        assert!(!demand.claim_clients(now + VIEW_GRACE));
+        demand.touched = Some(now + VIEW_GRACE);
+        assert!(demand.claim_clients(now + VIEW_GRACE));
+    }
+
+    #[test]
+    fn streaming_lease_survives_grace_and_last_disconnect_releases_demand() {
+        let demand = StdMutex::new(ViewDemand::default());
+        let first = ViewLease::new(&demand);
+        let second = ViewLease::new(&demand);
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert!(demand.lock().unwrap().active(later));
+        drop(first);
+        assert!(demand.lock().unwrap().active(later));
+        drop(second);
+        assert!(!demand.lock().unwrap().active(later));
+        assert!(!demand.lock().unwrap().claim_clients(later));
     }
 }

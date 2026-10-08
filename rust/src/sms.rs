@@ -261,6 +261,19 @@ async fn load_messages() -> Result<(Vec<Value>, bool), String> {
     }
 }
 
+/// Read already sampled messages without contacting the vendor or logging in.
+pub async fn cached_snapshot() -> Option<Value> {
+    let cache = CACHE.lock().await;
+    let mut value = cache.value()?;
+    if cache
+        .checked
+        .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+    {
+        value["stale"] = json!(true);
+    }
+    Some(value)
+}
+
 pub async fn snapshot() -> Option<Value> {
     let mut cache = CACHE.lock().await;
     let revision = REVISION.load(Ordering::Relaxed);

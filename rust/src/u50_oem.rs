@@ -12,14 +12,43 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_REPLY: usize = 64 * 1024;
 const SESSION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const LOGIN_INTERVAL: Duration = Duration::from_secs(3);
+const PAUSED_ERROR: &str = "已暂停官方后台访问，请等待自动恢复或在 App 中手动恢复";
+
+#[derive(Default)]
+pub(crate) struct AccessPause {
+    paused: bool,
+    deadline: Option<Instant>,
+    resume_at: Option<u64>,
+}
+
+impl AccessPause {
+    fn active(&self) -> bool {
+        self.paused
+            && self
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    fn status(&self) -> Value {
+        let paused = self.active();
+        let remaining = self.deadline.map(|deadline| {
+            let duration = deadline.saturating_duration_since(Instant::now());
+            duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+        });
+        json!({"supported":true,"paused":paused,
+            "remaining_seconds":if paused { remaining } else { Some(0) },
+            "resume_at":if paused { self.resume_at } else { None },
+            "restart_resumes":true})
+    }
+}
 /// GoAhead answers these hidden-page actions only after a second,
 /// developer-option login (same admin password, own LD challenge, plus AD).
 /// Mirrors the checklist table embedded in `zte_topsw_goahead`.
@@ -48,6 +77,7 @@ struct Inner {
     session: Mutex<Option<Session>>,
     last_login: Mutex<Option<Instant>>,
     write_gate: Mutex<()>,
+    access: RwLock<AccessPause>,
 }
 struct Session {
     token: String,
@@ -119,8 +149,60 @@ impl Bridge {
                 session: Mutex::new(None),
                 last_login: Mutex::new(None),
                 write_gate: Mutex::new(()),
+                access: RwLock::new(AccessPause::default()),
             }),
         })
+    }
+    pub(crate) async fn access_permit(&self) -> Result<RwLockReadGuard<'_, AccessPause>, String> {
+        let guard = self.inner.access.read().await;
+        if guard.active() {
+            return Err(PAUSED_ERROR.into());
+        }
+        Ok(guard)
+    }
+
+    pub async fn access_status(&self) -> Value {
+        self.inner.access.read().await.status()
+    }
+
+    /// Wait for in-flight HTTP exchanges before acknowledging the pause.
+    /// Never send LOGOUT: it could invalidate the user's official WebUI.
+    pub async fn set_access(&self, params: &Value) -> Result<Value, String> {
+        let object = params.as_object().ok_or("params must be an object")?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "paused" | "duration_seconds"))
+        {
+            return Err("only paused and duration_seconds are accepted".into());
+        }
+        let paused = params["paused"].as_bool().ok_or("paused must be boolean")?;
+        let duration = match params.get("duration_seconds") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= 3600)
+                .ok_or("duration_seconds must be 0 (manual) or 1..3600")?,
+        };
+        if !paused && duration != 0 {
+            return Err("resume does not accept a duration".into());
+        }
+        let mut guard = self.inner.access.write().await;
+        *guard = AccessPause {
+            paused,
+            deadline: (paused && duration > 0)
+                .then(|| Instant::now() + Duration::from_secs(duration)),
+            resume_at: (paused && duration > 0).then(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + duration
+            }),
+        };
+        if paused {
+            self.drop_session().await;
+        }
+        Ok(guard.status())
     }
     fn request(&self, request: reqwest::RequestBuilder, cookie: &str) -> reqwest::RequestBuilder {
         let origin = format!("http://{}", self.inner.host);
@@ -181,6 +263,7 @@ impl Bridge {
         params: &BTreeMap<String, String>,
         multi_data: bool,
     ) -> Result<(Value, String), String> {
+        let _permit = self.access_permit().await?;
         if keys.len() > 1024 || keys.split(',').count() > 32 || !keys.split(',').all(valid_key) {
             return Err("invalid OEM read keys".into());
         }
@@ -221,6 +304,7 @@ impl Bridge {
         form: &[(String, String)],
         cookie: &str,
     ) -> Result<(Value, String), String> {
+        let _permit = self.access_permit().await?;
         let request = self.request(
             self.inner
                 .client
@@ -500,6 +584,8 @@ impl Bridge {
     /// Token of the daemon's own OEM session, logging in from the stored admin
     /// hash when there is none or it is about to expire.
     pub async fn local_token(&self) -> Result<String, String> {
+        // Do not read credentials or enter a login retry while paused.
+        drop(self.access_permit().await?);
         {
             let guard = self.inner.session.lock().await;
             if let Some(session) = guard.as_ref()
@@ -636,6 +722,161 @@ fn cookies_from_two(first: &str, second: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bridge() -> Bridge {
+        Bridge::new(
+            Client::new(),
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            "127.0.0.1".into(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn access_pause_blocks_reads_writes_login_and_drops_only_local_session() {
+        let bridge = bridge();
+        *bridge.inner.session.lock().await = Some(Session {
+            token: "fixture".into(),
+            cookie: "zte_web_cookie=fixture".into(),
+            first: Zeroizing::new("A".repeat(64)),
+            expires: Instant::now() + SESSION_LIFETIME,
+        });
+        assert_eq!(bridge.access_status().await["paused"], false);
+        let status = bridge
+            .set_access(&json!({"paused":true,"duration_seconds":300}))
+            .await
+            .unwrap();
+        assert_eq!(status["paused"], true);
+        assert_eq!(status["remaining_seconds"], 300);
+        assert!(status["resume_at"].as_u64().is_some());
+        assert!(bridge.inner.session.lock().await.is_none());
+        // A dead endpoint ensures these fail at the gate, not in HTTP or cfg.
+        assert_eq!(bridge.local_token().await.unwrap_err(), PAUSED_ERROR);
+        assert_eq!(
+            bridge.get("loginfo", "existing-cookie").await.unwrap_err(),
+            PAUSED_ERROR
+        );
+        assert_eq!(
+            bridge.post(&[], "existing-cookie").await.unwrap_err(),
+            PAUSED_ERROR
+        );
+        assert_eq!(
+            bridge
+                .local_read("sms_capacity_info", &BTreeMap::new())
+                .await
+                .unwrap_err(),
+            PAUSED_ERROR
+        );
+        let status = bridge.set_access(&json!({"paused":false})).await.unwrap();
+        assert_eq!(status["paused"], false);
+        assert_eq!(status["remaining_seconds"], 0);
+        assert!(bridge.access_permit().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn access_pause_manual_extension_and_expiration() {
+        let bridge = bridge();
+        let manual = bridge.set_access(&json!({"paused":true})).await.unwrap();
+        assert!(manual["remaining_seconds"].is_null());
+        assert!(manual["resume_at"].is_null());
+        assert!(bridge.access_permit().await.is_err());
+        let timed = bridge
+            .set_access(&json!({"paused":true,"duration_seconds":600}))
+            .await
+            .unwrap();
+        assert_eq!(timed["remaining_seconds"], 600);
+        bridge.inner.access.write().await.deadline = Some(Instant::now() - Duration::from_secs(1));
+        // Expiration must work without any App polling/status request.
+        assert!(bridge.access_permit().await.is_ok());
+        let expired = bridge.access_status().await;
+        assert_eq!(expired["paused"], false);
+        assert_eq!(expired["remaining_seconds"], 0);
+        assert!(expired["resume_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn access_pause_invalid_input_leaves_state_unchanged() {
+        let bridge = bridge();
+        bridge.set_access(&json!({"paused":true})).await.unwrap();
+        for params in [
+            json!(null),
+            json!({}),
+            json!({"paused":"false"}),
+            json!({"paused":false,"duration_seconds":300}),
+            json!({"paused":true,"duration_seconds":-1}),
+            json!({"paused":true,"duration_seconds":3601}),
+            json!({"paused":true,"duration_seconds":1.5}),
+            json!({"paused":true,"duration_seconds":"300"}),
+            json!({"paused":true,"duration_seconds":null}),
+            json!({"paused":false,"unexpected":true}),
+        ] {
+            assert!(bridge.set_access(&params).await.is_err());
+            assert_eq!(bridge.access_status().await["paused"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn access_pause_waits_for_inflight_http_and_prevents_later_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let app = axum::Router::new().fallback({
+            let (entered, release, count) = (entered.clone(), release.clone(), count.clone());
+            move || {
+                let (entered, release, count) = (entered.clone(), release.clone(), count.clone());
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"loginfo":"ok"}))
+                }
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bridge = Bridge::new(
+            Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            url,
+            "127.0.0.1".into(),
+        )
+        .unwrap();
+        let request = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.get("loginfo", "").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mut pause = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.set_access(&json!({"paused":true})).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut pause)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        assert!(request.await.unwrap().is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pause)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(bridge.get("loginfo", "").await.unwrap_err(), PAUSED_ERROR);
+        assert_eq!(bridge.post(&[], "").await.unwrap_err(), PAUSED_ERROR);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn token_and_key_validation() {
         assert_eq!(
