@@ -82,7 +82,14 @@ NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将�
 
 从 0.10.31 起，可单独启用设备端 HTTPS 短信转发，支持固定 JSON POST Webhook 与钉钉机器人。从 0.10.32 起，还支持用本机 SIM 向最多三个号码转发收到的短信；跳过原发件人和已发送短信，每日最多尝试发送 60 条，短信过长时拒绝发送。短信方式和发送测试消息均可能产生运营商费用。从 0.10.33 起，还支持 SMTP 邮件：仅接受公网域名、465 隐式 TLS 或 587 强制 STARTTLS，固定解析出的公网地址并验证服务器证书；邮箱应用密码留在设备 0600 配置中，不随状态回传。配置默认关闭，原版任意 CURL 命令仍未接入。启用时先将现有短信指纹记作基线，只处理后续新短信；指纹在投递前以 0600 文件持久化，投递失败不自动重发，避免进程重启后重复发送。HTTPS 转发目标必须为有有效证书的公网域名，禁用代理/跳转，DNS 地址在连接前过滤并固定，响应严格限长。钉钉加签时间从已配置 NMS 的 HTTPS Date 响应取得；校时失败不改用可能偏移的设备时钟。密码、目标 URL、手机号、邮箱地址和短信内容均不在普通 MQTT 遥测或云端转发状态中出现；只有经授权的设备本地进程执行投递。若设备本地 UFI 已启用短信转发，应先关闭其中一方以免重复发送。
 
-从 0.10.34 起，有有效电池读数的设备可单独开启电源状态通知。充电状态变化或电量百分比变化会通过当前短信转发目的地投递；首次启用只记录基线，总开关关闭期间继续更新基线，不补发旧变化。原厂 `charge_status` 的 1/2/3/4 分别视为充电中/放电中/未在充电/已充满，未知读数不产生通知；MU5250 的状态 4 已由设备 `/sys/class/power_supply/battery/status=Full` 对照。事件和每日最多 60 次的额度在投递前以 0600 文件持久化，失败不自动重发；本机短信方式仍同时受自身每日 60 条限制。此功能默认关闭，发送到外部目的地前需由设备 Owner 或授权管理员在 NMS 二次确认。
+从 0.10.34 起，有有效电池读数的设备可单独开启电源状态通知。所有提供有效电池状态的机型共用提醒逻辑：充电状态变化，或电量升降到达、跨过 5%、20%、40%、60%、80%、100% 时，通过当前短信转发目的地投递；中间电量变化不通知，一次跨过多个提醒点仅发一条；首次启用只记录基线，总开关关闭期间继续更新基线，不补发旧变化。原厂 `charge_status` 的 1/2/3/4 分别视为充电中/放电中/未在充电/已充满，未知读数不产生通知；MU5250 的状态 4 已由设备 `/sys/class/power_supply/battery/status=Full` 对照。事件基线在投递前以 0600 文件持久化，失败不自动重发；电源通知不设每日次数上限，旧配置中的电源额度会在保存时移除；本机短信方式仍同时受自身每日 60 条限制。此功能默认关闭，发送到外部目的地前需由设备 Owner 或授权管理员在 NMS 二次确认。
+
+0.10.71 起：短信转发以“发件人 + 原始接收时间（UTC，精确到秒）+ 正文”识别同一条短信，短信在 SIM 与设备存储间搬动或已读状态变化都不会重复转发；只转发开启转发之后收到的短信。接收时间比设备时钟晚 5 分钟以上的短信（通常是开机后设备尚未对时）暂不处理、也不记为已处理，等时钟追上后再判断，不会因此丢失。电量提醒在同一个提醒点附近来回波动时只报一次，电量离开该点 3% 以上后才会再次提醒；充电状态变化总会通知。
+
+Forwarding also persists an enable-time cutoff and uses sender, full original UTC receipt timestamp (including seconds), and content as the message fingerprint. Moving an SMS between SIM/device storage or changing its read state does not trigger another delivery. Delayed historical messages and messages without a valid OEM receipt timestamp are not forwarded. On upgrade from ID-based fingerprints, the first complete inbox snapshot is baselined before new deliveries resume. Inconsistent complete inbox/capacity reads are marked stale, never treated as an empty inbox. Clock-change gates and the separate SIM sending allowance remain in force.
+
+SMTP AUTH PLAIN supports a server's 334 challenge after the initial response. Authentication 4xx responses report `smtp_auth_temporary`; permanent rejection reports `smtp_auth_failed`. Neither result is evidence that the saved password was lost. Forwarding still records delivery intent before sending and does not automatically replay failed attempts.
+
 
 从 0.10.35 起，原版“转发规则”可配置最多 64 个号码与 32 个关键词作为短信转发黑名单。号码允许纯数字或开头单个 `+`，比较时忽略这个 `+`；关键词区分大小写并做正文子串匹配。命中的新短信在设备端跳过目的地投递，但指纹仍以 0600 文件记录，之后清空规则不会补发。规则内容只保存在设备端，按需远程面板仅上报是否支持和条数；规则不影响电源状态通知。配置及清除走既有 NMS Owner/管理员权限、二次确认与审计。
 
