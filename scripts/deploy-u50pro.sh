@@ -75,7 +75,7 @@ for name in zwrt-datad start.sh zwrt-datad.service service-control.sh deploy-tra
     "${ADB[@]}" push "$(win_path "$input")" "$remote_stage/$name" >/dev/null
 done
 "${ADB[@]}" push "$(win_path "$stage_dir/SHA256SUMS")" "$remote_stage/SHA256SUMS" >/dev/null
-"${ADB[@]}" shell "cd $remote_stage && sha256sum -c SHA256SUMS && chmod 700 zwrt-datad && timeout 10 ./zwrt-datad --version" || die "staging verification failed; installed service was not changed"
+"${ADB[@]}" shell "cd $remote_stage && sha256sum -c SHA256SUMS && chmod 700 zwrt-datad && . ./service-control.sh && run_timeout 10 ./zwrt-datad --version" || die "staging verification failed; installed service was not changed"
 echo "== starting independent device transaction =="
 "${ADB[@]}" shell "nohup sh $remote_stage/deploy-transaction.sh $remote_stage > $remote_stage/deploy.log 2>&1 < /dev/null &" || die "could not launch transaction; inspect $remote_stage"
 for ((i=0; i<90; i++)); do

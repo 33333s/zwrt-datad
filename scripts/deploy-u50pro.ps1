@@ -116,7 +116,7 @@ try {
         Write-Host ("  {0}/{1} {2}" -f ($index + 1), $toPush.Count, $name)
         [void](Invoke-Adb -Arguments @('-s', $Serial, 'push', (Join-Path $payloadDir $name), "$remoteStage/$name") -TimeoutSeconds 120)
     }
-    $verified = Device-Shell "cd $remoteStage && sha256sum -c SHA256SUMS && chmod 700 zwrt-datad && timeout 10 ./zwrt-datad --version"
+    $verified = Device-Shell "cd $remoteStage && sha256sum -c SHA256SUMS && chmod 700 zwrt-datad && . ./service-control.sh && run_timeout 10 ./zwrt-datad --version"
     Write-Host $verified.Output
     if ($verified.Output -notmatch '(?m)^zwrt-datad \d+\.\d+\.\d+\s*$') { throw 'Unexpected binary version response; existing service unchanged' }
 

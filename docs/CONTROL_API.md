@@ -36,6 +36,34 @@ Content-Type: application/json
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
+## U50 官方后台避让（0.10.71）
+
+仅在 `/capabilities.controls` 同时包含以下动作时显示入口。沿用 `/control` 的鉴权，不需要 OEM 会话，也不会修改 datad/App 登录状态。
+
+| action | params | 说明 |
+|---|---|---|
+| `oem.access.status` | `{}` | 读取设备端实时暂停状态 |
+| `oem.access.set` | `paused` 布尔值，`duration_seconds` 可选整数 | 暂停或恢复 OEM GoAhead 访问；时长 1–3600 秒，0 或省略表示手动恢复；恢复时只能省略或传 0 |
+
+例如暂停 5 分钟：`{"action":"oem.access.set","params":{"paused":true,"duration_seconds":300}}`。
+立即恢复：`{"action":"oem.access.set","params":{"paused":false}}`。
+响应的 `result` 与 `/state.oem_access` 都包含：
+
+```json
+{"supported":true,"paused":true,"remaining_seconds":300,"resume_at":1791446400,"restart_resumes":true}
+```
+
+`resume_at` 是 Unix 秒，供显示；实际期限使用设备端单调时钟，不受修改系统时间影响。
+手动暂停的 `remaining_seconds`、`resume_at` 为 null；未暂停时分别为 0、null。
+重复暂停从本次成功应用起重新计时，关闭 App 不影响到期恢复。
+状态仅保存在内存：datad 服务或设备重启后恢复访问。
+
+暂停确认会等待已发出的 OEM HTTP 请求结束，然后阻止登录、重登、已有会话及匿名 OEM HTTP 读写；仅丢弃 datad 自身 Cookie，不发送 LOGOUT。
+基础 cfg/proc/sysfs 采集及 datad API 继续工作。依赖 OEM 的操作明确返回暂停错误，短信刷新/转发及部分设置暂不可用；采集器保留上次 clients/sms/neighbor 数据并标记 stale/paused。
+这不是共享会话：恢复后 datad 重新登录仍可能挤出官方后台。
+
+同时优化 U50 的无人使用状态：仅最近 15 秒内读取过 `/state`、存在 `/events` 连接或已连接的按需远程面板时，采集器查询登录态设备列表、短信和已启用的邻区。设备列表最多每 5 秒查询一次。断开界面后停止这些后台登录态查询，保留缓存；永久 MQTT 遥测订阅不算界面查看。短信转发自己的任务仍仅在开关启用时每 15 秒读源。显式控制操作仍可按需登录，基础 cfg/sysfs 及匿名状态、流量历史采集不因此停用。
+
 ## Cellular And Radio
 
 | action | params |

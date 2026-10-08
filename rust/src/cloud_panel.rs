@@ -690,6 +690,9 @@ pub(crate) async fn run(
     {
         return;
     }
+    // Only a successfully connected on-demand panel counts as a viewer;
+    // the permanent MQTT telemetry subscription does not acquire this lease.
+    let _viewer = crate::u50_ctl::get().map(|ctl| ctl.watch_view());
     let mut last = state_rx.borrow().clone();
     let mut history = history_rx.borrow_and_update().clone();
     let cloud_management = if let Some(app) = &cloud_app {

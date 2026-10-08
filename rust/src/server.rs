@@ -1399,7 +1399,15 @@ async fn version() -> Json<DatadVersion> {
     Json(Default::default())
 }
 async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
+    if let Some(ctl) = crate::u50_ctl::get() {
+        ctl.touch_view();
+    }
     let mut snapshot = app.snapshot().await;
+    if let Some(ctl) = crate::u50_ctl::get() {
+        snapshot
+            .fields
+            .insert("oem_access".into(), ctl.oem_access_status().await);
+    }
     // The U50 neighbor monitor toggles instantly in memory; the cached
     // snapshot would lag up to one sampler tick and make a client's
     // post-toggle readback race. Serve its status live.
@@ -1472,8 +1480,10 @@ async fn events(State(app): State<App>) -> Response {
         )
             .into_response();
     };
+    let viewer = crate::u50_ctl::get().map(|ctl| ctl.watch_view());
     let stream = WatchStream::new(app.inner.tx.subscribe()).map(move |v| {
         let _keep_permit_alive = &permit;
+        let _keep_viewer_alive = &viewer;
         Ok::<_, Infallible>(Event::default().event("state").json_data(v).unwrap())
     });
     Sse::new(stream)

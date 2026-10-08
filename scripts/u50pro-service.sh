@@ -8,6 +8,27 @@ PORT_HEX=$(printf '%04X' "$PORT")
 WAIT_SECONDS=30
 STABLE_SECONDS=10
 
+# Old BusyBox uses `timeout -t SECONDS COMMAND`; newer BusyBox/coreutils
+# use `timeout SECONDS COMMAND`. Probe only a harmless command, never retry
+# a real service operation to discover the syntax.
+U50_TIMEOUT_STYLE=
+run_timeout() {
+    if [ -z "$U50_TIMEOUT_STYLE" ]; then
+        if timeout 1 sh -c 'exit 0' >/dev/null 2>&1; then
+            U50_TIMEOUT_STYLE=positional
+        elif timeout -t 1 sh -c 'exit 0' >/dev/null 2>&1; then
+            U50_TIMEOUT_STYLE=legacy
+        else
+            echo 'unsupported timeout utility; refusing to continue' >&2
+            return 125
+        fi
+    fi
+    case "$U50_TIMEOUT_STYLE" in
+        positional) timeout "$@" ;;
+        legacy) timeout -t "$@" ;;
+    esac
+}
+
 binary_sha() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 owned_pid() {
@@ -87,13 +108,13 @@ wait_healthy() {
     return 1
 }
 
-ctl() { timeout 15 systemctl "$@"; }
+ctl() { run_timeout 15 systemctl "$@"; }
 
 has_unit() {
     command -v systemctl >/dev/null 2>&1 || return 1
     if ctl --no-pager cat "$UNIT" >/dev/null 2>&1; then return 0; else status=$?; fi
     case "$status" in
-        124|137) echo 'systemctl timed out; refusing to continue' >&2; return 2 ;;
+        124|125|126|127|137|143) echo 'systemctl timed out or could not run; refusing to continue' >&2; return 2 ;;
     esac
     return 1
 }
@@ -124,7 +145,7 @@ stop_service() {
         if state=$(ctl --no-pager show "$UNIT" -p ActiveState --value 2>/dev/null); then :
         else
             status=$?
-            case "$status" in 124|137) echo 'systemctl timed out while stopping' >&2; return 1 ;; esac
+            case "$status" in 124|125|126|127|137|143) echo 'systemctl timed out or could not run while stopping' >&2; return 1 ;; esac
         fi
         if [ -z "$(owned_pids)" ]; then
             case "$state" in active|activating|deactivating) ;; *) return 0 ;; esac
@@ -149,7 +170,7 @@ start_service() {
         ctl --no-block start "$UNIT"
     elif command -v systemd-run >/dev/null 2>&1; then
         ctl reset-failed "$UNIT" 2>/dev/null || true
-        timeout 30 systemd-run --unit="$UNIT" --description='zwrt-datad ZWRT backend' \
+        run_timeout 30 systemd-run --unit="$UNIT" --description='zwrt-datad ZWRT backend' \
             --property=Restart=on-failure --property=RestartSec=3 \
             "$DIR/zwrt-datad" --u50-model u50pro --u50-data-dir "$DIR" \
             --u50-signaling --u50-enable-webshell --bind 127.0.0.1 --port 9460
