@@ -14,7 +14,24 @@ use std::{
 
 const FILE_NAME: &str = "scheduled-tasks.json";
 const MAX_FILE_BYTES: u64 = 32 * 1024;
-const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 16;
+pub const ACTIONS: &[&str] = &[
+    "device.reboot",
+    "device.poweroff",
+    "cellular.connect",
+    "cellular.disconnect",
+    "network.set_mode",
+    "sim.set_slot",
+    "cellular.set",
+    "wifi.set_module",
+    "wifi.set_chip",
+    "nfc.set",
+    "sms.send_scheduled",
+    "sms.forward.device_info",
+    "cell.lock_lte",
+    "cell.lock_nr",
+    "cell.unlock_all",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -408,6 +425,39 @@ mod tests {
             action: action.into(),
             params,
         }
+    }
+
+    #[test]
+    fn all_tasks_for_one_minute_are_drained_once_and_survive_restart() {
+        let (dir, mut schedule) = fixture();
+        for n in 0..MAX_TASKS {
+            let mut task = input("cellular.connect", json!({}));
+            task.id = format!("task-{n}");
+            schedule.upsert(task).unwrap();
+        }
+        let clock = Clock {
+            date: "2026-10-07".into(),
+            time: "08:30".into(),
+            offset: "+0800".into(),
+        };
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..MAX_TASKS {
+            let due = schedule.observe(Some(&clock)).unwrap();
+            assert!(ids.insert(due.id.clone()));
+            schedule.finish(&due.id, &clock.date, true);
+        }
+        assert!(schedule.observe(Some(&clock)).is_none());
+        assert!(TaskSchedule::load(&dir).observe(Some(&clock)).is_none());
+        assert_eq!(
+            schedule.status()["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|task| task["last_result"] == "ok")
+                .count(),
+            MAX_TASKS
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

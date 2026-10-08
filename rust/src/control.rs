@@ -162,6 +162,41 @@ async fn mapped_call(
 }
 
 pub async fn execute(action: &str, params: &Value) -> Outcome {
+    let relevant = crate::network_recovery::network_action(action);
+    let _gate = if relevant {
+        Some(crate::network_recovery::NETWORK_GATE.lock().await)
+    } else {
+        None
+    };
+    if relevant && let Some(shared) = crate::network_recovery::active() {
+        let mut recovery = shared.lock().await;
+        // A failed pause write must still cancel in-flight automatic work.
+        if recovery
+            .manual_intent(action, crate::activity::now())
+            .is_err()
+        {
+            recovery.generation += 1;
+        }
+    }
+    execute_inner(action, params).await
+}
+
+pub async fn execute_recovery(action: &str, plan: crate::network_recovery::Plan) -> Outcome {
+    let _gate = crate::network_recovery::NETWORK_GATE.lock().await;
+    let Some(shared) = crate::network_recovery::active() else {
+        return Outcome::Failed("recovery_cancelled".into());
+    };
+    if !shared.lock().await.allows(plan) {
+        return Outcome::Failed("recovery_cancelled".into());
+    }
+    execute_inner(action, &json!({})).await
+}
+
+async fn execute_inner(action: &str, params: &Value) -> Outcome {
+    // The process will not outlive these; write the buffered history first.
+    if matches!(action, "device.reboot" | "device.poweroff") {
+        crate::activity::flush_active().await;
+    }
     match action {
         "device.reboot" => {
             call(

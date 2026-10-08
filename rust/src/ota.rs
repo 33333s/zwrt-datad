@@ -77,6 +77,8 @@ pub struct Artifact {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
+    #[serde(default)]
+    pub notes: String,
     pub schema: i64,
     pub version: String,
     pub tag: String,
@@ -86,6 +88,8 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub install_started_at: i64,
     pub state: String,
     pub current_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -114,6 +118,7 @@ fn is_zero(value: &i64) -> bool {
 impl Default for Status {
     fn default() -> Self {
         Self {
+            install_started_at: 0,
             state: "idle".into(),
             current_version: env!("DATAD_VERSION").into(),
             latest_version: String::new(),
@@ -137,6 +142,8 @@ pub struct Candidate {
 }
 
 pub struct Ota {
+    view: tokio::sync::watch::Sender<Value>,
+    install_deadline: Option<Duration>,
     dir: PathBuf,
     config: Config,
     status: Status,
@@ -157,6 +164,8 @@ struct StoredStatus {
     status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry: Option<RetryTimer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_wait: Option<RetryTimer>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +196,29 @@ impl Ota {
         let mut status = stored.status;
         status.current_version = env!("DATAD_VERSION").into();
         status.source = source_name(&status.source).into();
+        if matches!(status.state.as_str(), "checking" | "downloading") {
+            status.state = "error".into();
+            status.error = "上次更新检查或下载被中断，请重新检查".into();
+            status.signature_verified = false;
+            status.latest_version.clear();
+            status.source.clear();
+            status.wait_reasons.clear();
+            status.progress = 0;
+        }
+        // An ADB/manual upgrade can supersede a previously checked candidate.
+        // Keep an in-flight install's target intact until its result is reconciled.
+        if matches!(status.state.as_str(), "available" | "waiting_idle")
+            && !status.latest_version.is_empty()
+            && !newer(&status.latest_version, env!("DATAD_VERSION"))
+        {
+            status.state = "idle".into();
+            status.latest_version = env!("DATAD_VERSION").into();
+            status.signature_verified = false;
+            status.source.clear();
+            status.wait_reasons.clear();
+            status.error.clear();
+            status.progress = 0;
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
@@ -206,7 +238,21 @@ impl Ota {
             // Rearm the bounded cooldown; never infer elapsed age from RTC/wall time.
             Some(elapsed::now().saturating_add(delay))
         };
+        let install_deadline = (status.state == "installing").then(|| {
+            stored
+                .install_wait
+                .filter(|timer| {
+                    elapsed::boot_id().as_deref() == Some(timer.boot_id.as_str())
+                        && Duration::from_millis(timer.deadline_ms)
+                            <= elapsed::now().saturating_add(Duration::from_secs(1800))
+                })
+                .map(|timer| Duration::from_millis(timer.deadline_ms))
+                .unwrap_or_else(|| elapsed::now().saturating_add(Duration::from_secs(1800)))
+        });
+        let (view, _) = tokio::sync::watch::channel(Value::Null);
         let manager = Self {
+            view,
+            install_deadline,
             dir: dir.to_owned(),
             config,
             status,
@@ -221,10 +267,44 @@ impl Ota {
             retry_deadline,
         };
         publish_config(&manager.config);
-        if manager.retry_deadline.is_some() {
+        manager.publish();
+        if manager.retry_deadline.is_some() || manager.install_deadline.is_some() {
             manager.save_status();
         }
         Ok(manager)
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Value> {
+        self.view.subscribe()
+    }
+
+    fn candidate_id(candidate: &Candidate) -> String {
+        hex_sha256(
+            &serde_json::to_vec(
+                &json!({"manifest":candidate.manifest,"source":candidate.base_url}),
+            )
+            .expect("serialize candidate"),
+        )
+    }
+
+    fn publish(&self) {
+        let candidate = self
+            .candidate
+            .as_ref()
+            .filter(|c| has_update(c) && self.status.signature_verified);
+        self.view.send_replace(json!({"status":self.display_status(),"config":self.config,
+            "busy": self.busy || self.status.state == "installing", "platform":"update.json",
+            "candidate":candidate.map(|c| json!({"id":Self::candidate_id(c),"manifest":c.manifest}))}));
+    }
+
+    pub fn approved_candidate(&self, id: &str) -> Result<Candidate, String> {
+        self.candidate
+            .as_ref()
+            .filter(|c| {
+                has_update(c) && self.status.signature_verified && Self::candidate_id(c) == id
+            })
+            .cloned()
+            .ok_or_else(|| "更新信息已失效，请重新检查更新".into())
     }
 
     pub fn config_json(&self) -> Value {
@@ -263,7 +343,7 @@ impl Ota {
         if time_control::clock_change_in_progress() {
             return Err("系统时间正在切换，请稍后重试".into());
         }
-        if self.busy {
+        if self.busy || self.status.state == "installing" {
             return Err("更新任务正在运行".into());
         }
         self.busy = true;
@@ -275,9 +355,13 @@ impl Ota {
 
     pub fn finish_update(&mut self) {
         self.busy = false;
+        self.publish();
     }
 
     pub fn update_config(&mut self, mut config: Config) -> Result<Value, String> {
+        if self.busy || self.status.state == "installing" {
+            return Err("update_in_progress".into());
+        }
         validate_config(&config)?;
         for server in &mut config.servers {
             *server = server.trim().trim_end_matches('/').to_owned();
@@ -285,6 +369,16 @@ impl Ota {
         atomic_json(&self.dir.join("ota.json"), &config, 0o600)?;
         self.config = config;
         publish_config(&self.config);
+        self.candidate = None;
+        self.status.signature_verified = false;
+        self.status.latest_version.clear();
+        self.status.source.clear();
+        self.status.wait_reasons.clear();
+        self.status.progress = 0;
+        self.status.state = "idle".into();
+        self.status.error.clear();
+        self.save_status();
+
         Ok(json!({"success":true,"config":self.config}))
     }
 
@@ -323,11 +417,19 @@ impl Ota {
     }
 
     pub async fn check(&mut self) -> Result<Candidate, String> {
+        if self.status.state == "installing" {
+            return Err("update_in_progress".into());
+        }
         if time_control::clock_change_in_progress() {
             return Err("系统时间正在切换，请稍后重试".into());
         }
         self.status.state = "checking".into();
         self.status.error.clear();
+        self.candidate = None;
+        self.status.signature_verified = false;
+        self.status.latest_version.clear();
+        self.status.source.clear();
+        self.status.wait_reasons.clear();
         self.status.last_check_at = now();
         self.status.progress = 0;
         self.save_status();
@@ -488,8 +590,16 @@ impl Ota {
             update_status::update("install_failed");
             return Err(error);
         }
+        match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.status.latest_version = candidate.manifest.version.clone();
         self.status.state = "installing".into();
-        self.status.progress = 100;
+        self.status.progress = 95;
+        self.status.install_started_at = now();
+        self.install_deadline = Some(elapsed::now().saturating_add(Duration::from_secs(1800)));
         self.save_status();
         update_status::update("installing");
         if let Err(error) = Command::new("/bin/sh")
@@ -524,13 +634,25 @@ impl Ota {
     pub fn reconcile_install_result(&mut self) {
         let marker = self.dir.join("ota-install-result");
         let Ok(value) = fs::read_to_string(&marker) else {
+            if self.status.state == "installing"
+                && self
+                    .install_deadline
+                    .is_some_and(|deadline| elapsed::now() >= deadline)
+            {
+                self.fail(
+                    None,
+                    "Installation result not confirmed; check device logs".into(),
+                );
+            }
             return;
         };
         let _ = fs::remove_file(marker);
-        if value.trim() == "success" {
+        if value.trim() == "success" && self.status.latest_version == env!("DATAD_VERSION") {
             update_status::update("succeeded");
             self.status.state = "succeeded".into();
             self.status.current_version = env!("DATAD_VERSION").into();
+            self.status.progress = 100;
+            self.install_deadline = None;
             self.status.last_success_at = now();
             self.status.error.clear();
             self.status.wait_reasons.clear();
@@ -549,6 +671,7 @@ impl Ota {
     pub fn auto_candidate(&mut self) -> Option<Candidate> {
         if !self.config.enabled
             || self.busy
+            || self.status.state == "installing"
             || !self.retry_ready()
             || time_control::clock_change_in_progress()
         {
@@ -570,6 +693,7 @@ impl Ota {
     pub fn should_auto_check(&self) -> bool {
         self.config.enabled
             && !self.busy
+            && self.status.state != "installing"
             && self.retry_ready()
             && !time_control::clock_change_in_progress()
             && (self.candidate.is_none()
@@ -653,7 +777,7 @@ impl Ota {
     }
 
     async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
-        let response = self
+        let mut response = self
             .client
             .get(url)
             .send()
@@ -668,14 +792,24 @@ impl Ota {
         {
             return Err("响应过大".into());
         }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > max {
-            return Err("响应过大".into());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len().saturating_add(chunk.len()) > max {
+                return Err("响应过大".into());
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn save_status(&self) {
+        self.publish();
+        let install_wait = self.install_deadline.and_then(|deadline| {
+            Some(RetryTimer {
+                boot_id: elapsed::boot_id()?,
+                deadline_ms: u64::try_from(deadline.as_millis()).ok()?,
+            })
+        });
         let retry = self.retry_deadline.and_then(|deadline| {
             Some(RetryTimer {
                 boot_id: elapsed::boot_id()?,
@@ -687,6 +821,7 @@ impl Ota {
             &StoredStatus {
                 status: self.display_status(),
                 retry,
+                install_wait,
             },
             0o600,
         );
@@ -735,6 +870,9 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    if manifest.notes.len() > 32768 {
+        return Err("Release notes exceed limit".into());
+    }
     let version_ok = manifest.version.split('.').count() == 3
         && manifest
             .version
@@ -902,6 +1040,76 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
+    fn installation_timeout_uses_boot_elapsed_time_across_wall_clock_steps() {
+        elapsed::with_clock(Duration::from_secs(100), 1_780_000_000, || {
+            let dir = std::env::temp_dir()
+                .join(format!("datad-ota-install-clock-{}", rand::random::<u64>()));
+            let mut ota = Ota::load(&dir).unwrap();
+            ota.status.state = "installing".into();
+            ota.status.latest_version = "99.0.0".into();
+            ota.install_deadline = Some(elapsed::now() + Duration::from_secs(1800));
+            ota.save_status();
+            elapsed::advance(Duration::from_secs(60), 86400);
+            let mut reopened = Ota::load(&dir).unwrap();
+            reopened.reconcile_install_result();
+            assert_eq!(reopened.status.state, "installing");
+            elapsed::advance(Duration::from_secs(1740), -172800);
+            reopened.reconcile_install_result();
+            assert_eq!(reopened.status.state, "error");
+            fs::remove_dir_all(dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn newer_running_build_does_not_offer_an_old_saved_candidate() {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-upgraded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load(&dir).unwrap();
+        for state in ["available", "waiting_idle"] {
+            ota.status.state = state.into();
+            ota.status.latest_version = "0.0.1".into();
+            ota.status.signature_verified = true;
+            ota.status.wait_reasons = vec!["old storage warning".into()];
+            ota.save_status();
+            let restored = Ota::load(&dir).unwrap();
+            assert_eq!(restored.status.state, "idle");
+            assert_eq!(restored.status.latest_version, env!("DATAD_VERSION"));
+            assert!(!restored.status.signature_verified);
+            assert!(restored.status.wait_reasons.is_empty());
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installing_survives_restart_and_result_must_match_running_version() {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-result-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ota = Ota::load(&dir).unwrap();
+        ota.status.state = "installing".into();
+        ota.status.install_started_at = now();
+        ota.status.latest_version = "99.0.0".into();
+        ota.save_status();
+        let mut restarted = Ota::load(&dir).unwrap();
+        assert!(restarted.subscribe().borrow()["busy"].as_bool().unwrap());
+        assert!(restarted.begin_update().is_err());
+        assert!(restarted.update_config(Config::default()).is_err());
+        assert!(!restarted.should_auto_check());
+        fs::write(dir.join("ota-install-result"), "success").unwrap();
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "error");
+        restarted.status.latest_version = env!("DATAD_VERSION").into();
+        fs::write(dir.join("ota-install-result"), "success").unwrap();
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "succeeded");
+        assert_eq!(restarted.status.progress, 100);
+        restarted.status.state = "installing".into();
+        restarted.install_deadline = Some(elapsed::now());
+        restarted.reconcile_install_result();
+        assert_eq!(restarted.status.state, "error");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn public_key_and_defaults_are_valid() {
         parse_public_key(PUBLIC_KEY).unwrap();
         validate_config(&Config::default()).unwrap();
@@ -972,6 +1180,7 @@ mod tests {
     fn timer_candidate() -> Candidate {
         Candidate {
             manifest: Manifest {
+                notes: String::new(),
                 schema: 1,
                 version: "99.0.0".into(),
                 tag: "v99.0.0".into(),
@@ -1113,6 +1322,7 @@ mod tests {
     async fn check_uses_order_and_rejects_bad_signature() {
         let signing = SigningKey::from_bytes(&[9; 32]);
         let manifest = Manifest {
+            notes: String::new(),
             schema: 1,
             version: "99.0.0".into(),
             tag: "v99.0.0".into(),
@@ -1200,6 +1410,28 @@ mod tests {
         assert_eq!(candidate.base_url, format!("http://{address}/good"));
         assert_eq!(candidate.manifest.version, "99.0.0");
         assert!(ota.status.signature_verified);
+        let id = Ota::candidate_id(&candidate);
+        assert!(ota.approved_candidate(&id).is_ok());
+        let mut changed = candidate.clone();
+        changed.manifest.artifacts.get_mut("binary").unwrap().sha256 = "c".repeat(64);
+        assert_ne!(Ota::candidate_id(&changed), id);
+        assert!(
+            ota.approved_candidate(&Ota::candidate_id(&changed))
+                .is_err()
+        );
+        changed = candidate.clone();
+        changed.base_url.push_str("/other");
+        assert_ne!(Ota::candidate_id(&changed), id);
+        let watch = ota.subscribe();
+        assert_eq!(watch.borrow()["candidate"]["id"], id);
+        ota.config.servers = vec![format!("http://{address}/bad")];
+        assert!(ota.check().await.is_err());
+        assert!(ota.approved_candidate(&id).is_err());
+        assert!(watch.borrow()["candidate"].is_null());
+        assert_eq!(watch.borrow()["status"]["signature_verified"], false);
+        assert_eq!(watch.borrow()["status"]["latest_version"], Value::Null);
+        assert_eq!(watch.borrow()["status"]["wait_reasons"], Value::Null);
+
         let _ = fs::remove_dir_all(dir);
     }
 

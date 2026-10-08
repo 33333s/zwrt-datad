@@ -679,7 +679,7 @@ fn messages(snapshot: &Value) -> Result<Vec<IncomingMessage>, String> {
     Ok(output)
 }
 
-fn delivery_result_code(result: &Result<(), String>) -> &'static str {
+pub(crate) fn delivery_result_code(result: &Result<(), String>) -> &'static str {
     match result {
         Ok(()) => "sent",
         Err(error) if error == "clock_unavailable" => "clock_unavailable",
@@ -750,6 +750,23 @@ impl Forwarder {
             "dingtalk_forward_device_info":self.config.dingtalk_forward_device_info,
             "sms_forward_device_info":self.config.sms_forward_device_info,
             "last_result":self.last_result})
+    }
+
+    /// Private, authenticated App editor only. Never include this in telemetry.
+    /// Explicit projection keeps passwords, fingerprints and quotas out of config.
+    pub fn app_config(&self) -> Value {
+        let c = &self.config;
+        json!({"enabled":c.enabled,"method":c.method,
+            "webhook_url":c.webhook_url,"dingtalk_webhook":c.dingtalk_webhook,
+            "dingtalk_secret_configured":!c.dingtalk_secret.is_empty(),
+            "sms_to_phone":c.sms_to_phone,
+            "smtp":{"host":c.smtp.host,"port":c.smtp.port,"username":c.smtp.username,
+                "to":c.smtp.to,"password_configured":!c.smtp.password.is_empty()},
+            "power_forward_enabled":c.power_forward_enabled,
+            "blacklist_phone":c.blacklist_phone,"blacklist_keywords":c.blacklist_keywords,
+            "nickname":c.nickname,"smtp_forward_device_info":c.smtp_forward_device_info,
+            "dingtalk_forward_device_info":c.dingtalk_forward_device_info,
+            "sms_forward_device_info":c.sms_forward_device_info})
     }
 
     pub fn requires_baseline(&self, input: &Update) -> bool {

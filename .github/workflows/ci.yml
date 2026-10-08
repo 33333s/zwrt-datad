@@ -70,6 +70,12 @@ jobs:
       - run: python3 ../tests/version_test.py target/debug/zwrt-datad
       - run: python3 ../tests/time_control_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_embedded_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/cloud_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/sms_forward_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/tasks_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/lan_history_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/automation_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/ota_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_lte_test.py target/debug/zwrt-datad
       - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
@@ -80,7 +86,8 @@ jobs:
         run: |
           for suite in rust_sms_test.py rust_usb_test.py rust_apn_session_test.py identity_test.py \
                        rust_webshell_test.py rust_sse_limit_test.py version_test.py time_control_test.py \
-                       cloud_embedded_test.py neighbor_http_test.py direct_supply_test.py wifi_control_test.py; do
+                       cloud_embedded_test.py neighbor_http_test.py direct_supply_test.py wifi_control_test.py \
+                       cloud_app_test.py sms_forward_app_test.py tasks_app_test.py lan_history_app_test.py automation_app_test.py ota_app_test.py; do
             sh ../tests/with_mock_ubusd.sh python3 "../tests/$suite" target/debug/zwrt-datad
           done
           sh ../tests/with_mock_ubusd.sh sh ../tests/service_token_test.sh target/debug/zwrt-datad

@@ -1,3 +1,4 @@
+mod activity;
 mod apn_targets;
 mod auth;
 mod cloud;
@@ -16,12 +17,14 @@ mod files;
 mod hosts;
 mod identity;
 mod kernel_wan;
+mod lan;
 #[cfg(feature = "mesh")]
 mod mesh;
 mod model;
 mod neighbor;
 mod neighbor_lte;
 mod neighbor_manager;
+mod network_recovery;
 mod ota;
 mod qos;
 mod qtrace_mask;
