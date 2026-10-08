@@ -132,19 +132,19 @@ impl App {
                 let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
                     continue;
                 };
-                let generation = {
+                let (generation, probe_urls) = {
                     let mut r = app.inner.recovery.lock().await;
                     if !r.may_probe(crate::activity::now()) {
                         continue;
                     }
-                    r.generation
+                    (r.generation, r.config().probe_urls)
                 };
                 let snapshot = app.inner.snapshot.read().await.clone();
                 if !crate::network_recovery::eligible(&snapshot, crate::activity::now()) {
                     app.inner.recovery.lock().await.hold();
                     continue;
                 }
-                let online = crate::network_recovery::probe().await;
+                let online = crate::network_recovery::probe(&probe_urls).await;
                 if !crate::network_recovery::eligible(
                     &*app.inner.snapshot.read().await,
                     crate::activity::now(),
@@ -2174,7 +2174,8 @@ async fn recovery_check(
         );
     }
     // Manual check never feeds recovery counters or executes recovery actions.
-    let online = crate::network_recovery::probe().await;
+    let probe_urls = app.inner.recovery.lock().await.config().probe_urls;
+    let online = crate::network_recovery::probe(&probe_urls).await;
     task_app_reply(
         StatusCode::OK,
         json!({"online":online,"checked_at":crate::activity::now()}),

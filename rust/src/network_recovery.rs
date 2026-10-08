@@ -3,6 +3,7 @@ use crate::{activity, model::Snapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock, Weak},
     time::Duration,
@@ -38,6 +39,16 @@ pub fn network_action(action: &str) -> bool {
             "apn.set_mode" | "apn.add" | "apn.modify" | "apn.delete" | "apn.enable"
         )
 }
+/// Probed in parallel; one answer from any of them means the network is up.
+/// Two sites reachable from mainland China plus one that is reachable from
+/// almost anywhere, so an overseas SIM, roaming or a VPN is not mistaken for
+/// an outage just because the Chinese sites do not answer there.
+pub const DEFAULT_PROBE_URLS: [&str; 3] = [
+    "https://www.baidu.com/",
+    "https://www.qq.com/",
+    "https://cp.cloudflare.com/generate_204",
+];
+pub const MAX_PROBE_URLS: usize = 4;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -47,6 +58,7 @@ pub struct Config {
     pub cooldown_seconds: u64,
     pub max_redials: u32,
     pub reboot_after_failures: bool,
+    pub probe_urls: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -57,16 +69,82 @@ impl Default for Config {
             cooldown_seconds: 300,
             max_redials: 3,
             reboot_after_failures: false,
+            probe_urls: DEFAULT_PROBE_URLS.map(String::from).to_vec(),
         }
     }
 }
 impl Config {
     pub fn valid(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
         [30, 60, 120].contains(&self.interval_seconds)
             && (3..=10).contains(&self.failure_threshold)
             && (180..=3600).contains(&self.cooldown_seconds)
             && (1..=5).contains(&self.max_redials)
+            && (1..=MAX_PROBE_URLS).contains(&self.probe_urls.len())
+            && self
+                .probe_urls
+                .iter()
+                .all(|url| valid_probe_url(url) && seen.insert(url.to_ascii_lowercase()))
     }
+}
+/// An HTTPS URL on the default port with no credentials or query, whose host
+/// is a public domain name or address. Only the reachability of the host is
+/// ever reported, never the response.
+pub fn valid_probe_url(raw: &str) -> bool {
+    if raw.len() > 200
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.port(), None | Some(443))
+        && url.host_str().is_some_and(public_host)
+}
+fn public_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(ip) => {
+                !(ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_multicast()
+                    || ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+            }
+            IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                !(ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || first & 0xfe00 == 0xfc00
+                    || first & 0xffc0 == 0xfe80)
+            }
+        };
+    }
+    let host = host.to_ascii_lowercase();
+    host.contains('.')
+        && !host.ends_with('.')
+        && !["localhost", "local", "lan", "internal", "home.arpa"]
+            .iter()
+            .any(|private| host == *private || host.ends_with(&format!(".{private}")))
+}
+fn probe_hosts(config: &Config) -> Vec<String> {
+    config
+        .probe_urls
+        .iter()
+        .filter_map(|raw| Some(reqwest::Url::parse(raw).ok()?.host_str()?.to_owned()))
+        .collect()
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -140,7 +218,7 @@ impl Recovery {
         json!({"config":self.stored.config,"status":if !self.storage_ok {"storage_failed"} else if !self.stored.config.enabled {"disabled"}else if self.stored.paused {"manual_pause"}else{self.status},
         "consecutive_failures":self.failures,"redials":self.stored.redials,"last_check":self.last_check,
         "next_allowed":self.stored.next_allowed.max(self.startup_until),"manual_paused":self.stored.paused,"storage_ok":self.storage_ok,
-        "probe_hosts":["www.baidu.com","www.qq.com"],"hourly_action_limit":5,"reboot_cooldown_seconds":21600})
+        "probe_hosts":probe_hosts(&self.stored.config),"hourly_action_limit":5,"reboot_cooldown_seconds":21600})
     }
     pub fn update(&mut self, config: Config, now: u64) -> Result<(), String> {
         if !config.valid() {
@@ -315,7 +393,9 @@ pub fn eligible(snapshot: &Snapshot, now: u64) -> bool {
     .iter()
     .any(|v| kind == *v || kind.starts_with(&format!("{v}_")))
 }
-pub async fn probe() -> bool {
+/// One bounded HTTPS HEAD per URL, all at once. Any HTTP answer, including an
+/// error status, proves the network path works; the first answer ends the check.
+pub async fn probe(urls: &[String]) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -325,19 +405,145 @@ pub async fn probe() -> bool {
     else {
         return false;
     };
-    let check = |url| {
-        let c = client.clone();
-        async move { c.head(url).send().await.is_ok() }
-    };
-    let (a, b) = tokio::join!(
-        check("https://www.baidu.com/"),
-        check("https://www.qq.com/")
-    );
-    a || b
+    any_reachable(urls, |url| {
+        let client = client.clone();
+        async move { client.head(url).send().await.is_ok() }
+    })
+    .await
+}
+async fn any_reachable<F, Fut>(urls: &[String], check: F) -> bool
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let mut pending: FuturesUnordered<_> = urls.iter().cloned().map(&check).collect();
+    while let Some(reachable) = pending.next().await {
+        if reachable {
+            return true;
+        }
+    }
+    false
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_probe_list_has_a_globally_reachable_address_and_is_valid() {
+        let config = Config::default();
+        assert!(config.valid());
+        assert!(
+            config
+                .probe_urls
+                .iter()
+                .any(|u| u.contains("cloudflare.com"))
+        );
+        assert_eq!(
+            probe_hosts(&config),
+            ["www.baidu.com", "www.qq.com", "cp.cloudflare.com"]
+        );
+    }
+    #[test]
+    fn probe_urls_must_be_public_https_without_surprises() {
+        for good in [
+            "https://www.baidu.com/",
+            "https://cp.cloudflare.com/generate_204",
+            "https://example.org",
+            "https://1.1.1.1/",
+            "https://[2606:4700:4700::1111]/",
+            "https://example.org:443/x",
+        ] {
+            assert!(valid_probe_url(good), "{good}");
+        }
+        for bad in [
+            "",
+            "http://example.org/",
+            "ftp://example.org/",
+            "https://user:pw@example.org/",
+            "https://example.org/?q=1",
+            "https://example.org/#x",
+            "https://example.org:8443/",
+            "https://example.org /x",
+            "https://localhost/",
+            "https://printer.local/",
+            "https://nas.lan/",
+            "https://router.home.arpa/",
+            "https://intranet/",
+            "https://192.168.0.1/",
+            "https://10.0.0.1/",
+            "https://172.16.0.1/",
+            "https://100.64.0.1/",
+            "https://127.0.0.1/",
+            "https://169.254.169.254/",
+            "https://0.0.0.0/",
+            "https://[::1]/",
+            "https://[fe80::1]/",
+            "https://[fd00::1]/",
+            "https://example.org./",
+        ] {
+            assert!(!valid_probe_url(bad), "{bad}");
+        }
+        assert!(!valid_probe_url(&format!(
+            "https://{}.example.org/",
+            "a".repeat(200)
+        )));
+    }
+    #[test]
+    fn probe_list_bounds_and_duplicates_are_enforced() {
+        let with = |urls: &[&str]| Config {
+            probe_urls: urls.iter().map(|u| (*u).to_owned()).collect(),
+            ..Default::default()
+        };
+        assert!(with(&["https://example.org/"]).valid());
+        assert!(!with(&[]).valid());
+        assert!(!with(&["https://a.example.org/", "HTTPS://A.EXAMPLE.ORG/"]).valid());
+        assert!(
+            with(&[
+                "https://a.example.org/",
+                "https://b.example.org/",
+                "https://c.example.org/",
+                "https://d.example.org/"
+            ])
+            .valid()
+        );
+        assert!(
+            !with(&[
+                "https://a.example.org/",
+                "https://b.example.org/",
+                "https://c.example.org/",
+                "https://d.example.org/",
+                "https://e.example.org/"
+            ])
+            .valid()
+        );
+        // A saved file from before probe_urls existed gets the default list.
+        let old: Config =
+            serde_json::from_str(r#"{"enabled":true,"interval_seconds":60}"#).unwrap();
+        assert!(old.valid());
+        assert_eq!(old.probe_urls, Config::default().probe_urls);
+        assert!(serde_json::from_str::<Config>(r#"{"probe_hosts":[]}"#).is_err());
+    }
+    #[tokio::test]
+    async fn any_single_answer_means_online_and_ends_the_check_early() {
+        let urls: Vec<String> = ["cn-a", "cn-b", "global"].map(String::from).to_vec();
+        // Only the global address answers.
+        let only_global = |url: String| async move { url == "global" };
+        assert!(any_reachable(&urls, only_global).await);
+        // Nothing answers.
+        assert!(!any_reachable(&urls, |_| async { false }).await);
+        assert!(!any_reachable(&[], |_| async { true }).await);
+        // A hung probe does not delay an answer from another one.
+        let started = std::time::Instant::now();
+        let hung_first = |url: String| async move {
+            if url == "cn-a" {
+                std::future::pending::<bool>().await
+            } else {
+                url == "global"
+            }
+        };
+        assert!(any_reachable(&urls, hung_first).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
     #[test]
     fn fresh_radio_state_and_read_actions_are_not_network_intent() {
         let now = activity::now();

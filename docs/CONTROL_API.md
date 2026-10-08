@@ -416,18 +416,27 @@ open. Recovery is disabled by default and never runs an unrestricted command.
 - `POST /network/recovery`: saves `enabled` (default false), `interval_seconds`
   (30/60/120, default 60), `failure_threshold` (3–10, default 3),
   `cooldown_seconds` (180–3600, default 300), `max_redials` (1–5, default 3), and
-  `reboot_after_failures` (default false). Unknown properties are rejected.
+  `reboot_after_failures` (default false), and `probe_urls` (1–4 HTTPS URLs, default
+  `https://www.baidu.com/`, `https://www.qq.com/`, `https://cp.cloudflare.com/generate_204`).
+  A probe URL must use port 443 (or none), carry no credentials, query or fragment, and
+  name a public host: loopback, private, link-local and carrier-grade-NAT addresses and
+  `localhost`/`.local`/`.lan`/`.internal`/`.home.arpa` names are refused, and duplicates
+  are rejected. A saved configuration from before 0.10.72 gets the default list. Unknown
+  properties are rejected. `probe_hosts` in the status is read-only and lists the hosts.
 - `POST /network/recovery/resume` with `{}` explicitly releases a manual pause
   and starts a new redial round after a grace period. Hourly/reboot limits remain.
 - `POST /network/recovery/check` with `{}` performs one read-only connectivity
   check and returns `online` and `checked_at`. It does not increment failure
   counters, enable recovery or perform recovery actions; limited to once per 10s.
 
-Detection uses bounded HTTPS HEAD requests to two fixed, independent hosts
-(`www.baidu.com`, `www.qq.com`), with normal certificate validation, no proxy and
-no redirect following. Any authenticated HTTPS response proves reachability (including HTTP errors,
-which must not be mistaken for a broken cellular connection).
-Both failing for the configured number of rounds triggers a bearer reconnect;
+Detection sends bounded HTTPS HEAD requests to every configured `probe_urls` entry at
+once, with normal certificate validation, no proxy and no redirect following. The first
+authenticated HTTPS response, including an HTTP error, proves reachability and ends the
+round; errors must not be mistaken for a broken cellular connection. The default list
+pairs two sites that answer in mainland China with a Cloudflare address that answers
+almost everywhere, so an overseas SIM, roaming or a VPN is not read as an outage when
+the Chinese sites are unreachable. Every probe failing for the configured number of
+rounds triggers a bearer reconnect;
 optional reboot follows exhausted redials. DNS/TLS/remote-host failures can affect
 this check; it measures reachability, not bandwidth. It does not change bands,
 cell locks, APNs or network mode. A submitted action is recorded as such; only a
