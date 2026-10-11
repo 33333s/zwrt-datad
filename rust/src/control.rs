@@ -42,6 +42,8 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_dual_band",
     "wifi.set_module",
     "wifi.set_chip",
+    "wifi.radio.set",
+    "wifi.guest.set",
     "wifi.configure",
     "wireless.config",
     "wifi.txpower.apply",
@@ -276,29 +278,24 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
         "cell.unlock_all" => unlock_all().await,
         "sim.set_slot" => sim_slot(params).await,
         "wifi.set_dual_band" => wifi_dual_band(params).await,
-        "wifi.set_module" => {
-            mapped_call(
-                params,
-                "zwrt_wlan",
-                "set",
-                &[("enabled", "SwitchOption", true, true)],
-                false,
-            )
-            .await
-        }
-        "wifi.set_chip" => {
-            mapped_call(
-                params,
-                "zwrt_wlan",
-                "set",
-                &[
-                    ("chip", "ChipEnum", true, false),
-                    ("guest_enabled", "GuestEnable", false, true),
-                ],
-                false,
-            )
-            .await
-        }
+        "wifi.set_module" => match boolean(params, "enabled") {
+            Ok(enabled) => wifi_outcome(crate::wifi_control::set_module(enabled).await),
+            Err(e) => Outcome::Invalid(e),
+        },
+        // The legacy ChipEnum/GuestEnable fields are rejected or ignored by
+        // every supported firmware; fail loudly instead of pretending.
+        "wifi.set_chip" => Outcome::Invalid(
+            "wifi.set_chip is not supported by this firmware; use wifi.radio.set or wifi.guest.set"
+                .into(),
+        ),
+        "wifi.radio.set" => match (string(params, "band", true), boolean(params, "enabled")) {
+            (Ok(Some(band)), Ok(enabled)) => {
+                wifi_outcome(crate::wifi_control::set_radio(&band, enabled).await)
+            }
+            (Err(e), _) | (_, Err(e)) => Outcome::Invalid(e),
+            (Ok(None), _) => Outcome::Invalid("missing parameter: band".into()),
+        },
+        "wifi.guest.set" => wifi_guest_set(params).await,
         "wifi.configure" => wifi_configure(params).await,
         "wifi.txpower.apply" => wifi_power(params, "apply").await,
         "wifi.txpower.set_percent" => wifi_power(params, "percent").await,
@@ -1211,6 +1208,69 @@ async fn nat_detect(params: &Value) -> Outcome {
         Ok(result) => Outcome::Ok(result),
         Err(code) => Outcome::Coded(code),
     }
+}
+
+/// Wi-Fi switch results: an "invalid:" prefix marks a bad request.
+fn wifi_outcome(result: Result<Value, String>) -> Outcome {
+    match result {
+        Ok(value) => Outcome::Ok(value),
+        Err(error) => match error.strip_prefix("invalid:") {
+            Some(message) => Outcome::Invalid(message.into()),
+            None => Outcome::Failed(error),
+        },
+    }
+}
+
+async fn wifi_guest_set(params: &Value) -> Outcome {
+    let fields = object(params);
+    let mut update = crate::wifi_control::GuestUpdate::default();
+    if fields.contains_key("enabled") {
+        match boolean(params, "enabled") {
+            Ok(on) => update.all = Some(on),
+            Err(e) => return Outcome::Invalid(e),
+        }
+    }
+    if let Some(bands) = fields.get("bands") {
+        let Some(bands) = bands.as_object().filter(|bands| !bands.is_empty()) else {
+            return Outcome::Invalid("bands must be an object like {\"2g\":true}".into());
+        };
+        for (band, value) in bands {
+            let on = match value {
+                Value::Bool(on) => *on,
+                Value::Number(n) if n.as_i64() == Some(0) => false,
+                Value::Number(n) if n.as_i64() == Some(1) => true,
+                _ => return Outcome::Invalid(format!("bands.{band} must be boolean or 0/1")),
+            };
+            if !crate::wifi::BANDS.contains(&band.as_str()) {
+                return Outcome::Invalid(format!("unknown band {band}"));
+            }
+            update.bands.push((band.clone(), on));
+        }
+    }
+    match integer(params, "active_time", false) {
+        Ok(Some(minutes)) if crate::wifi_control::GUEST_ACTIVE_TIMES.contains(&minutes) => {
+            update.active_time = Some(minutes)
+        }
+        Ok(Some(_)) => {
+            return Outcome::Invalid("active_time must be 0, 120, 240, 480 or 720 minutes".into());
+        }
+        Ok(None) => {}
+        Err(e) => return Outcome::Invalid(e),
+    }
+    if fields.contains_key("management_access") {
+        match boolean(params, "management_access") {
+            Ok(allow) => update.management_access = Some(allow),
+            Err(e) => return Outcome::Invalid(e),
+        }
+    }
+    if update.all.is_none()
+        && update.bands.is_empty()
+        && update.active_time.is_none()
+        && update.management_access.is_none()
+    {
+        return Outcome::Invalid("no guest fields supplied".into());
+    }
+    wifi_outcome(crate::wifi_control::set_guest(update).await)
 }
 
 /// Upper bound for each MAC filter list accepted from a client.

@@ -344,6 +344,8 @@ fn needs_confirmation(action: &str) -> bool {
             | "wifi.set_dual_band"
             | "wifi.set_module"
             | "wifi.set_chip"
+            | "wifi.radio.set"
+            | "wifi.guest.set"
             | "wifi.configure"
             | "wireless.config"
             | "wifi.txpower.apply"
@@ -842,7 +844,7 @@ pub(crate) async fn run(
                 Some(Ok(Message::Text(raw))) if control_mode => {
                     let Some(request) = parse_control(&raw) else { return; };
                     if used_ids.len() >= MAX_CONTROLS_PER_SESSION || !used_ids.insert(request.request_id.clone()) { return; }
-                    let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config");
+                    let refresh_wifi = matches!(request.action.as_str(), "wifi.configure" | "wifi.set_dual_band" | "wireless.config" | "wifi.set_module" | "wifi.radio.set" | "wifi.guest.set");
                     let refresh_apn = request.action.starts_with("apn.");
                     let refresh_cooling = request.action.starts_with("cooling.");
                     let refresh_tasks = request.action.starts_with("schedule.task.");

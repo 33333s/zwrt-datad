@@ -3,6 +3,6 @@
   "datad": {
     "version": "0.10.74",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增 NAT 类型检测：nat.detect 用 STUN（RFC 5780）检测运营商侧 NAT 类型（全锥形/受限锥形/端口受限锥形/对称，即 NAT1–NAT4），通过抓包在设备防火墙之前观察回包，不改防火墙；同时给出经过设备防火墙后的实际类型（device）；nat.status 读取上一次结果"
+    "notes": "新增 NAT 类型检测：nat.detect 用 STUN（RFC 5780）检测运营商侧 NAT 类型（全锥形/受限锥形/端口受限锥形/对称，即 NAT1–NAT4），通过抓包在设备防火墙之前观察回包，不改防火墙，同时给出经过设备防火墙后的实际类型；nat.status 读取上一次结果。Wi-Fi 开关分层：新增 wifi.state 分别返回 Wi-Fi 模块、各频段射频、主 AP、访客 AP 的开关和实际状态；修复 Wi-Fi 总开关 wifi.set_module 一直被固件拒绝的问题（改用原厂 zte_mbb.wifi_onoff）；新增 wifi.radio.set 单频段射频开关；新增访客网络 wifi.guest.status / wifi.guest.set（开关、访问时限、剩余时间、管理页访问、在线人数，只改传入字段，读不到的数据返回 null）；wifi.set_chip 在现有固件上无效，改为明确返回不支持"
   }
 }
