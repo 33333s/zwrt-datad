@@ -199,6 +199,49 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert request('client.block', dict(mac='00:11:22:33:44:66'))[0] == 200
         assert not any('6g' in json.dumps(args) for args in writes()[before:])
         assert not any('router_set_wifi_isolate' in args for args in writes())
+
+        # MAC filter: a whitelist set in the stock UI must survive block/unblock.
+        setup()
+        sections = ('main_2g', 'main_5g', 'guest_2g', 'guest_5g')
+        status = request('wifi.acl.status')[1]['result']
+        assert status['mode'] == 'disable' and status['allow'] == [] and status['consistent'], status
+        assert request('wifi.acl.set', dict(mode='allow', allow=[]))[0] == 400
+        assert request('wifi.acl.set', dict(mode='allow'))[0] == 400
+        assert request('wifi.acl.set', dict(mode='block', allow=['00:11:22:33:44:55']))[0] == 400
+        assert request('wifi.acl.set', dict(mode='allow', allow=['not-a-mac']))[0] == 400
+        assert request('wifi.acl.set', dict(mode='allow', allow='00:11:22:33:44:55'))[0] == 400
+        too_many = [f'02:00:00:00:00:{i:02x}' for i in range(65)]
+        assert request('wifi.acl.set', dict(mode='allow', allow=too_many))[0] == 400
+        before = len(writes())
+        code, body = request('wifi.acl.set', dict(mode='allow', allow=['AA:BB:CC:DD:EE:01', 'aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02']))
+        assert code == 200 and body['result']['changed'] and body['result']['verified'], body
+        assert body['result']['allow'] == ['aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'], body
+        new = [json.dumps(args) for args in writes()[before:]]
+        for section in sections:
+            assert any(f'wireless.{section}.macfilter=allow' in item for item in new), (section, new)
+            assert any(f'wireless.{section}.allowmaclist=aa:bb:cc:dd:ee:02' in item for item in new), (section, new)
+        assert any('"reload"' in item for item in new), new
+        status = request('wifi.acl.status')[1]['result']
+        assert status == dict(mode='allow', allow=['aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'], deny=[],
+                              consistent=True, max_entries=64), status
+        before = len(writes())
+        assert request('wifi.acl.set', dict(mode='allow', allow=['aa:bb:cc:dd:ee:02', 'aa:bb:cc:dd:ee:01']))[1]['result']['changed']
+        assert request('wifi.acl.set', dict(mode='allow'))[1]['result']['changed'] is False
+        before = len(writes())
+        for action in ('client.block', 'client.unblock'):
+            code, body = request(action, dict(mac='00:11:22:33:44:77'))
+            assert code == 409 and body['error']['code'] == 'wifi_acl_allow_mode', body
+        assert len(writes()) == before
+        assert request('wifi.acl.status')[1]['result']['mode'] == 'allow'
+        # Switching back keeps the stored allow list; blocking then works again.
+        code, body = request('wifi.acl.set', dict(mode='deny'))
+        assert code == 200 and body['result']['allow'] == ['aa:bb:cc:dd:ee:02', 'aa:bb:cc:dd:ee:01'], body
+        assert request('client.block', dict(mac='00:11:22:33:44:77'))[0] == 200
+        status = request('wifi.acl.status')[1]['result']
+        assert status['mode'] == 'deny' and status['deny'] == ['00:11:22:33:44:77'], status
+        code, body = request('wifi.acl.set', dict(mode='disable', deny=[]))
+        assert code == 200 and body['result']['deny'] == [], body
+        assert 'wireless.main_2g.denymaclist' not in json.loads(fixture.read_text())['config']
         print('Wi-Fi status fields, steering mapping, no-op, validation, auth, failure/readback and credential redaction PASS')
     finally:
         proc.terminate()

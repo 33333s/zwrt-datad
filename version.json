@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.72",
+    "version": "0.10.73",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增带认证的局域网 App 管理接口（NMS 配置、短信转发、定时任务、LAN/MTU、流量历史、OTA、执行记录）和默认关闭的网络自动恢复；网络恢复的探测地址可配置（1–4 个 HTTPS 地址），默认加入全球可达的 Cloudflare 地址，任意一个有应答就算在线，境外 SIM、漫游或 VPN 下不再因国内站点不可达而误判断网；执行记录分为 关闭/简要/标准/详细 四档，默认标准：只有详细档每条立即写盘，其他档每 5 分钟统一写一次（正常停止、重启前也会补写），可通过 POST /activity/level 切换"
+    "notes": "Wi-Fi 黑白名单：新增 wifi.acl.status / wifi.acl.set，可查询和管理白名单（allow）、黑名单（deny）和关闭过滤；修复白名单模式下拉黑或解除拉黑会把白名单悄悄改回黑名单的问题（现在返回 409 wifi_acl_allow_mode）；TopFlow 额外 SSID 同步主 AP 的黑白名单；/state 的 clients.list 无线设备新增 band（2g/5g/6g）和 guest，clients 新增 acl_mode 和 allowed，blocked 只在黑名单模式下列出"
   }
 }

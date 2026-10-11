@@ -166,7 +166,7 @@ case "$service:$method" in
         printf '%s\n' '{"access_total_num":2,"wireless_num":1,"lan_num":1}'
         ;;
     zwrt_router.api:router_wireless_access_list)
-        printf '%s\n' '{"wireless_access_list_info":[{"hostname":"wifi-live","ip_address":"192.168.0.2","mac_address":"00:11:22:33:44:55"}]}'
+        printf '%s\n' '{"wireless_access_list_info":[{"hostname":"wifi-live","ip_address":"192.168.0.2","mac_address":"00:11:22:33:44:55","interface_type":"5G"}]}'
         ;;
     zwrt_router.api:router_lan_access_list)
         printf '%s\n' '{"lan_access_list_info":[{"hostname":"lan-live","ip_address":"192.168.0.3","mac_address":"00:11:22:33:44:66"}]}'

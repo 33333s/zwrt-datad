@@ -117,7 +117,7 @@ SMTP AUTH PLAIN supports a server's 334 challenge after the initial response. Au
 
 0.10.22 起，面板按需附带 `uci_device_info` 中的 ICCID/IMEI/IMSI/MSISDN/MAC/MSN，以及 `interfaces` 中最多四个有效 WAN IPv4/IPv6 地址。设备端先逐字段筛选，NMS 再做第二层筛选；原始 UCI、蜂窝接口配置、DNS 与其他字段不随面板流发送，也不进入常规 MQTT 遥测。
 
-`clients` 状态包含在线设备列表和经过 MAC 格式校验、去重并限制为 128 条的 `blocked` 黑名单，用于 NMS 托管的原版接入设备弹窗；不会把 Wi-Fi 密钥或原厂管理凭据放入该状态块。
+`clients` 状态包含在线设备列表（无线设备含 `band/guest`）、过滤模式 `acl_mode`，以及经过 MAC 格式校验、去重并限制为 128 条的 `blocked` 黑名单和 `allowed` 白名单（各自只在对应模式下有内容），用于 NMS 托管的原版接入设备弹窗；不会把 Wi-Fi 密钥或原厂管理凭据放入该状态块。白名单模式下远程 `client.block/unblock` 返回 `wifi_acl_allow_mode`；远程 `wifi.acl.set` 与其他写操作一样需要确认。
 
 远程面板会话开启后按需读取 `wifi_config`：仅包含双频合一状态、各频段（2.4/5 GHz，有 6 GHz 的机型含 6 GHz）SSID、加密模式、隐藏/PMF/最大接入、国家、信道与设备允许的选项；不读取或传输已保存的 Wi-Fi 密钥。改动 Wi-Fi 后重新读取这些字段。`wireless.config` 作为 v2 受确认的频段配置动作，仍由 datad 验证国家和信道并执行读回；普通 MQTT 遥测不含该配置。
 
