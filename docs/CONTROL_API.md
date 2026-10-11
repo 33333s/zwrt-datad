@@ -91,6 +91,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `client.access` | 无，返回访问策略和设备列表 |
 | `client.block` | `mac` |
 | `client.unblock` | `mac` |
+| `wifi.acl.status` | 无，返回 Wi-Fi MAC 过滤模式和黑白名单 |
+| `wifi.acl.set` | `mode`=`allow`/`deny`/`disable`，可选 `allow`、`deny`（MAC 数组） |
 | `client.kick` | `macs`，逗号分隔 |
 | `client.rename` | `mac`, `hostname` |
 
@@ -112,6 +114,31 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 存在 `main_6g`）时还可取 `main_6g/guest_6g`，没有 6 GHz 的机型对这两个段返回 400，不会凭空创建。
 6 GHz 强制 WPA3，`encryption` 只接受 `sae`。`client.block/unblock` 的黑名单同样写入 6 GHz 的主/访客
 段（仅当它们存在）。
+
+### Wi-Fi 黑白名单
+
+原厂把过滤模式写在每个 SSID 段的 `macfilter`（`allow` 白名单、`deny` 黑名单、`disable`
+或未设置为不过滤），名单分别存在 `allowmaclist` 和 `denymaclist`；`zwrt_wlan.reload`
+按当前模式把对应名单同步成驱动实际使用的 `maclist`，并断开新策略不允许的设备。两份名单
+互相独立，切换模式不会丢失另一份。
+
+`wifi.acl.status` 返回 `mode/allow/deny/consistent/max_entries`。模式和名单取自 `main_2g`
+（原厂以它为整机策略）；`consistent=false` 表示其他 SSID 段与它不一致（例如手工改过 UCI）。
+MAC 统一为小写并去重。
+
+`wifi.acl.set` 把模式和名单写到所有主/访客 SSID 段（有 6 GHz 的机型含 6 GHz 段），与原厂
+页面行为一致。省略 `allow` 或 `deny` 时保留现有名单，传空数组表示清空。每份名单最多 64 条，
+MAC 格式非法、重复项会被拒绝或合并。`mode=allow` 时白名单不能为空，否则所有设备都会被断开；
+调用方应确认当前操作设备的 MAC 已在白名单内，否则保存后会被立即断开。配置与现有完全相同
+时返回 `changed=false` 且不重载 Wi-Fi；否则提交后重载一次并读回核对，`verified=true`。
+
+`client.block/unblock` 只维护黑名单。白名单模式下调用它们会返回 HTTP 409，错误码
+`wifi_acl_allow_mode`，不会改动任何配置；旧版本会把模式强制改成 `deny`，悄悄关闭白名单。
+黑名单为空或未开启过滤时，`client.block` 会开启黑名单模式。
+
+TopFlow 的额外 SSID 由 datad 自己的 hostapd 承载，原厂脚本不会刷新它们的过滤列表。datad
+按同频段主 AP 的模式和名单给额外 SSID 生成独立的 `macaddr_acl` 与名单文件；名单或模式
+变化（包括在原厂页面修改）后，下一次巡检（约 5 秒）会重启该额外 AP 以应用新名单。
 
 `wifi.configure` 检查原厂 reload 的业务结果和提交后的字段读回；原厂拒绝或
 读回不一致返回错误。`verified=true` 只表示配置已核对，不表示 AP 广播已恢复；

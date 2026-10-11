@@ -211,12 +211,22 @@ fn wlan_bands(sets: &[BTreeMap<String, String>]) -> Vec<Value> {
         })
         .collect()
 }
-fn blocked_client_macs(sets: &[BTreeMap<String, String>]) -> Vec<String> {
+/// Wi-Fi MAC filter mode; the firmware treats `main_2g` as the device policy.
+fn client_acl_mode(sets: &[BTreeMap<String, String>]) -> &'static str {
+    match uci_get(sets, "wireless.main_2g.macfilter") {
+        "allow" => "allow",
+        "deny" => "deny",
+        _ => "disable",
+    }
+}
+/// MAC addresses in one filter list option (`denymaclist`/`allowmaclist`)
+/// across every SSID section.
+fn client_filter_macs(sets: &[BTreeMap<String, String>], option: &str) -> Vec<String> {
     let mut blocked = BTreeSet::new();
     'sections: for section in [
         "main_2g", "main_5g", "guest_2g", "guest_5g", "main_6g", "guest_6g",
     ] {
-        let path = format!("wireless.{section}.denymaclist");
+        let path = format!("wireless.{section}.{option}");
         for entry in uci_get(sets, &path).split_whitespace() {
             let mac = entry.trim_matches('\'').to_ascii_lowercase();
             if mac.len() == 17
@@ -1075,12 +1085,30 @@ fn client_array(value: &Value, key: &str) -> Option<Vec<Value>> {
                     .or_else(|| lease.map(|value| value.1.clone()))
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| mac.clone());
-                Some(json!({"name":name,"ip":ip,"mac":mac}))
+                let mut client = json!({"name":name,"ip":ip,"mac":mac});
+                if let Some((band, guest)) = client_wifi_band(&string(entry, "interface_type")) {
+                    client["band"] = json!(band);
+                    client["guest"] = json!(guest);
+                }
+                Some(client)
             })
             .collect()
     })
 }
 
+/// Band and guest flag from the firmware's `interface_type` (`2.4G`, `5G`,
+/// `6G`, optionally with `_guest`). Wired types such as `Agent_Ethernet` and
+/// unknown values give no band rather than a guess.
+fn client_wifi_band(kind: &str) -> Option<(&'static str, bool)> {
+    let (band, rest) = [("2.4G", "2g"), ("5G", "5g"), ("6G", "6g")]
+        .into_iter()
+        .find_map(|(prefix, band)| kind.strip_prefix(prefix).map(|rest| (band, rest)))?;
+    match rest {
+        "" => Some((band, false)),
+        "_guest" => Some((band, true)),
+        _ => None,
+    }
+}
 fn connected_clients(lan: &Value, wifi: &Value) -> (Value, i64, i64) {
     let wifi = client_array(wifi, "wireless_access_list_info").unwrap_or_default();
     let lan = client_array(lan, "lan_access_list_info").unwrap_or_default();
@@ -1671,10 +1699,21 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert("net".into(), Value::Object(net));
     fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
     let (client_list, wifi_count, lan_count) = connected_clients(&lan_clients, &wifi_clients);
-    let blocked = blocked_client_macs(&uci_sets);
+    // Each list only applies while its mode is selected; the other one is kept
+    // in the configuration but filters nothing.
+    let acl_mode = client_acl_mode(&uci_sets);
+    let filtered = |mode: &str, option: &str| {
+        if acl_mode == mode {
+            client_filter_macs(&uci_sets, option)
+        } else {
+            Vec::new()
+        }
+    };
+    let blocked = filtered("deny", "denymaclist");
+    let allowed = filtered("allow", "allowmaclist");
     fields.insert(
         "clients".into(),
-        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list,"blocked":blocked}),
+        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list,"blocked":blocked,"acl_mode":acl_mode,"allowed":allowed}),
     );
     // No battery fitted (CPEs, and models whose template says so): the vendor
     // service still answers with a placeholder (`battery_online` 0, capacity 0),
@@ -2278,7 +2317,10 @@ mod tests {
             "wireless.guest_6g.denymaclist".to_owned(),
             "'AA:BB:CC:DD:EE:01'".to_owned(),
         )]);
-        assert_eq!(blocked_client_macs(&[wireless]), vec!["aa:bb:cc:dd:ee:01"]);
+        assert_eq!(
+            client_filter_macs(&[wireless], "denymaclist"),
+            vec!["aa:bb:cc:dd:ee:01"]
+        );
     }
     #[test]
     fn blocked_client_macs_are_bounded_and_validated() {
@@ -2293,7 +2335,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            blocked_client_macs(&[wireless]),
+            client_filter_macs(&[wireless], "denymaclist"),
             vec!["11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"]
         );
     }
@@ -2364,6 +2406,51 @@ mod tests {
         assert_eq!(lan, 0);
         assert_eq!(items.as_array().unwrap().len(), 1);
         assert_eq!(items[0]["mac"], "aa:bb:cc:dd:ee:ff");
+        assert!(items[0].get("band").is_none());
+    }
+    #[test]
+    fn connected_clients_report_the_wifi_band() {
+        let (items, _, _) = connected_clients(
+            &json!({"lan_access_list_info":[{"mac_address":"AA:BB:CC:DD:EE:01","interface_type":"Agent_Ethernet"}]}),
+            &json!({"wireless_access_list_info":[
+                {"mac_address":"AA:BB:CC:DD:EE:02","interface_type":"2.4G"},
+                {"mac_address":"AA:BB:CC:DD:EE:03","interface_type":"5G_guest"},
+                {"mac_address":"AA:BB:CC:DD:EE:04","interface_type":"6G"},
+                {"mac_address":"AA:BB:CC:DD:EE:05","interface_type":"5GX"}
+            ]}),
+        );
+        let bands: Vec<_> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| (item.get("band").cloned(), item.get("guest").cloned()))
+            .collect();
+        assert_eq!(
+            bands,
+            vec![
+                (Some(json!("2g")), Some(json!(false))),
+                (Some(json!("5g")), Some(json!(true))),
+                (Some(json!("6g")), Some(json!(false))),
+                (None, None),
+                (None, None),
+            ]
+        );
+    }
+    #[test]
+    fn client_acl_mode_defaults_to_no_filtering() {
+        let allow = BTreeMap::from([
+            ("wireless.main_2g.macfilter".to_owned(), "allow".to_owned()),
+            (
+                "wireless.main_2g.allowmaclist".to_owned(),
+                "'AA:BB:CC:DD:EE:01' 'aa:bb:cc:dd:ee:01'".to_owned(),
+            ),
+        ]);
+        assert_eq!(client_acl_mode(std::slice::from_ref(&allow)), "allow");
+        assert_eq!(
+            client_filter_macs(&[allow], "allowmaclist"),
+            vec!["aa:bb:cc:dd:ee:01"]
+        );
+        assert_eq!(client_acl_mode(&[BTreeMap::new()]), "disable");
     }
     #[test]
     fn topflow_uses_current_sim_slot_as_subid() {

@@ -46,6 +46,13 @@ if args[:1] in (['add_list'], ['del_list']):
     data['config'][key] = ' '.join(items)
     save()
     sys.exit(0)
+if args[:1] == ['delete']:
+    log()
+    if args[1] not in data['config']:
+        sys.exit(1)
+    del data['config'][args[1]]
+    save()
+    sys.exit(0)
 if args[:1] in (['commit'], ['revert']):
     log()
     sys.exit(0)

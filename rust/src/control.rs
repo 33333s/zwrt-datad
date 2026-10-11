@@ -74,6 +74,7 @@ pub const ACTIONS: &[&str] = &[
     "client.rename",
     "client.block",
     "client.unblock",
+    "wifi.acl.set",
     "multiwan.status",
     "multiwan.interface.set",
     "multiwan.member.set",
@@ -500,6 +501,7 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
         "client.rename" => client_rename(params).await,
         "client.block" => client_access(params, true).await,
         "client.unblock" => client_access(params, false).await,
+        "wifi.acl.set" => wifi_acl_set(params).await,
         "multiwan.status" => {
             if !crate::apn_targets::multi_modem() {
                 return Outcome::Invalid("multiwan.status is only available on MU5252".into());
@@ -1145,10 +1147,22 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         Ok(_) => return Outcome::Invalid("invalid mac address".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    for section in wifi_sections().await {
+    let sections = wifi_sections().await;
+    let mut modes = Vec::new();
+    for section in &sections {
+        modes.push(state::uci_read(&format!("wireless.{section}.macfilter")).await);
+    }
+    // Writing the blacklist mode over a whitelist would silently admit every
+    // device that is not blacklisted; the allow list is managed by wifi.acl.set.
+    if modes.iter().any(|mode| mode == "allow") {
+        return Outcome::Coded("wifi_acl_allow_mode");
+    }
+    for (section, mode) in sections.into_iter().zip(modes) {
         let filter = format!("wireless.{section}.macfilter");
         let list = format!("wireless.{section}.denymaclist");
-        if let Err(e) = state::uci_write("set", &filter, Some("deny")).await {
+        if mode != "deny"
+            && let Err(e) = state::uci_write("set", &filter, Some("deny")).await
+        {
             return revert_wireless(e).await;
         }
         let _ = state::uci_write("del_list", &list, Some(&mac)).await;
@@ -1166,6 +1180,175 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         let _ = state::ubus("zwrt_wlan", "kick_macs", json!({"macs":mac})).await;
     }
     Outcome::Ok(json!({"mac":mac,"blocked":block}))
+}
+
+/// Upper bound for each MAC filter list accepted from a client.
+const ACL_MAX_ENTRIES: usize = 64;
+
+/// MAC addresses in a UCI list value, lowercased and deduplicated in order.
+/// The firmware stores lists with mixed case and sometimes repeats entries.
+fn mac_list(raw: &str) -> Vec<String> {
+    let mut macs: Vec<String> = Vec::new();
+    for item in raw.split_whitespace() {
+        let mac = item.trim_matches('\'').to_ascii_lowercase();
+        if valid_mac(&mac) && !macs.contains(&mac) {
+            macs.push(mac);
+        }
+    }
+    macs
+}
+
+fn mac_param(params: &Value, name: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = object(params).get(name) else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{name} must be an array of MAC addresses"))?;
+    if items.len() > ACL_MAX_ENTRIES {
+        return Err(format!("{name} holds at most {ACL_MAX_ENTRIES} entries"));
+    }
+    let mut macs: Vec<String> = Vec::new();
+    for item in items {
+        let mac = item
+            .as_str()
+            .filter(|mac| valid_mac(mac))
+            .ok_or_else(|| format!("{name} contains an invalid MAC address"))?
+            .to_ascii_lowercase();
+        if !macs.contains(&mac) {
+            macs.push(mac);
+        }
+    }
+    Ok(Some(macs))
+}
+
+/// The stock firmware treats an unset filter as no filtering.
+fn acl_mode(raw: &str) -> &'static str {
+    match raw {
+        "allow" => "allow",
+        "deny" => "deny",
+        _ => "disable",
+    }
+}
+
+struct AclSection {
+    section: &'static str,
+    mode: String,
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+async fn acl_sections() -> Vec<AclSection> {
+    let mut output = Vec::new();
+    for section in wifi_sections().await {
+        let read = |option: &'static str| async move {
+            state::uci_read(&format!("wireless.{section}.{option}")).await
+        };
+        output.push(AclSection {
+            section,
+            mode: read("macfilter").await,
+            allow: mac_list(&read("allowmaclist").await),
+            deny: mac_list(&read("denymaclist").await),
+        });
+    }
+    output
+}
+
+/// Wi-Fi MAC filter of the primary 2.4 GHz AP, which the firmware treats as
+/// the device-wide policy. `consistent` is false when another SSID differs.
+pub async fn wifi_acl_status() -> Value {
+    let sections = acl_sections().await;
+    let Some(first) = sections.first() else {
+        return json!({"mode":"disable","allow":[],"deny":[],"consistent":true,"max_entries":ACL_MAX_ENTRIES});
+    };
+    let consistent = sections.iter().all(|item| {
+        acl_mode(&item.mode) == acl_mode(&first.mode)
+            && item.allow == first.allow
+            && item.deny == first.deny
+    });
+    json!({
+        "mode":acl_mode(&first.mode),
+        "allow":first.allow,
+        "deny":first.deny,
+        "consistent":consistent,
+        "max_entries":ACL_MAX_ENTRIES,
+    })
+}
+
+/// Sets the MAC filter mode, and optionally replaces the allow and deny lists,
+/// on every main and guest SSID, the same way the stock web UI does. The
+/// firmware reload derives the active `maclist` and disconnects stations the
+/// new policy rejects.
+async fn wifi_acl_set(params: &Value) -> Outcome {
+    let mode = match string(params, "mode", true) {
+        Ok(Some(mode)) if matches!(mode.as_str(), "allow" | "deny" | "disable") => mode,
+        Ok(_) => return Outcome::Invalid("mode must be allow, deny or disable".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let (allow, deny) = match (mac_param(params, "allow"), mac_param(params, "deny")) {
+        (Ok(allow), Ok(deny)) => (allow, deny),
+        (Err(e), _) | (_, Err(e)) => return Outcome::Invalid(e),
+    };
+    let sections = acl_sections().await;
+    let Some(first) = sections.first() else {
+        return Outcome::Failed("no Wi-Fi sections found".into());
+    };
+    let allow = allow.unwrap_or_else(|| first.allow.clone());
+    let deny = deny.unwrap_or_else(|| first.deny.clone());
+    if mode == "allow" && allow.is_empty() {
+        // An empty whitelist would disconnect every Wi-Fi device.
+        return Outcome::Invalid("allow mode needs at least one MAC address".into());
+    }
+    let mut changed = false;
+    for item in &sections {
+        let section = item.section;
+        if item.mode != mode {
+            let path = format!("wireless.{section}.macfilter");
+            if let Err(e) = state::uci_write("set", &path, Some(&mode)).await {
+                return revert_wireless(e).await;
+            }
+            changed = true;
+        }
+        for (option, current, wanted) in [
+            ("allowmaclist", &item.allow, &allow),
+            ("denymaclist", &item.deny, &deny),
+        ] {
+            if current == wanted {
+                continue;
+            }
+            let path = format!("wireless.{section}.{option}");
+            // Missing options make `uci delete` fail; that is the goal anyway.
+            let _ = state::uci_write("delete", &path, None).await;
+            for mac in wanted {
+                if let Err(e) = state::uci_write("add_list", &path, Some(mac)).await {
+                    return revert_wireless(e).await;
+                }
+            }
+            changed = true;
+        }
+    }
+    let result = |changed: bool| json!({"mode":mode,"allow":allow,"deny":deny,"changed":changed,"verified":true});
+    if !changed {
+        return Outcome::Ok(result(false));
+    }
+    if let Err(e) = state::uci_write("commit", "wireless", None).await {
+        return revert_wireless(e).await;
+    }
+    let reload = state::ubus("zwrt_wlan", "reload", json!({}))
+        .await
+        .and_then(|value| crate::wifi::check_write_response(&value));
+    if let Err(e) = reload {
+        return Outcome::Failed(format!("MAC filter committed but reload failed: {e}"));
+    }
+    for item in acl_sections().await {
+        if item.mode != mode || item.allow != allow || item.deny != deny {
+            return Outcome::Failed(format!(
+                "MAC filter readback did not confirm {}",
+                item.section
+            ));
+        }
+    }
+    Outcome::Ok(result(true))
 }
 
 fn flexible_i64(params: &Value, name: &str) -> Result<Option<i64>, String> {

@@ -387,6 +387,7 @@ fn needs_confirmation(action: &str) -> bool {
             | "client.kick"
             | "client.block"
             | "client.unblock"
+            | "wifi.acl.set"
             | "qos.clear"
             | "schedule.reboot.set"
             | "schedule.task.put"

@@ -70,6 +70,8 @@ interface=old
 ssid=old
 wpa_passphrase=must-not-survive
 wpa_key_mgmt=WPA-PSK
+macaddr_acl=0
+deny_mac_file=/data/vendor/wifi/must-not-survive.maclist
 vendor_element=kept
 EOF
 done
@@ -211,13 +213,41 @@ grep -F 'ssid=Fixture Extra' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/
 grep -F 'wpa_passphrase=fixture-extra-key' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
 grep -F 'vendor_element=kept' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
 ! grep -F 'must-not-survive' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+# client.block above selected the blacklist: the extra AP uses its own list file.
+grep -Fx 'macaddr_acl=0' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+grep -Fx "deny_mac_file=$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.maclist" "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+# A whitelist set in the stock UI must reach the extra AP as well.
+printf 'allow\n' >"$MOCK_UCI_STATE_DIR/wireless.main_5g.macfilter"
+printf "'AA:BB:CC:DD:EE:01' 'aa:bb:cc:dd:ee:02' 'aa:bb:cc:dd:ee:02'\n" >"$MOCK_UCI_STATE_DIR/wireless.main_5g.allowmaclist"
 printf 'old unbounded log\n' >"$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.log"
 post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","ssid":"Fixture Extra 2","enabled":true}}' >/dev/null
 [ ! -s "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.log" ]
 grep -F 'ssid=Fixture Extra 2' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+grep -Fx 'macaddr_acl=1' "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+grep -Fx "accept_mac_file=$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.maclist" "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.conf" >/dev/null
+[ "$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.maclist")" = "$(printf 'aa:bb:cc:dd:ee:01\naa:bb:cc:dd:ee:02')" ]
+[ "$(file_mode "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.maclist")" = 600 ]
 second_hostapd_pid=$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid")
 [ "$second_hostapd_pid" != "$first_hostapd_pid" ]
 process_gone "$first_hostapd_pid"
+kill -0 "$second_hostapd_pid"
+# A later list change in the stock UI restarts the extra AP on the next tick.
+printf "'aa:bb:cc:dd:ee:03'\n" >"$MOCK_UCI_STATE_DIR/wireless.main_5g.allowmaclist"
+attempt=0
+until [ "$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.maclist" 2>/dev/null || true)" = 'aa:bb:cc:dd:ee:03' ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 300 ] || { echo "extra AP kept the old MAC filter" >&2; exit 1; }
+    sleep 0.1
+done
+attempt=0
+until [ -s "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid" ] &&
+    [ "$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid")" != "$second_hostapd_pid" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "extra AP was not restarted" >&2; exit 1; }
+    sleep 0.1
+done
+process_gone "$second_hostapd_pid"
+second_hostapd_pid=$(cat "$ZWRT_DATAD_WIFI_RUNTIME_DIR/datad_ssid_1.pid")
 kill -0 "$second_hostapd_pid"
 post '{"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","enabled":false}}' >/dev/null
 [ ! -e "$ZWRT_DATAD_NET_CLASS_DIR/wlan4" ]
@@ -268,7 +298,7 @@ done
 curl -fsS "http://127.0.0.1:$PORT/state" | python3 -c 'import json,sys; assert "hosts_config" not in json.load(sys.stdin)'
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==88+3+3+2, d["control"]; assert {"time.status","time.config.set","time.sync","hosts.status","hosts.save","hosts.restore","device.session.login","datad.ota.set"} <= set(d["control"]); assert "sms.forward.set" in d["control"] and "sms.forward.test" in d["control"]; assert "schedule.task.put" in d["control"] and "schedule.task.remove" in d["control"]; assert "cloud.remote_features.set" in d["control"]; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "multiwan.status" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==88+3+3+2+2, d["control"]; assert {"time.status","time.config.set","time.sync","hosts.status","hosts.save","hosts.restore","device.session.login","datad.ota.set"} <= set(d["control"]); assert "sms.forward.set" in d["control"] and "sms.forward.test" in d["control"]; assert "schedule.task.put" in d["control"] and "schedule.task.remove" in d["control"]; assert "cloud.remote_features.set" in d["control"]; assert "schedule.reboot.set" in d["control"]; assert "speedtest.start" in d["control"] and "speedtest.stop" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "multiwan.status" in d["control"]; assert {"wifi.acl.status","wifi.acl.set"} <= set(d["control"]); assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
 post '{"action":"sms.forward.set","params":{"enabled":false,"method":"webhook","webhook_url":"https://example.com/hook"}}' |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["result"]["enabled"] is False and d["result"]["webhook_configured"] is True; assert "webhook_url" not in d["result"]'
 [ "$(file_mode "$TMP/data/sms-forward.json")" = 600 ]
@@ -345,7 +375,7 @@ sleep 1.2
 curl -fsS "http://127.0.0.1:$PORT/state" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["reboot_schedule"]["enabled"] is False and d["reboot_schedule"]["time"]=="02:03"'
 curl -fsS "http://127.0.0.1:$PORT/state" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["thermal"]["protection"]=={"active":True,"level":2,"speed_limited":True,"network_restricted":False,"raw":"1"}; assert d["battery"]["charge_protection"]=={"active":True,"mode":2}; assert d["net"]["HSR"] is True; assert d["net"]["high_speed_rail"]=={"active":True,"raw":"1"}; assert d["nfc"]["switch"]==1; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["roaming_allowed"]==0,d["net"]; assert d["net"]["lte_tac"]==40302,d["net"]; assert d["net"]["nr_tac"]==1234567,d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}],"blocked":[]}; assert d["dhcp"]["netmask"]=="255.255.255.0" and d["dhcp"]["disabled"] is False and d["dhcp"]["range_start"]=="192.168.0.2" and d["dhcp"]["range_end"]=="192.168.0.253"'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["thermal"]["protection"]=={"active":True,"level":2,"speed_limited":True,"network_restricted":False,"raw":"1"}; assert d["battery"]["charge_protection"]=={"active":True,"mode":2}; assert d["net"]["HSR"] is True; assert d["net"]["high_speed_rail"]=={"active":True,"raw":"1"}; assert d["nfc"]["switch"]==1; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["net"]["lte_bands"]=="1,3",d["net"]; assert d["net"]["roaming_allowed"]==0,d["net"]; assert d["net"]["lte_tac"]==40302,d["net"]; assert d["net"]["nr_tac"]==1234567,d["net"]; assert d["net"]["lte_supported_bands"]=="1,2,3,7,8,20,28,38,40,41,66",d["net"]; assert d["net"]["band_capabilities"]=={"source":"device_default_band_lock","complete":True,"lte":[1,2,3,7,8,20,28,38,40,41,66],"nr_sa":[1,3,28,41,77,78,79],"nr_nsa":[1,3,28,41,77,78,79]},d["net"]; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55","band":"5g","guest":False},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}],"blocked":[],"acl_mode":"disable","allowed":[]}; assert d["dhcp"]["netmask"]=="255.255.255.0" and d["dhcp"]["disabled"] is False and d["dhcp"]["range_start"]=="192.168.0.2" and d["dhcp"]["range_end"]=="192.168.0.253"'
 event_json=$({ curl -sN --max-time 3 "http://127.0.0.1:$PORT/events" || true; } | sed -n 's/^data: //p' | head -n 1)
 printf '%s' "$event_json" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["thermal"]["protection"]["level"]==2; assert d["battery"]["charge_protection"]["active"] is True; assert d["net"]["high_speed_rail"]["active"] is True'

@@ -41,6 +41,70 @@ struct Live {
     index: i64,
 }
 
+/// MAC filter of the band's primary AP. The extra SSID copies it into its own
+/// hostapd config: hostapd reads the list only at start, and the stock scripts
+/// refresh the filter of their own interfaces only.
+#[derive(Debug, PartialEq)]
+struct Acl {
+    mode: &'static str,
+    macs: Vec<String>,
+}
+
+impl Acl {
+    fn signature(&self) -> String {
+        format!("{}:{}", self.mode, self.macs.join(","))
+    }
+}
+
+fn parse_macs(raw: &str) -> Vec<String> {
+    let mut macs: Vec<String> = Vec::new();
+    for item in raw.split_whitespace() {
+        let mac = item.trim_matches('\'').to_ascii_lowercase();
+        let valid = mac.len() == 17
+            && mac.split(':').count() == 6
+            && mac
+                .split(':')
+                .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()));
+        if valid && !macs.contains(&mac) {
+            macs.push(mac);
+        }
+    }
+    macs
+}
+
+async fn acl_for(band: &str) -> Acl {
+    let section = format!("wireless.main_{band}");
+    let mode = match state::uci_read(&format!("{section}.macfilter"))
+        .await
+        .as_str()
+    {
+        "allow" => "allow",
+        "deny" => "deny",
+        _ => {
+            return Acl {
+                mode: "disable",
+                macs: Vec::new(),
+            };
+        }
+    };
+    let list = state::uci_read(&format!("{section}.{mode}maclist")).await;
+    Acl {
+        mode,
+        macs: parse_macs(&list),
+    }
+}
+
+fn acl_line(acl: &Acl) -> String {
+    format!("# datad_acl={}", acl.signature())
+}
+
+/// Whether the running extra AP was started with this filter.
+fn acl_applied(section: &str, acl: &Acl) -> bool {
+    let wanted = acl_line(acl);
+    fs::read_to_string(path(section, "conf"))
+        .is_ok_and(|conf| conf.lines().any(|line| line == wanted))
+}
+
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
@@ -154,7 +218,7 @@ pub async fn stop(section: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     }
-    for suffix in ["interface", "pid", "conf"] {
+    for suffix in ["interface", "pid", "conf", "maclist"] {
         match fs::remove_file(path(section, suffix)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -246,7 +310,7 @@ async fn base_for(config: &Config) -> Option<Live> {
     None
 }
 
-fn render_config(config: &Config, base: &Live) -> Result<(), String> {
+fn render_config(config: &Config, base: &Live, acl: &Acl) -> Result<(), String> {
     let root = PathBuf::from(env("ZWRT_DATAD_VENDOR_WIFI_DIR", "/data/vendor/wifi"));
     let source = fs::read_to_string(root.join(format!("hostapd-{}.conf", base.name)))
         .map_err(|e| e.to_string())?;
@@ -268,6 +332,9 @@ fn render_config(config: &Config, base: &Live) -> Result<(), String> {
                 | "ieee80211w"
                 | "ap_isolate"
                 | "ignore_broadcast_ssid"
+                | "macaddr_acl"
+                | "accept_mac_file"
+                | "deny_mac_file"
         ) || key.starts_with("wpa_")
             || key.starts_with("sae_")
             || key.starts_with("wps_")
@@ -297,17 +364,36 @@ fn render_config(config: &Config, base: &Live) -> Result<(), String> {
             output.push_str("sae_pwe=2\n");
         }
     }
+    let maclist = path(&config.section, "maclist");
+    output.push_str(&acl_line(acl));
+    output.push('\n');
+    match acl.mode {
+        "allow" => output.push_str(&format!(
+            "macaddr_acl=1\naccept_mac_file={}\n",
+            maclist.display()
+        )),
+        "deny" => output.push_str(&format!(
+            "macaddr_acl=0\ndeny_mac_file={}\n",
+            maclist.display()
+        )),
+        _ => output.push_str("macaddr_acl=0\n"),
+    }
+    let mut macs = acl.macs.join("\n");
+    if !macs.is_empty() {
+        macs.push('\n');
+    }
+    write_private(&maclist, macs.as_bytes())?;
     write_private(&path(&config.section, "conf"), output.as_bytes())
 }
 
-async fn start(config: &Config, base: &Live) -> Result<(), String> {
+async fn start(config: &Config, base: &Live, acl: &Acl) -> Result<(), String> {
     if process_owned(&config.section).is_some() || marker_matches(&config.section) {
         stop(&config.section).await?;
     }
     if net_path(ifname(&config.section)).exists() {
         return Err("reserved interface is owned by another service".into());
     }
-    render_config(config, base)?;
+    render_config(config, base, acl)?;
     command::run(
         &env("ZWRT_DATAD_IW_BIN", "/usr/sbin/iw"),
         [
@@ -368,13 +454,15 @@ pub async fn apply(config: &Config) -> Result<bool, String> {
     let Some(base) = base_for(config).await else {
         return Ok(false);
     };
+    let acl = acl_for(&config.band).await;
     if process_owned(&config.section).is_some()
         && marker_matches(&config.section)
         && ready(ifname(&config.section), true).await
+        && acl_applied(&config.section, &acl)
     {
         return Ok(true);
     }
-    start(config, &base).await?;
+    start(config, &base, &acl).await?;
     Ok(true)
 }
 
@@ -420,15 +508,19 @@ pub async fn tick() {
     }
     for (slot, section) in ["datad_ssid_1", "datad_ssid_2"].into_iter().enumerate() {
         if let Some(config) = read(section).await {
+            // The filter is part of the signature so that a change made in the
+            // stock web UI restarts the extra AP with the new list.
+            let acl = acl_for(&config.band).await;
             let signature = format!(
-                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 config.band,
                 config.ssid,
                 config.encryption,
                 config.key,
                 config.enabled,
                 config.hidden,
-                config.isolate
+                config.isolate,
+                acl.signature()
             );
             {
                 let mut states = RECONCILE.lock().await;
