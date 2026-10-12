@@ -93,7 +93,18 @@ pub async fn state() -> Value {
     for band in wifi::present_bands().await {
         let device = wifi::radio_for(band).await;
         if !device.is_empty() {
-            radios.push(json!({"band":band,"device":device,"enabled":enabled(&device).await}));
+            // `enabled` is the band switch of wifi.radio.set: the radio and the
+            // band's main SSID both on. `radio_enabled` is the radio alone.
+            let radio = enabled(&device).await;
+            let main = enabled(&format!("main_{band}")).await;
+            let band_enabled = match (radio, main) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            radios.push(
+                json!({"band":band,"device":device,"enabled":band_enabled,"radio_enabled":radio}),
+            );
         }
         for kind in ["main", "guest"] {
             if let Some(item) = ap(&format!("{kind}_{band}"), kind, band).await {
@@ -150,28 +161,205 @@ pub async fn set_module(enabled: bool) -> Result<Value, String> {
     Ok(json!({"enabled":enabled,"changed":changed,"verified":true}))
 }
 
-/// One band's radio. The firmware restarts all of Wi-Fi to apply it.
+/// Whether a radio runs on the single-chip qcacld32 firmwares (U60 Pro,
+/// MC7523, TopFlow). Their QCMAP starts a single AP only on wlan0 and every
+/// interface is created through wlan0, so one band cannot simply be switched
+/// off there: the band that stays on has to take over wlan0.
+pub async fn single_chip(device: &str) -> bool {
+    !device.is_empty() && state::uci_read(&format!("wireless.{device}.type")).await == "qcacld32"
+}
+
+/// The stock interface pair of a qcacld32 radio: wifiN uses wlan(2N) for its
+/// main SSID and wlan(2N+1) for the guest and backhaul SSIDs.
+fn default_ifnames(device: &str) -> Option<(String, String)> {
+    let index: u32 = device.strip_prefix("wifi")?.parse().ok()?;
+    (index < 3).then(|| {
+        (
+            format!("wlan{}", index * 2),
+            format!("wlan{}", index * 2 + 1),
+        )
+    })
+}
+
+async fn section_exists(section: &str) -> bool {
+    !state::uci_read(&format!("wireless.{section}"))
+        .await
+        .is_empty()
+}
+
+/// One band on or off.
+///
+/// qcacld32 firmwares: the layout TopFlow's own firmware uses. Off: the
+/// band's radio is disabled and its SSIDs park on ifname "wlanx" while the
+/// other band's main SSID takes wlan0 (guest/backhaul wlan1). On: the radio is
+/// enabled and every band gets its stock ifnames back. Writing only an SSID
+/// or radio `disabled` left the remaining AP on wlan2, QCMAP never found
+/// hostapd on wlan0 and Wi-Fi stayed down (U60 Pro, 0.10.74-0.10.76).
+///
+/// Other firmwares: through the band's SSIDs like the stock web UI (off:
+/// main and guest SSIDs; on: the main SSID, and the radio if an older release
+/// disabled it).
+///
+/// With EasyMesh on, a band is not switched off on the qcacld32 firmwares.
+///
+/// The firmware restarts all of Wi-Fi to apply either (about a minute on the
+/// qcacld32 firmwares); callers poll wifi.state.
 pub async fn set_radio(band: &str, enabled: bool) -> Result<Value, String> {
-    if !wifi::present_bands().await.contains(&band) {
+    let bands = wifi::present_bands().await;
+    if !bands.contains(&band) {
         return Err(format!("invalid:unsupported band {band}"));
     }
     let device = wifi::radio_for(band).await;
-    if device.is_empty() || self::enabled(&device).await.is_none() {
-        return Err(format!("invalid:no radio for band {band}"));
+    let main = format!("main_{band}");
+    let Some(main_enabled) = self::enabled(&main).await else {
+        return Err(format!("invalid:no SSID for band {band}"));
+    };
+    if single_chip(&device).await {
+        return set_single_chip_band(band, &device, enabled, main_enabled, &bands).await;
     }
-    let wanted = if enabled { "0" } else { "1" };
-    let path = format!("wireless.{device}.disabled");
-    // A radio is in the requested state when its `disabled` flag differs from `enabled`.
-    let changed = (state::uci_read(&path).await == "1") == enabled;
-    if changed {
-        let mut sections = Map::new();
-        sections.insert(device.clone(), json!({"disabled":wanted}));
-        wlan_set(Value::Object(sections)).await?;
-        if !confirm(|| async { (state::uci_read(&path).await == "1") != enabled }).await {
-            return Err("radio readback did not confirm the requested state".into());
+    let guest = format!("guest_{band}");
+    let mut wanted: Vec<(String, &'static str)> = Vec::new();
+    if enabled {
+        if !main_enabled {
+            wanted.push((main, "0"));
+        }
+        if !device.is_empty() && self::enabled(&device).await == Some(false) {
+            wanted.push((device.clone(), "0"));
+        }
+    } else {
+        if main_enabled {
+            wanted.push((main, "1"));
+        }
+        if self::enabled(&guest).await == Some(true) {
+            wanted.push((guest, "1"));
         }
     }
-    Ok(json!({"band":band,"device":device,"enabled":enabled,"changed":changed,"verified":true}))
+    let changed = !wanted.is_empty();
+    if changed {
+        let mut sections = Map::new();
+        for (section, value) in &wanted {
+            sections.insert(section.clone(), json!({"disabled":value}));
+        }
+        wlan_set(Value::Object(sections)).await?;
+        let confirmed = confirm(|| async {
+            for (section, value) in &wanted {
+                let disabled = state::uci_read(&format!("wireless.{section}.disabled")).await;
+                if (disabled == "1") != (*value == "1") {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+        if !confirmed {
+            return Err("Wi-Fi readback did not confirm the requested band state".into());
+        }
+    }
+    let sections: Vec<&str> = wanted.iter().map(|(section, _)| section.as_str()).collect();
+    Ok(
+        json!({"band":band,"device":device,"enabled":enabled,"changed":changed,"verified":true,"sections":sections}),
+    )
+}
+
+async fn set_single_chip_band(
+    band: &str,
+    device: &str,
+    enabled: bool,
+    main_enabled: bool,
+    bands: &[&'static str],
+) -> Result<Value, String> {
+    let mut radios = Vec::new();
+    for other in bands {
+        let radio = wifi::radio_for(other).await;
+        let Some(names) = default_ifnames(&radio) else {
+            return Err(format!("invalid:unknown radio layout for band {other}"));
+        };
+        radios.push((*other, radio, names));
+    }
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    if enabled {
+        wanted.push((format!("{device}.disabled"), "0".into()));
+        if !main_enabled {
+            wanted.push((format!("main_{band}.disabled"), "0".into()));
+        }
+        for (other, _, (main_if, extra_if)) in &radios {
+            wanted.push((format!("main_{other}.ifname"), main_if.clone()));
+            for kind in ["guest", "backhaul"] {
+                wanted.push((format!("{kind}_{other}.ifname"), extra_if.clone()));
+            }
+        }
+    } else {
+        // With EasyMesh on, the firmware starts Wi-Fi through ezmesh with both
+        // bands' backhaul APs; the single-band layout never came up (MC7523).
+        if state::uci_read("wireless.zte_mbb.mesh_onoff").await == "1" {
+            return Err("invalid:Mesh is on; switch Mesh off before switching a band off".into());
+        }
+        let keep: Vec<_> = radios
+            .iter()
+            .filter(|(other, _, _)| *other != band)
+            .collect();
+        let mut on = None;
+        for (other, radio, _) in &keep {
+            if self::enabled(radio).await == Some(true)
+                && self::enabled(&format!("main_{other}")).await == Some(true)
+            {
+                on = Some(*other);
+                break;
+            }
+        }
+        let Some(on) = on else {
+            return Err(
+                "invalid:no other band would stay on; switch Wi-Fi off with wifi.set_module".into(),
+            );
+        };
+        wanted.push((format!("{device}.disabled"), "1".into()));
+        for kind in ["main", "guest", "backhaul"] {
+            wanted.push((format!("{kind}_{band}.ifname"), "wlanx".into()));
+        }
+        wanted.push((format!("main_{on}.ifname"), "wlan0".into()));
+        for kind in ["guest", "backhaul"] {
+            wanted.push((format!("{kind}_{on}.ifname"), "wlan1".into()));
+        }
+    }
+    // Only sections the firmware has, and only values that differ.
+    let mut writes = Vec::new();
+    for (option, value) in wanted {
+        let section = option.split('.').next().unwrap_or_default().to_owned();
+        if !section_exists(&section).await {
+            continue;
+        }
+        let path = format!("wireless.{option}");
+        if state::uci_read(&path).await != value {
+            writes.push((path, value));
+        }
+    }
+    let changed = !writes.is_empty();
+    if changed {
+        for (path, value) in &writes {
+            if let Err(error) = state::uci_write("set", path, Some(value)).await {
+                let _ = state::uci_write("revert", "wireless", None).await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = state::uci_write("commit", "wireless", None).await {
+            let _ = state::uci_write("revert", "wireless", None).await;
+            return Err(error);
+        }
+        for (path, value) in &writes {
+            if state::uci_read(path).await != *value {
+                return Err(format!("Wi-Fi readback did not confirm {path}"));
+            }
+        }
+        let response = state::ubus("zwrt_wlan", "reload", json!({})).await?;
+        wifi::check_write_response(&response)?;
+    }
+    let options: Vec<String> = writes
+        .iter()
+        .map(|(path, value)| format!("{}={value}", path.trim_start_matches("wireless.")))
+        .collect();
+    Ok(
+        json!({"band":band,"device":device,"enabled":enabled,"changed":changed,"verified":true,"options":options}),
+    )
 }
 
 /// Guest support flags of the stock `wireless.readonly` section; chip1 is the

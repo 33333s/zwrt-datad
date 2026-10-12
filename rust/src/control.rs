@@ -1068,6 +1068,20 @@ async fn wifi_configure(params: &Value) -> Outcome {
             Value::Number(v) if v.as_i64() == Some(1) => true,
             _ => return Outcome::Invalid("enabled must be boolean or 0/1".into()),
         };
+        // On the single-chip qcacld32 firmwares the main SSID on wlan0 cannot
+        // be switched off alone: QCMAP then starts no AP and Wi-Fi stays down.
+        if !enabled
+            && section.starts_with("main_")
+            && state::uci_read(&format!("wireless.{section}.ifname")).await == "wlan0"
+            && crate::wifi_control::single_chip(
+                &state::uci_read(&format!("wireless.{section}.device")).await,
+            )
+            .await
+        {
+            return Outcome::Invalid(
+                "this firmware cannot switch the band on wlan0 off through its SSID; use wifi.radio.set".into(),
+            );
+        }
         updates.push(("disabled", if enabled { "0" } else { "1" }.into()));
     }
     if updates.is_empty() {

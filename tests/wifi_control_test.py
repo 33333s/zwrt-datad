@@ -271,8 +271,10 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
                   {'section_name': 'guest_2g', 'guest_left_time': '99'}])))
         wifi = request('wifi.state')[1]['result']
         assert wifi['busy'] is False and wifi['module'] == {'enabled': True, 'user_enabled': True}, wifi
-        assert wifi['radios'] == [{'band': '2g', 'device': 'wifi0', 'enabled': False},
-                                  {'band': '5g', 'device': 'wifi1', 'enabled': True}], wifi
+        # A radio-level disabled 2.4 GHz (left by 0.10.74-0.10.76) reads as the band off.
+        assert wifi['radios'] == [
+            {'band': '2g', 'device': 'wifi0', 'enabled': False, 'radio_enabled': False},
+            {'band': '5g', 'device': 'wifi1', 'enabled': True, 'radio_enabled': True}], wifi
         aps = {item['section']: item for item in wifi['aps']}
         assert aps['main_2g']['enabled'] is True and aps['main_2g']['active'] is True, aps
         assert aps['main_5g']['state'] == 'down' and aps['main_5g']['active'] is False, aps
@@ -299,10 +301,100 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert request('wifi.set_module', dict(enabled=2))[0] == 400
         code, body = request('wifi.set_chip', dict(chip='chip2', guest_enabled=0))
         assert code == 400 and 'not supported' in body['error']['message'], body
+        # A band is switched through its SSIDs like the stock web UI, never
+        # through the radio: a disabled 2.4 GHz radio keeps every band down on
+        # the single-chip QCA firmwares and can hang the device at boot.
+        before = len(writes())
         code, body = request('wifi.radio.set', dict(band='5g', enabled=False))
         assert code == 200 and body['result'] == dict(band='5g', device='wifi1', enabled=False,
-                                                      changed=True, verified=True), body
+                                                      changed=True, verified=True,
+                                                      sections=['main_5g', 'guest_5g']), body
+        sets = [json.loads(args[3]) for args in writes()[before:] if args[:3] == ['call', 'zwrt_wlan', 'set']]
+        assert sets == [{'main_5g': {'disabled': '1'}, 'guest_5g': {'disabled': '1'}}], sets
+        radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
+        assert radios['5g']['enabled'] is False and radios['5g']['radio_enabled'] is True, radios
         assert request('wifi.radio.set', dict(band='5g', enabled=False))[1]['result']['changed'] is False
+        before = len(writes())
+        code, body = request('wifi.radio.set', dict(band='2g', enabled=False))
+        assert code == 200 and body['result']['sections'] == ['main_2g'], body
+        sets = [json.loads(args[3]) for args in writes()[before:] if args[:3] == ['call', 'zwrt_wlan', 'set']]
+        assert sets == [{'main_2g': {'disabled': '1'}}] and 'wifi0' not in json.dumps(sets), sets
+        # Switching a band on clears a radio-level disable left by older releases;
+        # the guest SSID keeps its own switch.
+        data = json.loads(fixture.read_text())
+        data['config']['wireless.wifi0.disabled'] = '1'
+        fixture.write_text(json.dumps(data))
+        before = len(writes())
+        code, body = request('wifi.radio.set', dict(band='2g', enabled=True))
+        assert code == 200 and body['result']['sections'] == ['main_2g', 'wifi0'], body
+        sets = [json.loads(args[3]) for args in writes()[before:] if args[:3] == ['call', 'zwrt_wlan', 'set']]
+        assert sets == [{'main_2g': {'disabled': '0'}, 'wifi0': {'disabled': '0'}}], sets
+        radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
+        assert radios['2g'] == {'band': '2g', 'device': 'wifi0', 'enabled': True, 'radio_enabled': True}, radios
+        code, body = request('wifi.radio.set', dict(band='5g', enabled=True))
+        assert code == 200 and body['result']['sections'] == ['main_5g'], body
+        aps = {item['section']: item for item in request('wifi.state')[1]['result']['aps']}
+        assert aps['main_5g']['enabled'] is True and aps['guest_5g']['enabled'] is False, aps
+        # Single-chip qcacld32 firmwares (U60 Pro, MC7523, TopFlow): QCMAP starts a lone
+        # AP only on wlan0, so the band that stays on takes wlan0 (TopFlow's own layout).
+        data = json.loads(fixture.read_text())
+        data['config'].update({
+            'wireless.wifi0.type': 'qcacld32', 'wireless.wifi1.type': 'qcacld32',
+            'wireless.wifi0.disabled': '0', 'wireless.wifi1.disabled': '0',
+            'wireless.main_2g.disabled': '0', 'wireless.main_5g.disabled': '0',
+            'wireless.main_2g.device': 'wifi0', 'wireless.main_5g.device': 'wifi1',
+            'wireless.main_2g.ifname': 'wlan0', 'wireless.guest_2g.ifname': 'wlan1',
+            'wireless.main_5g.ifname': 'wlan2', 'wireless.guest_5g.ifname': 'wlan3',
+            'wireless.backhaul_2g': 'wifi-iface', 'wireless.backhaul_2g.ifname': 'wlan1'})
+        fixture.write_text(json.dumps(data))
+        def layout():
+            config = json.loads(fixture.read_text())['config']
+            return {key.split('.', 1)[1]: config.get(key) for key in (
+                'wireless.wifi0.disabled', 'wireless.wifi1.disabled',
+                'wireless.main_2g.ifname', 'wireless.guest_2g.ifname', 'wireless.backhaul_2g.ifname',
+                'wireless.main_5g.ifname', 'wireless.guest_5g.ifname')}
+        # The main SSID on wlan0 cannot be switched off through wifi.configure here.
+        before = len(writes())
+        code, body = request('wifi.configure', dict(section='main_2g', enabled=False))
+        assert code == 400 and 'wifi.radio.set' in body['error']['message'], body
+        assert len(writes()) == before
+        # With Mesh on the single-band layout never comes up (MC7523): refused.
+        data = json.loads(fixture.read_text())
+        data['config']['wireless.zte_mbb.mesh_onoff'] = '1'
+        fixture.write_text(json.dumps(data))
+        before = len(writes())
+        code, body = request('wifi.radio.set', dict(band='2g', enabled=False))
+        assert code == 400 and 'Mesh' in body['error']['message'], body
+        assert len(writes()) == before
+        data['config']['wireless.zte_mbb.mesh_onoff'] = '0'
+        fixture.write_text(json.dumps(data))
+        before = len(writes())
+        code, body = request('wifi.radio.set', dict(band='2g', enabled=False))
+        assert code == 200 and body['result']['changed'] and body['result']['verified'], body
+        assert layout() == {'wifi0.disabled': '1', 'wifi1.disabled': '0',
+                            'main_2g.ifname': 'wlanx', 'guest_2g.ifname': 'wlanx', 'backhaul_2g.ifname': 'wlanx',
+                            'main_5g.ifname': 'wlan0', 'guest_5g.ifname': 'wlan1'}, layout()
+        new = writes()[before:]
+        assert any(args[:3] == ['call', 'zwrt_wlan', 'reload'] for args in new), new
+        assert not any(args[:3] == ['call', 'zwrt_wlan', 'set'] for args in new), new
+        assert 'backhaul_5g' not in json.dumps(new), new
+        radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
+        assert radios['2g']['enabled'] is False and radios['5g']['enabled'] is True, radios
+        assert request('wifi.radio.set', dict(band='2g', enabled=False))[1]['result']['changed'] is False
+        # The last band on is never switched off here; that is the module switch.
+        code, body = request('wifi.radio.set', dict(band='5g', enabled=False))
+        assert code == 400 and 'wifi.set_module' in body['error']['message'], body
+        code, body = request('wifi.radio.set', dict(band='2g', enabled=True))
+        assert code == 200 and body['result']['changed'], body
+        assert layout() == {'wifi0.disabled': '0', 'wifi1.disabled': '0',
+                            'main_2g.ifname': 'wlan0', 'guest_2g.ifname': 'wlan1', 'backhaul_2g.ifname': 'wlan1',
+                            'main_5g.ifname': 'wlan2', 'guest_5g.ifname': 'wlan3'}, layout()
+        # Switching 5 GHz off keeps 2.4 GHz on wlan0.
+        assert request('wifi.radio.set', dict(band='5g', enabled=False))[0] == 200
+        assert layout()['main_2g.ifname'] == 'wlan0' and layout()['main_5g.ifname'] == 'wlanx', layout()
+        assert layout()['wifi1.disabled'] == '1', layout()
+        assert request('wifi.radio.set', dict(band='5g', enabled=True))[0] == 200
+        assert layout()['main_5g.ifname'] == 'wlan2' and layout()['wifi1.disabled'] == '0', layout()
         assert request('wifi.radio.set', dict(band='6g', enabled=True))[0] == 400
         assert request('wifi.radio.set', dict(band='5g'))[0] == 400
         assert request('wifi.guest.set', {})[0] == 400
