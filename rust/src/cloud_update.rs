@@ -77,6 +77,21 @@ fn write_record(path: &Path, value: &Value) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())?;
     fs::rename(temp, path).map_err(|e| e.to_string())
 }
+/// Why an NMS installation of another version cannot complete any more, from
+/// the installer's result marker or, once the OTA manager has consumed that
+/// marker (it settles installations at startup and every minute), from the
+/// manager having left "installing". None while the install may still finish
+/// or the manager is busy.
+fn failed_install_code(marker: Option<&str>, ota_state: Option<&str>) -> Option<&'static str> {
+    match marker.map(str::trim) {
+        Some("success") => Some("installed_version_mismatch"),
+        Some("failed") => Some("installer_failed"),
+        _ => ota_state
+            .filter(|state| *state != "installing")
+            .map(|_| "installer_failed"),
+    }
+}
+
 impl App {
     pub async fn cloud_update_result(&self) -> Option<Value> {
         let path = self.inner._data_dir.join("cloud-update.json");
@@ -96,13 +111,20 @@ impl App {
                 result["data"]["current_version"] = json!(version);
                 result["data"]["installed_sha256"] = json!(actual);
                 let _ = write_record(&path, &result);
-            } else if let Ok(marker) =
-                fs::read_to_string(self.inner._data_dir.join("ota-install-result"))
-                && matches!(marker.trim(), "failed" | "success")
-            {
-                result["status"] = json!("failed");
-                result["error"] = json!({"code":if marker.trim()=="success" {"installed_version_mismatch"} else {"installer_failed"}});
-                let _ = write_record(&path, &result);
+            } else {
+                let marker =
+                    fs::read_to_string(self.inner._data_dir.join("ota-install-result")).ok();
+                let state = self
+                    .inner
+                    .ota
+                    .try_lock()
+                    .ok()
+                    .map(|manager| manager.state().to_owned());
+                if let Some(code) = failed_install_code(marker.as_deref(), state.as_deref()) {
+                    result["status"] = json!("failed");
+                    result["error"] = json!({"code":code});
+                    let _ = write_record(&path, &result);
+                }
             }
         }
         Some(result)
@@ -121,7 +143,7 @@ impl App {
                 if previous["status"] == "installing" { return Err("update_in_progress".into()); }
             }
             let mut manager = self.inner.ota.try_lock().map_err(|_| "update_in_progress".to_string())?;
-            manager.begin_update()?;
+            manager.begin_requested_update()?;
             persist = true;
             let operation: Result<Value, String> = async {
                 let candidate = manager.check().await?;
@@ -162,6 +184,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_install_record_settles_after_the_marker_was_consumed() {
+        assert_eq!(
+            failed_install_code(Some("success\n"), Some("installing")),
+            Some("installed_version_mismatch")
+        );
+        assert_eq!(
+            failed_install_code(Some("failed"), None),
+            Some("installer_failed")
+        );
+        // The OTA manager read the marker first and settled its own state.
+        assert_eq!(
+            failed_install_code(None, Some("error")),
+            Some("installer_failed")
+        );
+        assert_eq!(
+            failed_install_code(None, Some("blocked")),
+            Some("installer_failed")
+        );
+        // Still installing, or the manager is busy: keep waiting.
+        assert_eq!(failed_install_code(None, Some("installing")), None);
+        assert_eq!(failed_install_code(None, None), None);
+    }
     #[test]
     fn requires_current_boot_identity_freshness_and_pinned_install() {
         let config = Config {
