@@ -1448,6 +1448,7 @@ fn capability_controls() -> Vec<&'static str> {
         "apn.list",
         "client.access",
         "wifi.acl.status",
+        "nat.status",
         "neighbor.status",
         "neighbor.set",
         "state.refresh",
@@ -1948,6 +1949,9 @@ async fn control(
             | (_, _, _, Err(error)) => control_failed(action, error),
         };
     }
+    if action == "nat.status" {
+        return control_ok(action, crate::nat::status().await);
+    }
     if action == "wifi.acl.status" {
         return control_ok(action, crate::control::wifi_acl_status().await);
     }
@@ -2041,7 +2045,7 @@ fn coded_failure(action: &str, code: &'static str) -> Response {
         "invalid_credentials" => StatusCode::UNAUTHORIZED,
         "device_session_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
         "device_session_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-        "device_session_expired" | "wifi_acl_allow_mode" => StatusCode::CONFLICT,
+        "device_session_expired" | "wifi_acl_allow_mode" | "operation_busy" => StatusCode::CONFLICT,
         _ => StatusCode::BAD_GATEWAY,
     };
     (
@@ -2812,7 +2816,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 88 + 6 + 2 + 2);
+        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2);
         for action in [
             "time.status",
             "time.config.set",
@@ -2824,12 +2828,14 @@ mod tests {
             "datad.ota.set",
             "wifi.acl.status",
             "wifi.acl.set",
+            "nat.status",
+            "nat.detect",
         ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            88 + 6 + 2 + 2
+            88 + 6 + 2 + 2 + 2
         );
     }
 

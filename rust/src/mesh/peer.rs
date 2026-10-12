@@ -3,7 +3,8 @@
 //! str0m is sans-IO, so this task owns the UDP socket and the clock. Browser
 //! candidates arrive over the rendezvous socket and ours (host plus
 //! server-reflexive from a STUN probe on the same socket) go back the same way.
-use super::{frame, service::Service, stun};
+use super::{frame, service::Service};
+use crate::stun;
 use rand::Rng;
 use serde_json::{Value, json};
 use std::sync::Arc;
