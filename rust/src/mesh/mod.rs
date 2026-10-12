@@ -8,7 +8,6 @@ mod http;
 mod peer;
 mod rendezvous;
 mod service;
-mod stun;
 
 #[cfg(test)]
 mod browser_interop;
@@ -16,6 +15,7 @@ mod browser_interop;
 mod e2e_tests;
 
 use crate::cloud::Config;
+use crate::stun;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{net::SocketAddr, time::Duration};

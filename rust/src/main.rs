@@ -21,6 +21,7 @@ mod lan;
 #[cfg(feature = "mesh")]
 mod mesh;
 mod model;
+mod nat;
 mod neighbor;
 mod neighbor_lte;
 mod neighbor_manager;
@@ -35,6 +36,7 @@ mod sms_forward;
 mod smtp_forward;
 mod speedtest;
 mod state;
+mod stun;
 mod task_schedule;
 mod time_control;
 mod traffic_history;

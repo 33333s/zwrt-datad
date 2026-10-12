@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.73",
+    "version": "0.10.74",
     "asset": "zwrt-datad-aarch64",
-    "notes": "Wi-Fi 黑白名单：新增 wifi.acl.status / wifi.acl.set，可查询和管理白名单（allow）、黑名单（deny）和关闭过滤；修复白名单模式下拉黑或解除拉黑会把白名单悄悄改回黑名单的问题（现在返回 409 wifi_acl_allow_mode）；TopFlow 额外 SSID 同步主 AP 的黑白名单；/state 的 clients.list 无线设备新增 band（2g/5g/6g）和 guest，clients 新增 acl_mode 和 allowed，blocked 只在黑名单模式下列出"
+    "notes": "新增 NAT 类型检测：nat.detect 用 STUN（RFC 5780）检测运营商侧 NAT 类型（全锥形/受限锥形/端口受限锥形/对称，即 NAT1–NAT4），通过抓包在设备防火墙之前观察回包，不改防火墙；同时给出经过设备防火墙后的实际类型（device）；nat.status 读取上一次结果"
   }
 }

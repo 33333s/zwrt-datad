@@ -25,6 +25,7 @@ pub const ACTIONS: &[&str] = &[
     "sms.forward.test",
     "speedtest.start",
     "speedtest.stop",
+    "nat.detect",
     "cloud.remote_features.set",
     "device.poweroff",
     "cellular.connect",
@@ -502,6 +503,7 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
         "client.block" => client_access(params, true).await,
         "client.unblock" => client_access(params, false).await,
         "wifi.acl.set" => wifi_acl_set(params).await,
+        "nat.detect" => nat_detect(params).await,
         "multiwan.status" => {
             if !crate::apn_targets::multi_modem() {
                 return Outcome::Invalid("multiwan.status is only available on MU5252".into());
@@ -1180,6 +1182,35 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
         let _ = state::ubus("zwrt_wlan", "kick_macs", json!({"macs":mac})).await;
     }
     Outcome::Ok(json!({"mac":mac,"blocked":block}))
+}
+
+async fn nat_detect(params: &Value) -> Outcome {
+    let servers = match object(params).get("servers") {
+        None => crate::nat::DEFAULT_SERVERS
+            .iter()
+            .filter_map(|server| crate::stun::parse_server(server))
+            .collect(),
+        Some(Value::Array(items)) if (1..=crate::nat::MAX_SERVERS).contains(&items.len()) => {
+            let parsed: Option<Vec<_>> = items
+                .iter()
+                .map(|item| item.as_str().and_then(crate::stun::parse_server))
+                .collect();
+            match parsed {
+                Some(servers) => servers,
+                None => return Outcome::Invalid("servers must be stun:host[:port] entries".into()),
+            }
+        }
+        Some(_) => {
+            return Outcome::Invalid(format!(
+                "servers must be an array of 1-{} stun:host[:port] entries",
+                crate::nat::MAX_SERVERS
+            ));
+        }
+    };
+    match crate::nat::detect(servers).await {
+        Ok(result) => Outcome::Ok(result),
+        Err(code) => Outcome::Coded(code),
+    }
 }
 
 /// Upper bound for each MAC filter list accepted from a client.

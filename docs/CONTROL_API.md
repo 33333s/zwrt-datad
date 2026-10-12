@@ -27,6 +27,8 @@ Content-Type: application/json
 | `schedule.reboot.set` | `enabled`（布尔）、`time`（设备本地 `HH:MM`） | 保存 datad 每日定时重启；原厂周/间隔日计划开启时拒绝启用 |
 | `speedtest.start` | `bytes`（1–50 MiB）、`threads`（1–5）、`runs`（1 或 3） | 设备默认出口直连固定 Cloudflare HTTPS 下载端点，异步返回状态；总量不超过 `bytes` |
 | `speedtest.stop` | 无 | 取消正在运行的下载测试 |
+| `nat.detect` | 可选 `servers`（1–6 个 `stun:host[:port]`） | 用 STUN 检测设备默认出口的 IPv4 NAT 类型（运营商侧），同步返回结果，通常 1–3 秒，最长 20 秒；见下文 |
+| `nat.status` | 无 | 返回 `running` 和上一次检测结果 `last`（启动后未检测过为 `null`） |
 | `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
 | `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项。0.10.39 起授权面板上报 `cell_lock_supported=true`，定时 `cell.lock_lte` / `cell.lock_nr` 仅接受有界十进制 PCI、频率及 NR 频段。0.10.40 起上报 `sms_send_supported=true`，定时 `sms.send_scheduled` 仅接受 `number`（3–32 位、可带前导 `+`）及 `text`（1–280 UTF-16 单元），正文仅存设备私有 0600 文件并进入授权按需面板流；执行前持久化尝试和与短信转发共用的每日 60 条本机 SIM 配额，失败不重试。重复任务每日最多尝试一次；远程 v2 要求 `confirmed=true` |
 | `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
@@ -68,6 +70,42 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `sim.set_slot` | `slot`，设备侧编号 `1/2` |
 
 `cellular.set` 会先读取完整 `get_wwaniface` 对象，再覆盖调用方提供的字段，避免固件清空未指定的 PDP、配置档案等属性。
+
+## NAT 检测
+
+`nat.detect` 按 RFC 5780 测映射行为（mapping）和过滤行为（filtering），再换算成经典名称：
+
+| `type` | `nat_level` | 含义 |
+|---|---|---|
+| `full_cone` | 1 | 映射与目标无关，任何外部地址都能回包（NAT1） |
+| `restricted_cone` | 2 | 映射与目标无关，只接受访问过的 IP 回包（NAT2） |
+| `port_restricted_cone` | 3 | 映射与目标无关，只接受访问过的 IP+端口回包（NAT3） |
+| `symmetric` | 4 | 不同目标得到不同映射（NAT4） |
+| `open` / `firewalled` / `no_nat` | `null` | WAN 地址就是公网地址；分别为不过滤、有过滤、过滤未知 |
+| `udp_blocked` | `null` | 所有 STUN 服务器都没有应答（UDP 被封或服务器不可达） |
+| `unknown` | `null` | 服务器不支持 RFC 5780 等原因，无法判断 |
+
+返回字段：`mapping`/`filtering`（`endpoint_independent`、`address_dependent`、
+`address_and_port_dependent`、`dependent`、`unknown`）、`nat`、`carrier_nat`（WAN 地址是私网或
+100.64.0.0/10，说明 NAT 在运营商侧）、`measured_at`、`device`、`public_address`、`local_address`、
+`port_preserved`、`server`、`rfc5780`、`duration_ms`、`checked_at`，失败时另有 `error`（`dns_failed`、
+`no_stun_answer`、`timeout`）。
+
+主结果 `type`/`nat_level`/`filtering` 是**运营商侧**的 NAT 行为（`measured_at="carrier"`）。设备自身的
+INPUT 防火墙只放行已建立连接的回包，会丢掉 STUN 服务器从另一个地址发回的探测包，普通套接字因此只能看到
+“运营商 NAT + 设备防火墙”的结果。datad 为每个探测端口另开一个 AF_PACKET 抓包套接字（内核 BPF 只收发往该端口的
+未分片 UDP），在 netfilter 之前看到运营商实际送到设备的回包；同一轮测试同时得出两种结果，不修改防火墙。
+`device` 为 `{type, nat_level, filtering}`，是经过设备防火墙后、设备本身与局域网设备实际能得到的效果。
+无法打开抓包套接字（非 root、非 Linux）时退回设备视角，`measured_at="device"`，主结果与 `device` 相同。
+
+实测（0.10.74）：U60、MC7523、TopFlow 的移动网 CGNAT 为 `type=full_cone`（NAT1），`device.type=port_restricted_cone`
+（NAT3）；MC8532B 直接获得公网 IPv4，`nat=false`、`type=open`。检测约 1.5–2 秒。
+
+默认服务器依次为 `stun.miwifi.com:3478`、`stun.voipgate.com:3478`、`stun.fitauto.ru:3478`、
+`stun.nextcloud.com:443`（以上支持 RFC 5780）、`stun.cloudflare.com:3478`、
+`stun.chat.bilibili.com:3478`。部分服务器从不回应“只换端口”的请求，所以这一步会再用其他
+RFC 5780 服务器确认。只提供不支持 RFC 5780 的服务器时，只能比较两台服务器看到的映射，
+过滤行为为 `unknown`。同一时间只允许一次检测，并发请求返回 409 `operation_busy`。只测 IPv4。
 
 ## WiFi, LAN And Clients
 

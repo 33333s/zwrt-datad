@@ -1,13 +1,34 @@
-//! A minimal STUN binding client (RFC 5389): enough to learn this socket's
-//! server-reflexive address. The probe runs on the ICE socket itself, so the
+//! A minimal STUN binding client (RFC 5389), plus the RFC 5780 attributes the
+//! NAT type probe needs. The mesh probe runs on the ICE socket itself, so the
 //! mapping it finds is the one the peer will actually reach.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
+const BINDING_ERROR: u16 = 0x0111;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const MAPPED_ADDRESS: u16 = 0x0001;
+const CHANGE_REQUEST: u16 = 0x0003;
+/// RFC 3489 name of OTHER-ADDRESS; older servers still send it.
+const CHANGED_ADDRESS: u16 = 0x0005;
+const OTHER_ADDRESS: u16 = 0x802c;
+/// CHANGE-REQUEST flags (RFC 5780 section 7.2).
+pub const CHANGE_IP: u8 = 0x04;
+pub const CHANGE_PORT: u8 = 0x02;
+
+/// A binding response for one transaction.
+#[derive(Debug, PartialEq)]
+pub enum Response {
+    /// Success: the reflexive address and, from an RFC 5780 server, the
+    /// alternate address it can answer from.
+    Mapped {
+        mapped: SocketAddr,
+        other: Option<SocketAddr>,
+    },
+    /// The server rejected the request (for example an unknown CHANGE-REQUEST).
+    Error,
+}
 
 /// `stun:host[:port]` as NMS sends it (port defaults to 3478). Returns host and port.
 pub fn parse_server(value: &str) -> Option<(String, u16)> {
@@ -24,40 +45,68 @@ pub fn parse_server(value: &str) -> Option<(String, u16)> {
     .then(|| (host.to_owned(), port))
 }
 
+#[cfg_attr(not(feature = "mesh"), allow(dead_code))]
 pub fn binding_request(transaction: [u8; 12]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(20);
+    request(transaction, 0)
+}
+
+/// A binding request; `change` holds CHANGE_IP/CHANGE_PORT flags, or 0 for none.
+pub fn request(transaction: [u8; 12], change: u8) -> Vec<u8> {
+    let length: u16 = if change == 0 { 0 } else { 8 };
+    let mut packet = Vec::with_capacity(20 + usize::from(length));
     packet.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&length.to_be_bytes());
     packet.extend_from_slice(&MAGIC);
     packet.extend_from_slice(&transaction);
+    if change != 0 {
+        packet.extend_from_slice(&CHANGE_REQUEST.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, change]);
+    }
     packet
 }
 
 /// The mapped address of a binding success response for `transaction`.
+#[cfg_attr(not(feature = "mesh"), allow(dead_code))]
 pub fn parse_response(packet: &[u8], transaction: &[u8; 12]) -> Option<SocketAddr> {
-    if packet.len() < 20
-        || u16::from_be_bytes([packet[0], packet[1]]) != BINDING_SUCCESS
-        || packet[4..8] != MAGIC
-        || packet[8..20] != transaction[..]
-    {
+    match parse(packet, transaction)? {
+        Response::Mapped { mapped, .. } => Some(mapped),
+        Response::Error => None,
+    }
+}
+
+/// A binding success or error response for `transaction`; anything else
+/// (another transaction, a damaged packet, a success without an address) is None.
+pub fn parse(packet: &[u8], transaction: &[u8; 12]) -> Option<Response> {
+    if packet.len() < 20 || packet[4..8] != MAGIC || packet[8..20] != transaction[..] {
         return None;
+    }
+    match u16::from_be_bytes([packet[0], packet[1]]) {
+        BINDING_SUCCESS => {}
+        BINDING_ERROR => return Some(Response::Error),
+        _ => return None,
     }
     let length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
     let body = packet.get(20..20 + length)?;
     let mut offset = 0;
-    let mut plain = None;
+    let (mut xor, mut plain, mut other, mut changed) = (None, None, None, None);
     while offset + 4 <= body.len() {
         let kind = u16::from_be_bytes([body[offset], body[offset + 1]]);
         let size = usize::from(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
         let value = body.get(offset + 4..offset + 4 + size)?;
         match kind {
-            XOR_MAPPED_ADDRESS => return decode_address(value, true, transaction),
+            XOR_MAPPED_ADDRESS => xor = decode_address(value, true, transaction),
             MAPPED_ADDRESS => plain = decode_address(value, false, transaction),
+            OTHER_ADDRESS => other = decode_address(value, false, transaction),
+            CHANGED_ADDRESS => changed = decode_address(value, false, transaction),
             _ => {}
         }
         offset += 4 + size.div_ceil(4) * 4;
     }
-    plain
+    Some(Response::Mapped {
+        mapped: xor.or(plain)?,
+        other: other.or(changed),
+    })
 }
 
 fn decode_address(value: &[u8], xor: bool, transaction: &[u8; 12]) -> Option<SocketAddr> {
@@ -174,6 +223,47 @@ mod tests {
         let plain = [0, 1, 0x30, 0x39, 198, 51, 100, 7];
         let got = parse_response(&response(transaction, MAPPED_ADDRESS, &plain), &transaction);
         assert_eq!(got, Some("198.51.100.7:12345".parse().unwrap()));
+    }
+
+    #[test]
+    fn change_requests_and_rfc5780_addresses() {
+        let packet = request([3; 12], CHANGE_IP | CHANGE_PORT);
+        assert_eq!(packet.len(), 28);
+        assert_eq!(&packet[2..4], &[0, 8]);
+        assert_eq!(&packet[20..], &[0, 3, 0, 4, 0, 0, 0, 6]);
+        let transaction = [4; 12];
+        let mut body = Vec::new();
+        for (kind, value) in [
+            (MAPPED_ADDRESS, [0, 1, 0x30, 0x39, 198, 51, 100, 7]),
+            (OTHER_ADDRESS, [0, 1, 0x0d, 0x97, 203, 0, 113, 2]),
+        ] {
+            body.extend_from_slice(&kind.to_be_bytes());
+            body.extend_from_slice(&8u16.to_be_bytes());
+            body.extend_from_slice(&value);
+        }
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        packet.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&MAGIC);
+        packet.extend_from_slice(&transaction);
+        packet.extend(body);
+        assert_eq!(
+            parse(&packet, &transaction),
+            Some(Response::Mapped {
+                mapped: "198.51.100.7:12345".parse().unwrap(),
+                other: Some("203.0.113.2:3479".parse().unwrap()),
+            })
+        );
+        // RFC 3489 servers name the same attribute CHANGED-ADDRESS.
+        packet[20 + 12..20 + 14].copy_from_slice(&CHANGED_ADDRESS.to_be_bytes());
+        assert!(matches!(
+            parse(&packet, &transaction),
+            Some(Response::Mapped { other: Some(_), .. })
+        ));
+        let mut error = response(transaction, 0x0009, &[0, 0, 4, 20]);
+        error[1] = 0x11;
+        assert_eq!(parse(&error, &transaction), Some(Response::Error));
+        assert_eq!(parse(&error, &[5; 12]), None);
     }
 
     #[test]
