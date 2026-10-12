@@ -353,6 +353,44 @@ impl Ota {
         Ok(())
     }
 
+    /// Starts a check or install requested from outside (the panel or NMS).
+    /// An installation that restarted this process is settled first, so a
+    /// finished or timed-out install never blocks the request.
+    pub fn begin_requested_update(&mut self) -> Result<(), String> {
+        self.reconcile_install_result();
+        self.begin_update()
+    }
+
+    pub fn state(&self) -> &str {
+        &self.status.state
+    }
+
+    /// One background round. The installation result is always settled: the
+    /// installer restarts datad, and with automatic updates off nothing else
+    /// may read it, which left the state "installing" for good. Automatic
+    /// checks and installs only run when `auto` is set.
+    pub async fn tick(&mut self, auto: bool, snapshot: &Value) {
+        self.reconcile_install_result();
+        if !auto {
+            return;
+        }
+        if self.should_auto_check() && self.begin_update().is_ok() {
+            self.mark_auto_check();
+            let _ = self.check().await;
+            self.finish_update();
+        }
+        if let Some(candidate) = self.auto_candidate()
+            && self.begin_update().is_ok()
+        {
+            if let Err(error) = self.install(&candidate, snapshot, false).await
+                && !error.starts_with("等待安装条件:")
+            {
+                self.fail(Some(&candidate), error);
+            }
+            self.finish_update();
+        }
+    }
+
     pub fn finish_update(&mut self) {
         self.busy = false;
         self.publish();
@@ -828,6 +866,16 @@ impl Ota {
     }
 }
 
+/// `ZWRT_DATAD_OTA_DISABLE_AUTO=1` turns automatic checks and installs off.
+/// Installation results are still reconciled either way.
+pub fn auto_updates_disabled() -> bool {
+    auto_disabled(std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").ok().as_deref())
+}
+
+fn auto_disabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 pub fn has_update(candidate: &Candidate) -> bool {
     newer(&candidate.manifest.version, env!("DATAD_VERSION"))
 }
@@ -1106,6 +1154,82 @@ mod tests {
         restarted.install_deadline = Some(elapsed::now());
         restarted.reconcile_install_result();
         assert_eq!(restarted.status.state, "error");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// state=installing for the running version with a success marker, as the
+    /// installer leaves it when datad restarts into the new build.
+    fn installed_but_unsettled(name: &str) -> (PathBuf, Ota) {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-{name}-{}", rand::random::<u64>()));
+        let mut ota = Ota::load(&dir).unwrap();
+        ota.status.state = "installing".into();
+        ota.status.install_started_at = now();
+        ota.status.latest_version = env!("DATAD_VERSION").into();
+        ota.install_deadline = Some(elapsed::now() + Duration::from_secs(1800));
+        ota.save_status();
+        fs::write(dir.join("ota-install-result"), "success").unwrap();
+        let reopened = Ota::load(&dir).unwrap();
+        (dir, reopened)
+    }
+
+    #[test]
+    fn a_requested_check_settles_a_finished_install_instead_of_reporting_busy() {
+        let (dir, mut ota) = installed_but_unsettled("requested");
+        // Before the fix the NMS path called begin_update() directly.
+        assert_eq!(ota.begin_update().unwrap_err(), "更新任务正在运行");
+        assert!(ota.begin_requested_update().is_ok());
+        assert!(!dir.join("ota-install-result").exists());
+        assert!(ota.status.last_success_at > 0);
+        assert_eq!(ota.status.failure_count, 0);
+        assert_eq!(ota.install_deadline, None);
+        assert_eq!(ota.status.state, "checking");
+        ota.finish_update();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rounds_settle_installs_with_automatic_updates_disabled() {
+        let (dir, mut ota) = installed_but_unsettled("noauto");
+        ota.config.enabled = true;
+        ota.tick(false, &Value::Null).await;
+        assert_eq!(ota.status.state, "succeeded");
+        assert!(!dir.join("ota-install-result").exists());
+        // Automatic updates would be due now, but none was started.
+        assert!(ota.should_auto_check());
+        assert_eq!(ota.last_auto_check, None);
+        assert!(!ota.busy);
+        assert_eq!(ota.status.state, "succeeded");
+        assert!(auto_disabled(Some("1")));
+        assert!(!auto_disabled(Some("0")));
+        assert!(!auto_disabled(None));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_requested_check_turns_an_expired_install_into_an_error() {
+        let dir = std::env::temp_dir().join(format!("zwrt-ota-expired-{}", rand::random::<u64>()));
+        let mut ota = Ota::load(&dir).unwrap();
+        ota.status.state = "installing".into();
+        ota.status.latest_version = "99.0.0".into();
+        ota.install_deadline = Some(elapsed::now());
+        ota.save_status();
+        assert!(!dir.join("ota-install-result").exists());
+        // The settle step records the failure (begin_update then clears the
+        // message and starts the requested check).
+        let mut settled = Ota::load(&dir).unwrap();
+        settled.install_deadline = Some(elapsed::now());
+        settled.reconcile_install_result();
+        assert_eq!(settled.status.state, "error");
+        assert_eq!(
+            settled.status.error,
+            "Installation result not confirmed; check device logs"
+        );
+        assert!(ota.begin_requested_update().is_ok());
+        assert_eq!(ota.status.failure_count, 1);
+        assert!(ota.retry_deadline.is_some());
+        ota.finish_update();
+        let stored = read_json::<StoredStatus>(&dir.join("ota-state.json")).unwrap();
+        assert_ne!(stored.status.state, "installing");
         let _ = fs::remove_dir_all(dir);
     }
 
