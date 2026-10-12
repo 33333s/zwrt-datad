@@ -485,7 +485,10 @@ impl App {
         history.record(&initial);
         let (history_tx, _) = watch::channel(history.days());
         let (tx, _) = watch::channel(initial.clone());
-        let ota = Ota::load(&data_dir).map_err(anyhow::Error::msg)?;
+        let mut ota = Ota::load(&data_dir).map_err(anyhow::Error::msg)?;
+        // The installer restarts datad into the new build; read its result now
+        // rather than a minute later.
+        ota.reconcile_install_result();
         let ota_view = ota.subscribe();
         let app = Self {
             inner: Arc::new(Inner {
@@ -784,32 +787,19 @@ impl App {
         });
     }
     fn spawn_ota(&self) {
-        if std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").as_deref() == Ok("1") {
-            return;
-        }
+        // Installation results are settled even with automatic updates off;
+        // only the automatic checks and installs follow the switch.
+        let auto = !crate::ota::auto_updates_disabled();
         let app = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(90)).await;
             loop {
-                let snapshot = serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null);
-                let mut manager = app.inner.ota.lock().await;
-                manager.reconcile_install_result();
-                if manager.should_auto_check() && manager.begin_update().is_ok() {
-                    manager.mark_auto_check();
-                    let _ = manager.check().await;
-                    manager.finish_update();
-                }
-                if let Some(candidate) = manager.auto_candidate()
-                    && manager.begin_update().is_ok()
-                {
-                    if let Err(error) = manager.install(&candidate, &snapshot, false).await
-                        && !error.starts_with("等待安装条件:")
-                    {
-                        manager.fail(Some(&candidate), error);
-                    }
-                    manager.finish_update();
-                }
-                drop(manager);
+                let snapshot = if auto {
+                    serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                app.inner.ota.lock().await.tick(auto, &snapshot).await;
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
@@ -2662,8 +2652,7 @@ async fn ota_app_check(
         let Ok(mut manager) = app.inner.ota.try_lock() else {
             return ota_app_busy();
         };
-        manager.reconcile_install_result();
-        if manager.begin_update().is_err() {
+        if manager.begin_requested_update().is_err() {
             return ota_app_busy();
         }
     }
