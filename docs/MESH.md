@@ -30,9 +30,15 @@ the data channel is the only transport. Other services ignore the mesh object an
    backoff while the session lives.
 2. A `signal` carrying an `offer` builds a fresh peer connection (a new offer drops the old peer): answer,
    trickle ICE both ways, accept the data channel labelled `nms`.
-3. ICE uses one UDP socket per local IPv4 address, all on the same port, preferring a random port of
-   `udp_ports`. Candidates are host plus server-reflexive (a STUN binding probe on the ICE socket); there is no
-   TURN. Browser candidates that are mDNS names cannot be parsed and are skipped.
+3. ICE uses one UDP socket per local address, all on the same port, preferring a random port of `udp_ports`:
+   every IPv4 address except loopback and link-local, and up to four IPv6 addresses (global before unique-local,
+   stable before temporary; link-local, deprecated and not yet settled addresses are left out, from the flags in
+   `/proc/net/if_inet6`). Candidates are host plus server-reflexive: each STUN server is resolved to one IPv4 and
+   one IPv6 address and probed from an ICE socket of that family (the one on the address that family's default
+   route uses). A mapped address equal to a host candidate, the usual IPv6 case without NAT, is not offered again.
+   Only candidates of the same family are paired. There is no TURN. Browser candidates that are mDNS names cannot
+   be parsed and are skipped. Inbound UDP to `udp_ports` over IPv6 depends on the device firewall; without it a
+   path still opens when both ends send checks at the same time.
 4. The channel answers `{"t":"ping","n":N}` with `{"t":"pong","n":N}` straight away: pongs go into SCTP ahead of
    queued HTTP frames and the datagram leaves in the same loop pass (0.10.67 and earlier waited for the next
    timer or inbound packet, adding up to about 200 ms). A pong still follows whatever is already in the ordered

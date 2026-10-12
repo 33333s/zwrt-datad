@@ -130,6 +130,8 @@ impl Params {
     }
 }
 
+/// The first IPv4 and the first IPv6 address of every STUN server; the peer
+/// probes each family from an ICE socket of that family.
 async fn resolve(servers: &[(String, u16)]) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for (host, port) in servers {
@@ -138,10 +140,10 @@ async fn resolve(servers: &[(String, u16)]) -> Vec<SocketAddr> {
             tokio::net::lookup_host((host.as_str(), *port)),
         )
         .await;
-        if let Ok(Ok(addresses)) = found
-            && let Some(address) = addresses.into_iter().find(SocketAddr::is_ipv4)
-        {
-            out.push(address);
+        if let Ok(Ok(addresses)) = found {
+            let addresses: Vec<SocketAddr> = addresses.collect();
+            out.extend(addresses.iter().find(|address| address.is_ipv4()));
+            out.extend(addresses.iter().find(|address| address.is_ipv6()));
         }
     }
     out
