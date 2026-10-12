@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.75",
+    "version": "0.10.76",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 OTA 状态卡在“安装中”：关闭自动更新（ZWRT_DATAD_OTA_DISABLE_AUTO=1）时安装结果从不被读取，NMS 一直收到“更新任务正在运行”。现在新进程启动时立即读取安装结果，之后每分钟检查一次（不论是否开启自动更新），NMS 和 App 发起检查或安装前也会先收尾；超过 30 分钟未确认的安装会转为失败。"
+    "notes": "P2P 直连支持 IPv6：设备除 IPv4 外还为最多 4 个 IPv6 地址（公网优先于 ULA，稳定地址优先于临时地址，跳过链路本地、已弃用和未完成重复检测的地址）开 ICE socket 并提供候选；STUN 服务器分别解析 IPv4 和 IPv6 地址，从同一地址族的 ICE socket 探测。两端都有 IPv6 时，IPv4 打洞失败也能直连。"
   }
 }

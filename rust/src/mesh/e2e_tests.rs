@@ -386,6 +386,40 @@ async fn the_device_connects_over_its_real_interface_addresses() {
     assert_eq!(seen.frames[0].0["error"], "unsupported");
 }
 
+/// An IPv6-only browser: the device must pair its IPv6 socket with it. Skipped
+/// on a host without IPv6 loopback.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_connects_over_ipv6_loopback() {
+    if StdUdp::bind("[::1]:0").is_err() {
+        eprintln!("no IPv6 loopback: skipped");
+        return;
+    }
+    let mut plan = plan(vec![json!({"t":"nope","id":3})], vec![b""], 1);
+    plan.bind = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    let (seen, _, _) = session(plan, 80).await;
+    assert_eq!(seen.pong, Some(json!({"t":"pong","n":42})));
+    assert_eq!(seen.frames[0].0["error"], "unsupported");
+}
+
+/// The same over a real IPv6 interface address, as a device with a global or
+/// unique-local address does. Skipped on a host without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_connects_over_a_real_ipv6_address() {
+    let Some(address) = peer::local_addresses(false)
+        .into_iter()
+        .find(std::net::IpAddr::is_ipv6)
+    else {
+        eprintln!("no usable IPv6 interface address: skipped");
+        return;
+    };
+    let mut plan = plan(vec![json!({"t":"nope","id":3})], vec![b""], 1);
+    plan.bind = address;
+    plan.loopback_only = false;
+    let (seen, _, _) = session(plan, 80).await;
+    assert_eq!(seen.pong, Some(json!({"t":"pong","n":42})));
+    assert_eq!(seen.frames[0].0["error"], "unsupported");
+}
+
 /// Needs the network: `ZWRT_MESH_STUN_TEST=stun:stun.cloudflare.com:3478 cargo test stun_probe`.
 /// The device must offer a server-reflexive candidate learned on its ICE socket.
 #[tokio::test(flavor = "multi_thread")]
