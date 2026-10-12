@@ -117,7 +117,7 @@ RFC 5780 服务器确认。只提供不支持 RFC 5780 的服务器时，只能�
 | `wifi.set_dual_band` | `enabled`，布尔值 |
 | `wifi.state` | 无；分别返回 Wi-Fi 模块、各频段射频、主 AP、访客 AP 的开关和实际状态，见下文 |
 | `wifi.set_module` | `enabled`，布尔或 `0/1`；Wi-Fi 模块总开关（原厂 `zte_mbb.wifi_onoff`） |
-| `wifi.radio.set` | `band`=`2g`/`5g`（有 6 GHz 的机型含 `6g`），`enabled`；单个频段的射频开关 |
+| `wifi.radio.set` | `band`=`2g`/`5g`（有 6 GHz 的机型含 `6g`），`enabled`；单个频段的开关（与原厂网页一致，通过该频段的 SSID 实现，见下文） |
 | `wifi.guest.status` | 无；访客 SSID 开关与实际状态、访问时限、剩余时间、管理页访问、在线人数 |
 | `wifi.guest.set` | `enabled`（全部访客频段）、`bands`（如 `{"5g":true}`）、`active_time`（分钟）、`management_access` 至少一项 |
 | `wifi.set_chip` | 已不支持，固定返回 400；改用 `wifi.radio.set` / `wifi.guest.set` |
@@ -168,7 +168,9 @@ SSID 才在广播。
 - `busy`：原厂 `zwrt_wlan.status` 的 `app_status`/`driver_status` 不是 `idle`。原厂重启 Wi-Fi 的几十秒内
   `module.enabled` 会暂时读到 `false`，`busy=true` 时不要把它当成用户关闭了 Wi-Fi。
 - `module`：`enabled`（`wifi_onoff`，当前状态）和 `user_enabled`（`wifi_onoff_by_user`，用户设置）。
-- `radios`：`[{band, device, enabled}]`。射频与频段的对应关系按机型从 `wireless.main_<band>.device` 读取。
+- `radios`：`[{band, device, enabled, radio_enabled}]`。`enabled` 是 `wifi.radio.set` 控制的频段开关：射频和该频段
+  主 SSID 都打开才为 `true`；`radio_enabled` 只是射频（wifi-device）本身的配置。射频与频段的对应关系按机型从
+  `wireless.main_<band>.device` 读取。
 - `aps`：每个主/访客 SSID 一项 `{section, kind, band, ifname, enabled, state, active}`。`enabled` 是配置，
   `state` 是内核接口的 `operstate`（接口不存在为 `absent`），`active` 仅在 `state=up` 时为 `true`；
   接口启动过程中会短暂出现 `down`/`unknown`。没有 `ifname` 时 `state/active` 为 `null`。
@@ -178,7 +180,22 @@ SSID 才在广播。
 `wifi.set_module` 写原厂 `zwrt_wlan.set {"zte_mbb":{"wifi_onoff":"0|1"}}`，并读回 `wifi_onoff_by_user`
 确认。旧版本发送的 `SwitchOption` 会被所有已适配固件以 Invalid argument 拒绝，0.10.74 起已改正。
 原厂行为：关闭模块会把所有射频置为关闭，打开模块会把所有射频重新打开，因此先前单独关掉的频段会被
-重新打开。`wifi.radio.set` 写 `zwrt_wlan.set {"<radio>":{"disabled":"0|1"}}`。两者都会让原厂重启全部
+重新打开。`wifi.radio.set` 按固件区分：
+
+- **高通 qcacld32 单芯片固件**（射频 `type=qcacld32`：U60 Pro、MC7523、TopFlow）：原厂只剩一个 AP 时以单 AP 模式启动
+  QCMAP，而 QCMAP 只在 `wlan0` 上起这个 AP，且所有接口都经 wlan0 创建。因此关闭一个频段采用 TopFlow 固件自身的布局：
+  该频段射频 `disabled=1`，它的 main/guest/backhaul SSID 的 `ifname` 改为 `wlanx`，留下的频段主 SSID 改用 `wlan0`、
+  访客/回传改用 `wlan1`；打开时启用射频，所有频段恢复原厂接口名（`wifiN` → 主 SSID `wlan(2N)`、访客/回传 `wlan(2N+1)`），
+  主 SSID 关着的一并打开。写 UCI 后执行 `zwrt_wlan.reload`，原厂约一分钟完成重启。不会关掉最后一个开着的频段（返回 400，
+  请用 `wifi.set_module`）；Mesh（`zte_mbb.mesh_onoff=1`）打开时不允许关闭频段（返回 400），因为 Mesh 下原厂用两个频段的
+  回传 AP 经 ezmesh 启动，单频布局起不来（MC7523 实测），打开频段不受限。返回的 `options` 列出实际改动的 UCI 项。`wifi.configure` 在这类固件上不能把占用 `wlan0` 的
+  主 SSID 关掉（返回 400，请用 `wifi.radio.set`）：只关这个 SSID 时剩下的 AP 不在 wlan0 上，Wi-Fi 会整体起不来。
+- **其他固件**（MC8532B、MC8531 等 ath 驱动）：与原厂网页的单频段开关一致，只改 SSID：关闭写
+  `{"main_<band>":{"disabled":"1"},"guest_<band>":{"disabled":"1"}}`（只包含开着的段），打开写主 SSID `disabled:"0"`，
+  访客 SSID 仍由 `wifi.guest.set` 控制；射频被旧版关掉时一并恢复。返回的 `sections` 列出写入的段。
+
+0.10.74–0.10.76 只写射频 `disabled`；在 U60 Pro / MC7523 上关 2.4 GHz 后 Wi-Fi 起不来，重启可能卡死。
+两者都会让原厂重启全部
 Wi-Fi，其他频段的 SSID 也会断开约 10–40 秒；返回成功只表示配置已确认，客户端应轮询 `wifi.state`
 等待 `busy=false` 且 `active=true`。
 

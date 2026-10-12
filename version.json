@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.76",
+    "version": "0.10.77",
     "asset": "zwrt-datad-aarch64",
-    "notes": "P2P 直连支持 IPv6：设备除 IPv4 外还为最多 4 个 IPv6 地址（公网优先于 ULA，稳定地址优先于临时地址，跳过链路本地、已弃用和未完成重复检测的地址）开 ICE socket 并提供候选；STUN 服务器分别解析 IPv4 和 IPv6 地址，从同一地址族的 ICE socket 探测。两端都有 IPv6 时，IPv4 打洞失败也能直连。"
+    "notes": "修复 U60 Pro / MC7523 上关闭 2.4G 后 Wi-Fi 起不来、重启卡死：原厂只剩一个 AP 时只在 wlan0 上启动，wifi.radio.set 在高通 qcacld32 单芯片固件上改用 TopFlow 固件同款布局（关闭的频段改名 wlanx、留下的频段改用 wlan0），打开时恢复原厂接口名；wifi.configure 不再允许单独关掉占用 wlan0 的主 SSID；其他固件按原厂网页方式只开关 SSID。wifi.state 的 radios 增加 radio_enabled，enabled 表示频段开关。"
   }
 }
