@@ -115,8 +115,12 @@ RFC 5780 服务器确认。只提供不支持 RFC 5780 的服务器时，只能�
 | `wireless.config` | 无参数时返回各频段（2g/5g，有 6 GHz 的机型另有 6g）国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
 | `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
 | `wifi.set_dual_band` | `enabled`，布尔值 |
-| `wifi.set_module` | `enabled`，`0/1` |
-| `wifi.set_chip` | `chip`, `guest_enabled?` |
+| `wifi.state` | 无；分别返回 Wi-Fi 模块、各频段射频、主 AP、访客 AP 的开关和实际状态，见下文 |
+| `wifi.set_module` | `enabled`，布尔或 `0/1`；Wi-Fi 模块总开关（原厂 `zte_mbb.wifi_onoff`） |
+| `wifi.radio.set` | `band`=`2g`/`5g`（有 6 GHz 的机型含 `6g`），`enabled`；单个频段的射频开关 |
+| `wifi.guest.status` | 无；访客 SSID 开关与实际状态、访问时限、剩余时间、管理页访问、在线人数 |
+| `wifi.guest.set` | `enabled`（全部访客频段）、`bands`（如 `{"5g":true}`）、`active_time`（分钟）、`management_access` 至少一项 |
+| `wifi.set_chip` | 已不支持，固定返回 400；改用 `wifi.radio.set` / `wifi.guest.set` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
 | `wifi.txpower.status` | 无；返回两频段的启用状态、功率百分比、配置功率、配置上限和原厂上限 |
 | `wifi.txpower.apply` | `band`=`2g`/`5g`，以及 `percent`/`limit_dbm` 至少一项；一次提交并只重载一次 WiFi |
@@ -152,6 +156,61 @@ RFC 5780 服务器确认。只提供不支持 RFC 5780 的服务器时，只能�
 存在 `main_6g`）时还可取 `main_6g/guest_6g`，没有 6 GHz 的机型对这两个段返回 400，不会凭空创建。
 6 GHz 强制 WPA3，`encryption` 只接受 `sae`。`client.block/unblock` 的黑名单同样写入 6 GHz 的主/访客
 段（仅当它们存在）。
+
+### Wi-Fi 开关与状态
+
+原厂把 Wi-Fi 开关分成三层：模块总开关 `wireless.zte_mbb.wifi_onoff`、每个射频（wifi-device）的
+`disabled`、每个 SSID（wifi-iface，`main_*`/`guest_*`）的 `disabled`。三层都打开且接口真正起来，
+SSID 才在广播。
+
+`wifi.state` 返回：
+
+- `busy`：原厂 `zwrt_wlan.status` 的 `app_status`/`driver_status` 不是 `idle`。原厂重启 Wi-Fi 的几十秒内
+  `module.enabled` 会暂时读到 `false`，`busy=true` 时不要把它当成用户关闭了 Wi-Fi。
+- `module`：`enabled`（`wifi_onoff`，当前状态）和 `user_enabled`（`wifi_onoff_by_user`，用户设置）。
+- `radios`：`[{band, device, enabled}]`。射频与频段的对应关系按机型从 `wireless.main_<band>.device` 读取。
+- `aps`：每个主/访客 SSID 一项 `{section, kind, band, ifname, enabled, state, active}`。`enabled` 是配置，
+  `state` 是内核接口的 `operstate`（接口不存在为 `absent`），`active` 仅在 `state=up` 时为 `true`；
+  接口启动过程中会短暂出现 `down`/`unknown`。没有 `ifname` 时 `state/active` 为 `null`。
+
+读不到的字段一律为 `null`，不补 0 或 `false`。
+
+`wifi.set_module` 写原厂 `zwrt_wlan.set {"zte_mbb":{"wifi_onoff":"0|1"}}`，并读回 `wifi_onoff_by_user`
+确认。旧版本发送的 `SwitchOption` 会被所有已适配固件以 Invalid argument 拒绝，0.10.74 起已改正。
+原厂行为：关闭模块会把所有射频置为关闭，打开模块会把所有射频重新打开，因此先前单独关掉的频段会被
+重新打开。`wifi.radio.set` 写 `zwrt_wlan.set {"<radio>":{"disabled":"0|1"}}`。两者都会让原厂重启全部
+Wi-Fi，其他频段的 SSID 也会断开约 10–40 秒；返回成功只表示配置已确认，客户端应轮询 `wifi.state`
+等待 `busy=false` 且 `active=true`。
+
+旧的 `wifi.set_chip`（`ChipEnum`/`GuestEnable`）在现有固件上没有对应字段，现在固定返回 400，
+不再假装成功；已有的同名定时任务执行时会得到同样的错误。
+
+### 访客网络
+
+SSID、加密和密码继续用 `wifi.configure`（`section=guest_2g/guest_5g`）。其余访客设置用：
+
+`wifi.guest.status` 返回 `guests` 数组，每项除 `wifi.state` 的 AP 字段外还有 `supported`（原厂
+`wireless.readonly.wifi_attr_chip1/2_support_guest_ssid`，分别对应 2.4/5 GHz，没有该标记为 `null`）、
+`ssid`、`encryption`、`active_time_minutes`、`left_seconds`、`clients`；以及顶层的
+`active_time_minutes`（所有访客段一致时的值）、`active_time_supported`（`wifi_attr_support_guest_ssid_active_time`）、
+`active_time_options`（`[0,120,240,480,720]`）和 `management_access`。
+
+| 字段 | 原厂来源 | 单位/取值 |
+|---|---|---|
+| `enabled` | `guest_*.disabled` | 布尔 |
+| `active_time_minutes` | `guest_*.guest_active_time` | 分钟，0 表示不限时 |
+| `left_seconds` | `zwrt_wlan.wlan_get_guest_access_left_time` → `guest_left_time` | 秒；访客关闭时为 `null`（原厂关闭后仍会继续倒数一段时间） |
+| `management_access` | `router_get_wifi_isolate` → `guest_access_restrict_enable` | `0` 为允许（`true`），`1` 为禁止（`false`） |
+| `clients` | `router_get_user_list_num` → `guest_num_24g/5g/6g` | 人数；读不到为 `null` |
+
+剩余时间和人数只在调用时读取，datad 不会周期轮询。
+
+`wifi.guest.set` 只改传入的字段，其余保持不变：`enabled` 作用于所有支持访客的频段，`bands` 按频段开关
+（与 `enabled` 同时给出时以 `bands` 为准）；`active_time` 只能取 0/120/240/480/720，写到所有访客段；
+`management_access` 写 `router_set_wifi_isolate`，只发送 `guest_access_restrict_enable` 这一个字段
+（原厂只改传入字段；部分机型的隔离设置里有读接口不返回的字段，整组写回会丢失它们）。SSID 相关字段合并
+为一次 `zwrt_wlan.set`，与当前值相同的字段不写，全部未变时返回 `changed=false` 且不重启 Wi-Fi。写入后
+读回确认；读不到隔离设置时 `management_access` 写入返回 502。开启访客会触发原厂重启 Wi-Fi。
 
 ### Wi-Fi 黑白名单
 

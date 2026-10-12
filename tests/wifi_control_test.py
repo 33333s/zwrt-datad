@@ -38,7 +38,11 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    env = dict(os.environ, WIFI_FIXTURE=str(fixture), WIFI_WRITES=str(calls),
+    net = base / 'net'
+    for name, state in [('wlan0', 'up'), ('wlan2', 'down')]:
+        (net / name).mkdir(parents=True)
+        (net / name / 'operstate').write_text(state + '\n')
+    env = dict(os.environ, WIFI_FIXTURE=str(fixture), WIFI_WRITES=str(calls), ZWRT_DATAD_NET_CLASS_DIR=str(net),
                ZWRT_DATAD_UBUS_BIN=str(mock), ZWRT_DATAD_UCI_BIN=str(mock),
                ZWRT_DATAD_DIR=str(base / 'cloud'), ZWRT_DATAD_COOLING_CONFIG=str(base / 'cooling'))
     proc = subprocess.Popen([str(binary), '--port', str(port), '--data-dir', str(base / 'data'),
@@ -242,6 +246,94 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         code, body = request('wifi.acl.set', dict(mode='disable', deny=[]))
         assert code == 200 and body['result']['deny'] == [], body
         assert 'wireless.main_2g.denymaclist' not in json.loads(fixture.read_text())['config']
+        # Module, radio and AP switches are reported separately; unknown is null.
+        switches = dict(config)
+        switches.update({
+            'wireless.zte_mbb': 'zte_mbb', 'wireless.zte_mbb.wifi_onoff': '1',
+            'wireless.zte_mbb.wifi_onoff_by_user': '1',
+            'wireless.wifi0': 'wifi-device', 'wireless.wifi0.disabled': '1',
+            'wireless.wifi1': 'wifi-device', 'wireless.wifi1.disabled': '0',
+            'wireless.main_2g': 'wifi-iface', 'wireless.main_2g.ifname': 'wlan0',
+            'wireless.main_5g': 'wifi-iface', 'wireless.main_5g.ifname': 'wlan2',
+            'wireless.guest_2g': 'wifi-iface', 'wireless.guest_2g.ifname': 'wlan1',
+            'wireless.guest_2g.disabled': '1', 'wireless.guest_2g.guest_active_time': '240',
+            'wireless.guest_5g': 'wifi-iface', 'wireless.guest_5g.ifname': 'wlan3',
+            'wireless.guest_5g.disabled': '0', 'wireless.guest_5g.guest_active_time': '240',
+            'wireless.guest_5g.ssid': 'Fixture Guest', 'wireless.guest_5g.encryption': 'none',
+            'wireless.readonly': 'readonly',
+            'wireless.readonly.wifi_attr_chip1_support_guest_ssid': '1',
+            'wireless.readonly.wifi_attr_chip2_support_guest_ssid': '1',
+        })
+        fixture.write_text(json.dumps(dict(
+            config=switches, lbd='0', isolate={'guest_access_restrict_enable': 0},
+            users={'guest_num_24g': 0, 'guest_num_5g': 2},
+            left=[{'section_name': 'guest_5g', 'guest_left_time': '7179'},
+                  {'section_name': 'guest_2g', 'guest_left_time': '99'}])))
+        wifi = request('wifi.state')[1]['result']
+        assert wifi['busy'] is False and wifi['module'] == {'enabled': True, 'user_enabled': True}, wifi
+        assert wifi['radios'] == [{'band': '2g', 'device': 'wifi0', 'enabled': False},
+                                  {'band': '5g', 'device': 'wifi1', 'enabled': True}], wifi
+        aps = {item['section']: item for item in wifi['aps']}
+        assert aps['main_2g']['enabled'] is True and aps['main_2g']['active'] is True, aps
+        assert aps['main_5g']['state'] == 'down' and aps['main_5g']['active'] is False, aps
+        assert aps['guest_2g']['enabled'] is False and aps['guest_2g']['state'] == 'absent', aps
+        assert aps['guest_5g']['kind'] == 'guest' and aps['guest_5g']['enabled'] is True, aps
+        guest = request('wifi.guest.status')[1]['result']
+        assert guest['management_access'] is True and guest['active_time_minutes'] == 240, guest
+        assert guest['active_time_supported'] is None, guest
+        bands = {item['band']: item for item in guest['guests']}
+        # A switched-off guest SSID reports no remaining time, even if the
+        # firmware still counts a stale timer for it.
+        assert bands['2g']['left_seconds'] is None and bands['2g']['clients'] == 0, bands
+        assert bands['5g']['left_seconds'] == 7179 and bands['5g']['clients'] == 2, bands
+        assert bands['5g']['supported'] is True and bands['5g']['ssid'] == 'Fixture Guest', bands
+        before = len(writes())
+        code, body = request('wifi.set_module', dict(enabled=0))
+        assert code == 200 and body['result']['changed'] and body['result']['verified'], body
+        new = [json.dumps(args) for args in writes()[before:]]
+        assert any('wifi_onoff' in item for item in new), new
+        assert not any('SwitchOption' in item for item in new), new
+        assert request('wifi.state')[1]['result']['module']['enabled'] is False
+        assert request('wifi.set_module', dict(enabled=False))[1]['result']['changed'] is False
+        assert request('wifi.set_module', dict(enabled=1))[0] == 200
+        assert request('wifi.set_module', dict(enabled=2))[0] == 400
+        code, body = request('wifi.set_chip', dict(chip='chip2', guest_enabled=0))
+        assert code == 400 and 'not supported' in body['error']['message'], body
+        code, body = request('wifi.radio.set', dict(band='5g', enabled=False))
+        assert code == 200 and body['result'] == dict(band='5g', device='wifi1', enabled=False,
+                                                      changed=True, verified=True), body
+        assert request('wifi.radio.set', dict(band='5g', enabled=False))[1]['result']['changed'] is False
+        assert request('wifi.radio.set', dict(band='6g', enabled=True))[0] == 400
+        assert request('wifi.radio.set', dict(band='5g'))[0] == 400
+        assert request('wifi.guest.set', {})[0] == 400
+        assert request('wifi.guest.set', dict(active_time=100))[0] == 400
+        assert request('wifi.guest.set', dict(bands={'7g': True}))[0] == 400
+        assert request('wifi.guest.set', dict(bands={'6g': True}))[0] == 400
+        before = len(writes())
+        code, body = request('wifi.guest.set', dict(active_time=120, management_access=False))
+        assert code == 200 and body['result']['changed'], body
+        assert body['result']['active_time_minutes'] == 120 and body['result']['management_access'] is False, body
+        new = writes()[before:]
+        sets = [args for args in new if args[:3] == ['call', 'zwrt_wlan', 'set']]
+        assert len(sets) == 1 and json.loads(sets[0][3]) == {
+            'guest_2g': {'guest_active_time': '120'}, 'guest_5g': {'guest_active_time': '120'}}, sets
+        isolate = [args for args in new if 'router_set_wifi_isolate' in args]
+        assert len(isolate) == 1 and json.loads(isolate[0][3]) == {'guest_access_restrict_enable': 1}, isolate
+        before = len(writes())
+        assert request('wifi.guest.set', dict(active_time=120, management_access=False))[1]['result']['changed'] is False
+        assert len(writes()) == before
+        code, body = request('wifi.guest.set', dict(enabled=True))
+        assert code == 200 and all(item['enabled'] for item in body['result']['guests']), body
+        code, body = request('wifi.guest.set', dict(bands={'5g': False}))
+        assert {item['band']: item['enabled'] for item in body['result']['guests']} == {'2g': True, '5g': False}, body
+        # Missing counters and isolation are unknown, never zero.
+        data = json.loads(fixture.read_text())
+        del data['users'], data['isolate']
+        fixture.write_text(json.dumps(data))
+        guest = request('wifi.guest.status')[1]['result']
+        assert guest['management_access'] is None, guest
+        assert all(item['clients'] is None for item in guest['guests']), guest
+        assert request('wifi.guest.set', dict(management_access=True))[0] == 502
         print('Wi-Fi status fields, steering mapping, no-op, validation, auth, failure/readback and credential redaction PASS')
     finally:
         proc.terminate()

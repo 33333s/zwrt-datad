@@ -1449,6 +1449,8 @@ fn capability_controls() -> Vec<&'static str> {
         "client.access",
         "wifi.acl.status",
         "nat.status",
+        "wifi.state",
+        "wifi.guest.status",
         "neighbor.status",
         "neighbor.set",
         "state.refresh",
@@ -1951,6 +1953,12 @@ async fn control(
     }
     if action == "nat.status" {
         return control_ok(action, crate::nat::status().await);
+    }
+    if action == "wifi.state" {
+        return control_ok(action, crate::wifi_control::state().await);
+    }
+    if action == "wifi.guest.status" {
+        return control_ok(action, crate::wifi_control::guest_status().await);
     }
     if action == "wifi.acl.status" {
         return control_ok(action, crate::control::wifi_acl_status().await);
@@ -2816,7 +2824,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2);
+        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2 + 4);
         for action in [
             "time.status",
             "time.config.set",
@@ -2830,12 +2838,16 @@ mod tests {
             "wifi.acl.set",
             "nat.status",
             "nat.detect",
+            "wifi.state",
+            "wifi.guest.status",
+            "wifi.radio.set",
+            "wifi.guest.set",
         ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            88 + 6 + 2 + 2 + 2
+            88 + 6 + 2 + 2 + 2 + 4
         );
     }
 

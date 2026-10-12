@@ -45,6 +45,7 @@ mod update_status;
 mod usb;
 mod webshell;
 mod wifi;
+mod wifi_control;
 
 use anyhow::Result;
 use clap::Parser;
