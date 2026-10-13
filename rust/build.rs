@@ -3,6 +3,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DATAD_KEYMASTER_WORKER");
     println!("cargo:rerun-if-env-changed=DATAD_DIAG_WORKER");
     println!("cargo:rerun-if-env-changed=DATAD_DIAG_STREAMER");
+    println!("cargo:rerun-if-env-changed=DATAD_EFS_WORKER");
+    println!("cargo:rerun-if-changed=efs_worker.c");
     println!("cargo:rerun-if-changed=keymaster_worker.rs");
     println!("cargo:rerun-if-changed=u50_diag_worker.c");
     println!("cargo:rerun-if-changed=u50_diag_streamer.c");
@@ -91,6 +93,40 @@ fn main() {
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("diag-streamer"),
         diag_streamer,
+    )
+    .unwrap();
+    let efs_worker = match env::var_os("DATAD_EFS_WORKER") {
+        Some(path) => {
+            println!("cargo:rerun-if-changed={}", PathBuf::from(&path).display());
+            let bytes = fs::read(path).expect("read EFS worker");
+            assert!(bytes.len() > 64 && bytes.len() < 2 * 1024 * 1024);
+            let target = env::var("TARGET").unwrap();
+            let (class, machine) = if target.starts_with("armv7-") {
+                (1, 40u16)
+            } else if target.starts_with("aarch64-") {
+                (2, 183u16)
+            } else {
+                panic!("EFS worker can only be embedded in ARM builds");
+            };
+            assert_eq!(&bytes[..4], b"\x7fELF");
+            assert_eq!(&bytes[4..6], &[class, 1]);
+            assert_eq!(&bytes[18..20], &machine.to_le_bytes());
+            let loader = if class == 1 {
+                b"/lib/ld-linux-armhf.so.3\0".as_slice()
+            } else {
+                b"/lib/ld-musl-aarch64.so.1\0".as_slice()
+            };
+            assert!(
+                bytes.windows(loader.len()).any(|v| v == loader),
+                "EFS worker must use the firmware's dynamic loader"
+            );
+            bytes
+        }
+        None => Vec::new(),
+    };
+    fs::write(
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("efs-worker"),
+        efs_worker,
     )
     .unwrap();
     let path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../version.json");

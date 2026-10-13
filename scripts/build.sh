@@ -43,6 +43,12 @@ cp build/keymaster-target/$TARGET/release/keymaster-worker build/keymaster-worke
 file build/keymaster-worker | grep -q 'ARM aarch64.*dynamically linked.*stripped'
 export DATAD_KEYMASTER_WORKER="$ROOT/build/keymaster-worker"
 
+# EFS loads the firmware's native musl libdiag in a separate dynamic process.
+"$CC" -std=c11 -Os -fPIC -pie -Wl,--strip-all -Wall -Wextra -Werror \
+  "$ROOT/rust/efs_worker.c" -ldl -o "$ROOT/build/efs-worker-aarch64"
+file "$ROOT/build/efs-worker-aarch64" | grep -q 'ARM aarch64.*dynamically linked'
+export DATAD_EFS_WORKER="$ROOT/build/efs-worker-aarch64"
+
 "$CARGO" "+$RUST_TOOLCHAIN" build \
   --manifest-path rust/Cargo.toml \
   --locked --release --target "$TARGET" --bin zwrt-datad

@@ -7,6 +7,7 @@ mod cloud_update;
 mod command;
 mod control;
 mod cooling;
+mod efs;
 mod extra_wifi;
 mod identity;
 mod lan;

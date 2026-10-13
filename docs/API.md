@@ -12,6 +12,9 @@
 
 本机端口保持免鉴权，供设备上的 UFI 和脚本使用。内网端口通过 `POST /auth/login` 或 `POST /auth/exchange` 获取临时 Token；若配置了非空静态 Token 文件，也兼容该 Token。
 
+EFS 文件管理是例外：`/efs/*` 在本机和内网端口都强制校验 Authorization Bearer，
+不接受 URL、Cookie 或旧式 Token 请求头。接口、上传下载和限制见 [EFS API](EFS.md)。
+
 需要鉴权的接口接受以下请求头：
 
 ```http

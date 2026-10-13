@@ -77,6 +77,8 @@ jobs:
       - run: python3 ../tests/version_test.py target/debug/zwrt-datad
       - run: python3 ../tests/lan_cors_test.py target/debug/zwrt-datad
       - run: python3 ../tests/signal_auth_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/efs_worker_test.py
+      - run: python3 ../tests/efs_http_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_embedded_test.py target/debug/zwrt-datad
       - run: python3 ../tests/cloud_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/sms_forward_app_test.py target/debug/zwrt-datad
