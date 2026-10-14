@@ -45,6 +45,7 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
         (base / "low-speed", "low_speed_mode:1, low_speed_max:76"),
         (base / "liquid-thermal", "thermal_enable:1"), (base / "liquid-drive", "0 0 0"),
         (base / "qos", ""), (base / "qos.0", ""), (base / "leases", ""),
+        (base / "mc-state", "config zudata_mode_fun 'mode'\n\toption mode_main_state 'mode_power_on_charger'\n"),
     ):
         path.write_text(value)
     for index, temperature in enumerate((44, 48, 53)):
@@ -66,6 +67,7 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
         "ZWRT_DATAD_LIQUID_DRIVE_PATH": str(base / "liquid-drive"),
         "ZWRT_DATAD_QOS_LOG": str(base / "qos"), "ZWRT_DATAD_QOS_LOG_ROTATED": str(base / "qos.0"),
         "ZWRT_DATAD_DHCP_LEASES_PATH": str(base / "leases"),
+        "ZWRT_DATAD_MC_STATE_PATH": str(base / "mc-state"),
     })
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -136,19 +138,30 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
             replace(base / "uci" / "zwrt_deviceui.Device.fan_switch_status", "0")
             wait_for(lambda: state()["mode"] == "custom" and state()["pwm"] == 113, "native off did not restore curve")
 
+            # Quick power-off only pretends to switch the device off: the stock
+            # thermal zone takes the fan back and the curve stays paused.
+            replace(base / "mc-state", "config zudata_mode_fun 'mode'\n\toption mode_main_state 'mode_power_off_quicken'\n")
+            wait_for(lambda: (zone / "mode").read_text() == "enabled", "power-off did not hand the fan back")
+            replace(base / "pwm", "7")
+            time.sleep(1.5)
+            assert (base / "pwm").read_text() == "7", "curve kept driving the fan while powered off"
+            assert (zone / "mode").read_text() == "enabled"
+            replace(base / "mc-state", "config zudata_mode_fun 'mode'\n\toption mode_main_state 'mode_power_on_charger'\n")
+            wait_for(lambda: (zone / "mode").read_text() == "disabled" and state()["pwm"] == 113, "curve did not resume after power-on")
+
             action("cooling.liquid.set_mode", {"mode": "low"})
             # Always-on is re-applied by the periodic tick; regular files (unlike
             # sysfs) can be observed mid-rewrite, so wait for a stable value.
             wait_for(lambda: (base / "liquid-drive").read_text() == "1023 60 200", "liquid low drive")
             result = action("cooling.liquid.set_enabled", {"enabled": True})
-            assert result["mode"] == "high" and result["amplitude"] == 200
-            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 200 200", "liquid high drive")
+            assert result["mode"] == "high" and result["amplitude"] == 90
+            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 90 200", "liquid high drive")
             # The driver ignores atsin0 while thermal control is disabled.
             wait_for(lambda: (base / "liquid-thermal").read_text() == "1", "liquid thermal kept enabled")
             action("cooling.liquid.set_enabled", {"enabled": False})
             wait_for(lambda: (base / "liquid-drive").read_text() == "0 0 0", "liquid stop drive")
             replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "1")
-            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 200 200", "native liquid on not high")
+            wait_for(lambda: (base / "liquid-drive").read_text() == "1023 90 200", "native liquid on not high")
             replace(base / "uci" / "zwrt_deviceui.Device.liquid_cooling_switch_status", "0")
             wait_for(lambda: (base / "liquid-drive").read_text() == "0 0 0", "native liquid off did not stop drive")
             assert (base / "liquid-thermal").read_text() == "1"

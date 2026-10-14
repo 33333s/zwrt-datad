@@ -102,9 +102,12 @@ pub async fn state() -> Value {
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             };
-            radios.push(
-                json!({"band":band,"device":device,"enabled":band_enabled,"radio_enabled":radio}),
-            );
+            let htmode = state::uci_read(&format!("wireless.{device}.htmode")).await;
+            let hwmode = state::uci_read(&format!("wireless.{device}.hwmode")).await;
+            radios.push(json!({
+                "band":band,"device":device,"enabled":band_enabled,"radio_enabled":radio,
+                "width":width_of(&htmode),"widths":widths(band, &hwmode),"htmode":htmode,
+            }));
         }
         for kind in ["main", "guest"] {
             if let Some(item) = ap(&format!("{kind}_{band}"), kind, band).await {
@@ -118,6 +121,75 @@ pub async fn state() -> Value {
         "radios":radios,
         "aps":aps,
     })
+}
+
+/// The htmode family the stock web UI writes for a hardware mode
+/// (`getWifiBandwidthPrefix`): Wi-Fi 7 EHT, Wi-Fi 6 HE, 11ac VHT, else HT.
+fn htmode_prefix(hwmode: &str) -> &'static str {
+    match hwmode {
+        "11bea" | "11beg" => "EHT",
+        "11axa" | "11axg" => "HE",
+        "11ac" => "VHT",
+        _ => "HT",
+    }
+}
+
+/// Channel widths (MHz) a band can use in its hardware mode.
+fn widths(band: &str, hwmode: &str) -> Vec<u32> {
+    let prefix = htmode_prefix(hwmode);
+    match band {
+        "2g" => vec![20, 40],
+        _ if prefix == "HT" => vec![20, 40],
+        "6g" if prefix == "EHT" => vec![20, 40, 80, 160, 320],
+        "5g" | "6g" => vec![20, 40, 80, 160],
+        _ => Vec::new(),
+    }
+}
+
+/// The width in an htmode such as `EHT160`, or null.
+fn width_of(htmode: &str) -> Option<u32> {
+    htmode
+        .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .parse()
+        .ok()
+}
+
+/// Sets a band's channel width the way the stock advanced page does:
+/// `zwrt_wlan set {<radio>:{htmode:<prefix><width>}}`, which restarts that
+/// radio's APs.
+pub async fn set_bandwidth(band: &str, width: u32) -> Result<Value, String> {
+    if !wifi::present_bands().await.contains(&band) {
+        return Err(format!("invalid:unsupported band {band}"));
+    }
+    let device = wifi::radio_for(band).await;
+    if device.is_empty() {
+        return Err(format!("invalid:no radio for band {band}"));
+    }
+    let hwmode = state::uci_read(&format!("wireless.{device}.hwmode")).await;
+    let allowed = widths(band, &hwmode);
+    if !allowed.contains(&width) {
+        return Err(format!(
+            "invalid:width must be one of {} MHz for {band}",
+            allowed
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    let path = format!("wireless.{device}.htmode");
+    let old = state::uci_read(&path).await;
+    let htmode = format!("{}{width}", htmode_prefix(&hwmode));
+    let changed = old != htmode;
+    if changed {
+        wlan_set(json!({ device.clone(): {"htmode": htmode} })).await?;
+        if !confirm(|| async { state::uci_read(&path).await == htmode }).await {
+            return Err("Wi-Fi readback did not confirm the requested width".into());
+        }
+    }
+    Ok(
+        json!({"band":band,"device":device,"width":width,"htmode":htmode,"previous":old,"changed":changed}),
+    )
 }
 
 /// Waits until `check` holds; the firmware applies some writes asynchronously.
@@ -278,6 +350,23 @@ async fn set_single_chip_band(
     }
     let mut wanted: Vec<(String, String)> = Vec::new();
     if enabled {
+        // Every SSID that is on runs again once the stock names are back.
+        if let Some(limit) = ap_limit().await {
+            let mut count = 0;
+            for (other, radio, _) in &radios {
+                if *other != band && self::enabled(radio).await != Some(true) {
+                    continue;
+                }
+                for kind in ["main", "guest"] {
+                    let on = (kind == "main" && *other == band)
+                        || self::enabled(&format!("{kind}_{other}")).await == Some(true);
+                    count += usize::from(on);
+                }
+            }
+            if count > limit {
+                return Err(limit_error(limit));
+            }
+        }
         wanted.push((format!("{device}.disabled"), "0".into()));
         if !main_enabled {
             wanted.push((format!("main_{band}.disabled"), "0".into()));
@@ -321,7 +410,16 @@ async fn set_single_chip_band(
             wanted.push((format!("{kind}_{on}.ifname"), "wlan1".into()));
         }
     }
-    // Only sections the firmware has, and only values that differ.
+    let options = write_layout(wanted).await?;
+    Ok(
+        json!({"band":band,"device":device,"enabled":enabled,"changed":!options.is_empty(),"verified":true,"options":options}),
+    )
+}
+
+/// Writes `section.option=value` pairs with uci (`zwrt_wlan set` refuses
+/// ifname), only for sections the firmware has and values that differ, then
+/// commits and reloads Wi-Fi. Returns the options written.
+async fn write_layout(wanted: Vec<(String, String)>) -> Result<Vec<String>, String> {
     let mut writes = Vec::new();
     for (option, value) in wanted {
         let section = option.split('.').next().unwrap_or_default().to_owned();
@@ -333,8 +431,7 @@ async fn set_single_chip_band(
             writes.push((path, value));
         }
     }
-    let changed = !writes.is_empty();
-    if changed {
+    if !writes.is_empty() {
         for (path, value) in &writes {
             if let Err(error) = state::uci_write("set", path, Some(value)).await {
                 let _ = state::uci_write("revert", "wireless", None).await;
@@ -353,13 +450,125 @@ async fn set_single_chip_band(
         let response = state::ubus("zwrt_wlan", "reload", json!({})).await?;
         wifi::check_write_response(&response)?;
     }
-    let options: Vec<String> = writes
+    Ok(writes
         .iter()
         .map(|(path, value)| format!("{}={value}", path.trim_start_matches("wireless.")))
-        .collect();
-    Ok(
-        json!({"band":band,"device":device,"enabled":enabled,"changed":changed,"verified":true,"options":options}),
+        .collect())
+}
+
+/// APs the firmware can run at once. The U60 Pro (MU5250) QCMAP rejects three
+/// (`zte_wlan_ex_start mode=4`: "unsupported wifi mode") and Wi-Fi stays down.
+async fn ap_limit() -> Option<usize> {
+    (state::uci_read("zwrt_common_info.common_config.model_name").await == "MU5250").then_some(2)
+}
+
+/// Main and guest APs that would run, with `overrides` (section, on) applied.
+async fn running_aps(overrides: &[(String, bool)]) -> usize {
+    let mut count = 0;
+    for band in wifi::present_bands().await {
+        let radio = wifi::radio_for(band).await;
+        if radio.is_empty() || enabled(&radio).await == Some(false) {
+            continue;
+        }
+        for kind in ["main", "guest"] {
+            let section = format!("{kind}_{band}");
+            let on = match overrides.iter().find(|(name, _)| *name == section) {
+                Some((_, on)) => Some(*on),
+                None => enabled(&section).await,
+            };
+            if on == Some(true)
+                && state::uci_read(&format!("wireless.{section}.ifname")).await != "wlanx"
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Refuses a change that would run more APs than the firmware can.
+pub async fn check_ap_limit(overrides: &[(String, bool)]) -> Result<(), String> {
+    if let Some(limit) = ap_limit().await
+        && overrides.iter().any(|(_, on)| *on)
+        && running_aps(overrides).await > limit
+    {
+        return Err(limit_error(limit));
+    }
+    Ok(())
+}
+
+fn limit_error(limit: usize) -> String {
+    format!(
+        "invalid:this firmware runs at most {limit} Wi-Fi networks at once; switch another SSID off first"
     )
+}
+
+/// Whether `section` carries its band on wlan0 of a single-chip firmware.
+async fn holds_wlan0(section: &str) -> bool {
+    state::uci_read(&format!("wireless.{section}.ifname")).await == "wlan0"
+        && single_chip(&state::uci_read(&format!("wireless.{section}.device")).await).await
+}
+
+/// The SSID switch of `wifi.configure` on the single-chip firmwares, where
+/// QCMAP needs an AP on wlan0. A main SSID on wlan0 can go off only while the
+/// band's guest SSID stays on: the guest takes wlan0 and the main SSID is
+/// parked as wlanx (verified on the U60 Pro). Switching it on restores the
+/// stock interface names. None leaves the switch to the plain SSID write.
+pub async fn single_chip_ssid(section: &str, on: bool) -> Option<Result<Value, String>> {
+    let (kind, band) = section.split_once('_')?;
+    let device = state::uci_read(&format!("wireless.{section}.device")).await;
+    if !single_chip(&device).await {
+        return None;
+    }
+    let ifname = state::uci_read(&format!("wireless.{section}.ifname")).await;
+    let guest = format!("guest_{band}");
+    let result = match (kind, on) {
+        ("main", false) if ifname == "wlan0" => {
+            if enabled(&guest).await != Some(true) {
+                return Some(Err(
+                    "invalid:this firmware cannot switch the band on wlan0 off through its SSID; use wifi.radio.set".into(),
+                ));
+            }
+            write_layout(vec![
+                (format!("{section}.disabled"), "1".into()),
+                (format!("{section}.ifname"), "wlanx".into()),
+                (format!("{guest}.ifname"), "wlan0".into()),
+            ])
+            .await
+        }
+        ("main", true) if ifname == "wlanx" => {
+            if enabled(&device).await == Some(false) {
+                return Some(Err(format!(
+                    "invalid:band {band} is switched off; use wifi.radio.set"
+                )));
+            }
+            let Some((main_if, extra_if)) = default_ifnames(&device) else {
+                return Some(Err(format!("invalid:unknown radio layout for band {band}")));
+            };
+            // The count skips the parked SSID itself: it comes back as one more.
+            if let Some(limit) = ap_limit().await
+                && running_aps(&[]).await + 1 > limit
+            {
+                return Some(Err(limit_error(limit)));
+            }
+            write_layout(vec![
+                (format!("{section}.disabled"), "0".into()),
+                (format!("{section}.ifname"), main_if),
+                (format!("{guest}.ifname"), extra_if.clone()),
+                (format!("backhaul_{band}.ifname"), extra_if),
+            ])
+            .await
+        }
+        ("guest", false) if ifname == "wlan0" => {
+            return Some(Err(format!(
+                "invalid:the guest SSID carries band {band} while its main SSID is off; switch the main SSID on first, or the band off with wifi.radio.set"
+            )));
+        }
+        _ => return None,
+    };
+    Some(result.map(|options| {
+        json!({"section":section,"enabled":on,"changed":!options.is_empty(),"verified":true,"options":options})
+    }))
 }
 
 /// Guest support flags of the stock `wireless.readonly` section; chip1 is the
@@ -497,10 +706,17 @@ pub async fn set_guest(update: GuestUpdate) -> Result<Value, String> {
             }
         }
     }
+    let mut overrides = Vec::new();
     for (band, on) in &requested {
         let Some((_, section)) = guest_sections.iter().find(|(known, _)| known == band) else {
             return Err(format!("invalid:no guest SSID for band {band}"));
         };
+        if !*on && holds_wlan0(section).await {
+            return Err(format!(
+                "invalid:the guest SSID carries band {band} while its main SSID is off; switch the main SSID on first, or the band off with wifi.radio.set"
+            ));
+        }
+        overrides.push((section.clone(), *on));
         if *on && guest_supported(band).await == Some(false) {
             return Err(format!(
                 "invalid:guest SSID is not supported on band {band}"
@@ -515,6 +731,7 @@ pub async fn set_guest(update: GuestUpdate) -> Result<Value, String> {
             current,
         );
     }
+    check_ap_limit(&overrides).await?;
     if let Some(minutes) = update.active_time {
         if state::uci_read("wireless.readonly.wifi_attr_support_guest_ssid_active_time").await
             == "0"
@@ -583,6 +800,22 @@ pub async fn set_guest(update: GuestUpdate) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widths_follow_band_and_hardware_mode() {
+        assert_eq!(htmode_prefix("11beg"), "EHT");
+        assert_eq!(htmode_prefix("11axa"), "HE");
+        assert_eq!(htmode_prefix("11ac"), "VHT");
+        assert_eq!(htmode_prefix("11ng"), "HT");
+        assert_eq!(widths("2g", "11beg"), [20, 40]);
+        assert_eq!(widths("5g", "11bea"), [20, 40, 80, 160]);
+        assert_eq!(widths("5g", "11na"), [20, 40]);
+        assert_eq!(widths("6g", "11bea"), [20, 40, 80, 160, 320]);
+        assert_eq!(widths("6g", "11axa"), [20, 40, 80, 160]);
+        assert_eq!(width_of("EHT160"), Some(160));
+        assert_eq!(width_of("HT40"), Some(40));
+        assert_eq!(width_of(""), None);
+    }
 
     #[test]
     fn flags_and_numbers_never_default_to_zero() {

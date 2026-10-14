@@ -43,6 +43,7 @@ pub const ACTIONS: &[&str] = &[
     "wifi.set_module",
     "wifi.set_chip",
     "wifi.radio.set",
+    "wifi.bandwidth.set",
     "wifi.guest.set",
     "wifi.configure",
     "wireless.config",
@@ -294,6 +295,18 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
             }
             (Err(e), _) | (_, Err(e)) => Outcome::Invalid(e),
             (Ok(None), _) => Outcome::Invalid("missing parameter: band".into()),
+        },
+        "wifi.bandwidth.set" => match (string(params, "band", true), object(params).get("width")) {
+            (Ok(Some(band)), Some(width)) => match width
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+            {
+                Some(width) => wifi_outcome(crate::wifi_control::set_bandwidth(&band, width).await),
+                None => Outcome::Invalid("width must be a number of MHz".into()),
+            },
+            (Err(e), _) => Outcome::Invalid(e),
+            (Ok(None), _) => Outcome::Invalid("missing parameter: band".into()),
+            (_, None) => Outcome::Invalid("missing parameter: width".into()),
         },
         "wifi.guest.set" => wifi_guest_set(params).await,
         "wifi.configure" => wifi_configure(params).await,
@@ -1068,21 +1081,23 @@ async fn wifi_configure(params: &Value) -> Outcome {
             Value::Number(v) if v.as_i64() == Some(1) => true,
             _ => return Outcome::Invalid("enabled must be boolean or 0/1".into()),
         };
-        // On the single-chip qcacld32 firmwares the main SSID on wlan0 cannot
-        // be switched off alone: QCMAP then starts no AP and Wi-Fi stays down.
-        if !enabled
-            && section.starts_with("main_")
-            && state::uci_read(&format!("wireless.{section}.ifname")).await == "wlan0"
-            && crate::wifi_control::single_chip(
-                &state::uci_read(&format!("wireless.{section}.device")).await,
-            )
-            .await
-        {
-            return Outcome::Invalid(
-                "this firmware cannot switch the band on wlan0 off through its SSID; use wifi.radio.set".into(),
-            );
+        // On the single-chip qcacld32 firmwares QCMAP needs an AP on wlan0;
+        // switches that move SSIDs between interfaces are done there.
+        match crate::wifi_control::single_chip_ssid(&section, enabled).await {
+            Some(Err(error)) => return wifi_outcome(Err(error)),
+            Some(Ok(result)) if updates.is_empty() => return Outcome::Ok(result),
+            // The switch is done; the other fields follow below.
+            Some(Ok(_)) => {}
+            None => {
+                if enabled
+                    && let Err(error) =
+                        crate::wifi_control::check_ap_limit(&[(section.clone(), true)]).await
+                {
+                    return wifi_outcome(Err(error));
+                }
+                updates.push(("disabled", if enabled { "0" } else { "1" }.into()));
+            }
         }
-        updates.push(("disabled", if enabled { "0" } else { "1" }.into()));
     }
     if updates.is_empty() {
         return Outcome::Invalid("no wifi fields supplied".into());
@@ -1356,20 +1371,35 @@ async fn acl_sections() -> Vec<AclSection> {
     output
 }
 
+/// The filter mode a section gets for the device policy `mode`: a whitelist
+/// only covers the main SSIDs, so guests can still join the guest SSID; the
+/// blacklist covers the guest SSIDs too. The firmware applies each SSID's own
+/// `macfilter` to its interface (qcacld32.sh / zte_post_wifi.sh).
+fn section_acl_mode(section: &str, mode: &'static str) -> &'static str {
+    if section.starts_with("guest_") && mode == "allow" {
+        "deny"
+    } else {
+        mode
+    }
+}
+
 /// Wi-Fi MAC filter of the primary 2.4 GHz AP, which the firmware treats as
-/// the device-wide policy. `consistent` is false when another SSID differs.
+/// the device-wide policy. `consistent` is false when an SSID differs from
+/// what that policy gives it.
 pub async fn wifi_acl_status() -> Value {
     let sections = acl_sections().await;
     let Some(first) = sections.first() else {
-        return json!({"mode":"disable","allow":[],"deny":[],"consistent":true,"max_entries":ACL_MAX_ENTRIES});
+        return json!({"mode":"disable","guest_mode":"disable","allow":[],"deny":[],"consistent":true,"max_entries":ACL_MAX_ENTRIES});
     };
+    let mode = acl_mode(&first.mode);
     let consistent = sections.iter().all(|item| {
-        acl_mode(&item.mode) == acl_mode(&first.mode)
+        acl_mode(&item.mode) == section_acl_mode(item.section, mode)
             && item.allow == first.allow
             && item.deny == first.deny
     });
     json!({
-        "mode":acl_mode(&first.mode),
+        "mode":mode,
+        "guest_mode":section_acl_mode("guest_2g", mode),
         "allow":first.allow,
         "deny":first.deny,
         "consistent":consistent,
@@ -1378,12 +1408,13 @@ pub async fn wifi_acl_status() -> Value {
 }
 
 /// Sets the MAC filter mode, and optionally replaces the allow and deny lists,
-/// on every main and guest SSID, the same way the stock web UI does. The
-/// firmware reload derives the active `maclist` and disconnects stations the
-/// new policy rejects.
+/// on every main and guest SSID. Unlike the stock web UI, a whitelist leaves
+/// the guest SSIDs on the blacklist (`section_acl_mode`). The firmware reload
+/// derives the active `maclist` and disconnects stations the new policy
+/// rejects.
 async fn wifi_acl_set(params: &Value) -> Outcome {
     let mode = match string(params, "mode", true) {
-        Ok(Some(mode)) if matches!(mode.as_str(), "allow" | "deny" | "disable") => mode,
+        Ok(Some(mode)) if matches!(mode.as_str(), "allow" | "deny" | "disable") => acl_mode(&mode),
         Ok(_) => return Outcome::Invalid("mode must be allow, deny or disable".into()),
         Err(e) => return Outcome::Invalid(e),
     };
@@ -1404,9 +1435,10 @@ async fn wifi_acl_set(params: &Value) -> Outcome {
     let mut changed = false;
     for item in &sections {
         let section = item.section;
-        if item.mode != mode {
+        let wanted_mode = section_acl_mode(section, mode);
+        if item.mode != wanted_mode {
             let path = format!("wireless.{section}.macfilter");
-            if let Err(e) = state::uci_write("set", &path, Some(&mode)).await {
+            if let Err(e) = state::uci_write("set", &path, Some(wanted_mode)).await {
                 return revert_wireless(e).await;
             }
             changed = true;
@@ -1429,7 +1461,7 @@ async fn wifi_acl_set(params: &Value) -> Outcome {
             changed = true;
         }
     }
-    let result = |changed: bool| json!({"mode":mode,"allow":allow,"deny":deny,"changed":changed,"verified":true});
+    let result = |changed: bool| json!({"mode":mode,"guest_mode":section_acl_mode("guest_2g", mode),"allow":allow,"deny":deny,"changed":changed,"verified":true});
     if !changed {
         return Outcome::Ok(result(false));
     }
@@ -1443,7 +1475,10 @@ async fn wifi_acl_set(params: &Value) -> Outcome {
         return Outcome::Failed(format!("MAC filter committed but reload failed: {e}"));
     }
     for item in acl_sections().await {
-        if item.mode != mode || item.allow != allow || item.deny != deny {
+        if item.mode != section_acl_mode(item.section, mode)
+            || item.allow != allow
+            || item.deny != deny
+        {
             return Outcome::Failed(format!(
                 "MAC filter readback did not confirm {}",
                 item.section

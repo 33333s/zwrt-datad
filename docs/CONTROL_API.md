@@ -127,6 +127,7 @@ RFC 5780 服务器确认。只提供不支持 RFC 5780 的服务器时，只能�
 | `wifi.set_module` | `enabled`，布尔或 `0/1`；Wi-Fi 模块总开关（原厂 `zte_mbb.wifi_onoff`） |
 | `wifi.radio.set` | `band`=`2g`/`5g`（有 6 GHz 的机型含 `6g`），`enabled`；单个频段的开关（与原厂网页一致，通过该频段的 SSID 实现，见下文） |
 | `wifi.guest.status` | 无；访客 SSID 开关与实际状态、访问时限、剩余时间、管理页访问、在线人数 |
+| `wifi.bandwidth.set` | `band`、`width`（MHz）| 设置频段信道带宽：2.4 GHz 20/40，5 GHz 20/40/80/160（11n 只有 20/40），6 GHz Wi-Fi 7 另有 320；见下文 |
 | `wifi.guest.set` | `enabled`（全部访客频段）、`bands`（如 `{"5g":true}`）、`active_time`（分钟）、`management_access` 至少一项 |
 | `wifi.set_chip` | 已不支持，固定返回 400；改用 `wifi.radio.set` / `wifi.guest.set` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
@@ -178,7 +179,8 @@ SSID 才在广播。
 - `module`：`enabled`（`wifi_onoff`，当前状态）和 `user_enabled`（`wifi_onoff_by_user`，用户设置）。
 - `radios`：`[{band, device, enabled, radio_enabled}]`。`enabled` 是 `wifi.radio.set` 控制的频段开关：射频和该频段
   主 SSID 都打开才为 `true`；`radio_enabled` 只是射频（wifi-device）本身的配置。射频与频段的对应关系按机型从
-  `wireless.main_<band>.device` 读取。
+  `wireless.main_<band>.device` 读取。`width` 是当前信道带宽（MHz，取自 `wifiN.htmode`
+  的数字，读不到为 `null`），`widths` 是该频段可选的带宽，`htmode` 为原始值。
 - `aps`：每个主/访客 SSID 一项 `{section, kind, band, ifname, enabled, state, active}`。`enabled` 是配置，
   `state` 是内核接口的 `operstate`（接口不存在为 `absent`），`active` 仅在 `state=up` 时为 `true`；
   接口启动过程中会短暂出现 `down`/`unknown`。没有 `ifname` 时 `state/active` 为 `null`。
@@ -196,8 +198,14 @@ SSID 才在广播。
   访客/回传改用 `wlan1`；打开时启用射频，所有频段恢复原厂接口名（`wifiN` → 主 SSID `wlan(2N)`、访客/回传 `wlan(2N+1)`），
   主 SSID 关着的一并打开。写 UCI 后执行 `zwrt_wlan.reload`，原厂约一分钟完成重启。不会关掉最后一个开着的频段（返回 400，
   请用 `wifi.set_module`）；Mesh（`zte_mbb.mesh_onoff=1`）打开时不允许关闭频段（返回 400），因为 Mesh 下原厂用两个频段的
-  回传 AP 经 ezmesh 启动，单频布局起不来（MC7523 实测），打开频段不受限。返回的 `options` 列出实际改动的 UCI 项。`wifi.configure` 在这类固件上不能把占用 `wlan0` 的
-  主 SSID 关掉（返回 400，请用 `wifi.radio.set`）：只关这个 SSID 时剩下的 AP 不在 wlan0 上，Wi-Fi 会整体起不来。
+  回传 AP 经 ezmesh 启动，单频布局起不来（MC7523 实测），打开频段不受限。返回的 `options` 列出实际改动的 UCI 项。`wifi.configure` 关掉占用 `wlan0` 的
+  主 SSID 时（只关主 SSID、保留访客）：该频段访客 SSID 开着时，访客改用 `wlan0`、主 SSID `disabled=1` 且 `ifname=wlanx`
+  （U60 Pro 实测 QCMAP 保持两个 AP 正常启动），返回 `options`；访客关着时返回 400（请用 `wifi.radio.set`），因为只关这个
+  SSID 时剩下的 AP 不在 wlan0 上，Wi-Fi 会整体起不来。主 SSID 停放在 `wlanx` 期间，单独关掉占着 `wlan0` 的访客 SSID 会被拒绝
+  （400）；用 `wifi.configure` 打开主 SSID 时恢复原厂接口名。
+- **U60 Pro（MU5250）最多同时运行两个 AP**：主 2.4 + 主 5 + 任一访客会让 QCMAP 以 `mode=4` 启动并报 `unsupported wifi
+  mode`，Wi-Fi 整体起不来（0.10.79 实测）。`wifi.guest.set`、`wifi.configure` 打开 SSID、`wifi.radio.set` 打开频段时，
+  结果超过两个 AP 会返回 400，不写配置。
 - **其他固件**（MC8532B、MC8531 等 ath 驱动）：与原厂网页的单频段开关一致，只改 SSID：关闭写
   `{"main_<band>":{"disabled":"1"},"guest_<band>":{"disabled":"1"}}`（只包含开着的段），打开写主 SSID `disabled:"0"`，
   访客 SSID 仍由 `wifi.guest.set` 控制；射频被旧版关掉时一并恢复。返回的 `sections` 列出写入的段。
@@ -206,6 +214,11 @@ SSID 才在广播。
 两者都会让原厂重启全部
 Wi-Fi，其他频段的 SSID 也会断开约 10–40 秒；返回成功只表示配置已确认，客户端应轮询 `wifi.state`
 等待 `busy=false` 且 `active=true`。
+
+`wifi.bandwidth.set` 与原厂“高级设置”一致，写 `zwrt_wlan.set {"<wifiN>":{"htmode":"<前缀><带宽>"}}`，前缀按射频
+`hwmode` 取：`11bea/11beg` 为 `EHT`，`11axa/11axg` 为 `HE`，`11ac` 为 `VHT`，其他为 `HT`。带宽不在该频段可选列表内返回
+400；与当前相同返回 `changed=false` 且不重启 Wi-Fi；否则读回 `htmode` 确认，返回 `{band, device, width, htmode,
+previous, changed}`。改带宽会重启该射频上的 AP，客户端会短暂断开。
 
 旧的 `wifi.set_chip`（`ChipEnum`/`GuestEnable`）在现有固件上没有对应字段，现在固定返回 400，
 不再假装成功；已有的同名定时任务执行时会得到同样的错误。
@@ -244,12 +257,16 @@ SSID、加密和密码继续用 `wifi.configure`（`section=guest_2g/guest_5g`�
 按当前模式把对应名单同步成驱动实际使用的 `maclist`，并断开新策略不允许的设备。两份名单
 互相独立，切换模式不会丢失另一份。
 
-`wifi.acl.status` 返回 `mode/allow/deny/consistent/max_entries`。模式和名单取自 `main_2g`
-（原厂以它为整机策略）；`consistent=false` 表示其他 SSID 段与它不一致（例如手工改过 UCI）。
+`wifi.acl.status` 返回 `mode/guest_mode/allow/deny/consistent/max_entries`。模式和名单取自 `main_2g`
+（原厂以它为整机策略），`guest_mode` 是访客 SSID 应有的模式；`consistent=false` 表示某个 SSID 段与此不一致（例如手工改过
+UCI 或用原厂网页保存过）。
 MAC 统一为小写并去重。
 
-`wifi.acl.set` 把模式和名单写到所有主/访客 SSID 段（有 6 GHz 的机型含 6 GHz 段），与原厂
-页面行为一致。省略 `allow` 或 `deny` 时保留现有名单，传空数组表示清空。每份名单最多 64 条，
+`wifi.acl.set` 把模式和名单写到所有主/访客 SSID 段（有 6 GHz 的机型含 6 GHz 段）。0.10.79 起白名单只作用于
+主 SSID：`mode=allow` 时访客 SSID 写成黑名单模式（`macfilter=deny`，名单相同），访客无需加入白名单即可连接访客 Wi-Fi，
+黑名单仍对访客生效；`deny`/`disable` 时访客与主 SSID 相同。原厂按每个 SSID 自己的 `macfilter` 给对应接口下发
+（`qcacld32.sh`、`zte_post_wifi.sh` 的 `iwpriv setAclMode`），U60 Pro 实测两个 SSID 可分别生效。原厂网页保存白名单时仍会
+写到所有段，此时 `wifi.acl.status.consistent=false`，再调用一次 `wifi.acl.set` 即可恢复。省略 `allow` 或 `deny` 时保留现有名单，传空数组表示清空。每份名单最多 64 条，
 MAC 格式非法、重复项会被拒绝或合并。`mode=allow` 时白名单不能为空，否则所有设备都会被断开；
 调用方应确认当前操作设备的 MAC 已在白名单内，否则保存后会被立即断开。配置与现有完全相同
 时返回 `changed=false` 且不重载 Wi-Fi；否则提交后重载一次并读回核对，`verified=true`。
@@ -378,8 +395,8 @@ datad 校验后把它翻译成设备接口的 `slotId`：
 | `cooling.fan.set_enabled` | `enabled` | 兼容 action 名；`true` 切到常开，`false` 切到自定义曲线 |
 | `cooling.fan.set_mode` | `mode` | `automatic` 使用原厂内核三档曲线，`custom` 使用保存的 2–8 点线性曲线，`always_on` 固定 PWM 128 |
 | `cooling.fan.set_curve` | `points:[{temperature,pwm},...]` | 保存曲线；常开已开启时不退出常开，关闭后使用保存的曲线，否则立即启用曲线。2–8 点，温度严格递增、PWM 不递减 |
-| `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；`true` 固定原厂最高档 `1023 200 200`（幅值200），即使此前选过低档也切到高档；`false` 交还 thermal 控制 |
-| `cooling.liquid.set_mode` | `mode` | MU5252 液冷模式：`automatic` 交还内核 thermal；`low` 使用原厂低档幅度 60；`high` 使用原厂高档幅度 200。两档均保持频率 200，不伪造连续百分比 |
+| `cooling.liquid.set_enabled` | `enabled` | 兼容 action 名；`true` 固定高档 `1023 90 200`（幅值 90），即使此前选过低档也切到高档；`false` 交还 thermal 控制 |
+| `cooling.liquid.set_mode` | `mode` | MU5252 液冷模式：`automatic` 交还内核 thermal；`low` 使用原厂低档幅度 60；`high` 使用幅度 90（aw86320 驱动接受的上限，0.10.79 前写 200 会被驱动静默丢弃、泵不转）。两档均保持频率 200，不伪造连续百分比 |
 
 风扇/液冷配置持久化在 `/data/zwrt-datad/cooling.conf`，datad 重启时恢复。状态中的 `always_on` 表示常开，`enabled` 仅作为同值兼容别名。`automatic` 会重新启用 `sys-therm-4` 并使用设备树的 44/48/53℃、30/50/70% 三档曲线；`custom` 会禁用该 thermal zone、清零 `pwm-fan` 的锁存 state，并每秒按保存曲线线性插值写 PWM；`always_on` 采用同一用户态控制路径持续写 PWM 128。三种模式都保持风扇 `thermal_enable=1`，且 80℃ 始终强制 PWM 255。`factory_curve` 与 `custom_curve` 分别返回原厂和自定义曲线；`curve` 保留为旧消费者兼容字段。液冷自动模式恢复其 `thermal_enable`，低/高档使用原厂固定硬件参数。datad 正常退出时会把风扇 thermal 控制交还厂商驱动作为停服保护。不另装 `/etc/init.d` 或外部风扇脚本。
 

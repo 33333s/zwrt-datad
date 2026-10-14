@@ -221,13 +221,28 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert code == 200 and body['result']['changed'] and body['result']['verified'], body
         assert body['result']['allow'] == ['aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'], body
         new = [json.dumps(args) for args in writes()[before:]]
+        # The whitelist covers the main SSIDs only; the guest SSIDs keep the
+        # blacklist, so guests can still join the guest network.
+        assert body['result']['guest_mode'] == 'deny', body
         for section in sections:
-            assert any(f'wireless.{section}.macfilter=allow' in item for item in new), (section, new)
+            mode = 'deny' if section.startswith('guest_') else 'allow'
+            assert any(f'wireless.{section}.macfilter={mode}' in item for item in new), (section, new)
+            assert not any(f'wireless.{section}.macfilter={"allow" if mode == "deny" else "deny"}' in item
+                           for item in new), (section, new)
             assert any(f'wireless.{section}.allowmaclist=aa:bb:cc:dd:ee:02' in item for item in new), (section, new)
         assert any('"reload"' in item for item in new), new
         status = request('wifi.acl.status')[1]['result']
-        assert status == dict(mode='allow', allow=['aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'], deny=[],
-                              consistent=True, max_entries=64), status
+        assert status == dict(mode='allow', guest_mode='deny', allow=['aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'],
+                              deny=[], consistent=True, max_entries=64), status
+        # A whitelist written the stock way (every SSID) reads as inconsistent.
+        data = json.loads(fixture.read_text())
+        data['config']['wireless.guest_5g.macfilter'] = 'allow'
+        fixture.write_text(json.dumps(data))
+        assert request('wifi.acl.status')[1]['result']['consistent'] is False
+        code, body = request('wifi.acl.set', dict(mode='allow'))
+        assert code == 200 and body['result']['changed'] is True, body
+        assert json.loads(fixture.read_text())['config']['wireless.guest_5g.macfilter'] == 'deny'
+        assert request('wifi.acl.status')[1]['result']['consistent'] is True
         before = len(writes())
         assert request('wifi.acl.set', dict(mode='allow', allow=['aa:bb:cc:dd:ee:02', 'aa:bb:cc:dd:ee:01']))[1]['result']['changed']
         assert request('wifi.acl.set', dict(mode='allow'))[1]['result']['changed'] is False
@@ -243,6 +258,7 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert request('client.block', dict(mac='00:11:22:33:44:77'))[0] == 200
         status = request('wifi.acl.status')[1]['result']
         assert status['mode'] == 'deny' and status['deny'] == ['00:11:22:33:44:77'], status
+        assert status['guest_mode'] == 'deny' and status['consistent'], status
         code, body = request('wifi.acl.set', dict(mode='disable', deny=[]))
         assert code == 200 and body['result']['deny'] == [], body
         assert 'wireless.main_2g.denymaclist' not in json.loads(fixture.read_text())['config']
@@ -272,7 +288,7 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         wifi = request('wifi.state')[1]['result']
         assert wifi['busy'] is False and wifi['module'] == {'enabled': True, 'user_enabled': True}, wifi
         # A radio-level disabled 2.4 GHz (left by 0.10.74-0.10.76) reads as the band off.
-        assert wifi['radios'] == [
+        assert [{k: radio[k] for k in ('band', 'device', 'enabled', 'radio_enabled')} for radio in wifi['radios']] == [
             {'band': '2g', 'device': 'wifi0', 'enabled': False, 'radio_enabled': False},
             {'band': '5g', 'device': 'wifi1', 'enabled': True, 'radio_enabled': True}], wifi
         aps = {item['section']: item for item in wifi['aps']}
@@ -330,11 +346,34 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         sets = [json.loads(args[3]) for args in writes()[before:] if args[:3] == ['call', 'zwrt_wlan', 'set']]
         assert sets == [{'main_2g': {'disabled': '0'}, 'wifi0': {'disabled': '0'}}], sets
         radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
-        assert radios['2g'] == {'band': '2g', 'device': 'wifi0', 'enabled': True, 'radio_enabled': True}, radios
+        assert {k: radios['2g'][k] for k in ('band', 'device', 'enabled', 'radio_enabled')} == \
+            {'band': '2g', 'device': 'wifi0', 'enabled': True, 'radio_enabled': True}, radios
         code, body = request('wifi.radio.set', dict(band='5g', enabled=True))
         assert code == 200 and body['result']['sections'] == ['main_5g'], body
         aps = {item['section']: item for item in request('wifi.state')[1]['result']['aps']}
         assert aps['main_5g']['enabled'] is True and aps['guest_5g']['enabled'] is False, aps
+        # Channel width: the stock htmode family of the radio's hardware mode.
+        data = json.loads(fixture.read_text())
+        data['config'].update({'wireless.wifi1.hwmode': '11bea', 'wireless.wifi1.htmode': 'EHT160',
+                               'wireless.wifi0.hwmode': '11beg', 'wireless.wifi0.htmode': 'EHT40'})
+        fixture.write_text(json.dumps(data))
+        radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
+        assert radios['5g']['width'] == 160 and radios['5g']['widths'] == [20, 40, 80, 160], radios
+        assert radios['2g']['width'] == 40 and radios['2g']['widths'] == [20, 40], radios
+        before = len(writes())
+        code, body = request('wifi.bandwidth.set', dict(band='5g', width=80))
+        assert code == 200 and body['result']['htmode'] == 'EHT80' and body['result']['changed'] is True, body
+        sets = [json.loads(args[3]) for args in writes()[before:] if args[:3] == ['call', 'zwrt_wlan', 'set']]
+        assert sets == [{'wifi1': {'htmode': 'EHT80'}}], sets
+        radios = {item['band']: item for item in request('wifi.state')[1]['result']['radios']}
+        assert radios['5g']['width'] == 80, radios
+        assert request('wifi.bandwidth.set', dict(band='5g', width=80))[1]['result']['changed'] is False
+        for params in (dict(band='2g', width=80), dict(band='5g', width=320), dict(band='5g', width='80'),
+                       dict(band='5g'), dict(band='7g', width=20)):
+            code, body = request('wifi.bandwidth.set', params)
+            assert code == 400, (params, body)
+        code, body = request('wifi.bandwidth.set', dict(band='5g', width=160))
+        assert code == 200 and body['result']['htmode'] == 'EHT160', body
         # Single-chip qcacld32 firmwares (U60 Pro, MC7523, TopFlow): QCMAP starts a lone
         # AP only on wlan0, so the band that stays on takes wlan0 (TopFlow's own layout).
         data = json.loads(fixture.read_text())
@@ -395,6 +434,52 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert layout()['wifi1.disabled'] == '1', layout()
         assert request('wifi.radio.set', dict(band='5g', enabled=True))[0] == 200
         assert layout()['main_5g.ifname'] == 'wlan2' and layout()['wifi1.disabled'] == '0', layout()
+        # Main 2.4 GHz off while its guest SSID stays on: the guest takes wlan0
+        # and the main SSID is parked as wlanx (U60 Pro: QCMAP stays in mode=2).
+        data = json.loads(fixture.read_text())
+        data['config'].update({'wireless.guest_2g.disabled': '0', 'wireless.guest_5g.disabled': '1',
+                               'wireless.guest_2g.device': 'wifi0', 'wireless.guest_5g.device': 'wifi1',
+                               'zwrt_common_info.common_config.model_name': 'MU5250'})
+        fixture.write_text(json.dumps(data))
+        before = len(writes())
+        code, body = request('wifi.configure', dict(section='main_2g', enabled=False))
+        assert code == 200 and body['result']['changed'] and body['result']['verified'], body
+        assert layout()['main_2g.ifname'] == 'wlanx' and layout()['guest_2g.ifname'] == 'wlan0', layout()
+        assert layout()['wifi0.disabled'] == '0', layout()
+        config = json.loads(fixture.read_text())['config']
+        assert config['wireless.main_2g.disabled'] == '1' and config['wireless.guest_2g.disabled'] == '0'
+        new = writes()[before:]
+        assert any(args[:3] == ['call', 'zwrt_wlan', 'reload'] for args in new), new
+        assert not any(args[:3] == ['call', 'zwrt_wlan', 'set'] for args in new), new
+        # The guest SSID now carries 2.4 GHz: switching it off alone is refused.
+        before = len(writes())
+        code, body = request('wifi.guest.set', dict(bands={'2g': False}))
+        assert code == 400 and 'main SSID' in body['error']['message'], body
+        code, body = request('wifi.configure', dict(section='guest_2g', enabled=False))
+        assert code == 400 and 'main SSID' in body['error']['message'], body
+        assert len(writes()) == before
+        # U60 Pro runs at most two APs: main 2.4 + guest 2.4 + main 5 is refused.
+        code, body = request('wifi.configure', dict(section='main_2g', enabled=True))
+        assert code == 400 and 'at most 2' in body['error']['message'], body
+        code, body = request('wifi.guest.set', dict(bands={'5g': True}))
+        assert code == 400 and 'at most 2' in body['error']['message'], body
+        assert len(writes()) == before
+        # With 5 GHz off there is room: main 2.4 comes back with the stock names.
+        data = json.loads(fixture.read_text())
+        data['config']['wireless.main_5g.disabled'] = '1'
+        fixture.write_text(json.dumps(data))
+        code, body = request('wifi.configure', dict(section='main_2g', enabled=True))
+        assert code == 200 and body['result']['changed'], body
+        assert layout()['main_2g.ifname'] == 'wlan0' and layout()['guest_2g.ifname'] == 'wlan1', layout()
+        assert json.loads(fixture.read_text())['config']['wireless.main_2g.disabled'] == '0'
+        code, body = request('wifi.configure', dict(section='main_5g', enabled=True))
+        assert code == 400 and 'at most 2' in body['error']['message'], body
+        assert request('wifi.guest.set', dict(bands={'2g': False}))[0] == 200
+        assert request('wifi.configure', dict(section='main_5g', enabled=True))[0] == 200
+        # Other models have no such limit.
+        data = json.loads(fixture.read_text())
+        data['config']['zwrt_common_info.common_config.model_name'] = 'MU5252'
+        fixture.write_text(json.dumps(data))
         assert request('wifi.radio.set', dict(band='6g', enabled=True))[0] == 400
         assert request('wifi.radio.set', dict(band='5g'))[0] == 400
         assert request('wifi.guest.set', {})[0] == 400

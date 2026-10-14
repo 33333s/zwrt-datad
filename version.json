@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.78",
+    "version": "0.10.79",
     "asset": "zwrt-datad-aarch64",
-    "notes": "NAT 类型自动检测：WAN IPv4 变化（含启动后第一次拿到地址）并稳定 30 秒后检测一次，结果绑定当时的 IPv4 缓存到下一次变化，不做定时检测；失败时同一地址下 1/5/15 分钟最多重试 3 次；检测或测速进行中时推迟到结束后。结果随 telemetry/device 的 nat 字段（type、nat_level、carrier_nat、checked_at、error）上报 NMS，并新增能力 datad.nat。手动 nat.detect 写入同一缓存；nat.status 增加当前 wan_ipv4，结果增加 trigger 与 wan_ipv4。"
+    "notes": "用户反馈修复：液冷高档改为驱动接受的幅值 90（原先 200 被驱动静默丢弃、泵不转），常开时不再每秒重启波形；打开“快速开机”后假关机期间，风扇和液冷交还原厂温控，开机后恢复自定义曲线；新增 wifi.bandwidth.set 分频段设置 20/40/80/160 MHz 带宽，wifi.state 给出当前与可选带宽；白名单只作用于主 SSID，访客 Wi-Fi 保持黑名单；高通单芯片机型可以只关主 2.4G/5G、保留同频段访客；U60 Pro 限制最多两个 AP（三个会让 Wi-Fi 起不来）。"
   }
 }

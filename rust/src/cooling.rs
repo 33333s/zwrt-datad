@@ -14,6 +14,23 @@ static HARD_OVERRIDE: AtomicBool = AtomicBool::new(false);
 static STOPPING: AtomicBool = AtomicBool::new(false);
 static COOLING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CONTROL_REVISION: AtomicU64 = AtomicU64::new(0);
+/// Set once the cooling is handed back for an OEM power-off state.
+static HANDED_BACK: AtomicBool = AtomicBool::new(false);
+/// The last `atsin0` value written, so the tick does not restart a waveform
+/// that is still playing.
+static LIQUID_WRITTEN: Mutex<String> = Mutex::new(String::new());
+/// aw86320 `atsin0` amplitudes of the low and high pump levels. The driver
+/// silently drops a waveform above 90 (it logs `max_amp` and never enters
+/// atsin0 mode), so 200 never ran the pump.
+const LIQUID_AMPLITUDES: [i64; 2] = [60, 90];
+
+pub(crate) fn liquid_amplitude(level: i64) -> i64 {
+    match level {
+        1 => LIQUID_AMPLITUDES[0],
+        2 => LIQUID_AMPLITUDES[1],
+        _ => 0,
+    }
+}
 
 pub fn control_revision() -> u64 {
     CONTROL_REVISION.load(Ordering::Acquire)
@@ -372,7 +389,9 @@ async fn apply_fan_recorded(c: &Config) -> Result<(), String> {
     record_fan_policy(&result);
     result
 }
-async fn apply_liquid(c: &Config) -> Result<(), String> {
+/// `force` rewrites the waveform even when it is already playing; the tick
+/// leaves a playing waveform alone, since every write restarts it.
+async fn apply_liquid(c: &Config, force: bool) -> Result<(), String> {
     let thermal = env(
         "ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH",
         "/sys/class/leds/aw_vibrator/thermal_enable",
@@ -381,21 +400,56 @@ async fn apply_liquid(c: &Config) -> Result<(), String> {
         "ZWRT_DATAD_LIQUID_DRIVE_PATH",
         "/sys/class/leds/aw_vibrator/atsin0",
     );
+    let wanted = if c.liquid_always {
+        format!("1023 {} 200", liquid_amplitude(c.liquid_level.clamp(1, 2)))
+    } else {
+        "0 0 0".to_owned()
+    };
+    let status = tokio::fs::read_to_string(&thermal)
+        .await
+        .unwrap_or_default();
+    let unchanged = *LIQUID_WRITTEN.lock().unwrap_or_else(|p| p.into_inner()) == wanted;
+    if !force
+        && unchanged
+        && status.contains("thermal_enable:1")
+        && !(c.liquid_always && status.contains("ws_active:0"))
+    {
+        return Ok(());
+    }
     // The aw86320 driver only plays an atsin0 waveform while its thermal
     // control is enabled: with thermal_enable=0 the write is stored but never
     // played (ws_active stays 0), so "always on" silently stopped the pump.
     // The OEM switch (set_liquid_by_ui) likewise only writes atsin0.
     write(thermal, "1").await?;
-    if c.liquid_always {
-        write(
-            drive,
-            &format!("1023 {} 200", if c.liquid_level >= 2 { 200 } else { 60 }),
-        )
-        .await
-    } else {
-        write(drive, "0 0 0").await
-    }
+    write(drive, &wanted).await?;
+    *LIQUID_WRITTEN.lock().unwrap_or_else(|p| p.into_inner()) = wanted;
+    Ok(())
 }
+
+/// Whether the OEM power manager is in a power-off state
+/// (`zwrt_zte_mc_tmp.mode.mode_main_state`). With "quick power-on" the device
+/// only pretends to be off and datad keeps running.
+fn oem_powered_off() -> bool {
+    std::fs::read_to_string(env(
+        "ZWRT_DATAD_MC_STATE_PATH",
+        "/etc/config/zwrt_zte_mc_tmp",
+    ))
+    .is_ok_and(|raw| power_off_state(&raw))
+}
+
+fn power_off_state(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        line.trim()
+            .strip_prefix("option mode_main_state")
+            .is_some_and(|value| {
+                value
+                    .trim()
+                    .trim_matches(['\'', '"'])
+                    .starts_with("mode_power_off")
+            })
+    })
+}
+
 async fn vendor(path: &str, value: bool) -> Result<(), String> {
     state::uci_write("set", path, Some(if value { "1" } else { "0" })).await?;
     state::uci_write("commit", "zwrt_deviceui", None).await
@@ -408,6 +462,9 @@ fn failed(e: String) -> (bool, String) {
 }
 pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
     let _guard = COOLING_LOCK.lock().await;
+    // A change made while the device is powered off is handed back again by
+    // the next tick.
+    HANDED_BACK.store(false, Ordering::Relaxed);
     if STOPPING.load(Ordering::Relaxed) {
         return Err(failed("cooling controller is shutting down".into()));
     }
@@ -505,13 +562,13 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
             if e {
                 c.liquid_level = 2;
             }
-            apply_liquid(&c).await.map_err(failed)?;
+            apply_liquid(&c, true).await.map_err(failed)?;
             vendor("zwrt_deviceui.Device.liquid_cooling_switch_status", e)
                 .await
                 .map_err(failed)?;
             save(&c).await.map_err(failed)?;
             Ok(
-                json!({"enabled":e,"always_on":e,"mode":if e{"high"}else{"automatic"},"level":if e{2}else{0},"amplitude":if e{200}else{0}}),
+                json!({"enabled":e,"always_on":e,"mode":if e{"high"}else{"automatic"},"level":if e{2}else{0},"amplitude":if e{liquid_amplitude(2)}else{0}}),
             )
         }
         "cooling.liquid.set_mode" => {
@@ -531,7 +588,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
                 }
                 _ => return Err(invalid("mode must be automatic, low, or high")),
             }
-            apply_liquid(&c).await.map_err(failed)?;
+            apply_liquid(&c, true).await.map_err(failed)?;
             vendor(
                 "zwrt_deviceui.Device.liquid_cooling_switch_status",
                 c.liquid_always,
@@ -540,7 +597,7 @@ pub async fn execute(action: &str, p: &Value) -> Result<Value, (bool, String)> {
             .map_err(failed)?;
             save(&c).await.map_err(failed)?;
             Ok(
-                json!({"enabled":c.liquid_always,"always_on":c.liquid_always,"mode":mode,"level":if c.liquid_always{c.liquid_level}else{0},"amplitude":if c.liquid_always{if c.liquid_level==2{200}else{60}}else{0},"speed_percent":if c.liquid_always{if c.liquid_level==2{100}else{30}}else{0}}),
+                json!({"enabled":c.liquid_always,"always_on":c.liquid_always,"mode":mode,"level":if c.liquid_always{c.liquid_level}else{0},"amplitude":if c.liquid_always{liquid_amplitude(c.liquid_level)}else{0},"speed_percent":if c.liquid_always{if c.liquid_level==2{100}else{30}}else{0}}),
             )
         }
         _ => Err(invalid("unsupported cooling action")),
@@ -584,7 +641,7 @@ pub async fn sync_vendor_switches(
         if config.liquid_always {
             config.liquid_level = 2;
         }
-        apply_liquid(&config).await?;
+        apply_liquid(&config, true).await?;
     }
     save(&config).await
 }
@@ -599,8 +656,24 @@ pub async fn tick() {
         return;
     }
     let config = load().await;
+    if oem_powered_off() {
+        // A custom curve would keep cycling the fan of a device that looks
+        // switched off; the stock controllers own it until power-on.
+        if !HANDED_BACK.swap(true, Ordering::Relaxed) {
+            let _ = restore_kernel_fan().await;
+            if config.liquid_always {
+                let automatic = Config {
+                    liquid_always: false,
+                    ..config.clone()
+                };
+                let _ = apply_liquid(&automatic, true).await;
+            }
+        }
+        return;
+    }
+    let resumed = HANDED_BACK.swap(false, Ordering::Relaxed);
     if config.liquid_always {
-        let _ = apply_liquid(&config).await;
+        let _ = apply_liquid(&config, resumed).await;
     }
     let _ = apply_fan_recorded(&config).await;
 }
@@ -621,6 +694,36 @@ pub async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oem_power_off_states_are_recognised() {
+        let state = |mode: &str| {
+            format!(
+                "\nconfig zudata_mode_fun 'mode'\n\toption reboot_reason_code '1182'\n\toption mode_main_state '{mode}'\n"
+            )
+        };
+        for mode in [
+            "mode_power_off_quicken",
+            "mode_power_off_charger_quicken",
+            "mode_power_off_quickening",
+            "mode_power_off",
+        ] {
+            assert!(power_off_state(&state(mode)), "{mode}");
+        }
+        for mode in ["mode_power_on", "mode_power_on_charger", "mode_initial"] {
+            assert!(!power_off_state(&state(mode)), "{mode}");
+        }
+        assert!(!power_off_state(""));
+        assert!(!power_off_state("\toption other 'mode_power_off'\n"));
+    }
+
+    #[test]
+    fn liquid_levels_stay_inside_the_driver_limit() {
+        assert_eq!(liquid_amplitude(1), 60);
+        assert_eq!(liquid_amplitude(2), 90);
+        assert_eq!(liquid_amplitude(0), 0);
+        assert!(LIQUID_AMPLITUDES.iter().all(|amplitude| *amplitude <= 90));
+    }
     #[test]
     fn panel_config_uses_effective_curve_defaults() {
         let value = panel_value(&Config::default());
