@@ -164,6 +164,9 @@ impl SpeedTest {
         json!(self.status)
     }
 
+    pub fn running(&self) -> bool {
+        self.status.state == "running"
+    }
     pub fn refresh_availability(&mut self) {
         if !matches!(self.status.state, "idle" | "unavailable")
             || self.last_route_check.elapsed() < Duration::from_secs(30)

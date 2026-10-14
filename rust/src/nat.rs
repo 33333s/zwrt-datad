@@ -39,8 +39,33 @@ const WAITS: [Duration; 2] = [Duration::from_millis(150), Duration::from_millis(
 /// some servers never answer CHANGE-PORT alone.
 const PORT_FILTER_SERVERS: usize = 2;
 
+/// After a WAN IPv4 change, how long the addresses must hold before the
+/// automatic detection runs; another change restarts the wait.
+const SETTLE: Duration = Duration::from_secs(30);
+/// Waits before each retry of a failed automatic detection while the
+/// addresses stay the same; after the last one the failure stands.
+const RETRIES: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+];
+/// The classic names NMS accepts in telemetry.
+const TYPES: [&str; 9] = [
+    "full_cone",
+    "restricted_cone",
+    "port_restricted_cone",
+    "symmetric",
+    "open",
+    "firewalled",
+    "no_nat",
+    "udp_blocked",
+    "unknown",
+];
+
 static LAST: LazyLock<Mutex<Option<Value>>> = LazyLock::new(|| Mutex::new(None));
 static RUNNING: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// The WAN IPv4 addresses the watcher last saw; each detection records them.
+static WAN: LazyLock<std::sync::Mutex<Vec<String>>> = LazyLock::new(Default::default);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Behaviour {
@@ -648,10 +673,12 @@ async fn run(servers: &[(String, u16)], capture: bool) -> Value {
     })
 }
 
-/// The last finished detection, or null before the first one.
+/// The last finished detection, or null before the first one, and the WAN
+/// IPv4 addresses now; the result belongs to the addresses in its `wan_ipv4`.
 pub async fn status() -> Value {
     json!({
         "running":RUNNING.try_lock().is_err(),
+        "wan_ipv4":WAN.lock().unwrap().clone(),
         "last":LAST.lock().await.clone(),
     })
 }
@@ -659,10 +686,15 @@ pub async fn status() -> Value {
 /// Runs one detection; a second concurrent request is refused rather than
 /// queued, since both would share the same NAT state anyway.
 pub async fn detect(servers: Vec<(String, u16)>) -> Result<Value, &'static str> {
+    measure(&servers, "request").await
+}
+
+async fn measure(servers: &[(String, u16)], trigger: &str) -> Result<Value, &'static str> {
     let Ok(_running) = RUNNING.try_lock() else {
         return Err("operation_busy");
     };
-    let mut result = tokio::time::timeout(BUDGET, run(&servers, true))
+    let wan = WAN.lock().unwrap().clone();
+    let mut result = tokio::time::timeout(BUDGET, run(servers, true))
         .await
         .unwrap_or_else(|_| json!({"type":"unknown","nat_level":Value::Null,"error":"timeout"}));
     result["checked_at"] = json!(
@@ -671,8 +703,156 @@ pub async fn detect(servers: Vec<(String, u16)>) -> Result<Value, &'static str> 
             .map(|d| d.as_secs())
             .unwrap_or_default()
     );
+    result["trigger"] = json!(trigger);
+    result["wan_ipv4"] = json!(wan);
     *LAST.lock().await = Some(result.clone());
     Ok(result)
+}
+
+pub fn default_servers() -> Vec<(String, u16)> {
+    DEFAULT_SERVERS
+        .iter()
+        .filter_map(|server| stun::parse_server(server))
+        .collect()
+}
+
+/// Sorted IPv4 addresses of `wan4` in the snapshot's `interfaces`.
+pub fn wan_ipv4(interfaces: Option<&Value>) -> Vec<String> {
+    let mut addresses: Vec<String> = interfaces
+        .and_then(|interfaces| interfaces.pointer("/wan4/ipv4"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("address")?.as_str()?.parse::<Ipv4Addr>().ok())
+        .map(|ip| ip.to_string())
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+/// Detects the NAT type again whenever the WAN IPv4 addresses change and
+/// keeps the result until the next change. There is no periodic detection.
+pub struct Watcher {
+    servers: Vec<(String, u16)>,
+    seen: Vec<String>,
+    since: Instant,
+    /// Automatic detections run for `seen`.
+    attempts: usize,
+    retry_at: Option<Instant>,
+}
+
+impl Watcher {
+    pub fn new(servers: Vec<(String, u16)>) -> Self {
+        Self {
+            servers,
+            seen: Vec::new(),
+            since: Instant::now(),
+            attempts: 0,
+            retry_at: None,
+        }
+    }
+
+    /// `cached` is the cached result's `wan_ipv4` and whether it failed;
+    /// `busy` is a speed test or another detection in progress, which only
+    /// defers the detection.
+    fn due(
+        &mut self,
+        addresses: Vec<String>,
+        cached: Option<(Value, bool)>,
+        busy: bool,
+        now: Instant,
+    ) -> bool {
+        // Without IPv4 the old result stays; the next address decides.
+        if addresses.is_empty() {
+            return false;
+        }
+        if addresses != self.seen {
+            self.seen = addresses;
+            self.since = now;
+            self.attempts = 0;
+            self.retry_at = None;
+            return false;
+        }
+        if now.duration_since(self.since) < SETTLE {
+            return false;
+        }
+        if cached.is_some_and(|(wan, failed)| !failed && wan == json!(self.seen)) {
+            return false;
+        }
+        if self.attempts > RETRIES.len() || busy {
+            return false;
+        }
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// Records a finished automatic detection; a failure schedules the next
+    /// retry, if any is left.
+    fn finished(&mut self, failed: bool, now: Instant) {
+        self.attempts += 1;
+        self.retry_at = RETRIES
+            .get(self.attempts - 1)
+            .filter(|_| failed)
+            .map(|wait| now + *wait);
+    }
+
+    pub async fn tick(&mut self, addresses: Vec<String>, speedtest_running: bool) {
+        if !addresses.is_empty() {
+            *WAN.lock().unwrap() = addresses.clone();
+        }
+        let cached = LAST
+            .lock()
+            .await
+            .as_ref()
+            .map(|result| (result["wan_ipv4"].clone(), result.get("error").is_some()));
+        let busy = speedtest_running || RUNNING.try_lock().is_err();
+        if !self.due(addresses, cached, busy, Instant::now()) {
+            return;
+        }
+        // operation_busy: a requested detection started meanwhile; the next
+        // tick looks at its result.
+        if let Ok(result) = measure(&self.servers, "wan_change").await {
+            self.finished(result.get("error").is_some(), Instant::now());
+        }
+    }
+}
+
+/// The cached result as NMS telemetry (`telemetry/device.nat`), or None
+/// before the first detection. Only these keys are sent.
+pub async fn telemetry() -> Option<Value> {
+    LAST.lock().await.as_ref().map(summary)
+}
+
+fn summary(result: &Value) -> Value {
+    let kind = result["type"]
+        .as_str()
+        .filter(|kind| TYPES.contains(kind))
+        .unwrap_or("unknown");
+    // A failed detection has no verdict; a private or 100.64/10 WAN address
+    // still shows the carrier NAT.
+    let carrier_nat = result["carrier_nat"].as_bool().unwrap_or_else(|| {
+        result["wan_ipv4"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|ip| ip.as_str()?.parse::<Ipv4Addr>().ok())
+            .any(carrier_range)
+    });
+    let mut out = json!({
+        "type":kind,
+        "carrier_nat":carrier_nat,
+        "checked_at":result["checked_at"].as_u64().unwrap_or_default(),
+    });
+    if let Some(level) = result["nat_level"]
+        .as_u64()
+        .filter(|level| (1..=4).contains(level))
+    {
+        out["nat_level"] = json!(level);
+    }
+    if let Some(error) = result["error"].as_str() {
+        out["error"] = json!(error.to_ascii_lowercase());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -839,6 +1019,214 @@ mod tests {
         let port = silent.local_addr().unwrap().port();
         let result = run(&[("127.0.0.1".into(), port)], false).await;
         assert_eq!(result["type"], "udp_blocked", "{result}");
+    }
+
+    /// Drives a watcher in 5 s ticks like the server does. `wan(t)` gives the
+    /// addresses at t seconds, `busy(t)` a running detection or speed test,
+    /// `fails(n)` whether detection n (0-based) fails. Returns the times of
+    /// the detections.
+    fn simulate(
+        until: u64,
+        wan: impl Fn(u64) -> Vec<String>,
+        busy: impl Fn(u64) -> bool,
+        fails: impl Fn(usize) -> bool,
+    ) -> Vec<u64> {
+        let start = Instant::now();
+        let mut watcher = Watcher::new(Vec::new());
+        let mut cached: Option<(Value, bool)> = None;
+        let mut runs = Vec::new();
+        for t in (0..=until).step_by(5) {
+            let now = start + Duration::from_secs(t);
+            let addresses = wan(t);
+            if watcher.due(addresses.clone(), cached.clone(), busy(t), now) {
+                let failed = fails(runs.len());
+                runs.push(t);
+                cached = Some((json!(addresses), failed));
+                watcher.finished(failed, now);
+            }
+        }
+        runs
+    }
+
+    fn ips(list: &[&str]) -> Vec<String> {
+        list.iter().map(|ip| ip.to_string()).collect()
+    }
+
+    #[test]
+    fn watcher_detects_once_per_wan_change() {
+        // First IPv4 after start, 30 s later; nothing more while it holds.
+        let first = simulate(
+            7200,
+            |t| if t < 20 { ips(&[]) } else { ips(&["10.1.2.3"]) },
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(first, [50]);
+        // A changed address is detected again.
+        let changed = simulate(
+            7200,
+            |t| {
+                if t < 1000 {
+                    ips(&["10.1.2.3"])
+                } else {
+                    ips(&["10.9.8.7"])
+                }
+            },
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(changed, [30, 1030]);
+        // Changes within 30 s restart the wait: one detection, for the last one.
+        let flapping = simulate(
+            600,
+            |t| match t {
+                0..100 => ips(&["10.1.2.3"]),
+                100..115 => ips(&["10.1.2.4"]),
+                115..130 => ips(&["10.1.2.5"]),
+                _ => ips(&["10.1.2.6"]),
+            },
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(flapping, [30, 160]);
+        // Losing IPv4 keeps the result; the same address back is no change,
+        // a new one is.
+        let outage = simulate(
+            2000,
+            |t| match t {
+                0..500 => ips(&["10.1.2.3"]),
+                500..600 => ips(&[]),
+                600..1000 => ips(&["10.1.2.3"]),
+                1000..1100 => ips(&[]),
+                _ => ips(&["10.4.5.6"]),
+            },
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(outage, [30, 1130]);
+    }
+
+    #[test]
+    fn watcher_retries_failures_three_times() {
+        let wan = |_| ips(&["10.1.2.3"]);
+        // Every attempt fails (udp_blocked or timeout): 3 retries 1, 5 and
+        // 15 min apart, then the failure stands.
+        let failing = simulate(20_000, wan, |_| false, |_| true);
+        assert_eq!(failing, [30, 90, 390, 1290]);
+        // A retry that succeeds ends the series.
+        let recovers = simulate(20_000, wan, |_| false, |run| run < 2);
+        assert_eq!(recovers, [30, 90, 390]);
+        // A new address starts a fresh series.
+        let moved = simulate(
+            20_000,
+            |t| {
+                if t < 5000 {
+                    ips(&["10.1.2.3"])
+                } else {
+                    ips(&["10.4.5.6"])
+                }
+            },
+            |_| false,
+            |_| true,
+        );
+        assert_eq!(moved, [30, 90, 390, 1290, 5030, 5090, 5390, 6290]);
+    }
+
+    #[test]
+    fn watcher_defers_while_busy() {
+        let wan = |_| ips(&["10.1.2.3"]);
+        // A speed test or another detection from 20 s to 200 s: the
+        // detection runs right after it ends instead of being dropped.
+        let deferred = simulate(1000, wan, |t| (20..200).contains(&t), |_| false);
+        assert_eq!(deferred, [200]);
+        // A retry falling inside a busy window also waits for its end.
+        let retry = simulate(2000, wan, |t| (80..120).contains(&t), |run| run == 0);
+        assert_eq!(retry, [30, 120]);
+    }
+
+    #[test]
+    fn wan_addresses_come_sorted_from_the_snapshot() {
+        let interfaces = json!({"wan4":{"ipv4":[
+            {"address":"10.9.8.7"},{"address":"not-an-ip"},{"address":"2001:db8::1"},
+            {"address":"10.1.2.3"},{"address":"10.9.8.7"}
+        ]}});
+        assert_eq!(wan_ipv4(Some(&interfaces)), ["10.1.2.3", "10.9.8.7"]);
+        assert!(wan_ipv4(Some(&json!({}))).is_empty());
+        assert!(wan_ipv4(None).is_empty());
+    }
+
+    #[test]
+    fn telemetry_carries_only_the_nms_keys() {
+        let result = json!({
+            "type":"full_cone","nat_level":1,"nat":true,"carrier_nat":true,
+            "mapping":"endpoint_independent","filtering":"endpoint_independent",
+            "measured_at":"carrier",
+            "device":{"type":"port_restricted_cone","nat_level":3,"filtering":"address_and_port_dependent"},
+            "public_address":"203.0.113.9:40123","local_address":"10.1.2.3:51000",
+            "port_preserved":false,"server":"stun.example.com:3478","rfc5780":true,
+            "duration_ms":1650,"checked_at":1760000000u64,"trigger":"wan_change",
+            "wan_ipv4":["10.1.2.3"]
+        });
+        assert_eq!(
+            summary(&result),
+            json!({"type":"full_cone","nat_level":1,"carrier_nat":true,"checked_at":1760000000u64})
+        );
+        // Open public WAN: no level.
+        assert_eq!(
+            summary(
+                &json!({"type":"open","nat_level":null,"nat":false,"carrier_nat":false,
+                "public_address":"121.0.0.9:3000","checked_at":5,"wan_ipv4":["121.0.0.9"]})
+            ),
+            json!({"type":"open","carrier_nat":false,"checked_at":5})
+        );
+        // Failures carry the error code; carrier_nat follows the WAN address.
+        assert_eq!(
+            summary(
+                &json!({"type":"udp_blocked","nat_level":null,"error":"no_stun_answer",
+                "duration_ms":3000,"checked_at":7,"trigger":"wan_change","wan_ipv4":["10.1.2.3"]})
+            ),
+            json!({"type":"udp_blocked","carrier_nat":true,"checked_at":7,"error":"no_stun_answer"})
+        );
+        assert_eq!(
+            summary(&json!({"type":"unknown","nat_level":null,"error":"timeout",
+                "checked_at":8,"wan_ipv4":["121.0.0.9"]})),
+            json!({"type":"unknown","carrier_nat":false,"checked_at":8,"error":"timeout"})
+        );
+        // Anything outside the agreed names is reported as unknown.
+        assert_eq!(
+            summary(&json!({"type":"weird","nat_level":9,"checked_at":9,"wan_ipv4":[]}))["type"],
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_records_the_wan_with_the_result() {
+        let silent = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let wan = ips(&["10.1.2.3"]);
+        let mut watcher = Watcher::new(vec![("127.0.0.1".into(), port)]);
+        watcher.seen = wan.clone();
+        watcher.since = Instant::now().checked_sub(SETTLE).unwrap();
+        // A running speed test defers it.
+        watcher.tick(wan.clone(), true).await;
+        assert_eq!(watcher.attempts, 0);
+        watcher.tick(wan.clone(), false).await;
+        let status = status().await;
+        assert_eq!(status["wan_ipv4"], json!(["10.1.2.3"]));
+        let last = &status["last"];
+        assert_eq!(last["type"], "udp_blocked", "{last}");
+        assert_eq!(last["trigger"], "wan_change");
+        assert_eq!(last["wan_ipv4"], json!(["10.1.2.3"]));
+        assert_eq!(watcher.attempts, 1);
+        let retry = watcher.retry_at.unwrap();
+        // Not retried before the back-off ends.
+        watcher.tick(wan, false).await;
+        assert_eq!(watcher.attempts, 1);
+        assert_eq!(watcher.retry_at, Some(retry));
+        let reported = telemetry().await.unwrap();
+        assert_eq!(reported["type"], "udp_blocked");
+        assert_eq!(reported["error"], "no_stun_answer");
+        assert_eq!(reported["carrier_nat"], true);
     }
 
     fn ipv4_udp(source: [u8; 4], port: u16, payload: &[u8], flags: u16) -> Vec<u8> {
