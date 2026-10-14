@@ -203,9 +203,11 @@ SSID 才在广播。
   （U60 Pro 实测 QCMAP 保持两个 AP 正常启动），返回 `options`；访客关着时返回 400（请用 `wifi.radio.set`），因为只关这个
   SSID 时剩下的 AP 不在 wlan0 上，Wi-Fi 会整体起不来。主 SSID 停放在 `wlanx` 期间，单独关掉占着 `wlan0` 的访客 SSID 会被拒绝
   （400）；用 `wifi.configure` 打开主 SSID 时恢复原厂接口名。
-- **U60 Pro（MU5250）最多同时运行两个 AP**：主 2.4 + 主 5 + 任一访客会让 QCMAP 以 `mode=4` 启动并报 `unsupported wifi
-  mode`，Wi-Fi 整体起不来（0.10.79 实测）。`wifi.guest.set`、`wifi.configure` 打开 SSID、`wifi.radio.set` 打开频段时，
-  结果超过两个 AP 会返回 400，不写配置。
+- **U60 Pro（MU5250）不能恰好运行三个 AP**：QCMAP 支持一个、两个或四个 AP（`zte_wlan_ex_start mode=1/2/7`），三个时以
+  `mode=4` 启动并报 `unsupported wifi mode`，Wi-Fi 整体起不来（0.10.79 实测）。原厂网页的访客开关总是同时开关两个频段的访客
+  SSID，所以不会出现三个。`wifi.guest.set`、`wifi.configure` 开关 SSID、`wifi.radio.set` 打开频段时，结果恰好是三个 AP
+  会返回 400，不写配置；同时开关两个频段的访客（`wifi.guest.set` 的 `enabled`）不受影响。因此在 U60 Pro 上两个访客都开着时
+  不能只关主 2.4 GHz（会剩三个），只有 5 GHz 访客关着时才能关主 2.4 GHz、保留 2.4 GHz 访客。
 - **其他固件**（MC8532B、MC8531 等 ath 驱动）：与原厂网页的单频段开关一致，只改 SSID：关闭写
   `{"main_<band>":{"disabled":"1"},"guest_<band>":{"disabled":"1"}}`（只包含开着的段），打开写主 SSID `disabled:"0"`，
   访客 SSID 仍由 `wifi.guest.set` 控制；射频被旧版关掉时一并恢复。返回的 `sections` 列出写入的段。

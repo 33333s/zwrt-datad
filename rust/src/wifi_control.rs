@@ -351,7 +351,7 @@ async fn set_single_chip_band(
     let mut wanted: Vec<(String, String)> = Vec::new();
     if enabled {
         // Every SSID that is on runs again once the stock names are back.
-        if let Some(limit) = ap_limit().await {
+        if let Some(bad) = unsupported_aps().await {
             let mut count = 0;
             for (other, radio, _) in &radios {
                 if *other != band && self::enabled(radio).await != Some(true) {
@@ -363,8 +363,8 @@ async fn set_single_chip_band(
                     count += usize::from(on);
                 }
             }
-            if count > limit {
-                return Err(limit_error(limit));
+            if count == bad {
+                return Err(count_error(bad));
             }
         }
         wanted.push((format!("{device}.disabled"), "0".into()));
@@ -456,10 +456,12 @@ async fn write_layout(wanted: Vec<(String, String)>) -> Result<Vec<String>, Stri
         .collect())
 }
 
-/// APs the firmware can run at once. The U60 Pro (MU5250) QCMAP rejects three
-/// (`zte_wlan_ex_start mode=4`: "unsupported wifi mode") and Wi-Fi stays down.
-async fn ap_limit() -> Option<usize> {
-    (state::uci_read("zwrt_common_info.common_config.model_name").await == "MU5250").then_some(2)
+/// An AP count the firmware cannot start. The U60 Pro (MU5250) QCMAP runs one,
+/// two or four APs (mode 1, 2, 7) but rejects three (`zte_wlan_ex_start
+/// mode=4`: "unsupported wifi mode") and Wi-Fi stays down. Its stock web UI
+/// only switches both guest SSIDs together, so it never asks for three.
+async fn unsupported_aps() -> Option<usize> {
+    (state::uci_read("zwrt_common_info.common_config.model_name").await == "MU5250").then_some(3)
 }
 
 /// Main and guest APs that would run, with `overrides` (section, on) applied.
@@ -486,20 +488,21 @@ async fn running_aps(overrides: &[(String, bool)]) -> usize {
     count
 }
 
-/// Refuses a change that would run more APs than the firmware can.
-pub async fn check_ap_limit(overrides: &[(String, bool)]) -> Result<(), String> {
-    if let Some(limit) = ap_limit().await
-        && overrides.iter().any(|(_, on)| *on)
-        && running_aps(overrides).await > limit
-    {
-        return Err(limit_error(limit));
+/// Refuses a change that would leave the firmware with an AP count it cannot
+/// start.
+pub async fn check_ap_count(overrides: &[(String, bool)]) -> Result<(), String> {
+    if let Some(bad) = unsupported_aps().await {
+        let after = running_aps(overrides).await;
+        if after == bad && after != running_aps(&[]).await {
+            return Err(count_error(bad));
+        }
     }
     Ok(())
 }
 
-fn limit_error(limit: usize) -> String {
+fn count_error(bad: usize) -> String {
     format!(
-        "invalid:this firmware runs at most {limit} Wi-Fi networks at once; switch another SSID off first"
+        "invalid:this firmware cannot run {bad} Wi-Fi networks at once (Wi-Fi would stay down); switch the guest Wi-Fi of both bands on or off together"
     )
 }
 
@@ -529,6 +532,11 @@ pub async fn single_chip_ssid(section: &str, on: bool) -> Option<Result<Value, S
                     "invalid:this firmware cannot switch the band on wlan0 off through its SSID; use wifi.radio.set".into(),
                 ));
             }
+            if let Some(bad) = unsupported_aps().await
+                && running_aps(&[]).await.checked_sub(1) == Some(bad)
+            {
+                return Some(Err(count_error(bad)));
+            }
             write_layout(vec![
                 (format!("{section}.disabled"), "1".into()),
                 (format!("{section}.ifname"), "wlanx".into()),
@@ -546,10 +554,10 @@ pub async fn single_chip_ssid(section: &str, on: bool) -> Option<Result<Value, S
                 return Some(Err(format!("invalid:unknown radio layout for band {band}")));
             };
             // The count skips the parked SSID itself: it comes back as one more.
-            if let Some(limit) = ap_limit().await
-                && running_aps(&[]).await + 1 > limit
+            if let Some(bad) = unsupported_aps().await
+                && running_aps(&[]).await + 1 == bad
             {
-                return Some(Err(limit_error(limit)));
+                return Some(Err(count_error(bad)));
             }
             write_layout(vec![
                 (format!("{section}.disabled"), "0".into()),
@@ -731,7 +739,7 @@ pub async fn set_guest(update: GuestUpdate) -> Result<Value, String> {
             current,
         );
     }
-    check_ap_limit(&overrides).await?;
+    check_ap_count(&overrides).await?;
     if let Some(minutes) = update.active_time {
         if state::uci_read("wireless.readonly.wifi_attr_support_guest_ssid_active_time").await
             == "0"

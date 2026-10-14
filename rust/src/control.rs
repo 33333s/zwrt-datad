@@ -1089,9 +1089,8 @@ async fn wifi_configure(params: &Value) -> Outcome {
             // The switch is done; the other fields follow below.
             Some(Ok(_)) => {}
             None => {
-                if enabled
-                    && let Err(error) =
-                        crate::wifi_control::check_ap_limit(&[(section.clone(), true)]).await
+                if let Err(error) =
+                    crate::wifi_control::check_ap_count(&[(section.clone(), enabled)]).await
                 {
                     return wifi_outcome(Err(error));
                 }

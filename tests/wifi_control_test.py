@@ -458,11 +458,12 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         code, body = request('wifi.configure', dict(section='guest_2g', enabled=False))
         assert code == 400 and 'main SSID' in body['error']['message'], body
         assert len(writes()) == before
-        # U60 Pro runs at most two APs: main 2.4 + guest 2.4 + main 5 is refused.
+        # U60 Pro cannot start exactly three APs (QCMAP mode=4); one, two or four
+        # run. Main 2.4 back on would make main 2.4 + guest 2.4 + main 5.
         code, body = request('wifi.configure', dict(section='main_2g', enabled=True))
-        assert code == 400 and 'at most 2' in body['error']['message'], body
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
         code, body = request('wifi.guest.set', dict(bands={'5g': True}))
-        assert code == 400 and 'at most 2' in body['error']['message'], body
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
         assert len(writes()) == before
         # With 5 GHz off there is room: main 2.4 comes back with the stock names.
         data = json.loads(fixture.read_text())
@@ -473,9 +474,23 @@ with tempfile.TemporaryDirectory(prefix='datad-wifi-test-') as name:
         assert layout()['main_2g.ifname'] == 'wlan0' and layout()['guest_2g.ifname'] == 'wlan1', layout()
         assert json.loads(fixture.read_text())['config']['wireless.main_2g.disabled'] == '0'
         code, body = request('wifi.configure', dict(section='main_5g', enabled=True))
-        assert code == 400 and 'at most 2' in body['error']['message'], body
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
         assert request('wifi.guest.set', dict(bands={'2g': False}))[0] == 200
         assert request('wifi.configure', dict(section='main_5g', enabled=True))[0] == 200
+        # Both guests together (the stock switch) make four, which runs; one
+        # guest off from there would leave three.
+        code, body = request('wifi.guest.set', dict(enabled=True))
+        assert code == 200 and body['result']['changed'], body
+        config = json.loads(fixture.read_text())['config']
+        assert config['wireless.guest_2g.disabled'] == '0' and config['wireless.guest_5g.disabled'] == '0'
+        code, body = request('wifi.configure', dict(section='guest_5g', enabled=False))
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
+        code, body = request('wifi.guest.set', dict(bands={'5g': False}))
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
+        # Parking main 2.4 with four running would also leave three.
+        code, body = request('wifi.configure', dict(section='main_2g', enabled=False))
+        assert code == 400 and 'cannot run 3' in body['error']['message'], body
+        assert request('wifi.guest.set', dict(enabled=False))[0] == 200
         # Other models have no such limit.
         data = json.loads(fixture.read_text())
         data['config']['zwrt_common_info.common_config.model_name'] = 'MU5252'
