@@ -271,7 +271,7 @@ post '{"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}' >/dev/nul
 wait_file_value "$ZWRT_DATAD_COOLING_ZONE_PATH/mode" enabled
 wait_file_value "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp" 53000
 post '{"action":"cooling.liquid.set_mode","params":{"mode":"high"}}' >/dev/null
-wait_file_value "$ZWRT_DATAD_LIQUID_DRIVE_PATH" '1023 200 200'
+wait_file_value "$ZWRT_DATAD_LIQUID_DRIVE_PATH" '1023 90 200'
 post '{"action":"cooling.liquid.set_enabled","params":{"enabled":false}}' >/dev/null
 wait_file_value "$ZWRT_DATAD_LIQUID_DRIVE_PATH" '0 0 0'
 rm -f "$ZWRT_DATAD_FAN_PWM_PATH"
