@@ -915,11 +915,7 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         2 => 100,
         _ => 0,
     };
-    let liquid_amplitude = match effective_liquid_level {
-        1 => 60,
-        2 => 200,
-        _ => 0,
-    };
+    let liquid_amplitude = crate::cooling::liquid_amplitude(effective_liquid_level);
     json!({
         "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"policy":crate::cooling::fan_policy_status(),"temperature_source":zone,"levels_percent":[0,30,50,70]},
         "liquid":{"enabled":liquid_always||liquid_thermal,"active":liquid_active(liquid_playing,liquid_always,liquid_kernel_state),"driver_playing":liquid_playing,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":effective_liquid_level,"speed_percent":liquid_speed,"amplitude":liquid_amplitude,"kernel_state":liquid_kernel_state,"kernel_max_state":2,"levels_percent":[30,100]},
