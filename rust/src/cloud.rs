@@ -985,6 +985,7 @@ async fn report(
         "datad.remote_origins",
         "datad.remote_close",
         "datad.remote_nodes",
+        "datad.nat",
     ];
     // The direct data path: web UI proxy now; files stay on the relay.
     #[cfg(feature = "mesh")]
@@ -1026,6 +1027,10 @@ async fn report(
             if let Some(label) = device_label(state.pointer(pointer)) {
                 object.insert(key.into(), json!(label));
             }
+        }
+        // Set by the NAT watcher (nat::telemetry) once a detection exists.
+        if let Some(nat) = state.get("nat").filter(|nat| nat.is_object()) {
+            object.insert("nat".into(), nat.clone());
         }
     }
     // `due` also records the payload, so it runs even for a full report.
@@ -2546,6 +2551,8 @@ mod tests {
                 .unwrap()
                 .contains(&json!("datad.remote_nodes"))
         );
+        // No NAT result yet: no nat field.
+        assert!(device.get("nat").is_none(), "{device}");
         assert_eq!(device["remote_node_origins"], json!([]));
         assert_eq!(device["remote_nodes_revision"], 0);
         let strip = |mut value: Value| {
@@ -3632,6 +3639,10 @@ mod tests {
         );
         fields.insert("thermal".into(), json!({"cpu_celsius":51}));
         fields.insert("password".into(), json!("do-not-upload"));
+        fields.insert(
+            "nat".into(),
+            json!({"type":"full_cone","nat_level":1,"carrier_nat":true,"checked_at":1760000000}),
+        );
         let snapshot = Snapshot {
             ts: now(),
             datad: Default::default(),
@@ -3679,6 +3690,16 @@ mod tests {
                         .unwrap()
                         .contains(&json!("datad.remote_close"))
                 );
+                assert!(
+                    report["capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("datad.nat"))
+                );
+                assert_eq!(
+                    report["nat"],
+                    json!({"type":"full_cone","nat_level":1,"carrier_nat":true,"checked_at":1760000000})
+                );
                 found.insert("device");
             }
             if report["online"] == true {
@@ -3718,11 +3739,26 @@ mod tests {
             "interfaces".into(),
             json!({"wan4":{"ipv4":[{"address":"203.0.113.9"}]}}),
         );
-        state_tx.send(changed).unwrap();
+        state_tx.send(changed.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let report = reports_rx.recv().await.unwrap();
                 if report["upstream"]["ipv4"] == json!(["203.0.113.9"]) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // A new NAT result changes checked_at and re-sends the device payload.
+        let nat = json!({"type":"udp_blocked","carrier_nat":true,"checked_at":1760000600,"error":"no_stun_answer"});
+        changed.fields.insert("nat".into(), nat.clone());
+        state_tx.send(changed).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let report = reports_rx.recv().await.unwrap();
+                if report["model"] == "MU5252" {
+                    assert_eq!(report["nat"], nat);
                     break;
                 }
             }

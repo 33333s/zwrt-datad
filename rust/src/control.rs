@@ -1197,10 +1197,7 @@ async fn client_access(params: &Value, block: bool) -> Outcome {
 
 async fn nat_detect(params: &Value) -> Outcome {
     let servers = match object(params).get("servers") {
-        None => crate::nat::DEFAULT_SERVERS
-            .iter()
-            .filter_map(|server| crate::stun::parse_server(server))
-            .collect(),
+        None => crate::nat::default_servers(),
         Some(Value::Array(items)) if (1..=crate::nat::MAX_SERVERS).contains(&items.len()) => {
             let parsed: Option<Vec<_>> = items
                 .iter()

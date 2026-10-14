@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.77",
+    "version": "0.10.78",
     "asset": "zwrt-datad-aarch64",
-    "notes": "修复 U60 Pro / MC7523 上关闭 2.4G 后 Wi-Fi 起不来、重启卡死：原厂只剩一个 AP 时只在 wlan0 上启动，wifi.radio.set 在高通 qcacld32 单芯片固件上改用 TopFlow 固件同款布局（关闭的频段改名 wlanx、留下的频段改用 wlan0），打开时恢复原厂接口名；wifi.configure 不再允许单独关掉占用 wlan0 的主 SSID；其他固件按原厂网页方式只开关 SSID。wifi.state 的 radios 增加 radio_enabled，enabled 表示频段开关。"
+    "notes": "NAT 类型自动检测：WAN IPv4 变化（含启动后第一次拿到地址）并稳定 30 秒后检测一次，结果绑定当时的 IPv4 缓存到下一次变化，不做定时检测；失败时同一地址下 1/5/15 分钟最多重试 3 次；检测或测速进行中时推迟到结束后。结果随 telemetry/device 的 nat 字段（type、nat_level、carrier_nat、checked_at、error）上报 NMS，并新增能力 datad.nat。手动 nat.detect 写入同一缓存；nat.status 增加当前 wan_ipv4，结果增加 trigger 与 wan_ipv4。"
   }
 }

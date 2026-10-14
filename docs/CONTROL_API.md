@@ -27,8 +27,8 @@ Content-Type: application/json
 | `schedule.reboot.set` | `enabled`（布尔）、`time`（设备本地 `HH:MM`） | 保存 datad 每日定时重启；原厂周/间隔日计划开启时拒绝启用 |
 | `speedtest.start` | `bytes`（1–50 MiB）、`threads`（1–5）、`runs`（1 或 3） | 设备默认出口直连固定 Cloudflare HTTPS 下载端点，异步返回状态；总量不超过 `bytes` |
 | `speedtest.stop` | 无 | 取消正在运行的下载测试 |
-| `nat.detect` | 可选 `servers`（1–6 个 `stun:host[:port]`） | 用 STUN 检测设备默认出口的 IPv4 NAT 类型（运营商侧），同步返回结果，通常 1–3 秒，最长 20 秒；见下文 |
-| `nat.status` | 无 | 返回 `running` 和上一次检测结果 `last`（启动后未检测过为 `null`） |
+| `nat.detect` | 可选 `servers`（1–6 个 `stun:host[:port]`） | 立即重新检测设备默认出口的 IPv4 NAT 类型（运营商侧），同步返回结果，通常 1–3 秒，最长 20 秒；结果同样写入缓存。见下文 |
+| `nat.status` | 无 | 返回 `running`、当前 WAN IPv4 `wan_ipv4` 和缓存的检测结果 `last`（还没有结果时为 `null`）；datad 在 WAN IPv4 变化时自动检测，见下文 |
 | `cloud.remote_features.set` | `remote_panel_control_enabled`、`remote_webshell_enabled`（布尔），`services`（名称、1–65535 端口、`web`/`terminal` 类型的完整列表） | 仅修改云端远程功能；需已启用云端连接及远程后台，不能修改连接地址、凭据或 CA。9460/9461 不可用，最多 8 项且端口不重复；远程 v2 调用要求 `confirmed=true` |
 | `schedule.task.put` | `id`、设备本地 `time`（`HH:MM`）、`repeat_daily`、受限 `action`、`params` | 新增或修改本地任务；仅接受已支持的控制动作及精确参数，最多 16 项。0.10.39 起授权面板上报 `cell_lock_supported=true`，定时 `cell.lock_lte` / `cell.lock_nr` 仅接受有界十进制 PCI、频率及 NR 频段。0.10.40 起上报 `sms_send_supported=true`，定时 `sms.send_scheduled` 仅接受 `number`（3–32 位、可带前导 `+`）及 `text`（1–280 UTF-16 单元），正文仅存设备私有 0600 文件并进入授权按需面板流；执行前持久化尝试和与短信转发共用的每日 60 条本机 SIM 配额，失败不重试。重复任务每日最多尝试一次；远程 v2 要求 `confirmed=true` |
 | `schedule.task.remove` | `id` | 删除本地任务；远程 v2 要求 `confirmed=true` |
@@ -88,8 +88,16 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 返回字段：`mapping`/`filtering`（`endpoint_independent`、`address_dependent`、
 `address_and_port_dependent`、`dependent`、`unknown`）、`nat`、`carrier_nat`（WAN 地址是私网或
 100.64.0.0/10，说明 NAT 在运营商侧）、`measured_at`、`device`、`public_address`、`local_address`、
-`port_preserved`、`server`、`rfc5780`、`duration_ms`、`checked_at`，失败时另有 `error`（`dns_failed`、
+`port_preserved`、`server`、`rfc5780`、`duration_ms`、`checked_at`、`trigger`（`wan_change` 自动检测 /
+`request` 调用 `nat.detect`）、`wan_ipv4`（检测时的 WAN IPv4 地址，排序），失败时另有 `error`（`dns_failed`、
 `no_stun_answer`、`timeout`）。
+
+0.10.78 起 datad 自动检测，不做定时检测：每 5 秒读取 `/state.interfaces.wan4.ipv4`，地址集合变化（启动后第一次拿到
+IPv4 也算）并稳定 30 秒后检测一次，30 秒内再变就按新地址重新计时。结果连同当时的地址缓存到下一次 WAN IPv4 变化
+（datad 重启后重新检测一次）。IPv4 消失时保留旧结果，之后拿回同一地址不算变化。检测失败（带 `error`，含
+`udp_blocked`）时，同一地址下在 1、5、15 分钟后最多重试 3 次，仍失败就保留失败结果。已有检测或测速在进行时，
+自动检测推迟到它们结束后。手动 `nat.detect` 的结果写入同一份缓存，绑定当时的 WAN IPv4。`nat.status.last.wan_ipv4`
+与 `nat.status.wan_ipv4` 不同时，说明地址刚变、新结果还没出来。缓存摘要随 MQTT `telemetry/device.nat` 上报（见 CLOUD.md）。
 
 主结果 `type`/`nat_level`/`filtering` 是**运营商侧**的 NAT 行为（`measured_at="carrier"`）。设备自身的
 INPUT 防火墙只放行已建立连接的回包，会丢掉 STUN 服务器从另一个地址发回的探测包，普通套接字因此只能看到

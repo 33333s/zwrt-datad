@@ -527,6 +527,7 @@ impl App {
         app.spawn_activity_flush();
         app.spawn_sampler();
         app.spawn_ota();
+        app.spawn_nat();
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {
@@ -804,6 +805,20 @@ impl App {
             }
         });
     }
+    fn spawn_nat(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut watcher = crate::nat::Watcher::new(crate::nat::default_servers());
+            let mut ticks = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticks.tick().await;
+                let addresses =
+                    crate::nat::wan_ipv4(app.inner.snapshot.read().await.fields.get("interfaces"));
+                let speedtest = app.inner.speedtest.lock().await.running();
+                watcher.tick(addresses, speedtest).await;
+            }
+        });
+    }
     async fn refresh_snapshot(&self) {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
@@ -819,6 +834,9 @@ impl App {
         }
         next.fields
             .insert("time".into(), self.inner.time_control.status());
+        if let Some(nat) = crate::nat::telemetry().await {
+            next.fields.insert("nat".into(), nat);
+        }
         next.fields.insert(
             "reboot_schedule".into(),
             self.inner.schedule.lock().await.status(),

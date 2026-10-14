@@ -33,6 +33,8 @@ App 状态中的 `connected` 只表示 MQTT 已连接，绑定结果仍需在 NM
 
 发布协议 v1 非 retained 的 telemetry/device、telemetry/system、telemetry/network、status（含离线遗嘱），订阅本设备 command/request，只接受 `remote.open` 和已签名的 datad 自更新命令（见 `docs/NMS.md`）。拒绝 retained、重复会话、非平台 WSS、未授权端口和超限会话，只连接 127.0.0.1。保留后台认证，不执行免密 handoff 或额外端口。最多 4 会话，每个 4 流；到期、配置关闭或平台拒绝后退出。不开放云端 ubus 或系统固件 OTA；可选原生终端另需下文的独立授权。
 
+`telemetry/device` 0.10.78 起带能力 `datad.nat` 和 `nat` 字段：WAN IPv4 变化时自动检测的 NAT 类型，只有 `{type, nat_level, carrier_nat, checked_at, error}` 五个键。`type` 为 `full_cone`、`restricted_cone`、`port_restricted_cone`、`symmetric`、`open`、`firewalled`、`no_nat`、`udp_blocked`、`unknown` 之一；`nat_level` 为 1–4，没有时省略；`carrier_nat` 为布尔（检测失败时按 WAN 地址是否私网/100.64.0.0/10 判断）；`checked_at` 为 Unix 秒；`error` 只在失败时出现，是小写错误码（`dns_failed`、`no_stun_answer`、`timeout`）。还没有任何结果时不带 `nat`。新结果会改变 `checked_at`，按 `telemetry/device` 的变化规则补发。检测规则见 CONTROL_API.md 的 NAT 检测。
+
 `telemetry/network` 包含 `upstream.ipv4/ipv6` 与服务小区标识 `cell`：`rat`、`mcc`、`mnc`、`lte_tac`、`lte_cell_id`、`lte_pci`、`nr_tac`、`nr_cell_id`、`nr_pci`，供 NMS 做基站定位。数值字段只上报大于 0 的值（`mnc` 在 `mcc` 有效时保留 `0`）；原厂可能在切换制式后短暂保留旧小区值，消费端还须核对 `rat` 与上报时间。不包含 IMSI、ICCID 等 SIM 标识。
 
 端口清单使用 `remote_services` 扩展字段，自定义入口需要 NMS 服务端同时支持。`connected` 只证明 MQTT 连接，不能证明设备准入、绑定或网页访问成功。上报仅包含选定资源字段，不上传完整 `/state`、短信或认证信息。
