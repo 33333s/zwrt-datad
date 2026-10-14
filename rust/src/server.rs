@@ -143,6 +143,7 @@ impl App {
             loop {
                 let interval = app.inner.recovery.lock().await.config().interval_seconds;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
+                crate::power::awake().await;
                 let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
                     continue;
                 };
@@ -528,6 +529,7 @@ impl App {
         app.spawn_sampler();
         app.spawn_ota();
         app.spawn_nat();
+        app.spawn_power();
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {
@@ -542,6 +544,34 @@ impl App {
             .submit(action, params)
             .map_err(str::to_owned)
     }
+    /// Follows the OEM power state (`crate::power`): entering power-off hands
+    /// the cooling back and marks the snapshot; power-on samples at once.
+    fn spawn_power(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_secs(3));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let off = crate::power::oem_powered_off();
+                if !crate::power::set_dormant(off) {
+                    continue;
+                }
+                if off {
+                    eprintln!("power: OEM power-off; datad is dormant until power-on");
+                    crate::cooling::tick().await;
+                    let mut snapshot = app.inner.snapshot.write().await;
+                    snapshot
+                        .fields
+                        .insert("oem_power".into(), json!({"dormant":true}));
+                    let _ = app.inner.tx.send(snapshot.clone());
+                } else {
+                    eprintln!("power: power-on; datad resumes");
+                    app.refresh_snapshot().await;
+                }
+            }
+        });
+    }
     fn spawn_sampler(&self) {
         let app = self.clone();
         tokio::spawn(async move {
@@ -550,6 +580,7 @@ impl App {
                     app.inner.interval_ms.load(Ordering::Relaxed),
                 ))
                 .await;
+                crate::power::awake().await;
                 app.refresh_snapshot().await;
             }
         });
@@ -562,6 +593,7 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                crate::power::awake().await;
                 let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
                     continue;
                 };
@@ -598,6 +630,7 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                crate::power::awake().await;
                 let Some(_clock_lease) = crate::time_control::clock_sensitive_operation() else {
                     continue;
                 };
@@ -706,6 +739,7 @@ impl App {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticks.tick().await;
+                crate::power::awake().await;
                 let device_snapshot = app.inner.snapshot.read().await.clone();
                 let battery = device_snapshot.fields.get("battery").cloned();
                 let time_origin = app.inner.cloud.read().await.panel_config()["platform_url"]
@@ -795,6 +829,7 @@ impl App {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(90)).await;
             loop {
+                crate::power::awake().await;
                 let snapshot = if auto {
                     serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null)
                 } else {
@@ -812,6 +847,7 @@ impl App {
             let mut ticks = tokio::time::interval(Duration::from_secs(5));
             loop {
                 ticks.tick().await;
+                crate::power::awake().await;
                 let addresses =
                     crate::nat::wan_ipv4(app.inner.snapshot.read().await.fields.get("interfaces"));
                 let speedtest = app.inner.speedtest.lock().await.running();
@@ -834,6 +870,10 @@ impl App {
         }
         next.fields
             .insert("time".into(), self.inner.time_control.status());
+        next.fields.insert(
+            "oem_power".into(),
+            json!({"dormant":crate::power::dormant()}),
+        );
         if let Some(nat) = crate::nat::telemetry().await {
             next.fields.insert("nat".into(), nat);
         }

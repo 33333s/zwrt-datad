@@ -140,14 +140,27 @@ with tempfile.TemporaryDirectory(prefix="datad-cooling-") as directory:
 
             # Quick power-off only pretends to switch the device off: the stock
             # thermal zone takes the fan back and the curve stays paused.
+            assert request("/state")[1]["oem_power"] == {"dormant": False}
             replace(base / "mc-state", "config zudata_mode_fun 'mode'\n\toption mode_main_state 'mode_power_off_quicken'\n")
             wait_for(lambda: (zone / "mode").read_text() == "enabled", "power-off did not hand the fan back")
+            # datad goes dormant: the state is marked and sampling stops.
+            wait_for(lambda: request("/state")[1]["oem_power"] == {"dormant": True}, "power-off did not mark dormant")
+            # A sample already running when the state changed still completes.
+            time.sleep(3)
+            before = request("/state")[1]["ts"]
             replace(base / "pwm", "7")
-            time.sleep(1.5)
+            replace(zone / "temp", "70000")
+            time.sleep(3)
+            assert request("/state")[1]["ts"] == before, "sampling continued while dormant"
             assert (base / "pwm").read_text() == "7", "curve kept driving the fan while powered off"
             assert (zone / "mode").read_text() == "enabled"
+            assert state()["temperature_celsius"] == 64, "sampling continued while dormant"
+            replace(zone / "temp", "64000")
             replace(base / "mc-state", "config zudata_mode_fun 'mode'\n\toption mode_main_state 'mode_power_on_charger'\n")
+            wait_for(lambda: request("/state")[1]["oem_power"] == {"dormant": False}, "power-on did not resume sampling")
             wait_for(lambda: (zone / "mode").read_text() == "disabled" and state()["pwm"] == 113, "curve did not resume after power-on")
+            assert state()["temperature_celsius"] == 64
+            assert "power: OEM power-off" in (base / "server.log").read_text()
 
             action("cooling.liquid.set_mode", {"mode": "low"})
             # Always-on is re-applied by the periodic tick; regular files (unlike

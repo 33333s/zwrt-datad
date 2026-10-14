@@ -281,7 +281,7 @@ impl Cloud {
     }
 
     pub fn start(&self, state: watch::Receiver<Snapshot>, app: crate::server::App) {
-        let config = self.tx.subscribe();
+        let config = gated(self.tx.subscribe(), crate::power::subscribe());
         let status = self.status.clone();
         let nodes = self.nodes.clone();
         tokio::spawn(async move { supervisor(config, state, status, Some(app), nodes).await });
@@ -555,6 +555,35 @@ fn deterministic_uuid(seed: &str) -> String {
     )
 }
 
+/// The configuration the supervisor sees: none while the device is powered
+/// off (`crate::power`), so the session reports offline and closes; mobile
+/// data is down then anyway. Power-on hands the configuration back.
+fn gated(
+    mut config: watch::Receiver<Option<Config>>,
+    mut dormant: watch::Receiver<bool>,
+) -> watch::Receiver<Option<Config>> {
+    let effective = |config: &Option<Config>, dormant: bool| {
+        if dormant { None } else { config.clone() }
+    };
+    let (tx, rx) = watch::channel(effective(
+        &config.borrow_and_update(),
+        *dormant.borrow_and_update(),
+    ));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = config.changed() => if changed.is_err() { return },
+                changed = dormant.changed() => if changed.is_err() { return },
+            }
+            let next = effective(&config.borrow_and_update(), *dormant.borrow_and_update());
+            if tx.send(next).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 async fn supervisor(
     mut config_rx: watch::Receiver<Option<Config>>,
     state_rx: watch::Receiver<Snapshot>,
@@ -566,6 +595,9 @@ async fn supervisor(
     loop {
         let config = config_rx.borrow_and_update().clone();
         let Some(config) = config else {
+            if crate::power::dormant() {
+                set_status(&status, "dormant", "设备已关机（快速开机），云端连接暂停");
+            }
             if config_rx.changed().await.is_err() {
                 return;
             }
@@ -3966,6 +3998,33 @@ mod tests {
         assert_eq!(hardware_model(&fallback).as_deref(), Some("MU5002D"));
         assert!(hardware_model(&json!({"device":{"model_name":"bad/model"}})).is_none());
         assert!(hardware_model(&json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn power_off_withdraws_the_configuration_until_power_on() {
+        let (config_tx, config_rx) = watch::channel(Some(Config::default()));
+        let (dormant_tx, dormant_rx) = watch::channel(false);
+        let mut gated = gated(config_rx, dormant_rx);
+        assert!(gated.borrow_and_update().is_some());
+        dormant_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gated.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(gated.borrow_and_update().is_none());
+        // A configuration change while powered off stays withheld.
+        config_tx.send(Some(Config::default())).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gated.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(gated.borrow_and_update().is_none());
+        dormant_tx.send(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gated.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(gated.borrow_and_update().is_some());
     }
 
     #[test]

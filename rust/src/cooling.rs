@@ -426,30 +426,6 @@ async fn apply_liquid(c: &Config, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the OEM power manager is in a power-off state
-/// (`zwrt_zte_mc_tmp.mode.mode_main_state`). With "quick power-on" the device
-/// only pretends to be off and datad keeps running.
-fn oem_powered_off() -> bool {
-    std::fs::read_to_string(env(
-        "ZWRT_DATAD_MC_STATE_PATH",
-        "/etc/config/zwrt_zte_mc_tmp",
-    ))
-    .is_ok_and(|raw| power_off_state(&raw))
-}
-
-fn power_off_state(raw: &str) -> bool {
-    raw.lines().any(|line| {
-        line.trim()
-            .strip_prefix("option mode_main_state")
-            .is_some_and(|value| {
-                value
-                    .trim()
-                    .trim_matches(['\'', '"'])
-                    .starts_with("mode_power_off")
-            })
-    })
-}
-
 async fn vendor(path: &str, value: bool) -> Result<(), String> {
     state::uci_write("set", path, Some(if value { "1" } else { "0" })).await?;
     state::uci_write("commit", "zwrt_deviceui", None).await
@@ -656,7 +632,7 @@ pub async fn tick() {
         return;
     }
     let config = load().await;
-    if oem_powered_off() {
+    if crate::power::oem_powered_off() {
         // A custom curve would keep cycling the fan of a device that looks
         // switched off; the stock controllers own it until power-on.
         if !HANDED_BACK.swap(true, Ordering::Relaxed) {
@@ -694,28 +670,6 @@ pub async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn oem_power_off_states_are_recognised() {
-        let state = |mode: &str| {
-            format!(
-                "\nconfig zudata_mode_fun 'mode'\n\toption reboot_reason_code '1182'\n\toption mode_main_state '{mode}'\n"
-            )
-        };
-        for mode in [
-            "mode_power_off_quicken",
-            "mode_power_off_charger_quicken",
-            "mode_power_off_quickening",
-            "mode_power_off",
-        ] {
-            assert!(power_off_state(&state(mode)), "{mode}");
-        }
-        for mode in ["mode_power_on", "mode_power_on_charger", "mode_initial"] {
-            assert!(!power_off_state(&state(mode)), "{mode}");
-        }
-        assert!(!power_off_state(""));
-        assert!(!power_off_state("\toption other 'mode_power_off'\n"));
-    }
 
     #[test]
     fn liquid_levels_stay_inside_the_driver_limit() {

@@ -27,6 +27,7 @@ mod neighbor_lte;
 mod neighbor_manager;
 mod network_recovery;
 mod ota;
+mod power;
 mod qos;
 mod qtrace_mask;
 mod reboot_schedule;
