@@ -53,6 +53,7 @@ pub(crate) struct Inner {
     interval_ms: AtomicU64,
     pub(crate) _data_dir: PathBuf,
     identity: crate::identity::Identity,
+    efs: crate::efs::Efs,
     token: Option<String>,
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
@@ -441,6 +442,7 @@ impl App {
                 ota_view,
                 neighbor: Mutex::new(neighbor),
                 identity: crate::identity::Identity::new(&data_dir),
+                efs: crate::efs::Efs::new(&data_dir),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -782,6 +784,7 @@ impl App {
             .route("/ubus/list", get(ubus_list))
             .route("/ubus/call", post(ubus_call))
             .route("/control", post(control));
+        router = router.merge(efs_router(self.clone()));
         router = router
             .route("/ota/app", get(ota_app_status))
             .route(
@@ -1547,6 +1550,220 @@ async fn signal_stream(State(app): State<App>, headers: HeaderMap) -> Response {
 async fn signal_token_valid(app: &App, token: &str) -> bool {
     static_token_valid(app.inner.token.as_deref(), Some(token))
         || app.inner.sessions.lock().await.validate(token)
+}
+
+// Explicit auth on both listeners: the loopback listener otherwise permits
+// selected local APIs, while EFS may expose or modify modem configuration.
+fn efs_router(app: App) -> Router<App> {
+    Router::new()
+        .route("/efs/status", get(efs_status))
+        .route("/efs/nvread", get(efs_nvread))
+        .route("/efs/list", get(efs_list))
+        .route("/efs/stat", get(efs_stat))
+        .route("/efs/read", get(efs_read))
+        .route("/efs/download", get(efs_download))
+        .route(
+            "/efs/write",
+            post(efs_write).layer(RequestBodyLimitLayer::new(72 * 1024)),
+        )
+        .route(
+            "/efs/upload",
+            post(efs_upload).layer(RequestBodyLimitLayer::new(crate::efs::MAX_TRANSFER)),
+        )
+        .route(
+            "/efs/delete",
+            post(efs_delete).layer(RequestBodyLimitLayer::new(4096)),
+        )
+        .route(
+            "/efs/mkdir",
+            post(efs_mkdir).layer(RequestBodyLimitLayer::new(4096)),
+        )
+        .route(
+            "/efs/rename",
+            post(efs_rename).layer(RequestBodyLimitLayer::new(4096)),
+        )
+        .route_layer(middleware::from_fn_with_state(app, efs_auth))
+}
+async fn efs_auth(State(app): State<App>, request: Request, next: Next) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if let Some(token) = token
+        && signal_token_valid(&app, token).await
+    {
+        let mut response = next.run(request).await;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    efs_private((StatusCode::UNAUTHORIZED, Json(json!({"ok":false,"error":{"code":"unauthorized","message":"Bearer authentication required"}}))).into_response())
+}
+fn efs_private(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+fn efs_invalid(message: &str) -> Response {
+    efs_private(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":{"code":"invalid_parameter","message":message}})),
+        )
+            .into_response(),
+    )
+}
+fn efs_query<T>(
+    query: Result<Query<T>, axum::extract::rejection::QueryRejection>,
+) -> Result<T, &'static str> {
+    query
+        .map(|Query(v)| v)
+        .map_err(|_| "invalid EFS query parameters")
+}
+fn efs_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, &'static str> {
+    payload
+        .map(|Json(v)| v)
+        .map_err(|_| "invalid EFS JSON body")
+}
+async fn efs_execute(app: &App, operation: crate::efs::Operation) -> Response {
+    let name = operation.name();
+    match app.inner.efs.execute(operation).await {
+        Ok(crate::efs::Output::Json(value)) => {
+            app.record("efs", name, "success", "", "").await;
+            efs_private(Json(value).into_response())
+        }
+        Ok(crate::efs::Output::Binary(bytes)) => {
+            app.record("efs", name, "success", "", "").await;
+            efs_private(
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"efs-download.bin\"",
+                        ),
+                        (
+                            header::HeaderName::from_static("x-content-type-options"),
+                            "nosniff",
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response(),
+            )
+        }
+        Err(error) => {
+            let code = error.body["error"]["code"].as_str().unwrap_or("efs_failed");
+            app.record("efs", name, "failed", code, "").await;
+            efs_private((error.status, Json(error.body)).into_response())
+        }
+    }
+}
+async fn efs_status(State(app): State<App>) -> Response {
+    efs_private(Json(app.inner.efs.status()).into_response())
+}
+async fn efs_nvread(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::NvReadQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => efs_execute(&app, crate::efs::Operation::NvRead(q)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_list(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::PathQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => efs_execute(&app, crate::efs::Operation::List(q.path)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_stat(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::PathQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => efs_execute(&app, crate::efs::Operation::Stat(q.path)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_read(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::ReadQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => efs_execute(&app, crate::efs::Operation::Read(q)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_download(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::PathQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => efs_execute(&app, crate::efs::Operation::Download(q.path)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_write(
+    State(app): State<App>,
+    payload: Result<Json<crate::efs::WriteRequest>, JsonRejection>,
+) -> Response {
+    match efs_json(payload) {
+        Ok(v) => efs_execute(&app, crate::efs::Operation::Write(v)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_delete(
+    State(app): State<App>,
+    payload: Result<Json<crate::efs::DeleteRequest>, JsonRejection>,
+) -> Response {
+    match efs_json(payload) {
+        Ok(v) => efs_execute(&app, crate::efs::Operation::Delete(v)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_mkdir(
+    State(app): State<App>,
+    payload: Result<Json<crate::efs::DirectoryRequest>, JsonRejection>,
+) -> Response {
+    match efs_json(payload) {
+        Ok(v) => efs_execute(&app, crate::efs::Operation::Mkdir(v)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_rename(
+    State(app): State<App>,
+    payload: Result<Json<crate::efs::RenameRequest>, JsonRejection>,
+) -> Response {
+    match efs_json(payload) {
+        Ok(v) => efs_execute(&app, crate::efs::Operation::Rename(v)).await,
+        Err(r) => efs_invalid(r),
+    }
+}
+async fn efs_upload(
+    State(app): State<App>,
+    query: Result<Query<crate::efs::PathQuery>, axum::extract::rejection::QueryRejection>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    match efs_query(query) {
+        Ok(q) => {
+            efs_execute(
+                &app,
+                crate::efs::Operation::Upload {
+                    path: q.path,
+                    bytes: bytes.to_vec(),
+                },
+            )
+            .await
+        }
+        Err(r) => efs_invalid(r),
+    }
 }
 
 fn signal_body<F, V>(

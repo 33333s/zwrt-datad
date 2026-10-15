@@ -90,6 +90,7 @@ curl -N http://127.0.0.1:9460/events
 
 ## 文档
 
+- [`docs/ARM32_BUILD_PACKAGE.md`](docs/ARM32_BUILD_PACKAGE.md)：ARM32 编译、deploy_kano 整套打包与交付流程
 - [`docs/API.md`](docs/API.md)：HTTP、SSE、鉴权与命令行参数
 - [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)：状态字段契约
 - [`docs/CONTROL_API.md`](docs/CONTROL_API.md)：设备控制动作与安全边界

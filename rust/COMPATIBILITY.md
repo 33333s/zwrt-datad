@@ -11,6 +11,7 @@ line is retained on the `c` branch and is not used for new releases.
 | `/capabilities` | exact 79-action legacy set, legacy discovery/passthrough/transport metadata, duplicate guard and formal 404 unknown-action behavior | complete |
 | `/ubus`, `/ubus/list`, `/ubus/call` | implemented with validation, timeout, output cap and auth/list shape checks | complete |
 | static and dynamic authentication | static token, LAN Basic login, vendor-token exchange, 48-byte-hex sessions and sliding expiry implemented | supported-device login smoke |
+| EFS file management | authenticated `/efs/*` routes, isolated libdiag worker, bounded transfers and shared operation slot implemented; C protocol and HTTP/auth fixtures pass | real-device EFS acceptance pending |
 | normalized device state | MC7523 structure complete; battery, NFC, authenticated/normalized SMS, thermal, bounded QoS, TopFlow aggregation/multi-WAN/cooling and slot-aware MU5252 modem state ported | MU5250 and MC8532B device value comparisons remain outside the local-only rewrite gate |
 | allow-listed device controls | all 79 legacy actions implemented; local fixtures cover fixed UBus mapping, validation, rollback, extra-SSID hostapd ownership, cooling sysfs, SMS RSA/AES and injection rejection | supported-device acceptance remains intentionally deferred |
 | bounded neighbor QTrace parser | parser and lifecycle implemented; original parser and HTTP suites pass | final supported-device smoke |

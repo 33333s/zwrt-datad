@@ -156,6 +156,19 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 认证字段为 `username/password/auth_mode/pdp_type/roaming_pdp_type`。
 
+U50 的原厂 v2 接口通过 `APN_PROC_EX` 支持上述写操作，`apn.list.writable`
+表示当前是否读取到了可编辑的完整配置目录。`profile_id` 使用列表返回的 `manual-N`，
+自动运营商条目与 `current` 兜底条目不可修改。U50 的 `mode=0` 切回自动；
+`mode=1` 必须同时提供 `profile_id`，也可直接调用 `apn.enable`。
+U50 返回 `auth_modes:[0,1,2]`，`auth_mode=0/1/2` 分别为 none/PAP/CHAP，
+`pdp_type=1/2/3` 分别为 IPv4/IPv6/IPv4v6；U50 不支持单独设置 `roaming_pdp_type`。
+
+新增只保存，不自动启用；修改省略的用户名、密码和认证方式保留原值，
+IPv4/IPv6 的 DNS 分别保留。显式空字符串可清除认证凭据。
+当前配置不能删除；所有写入必须回读确认，原厂应答成功但回读不一致也返回失败。
+APN 写入失败不会自动重放，调用方应先刷新列表再决定是否重试。
+
+
 ## USB, Sleep And NFC
 
 | action | params |

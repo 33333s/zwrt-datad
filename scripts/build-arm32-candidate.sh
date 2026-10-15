@@ -38,6 +38,13 @@ export DATAD_DIAG_WORKER="$ROOT/build/u50-diag-worker"
 file "$ROOT/build/u50-diag-streamer" | grep -q "ELF 32-bit.*ARM"
 export DATAD_DIAG_STREAMER="$ROOT/build/u50-diag-streamer"
 
+# EFS runs in a private one-shot glibc process; the main daemon stays static.
+# PIC is required to avoid copy relocations against Zig's libc data stubs.
+"$ZIG" cc -target arm-linux-gnueabihf.2.31 -mcpu=cortex_a7 -std=c11 -Os -fPIC -pie -s \
+  -Wall -Wextra -Werror "$ROOT/rust/efs_worker.c" -ldl -o "$ROOT/build/efs-worker-armv7"
+file "$ROOT/build/efs-worker-armv7" | grep -q 'ELF 32-bit.*ARM.*dynamically linked'
+export DATAD_EFS_WORKER="$ROOT/build/efs-worker-armv7"
+
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-self-contained=no"
 export CC_armv7_unknown_linux_musleabihf="$ROOT/build/arm32-toolchain/cc"
 export AR_armv7_unknown_linux_musleabihf="$ROOT/build/arm32-toolchain/ar"
