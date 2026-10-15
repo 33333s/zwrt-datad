@@ -35,8 +35,9 @@ jobs:
       - run: GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o "$RUNNER_TEMP/install-datad-armv7" .
         working-directory: tools/u50pro-installer
   rust:
-    # Fork PRs stay on disposable GitHub-hosted machines.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "datad-ci"]') || 'ubuntu-latest' }}
+    # Only trusted upstream events can use its private runner. Fork pushes,
+    # manual runs and fork PRs use disposable GitHub-hosted machines.
+    runs-on: ${{ github.repository == '33333s/zwrt-datad' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "datad-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 4
