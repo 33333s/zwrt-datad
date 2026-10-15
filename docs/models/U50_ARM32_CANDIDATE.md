@@ -142,8 +142,10 @@ All verified with real writes on a U50 Pro (firmware `BD_FLYMODEMMU5120V1.0.1B12
 ## Reviewed panel read models (v0.10.51)
 
 The on-demand NMS panel now obtains Wi-Fi and APN views from the OEM backend
-instead of attempting ZWRT `uci`/`ubus` calls. Both views carry `writable: false`;
-this change does not implement Wi-Fi configuration or APN writes. Unknown or
+instead of attempting ZWRT `uci`/`ubus` calls. APN initially shipped read-only;
+the complete version 2 OEM catalog now exposes `writable: true` and supports
+`apn.add/modify/delete/enable/set_mode` through `APN_PROC_EX` with readback.
+The cfg-only fallback remains read-only. Unknown or
 unavailable data stays unknown, and an invalid resource is omitted from the
 panel instead of being presented as an empty successful configuration.
 
@@ -160,7 +162,7 @@ panel instead of being presented as an empty successful configuration.
   profile/current-mode fields. The adapter parses the OEM serialized profiles
   into the same reviewed `id/name/apn/auth_mode/pdp_type/enabled` fields as the
   NMS panel. Embedded account names/passwords, raw profile strings and the OEM
-  session are discarded. IDs identify read views and cannot be used for writes.
+  session are discarded. Manual IDs (`manual-N`) are now accepted by the normalized APN write controls when the complete v2 catalog is available; automatic/current entries remain read-only.
 - The local read actions `wifi.status`, `wifi.dual_band_status`, `apn.list` and
   `client.access` are listed in `/capabilities`; they accept no parameters.
   `client.access` returns the same reviewed list/blocked/counts view as

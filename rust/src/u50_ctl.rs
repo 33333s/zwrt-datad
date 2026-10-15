@@ -26,6 +26,7 @@ pub struct Ctl {
     last: Mutex<Option<Snapshot>>,
     neighbor: Mutex<NeighborState>,
     viewers: StdMutex<ViewDemand>,
+    apn_gate: Mutex<()>,
 }
 
 const VIEW_GRACE: Duration = Duration::from_secs(15);
@@ -114,6 +115,7 @@ pub fn install(collector: Collector, oem: Bridge) {
         last: Mutex::new(None),
         neighbor: Mutex::new(NeighborState::default()),
         viewers: StdMutex::new(ViewDemand::default()),
+        apn_gate: Mutex::new(()),
     });
 }
 
@@ -131,6 +133,11 @@ pub const CONTROLS: &[&str] = &[
     "wifi.status",
     "wifi.dual_band_status",
     "apn.list",
+    "apn.add",
+    "apn.modify",
+    "apn.delete",
+    "apn.enable",
+    "apn.set_mode",
     "client.access",
     "state.refresh",
     "state.set_interval",
@@ -1327,6 +1334,14 @@ impl Ctl {
     }
 
     async fn apn_oem_panel_config(&self) -> Result<Value, String> {
+        let raw = self.apn_raw_catalog().await?;
+        let writable = crate::u50_apn::Catalog::parse(raw.clone()).is_ok();
+        let mut config = crate::u50_panel::apn_config(&raw)?;
+        config["writable"] = json!(writable);
+        Ok(config)
+    }
+
+    async fn apn_raw_catalog(&self) -> Result<Value, String> {
         let mut raw = Map::new();
         for prefix in ["APN_config", "ipv6_APN_config"] {
             let keys = (0..20)
@@ -1336,9 +1351,46 @@ impl Ctl {
             let reply = self.read(&keys).await?;
             raw.extend(reply.as_object().ok_or("invalid OEM APN reply")?.clone());
         }
-        let reply = self.read("apn_interface_version,apn_mode,apn_auto_config,ipv6_apn_auto_config,m_profile_name,profile_name,profile_name_ui,wan_apn,wan_apn_ui,ppp_auth_mode,ppp_auth_mode_ui,pdp_type,pdp_type_ui").await?;
+        let reply = self.read("apn_interface_version,apn_mode,apn_auto_config,ipv6_apn_auto_config,m_profile_name,profile_name,profile_name_ui,wan_apn,wan_apn_ui,ppp_auth_mode,ppp_auth_mode_ui,pdp_type,pdp_type_ui,apn_num_preset,Current_index").await?;
         raw.extend(reply.as_object().ok_or("invalid OEM APN reply")?.clone());
-        crate::u50_panel::apn_config(&Value::Object(raw))
+        Ok(Value::Object(raw))
+    }
+
+    async fn apn_write(&self, action: &str, params: &Value) -> Outcome {
+        // Keep read/allocate/write/readback atomic between local and cloud clients.
+        let _guard = self.apn_gate.lock().await;
+        let before = match self
+            .apn_raw_catalog()
+            .await
+            .and_then(crate::u50_apn::Catalog::parse)
+        {
+            Ok(value) => value,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let plan = match before.plan(action, params) {
+            Ok(plan) => plan,
+            Err(error) => return Outcome::Invalid(error),
+        };
+        // Never replay an ambiguous APN write: delete may compact catalog indices.
+        if let Err(error) = self.oem.local_write_once("APN_PROC_EX", &plan.form).await {
+            return Outcome::Failed(error);
+        }
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if let Ok(after) = self
+                .apn_raw_catalog()
+                .await
+                .and_then(crate::u50_apn::Catalog::parse)
+                && plan.verified(&after)
+            {
+                return Outcome::Ok(json!({"ok":true,"verified":true,
+                    "profile_id":plan.index.map(|i|format!("manual-{i}"))}));
+            }
+        }
+        Outcome::Failed(
+            "OEM accepted APN write but readback did not confirm it; refresh before retrying"
+                .into(),
+        )
     }
 
     /// Original-firmware counterparts of the mainline local read actions.
@@ -1369,7 +1421,8 @@ impl Ctl {
                     json!({"apnListArray":items})
                 };
                 json!({"mode":{"apn_mode":config["mode"]},"automatic":profiles("automatic"),
-                    "manual":profiles("manual"),"enabled":{"profileId":config["enabled_id"]},"writable":false})
+                    "manual":profiles("manual"),"enabled":{"profileId":config["enabled_id"]},
+                    "writable":config["writable"],"auth_modes":[0,1,2]})
             }),
             "client.access" => self.clients_block().await.ok_or_else(||"OEM client list unavailable".into()),
             _ => return Outcome::NotHandled,
@@ -1511,6 +1564,9 @@ impl Ctl {
 
     pub async fn execute(&self, action: &str, params: &Value) -> Outcome {
         match action {
+            "apn.add" | "apn.modify" | "apn.delete" | "apn.enable" | "apn.set_mode" => {
+                self.apn_write(action, params).await
+            }
             "oem.access.set" => match self.oem.set_access(params).await {
                 Ok(value) => Outcome::Ok(value),
                 Err(error) => Outcome::Invalid(error),

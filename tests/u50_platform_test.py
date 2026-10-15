@@ -205,7 +205,34 @@ class Vendor(BaseHTTPRequestHandler):
             STORE["sa_ngbr_cell_manual_result_ext"] = "973,627264,-103,-14,n78;361,633984,-97,-7,n41;"
         one = {key: values[0] for key, values in form.items()}
         LOG.append(("write", action, {k: v for k, v in one.items() if k not in ("AD", "isTest")}))
-        if action == "SET_CONNECTION_MODE":
+        if action == "APN_PROC_EX":
+            if getattr(Vendor, "skip_apn_write", False):
+                return self.send_json({"result": "success"})
+            kind = one.get("apn_action")
+            if kind == "save":
+                index = int(one["index"])
+                for prefix in ("", "ipv6_"):
+                    if prefix + "wan_apn" not in one:
+                        continue
+                    parts = [one["profile_name"], one[prefix + "wan_apn"], "manual", "*99#",
+                             one[prefix + "ppp_auth_mode"], one[prefix + "ppp_username"], one[prefix + "ppp_passwd"],
+                             one["pdp_type"], "auto", "", one[prefix + "dns_mode"],
+                             one[prefix + "prefer_dns_manual"], one[prefix + "standby_dns_manual"]]
+                    STORE[f"{prefix}APN_config{index}"] = "($)".join(parts)
+            elif kind == "delete":
+                index = int(one["index"])
+                for prefix in ("", "ipv6_"):
+                    for i in range(index, 19):
+                        STORE[f"{prefix}APN_config{i}"] = STORE.get(f"{prefix}APN_config{i+1}", "")
+                    STORE[f"{prefix}APN_config19"] = ""
+            elif kind == "set_default":
+                record = STORE.get("APN_config" + one["index"], "") or STORE["ipv6_APN_config" + one["index"]]
+                STORE["profile_name_ui"], STORE["wan_apn_ui"] = record.split("($)")[:2]
+                STORE["pdp_type_ui"] = one["pdp_type"]
+                STORE["apn_mode"] = "manual"
+            else:
+                STORE["apn_mode"] = one["apn_mode"]
+        elif action == "SET_CONNECTION_MODE":
             STORE["dial_mode"], STORE["roam_setting_option"] = one["ConnectionMode"], one["roam_setting_option"]
         elif action == "SET_BEARER_PREFERENCE":
             # The U50 Pro firmware reports the 4G+5G preference as WL_AND_5G.
@@ -391,7 +418,7 @@ esac
         for action in ("wifi.status", "wifi.dual_band_status", "apn.list", "client.access",
                        "wifi.configure", "wifi.set_dual_band", "neighbor.set", "neighbor.status"):
             assert action in caps["controls"]
-        assert "apn.add" not in caps["controls"]
+        assert all(a in caps["controls"] for a in ("apn.add", "apn.modify", "apn.delete", "apn.enable", "apn.set_mode"))
 
         # Local reads use OEM resources, make no setting writes, and exclude
         # keys embedded in the firmware's APN response objects.
@@ -409,7 +436,7 @@ esac
         assert status == 200 and dual["result"]["enabled"] is False and dual["result"]["writable"] is False
         status, apn = control(port, "apn.list", {})
         assert status == 200, apn
-        assert apn["result"]["mode"] == {"apn_mode": 1} and apn["result"]["writable"] is False
+        assert apn["result"]["mode"] == {"apn_mode": 1} and apn["result"]["writable"] is True
         assert apn["result"]["enabled"] == {"profileId": "manual-0"}
         assert apn["result"]["manual"]["apnListArray"][0]["wanapn"] == "fixture.apn"
         # The real original image can return empty APN metadata. Fall back
@@ -441,8 +468,44 @@ esac
         assert "wifi-password-secret" not in json.dumps([dual, apn, cfg_view, clients_read])
         for secret in ("apn-account-secret", "apn-password-secret", ADMIN_HASH):
             assert secret not in json.dumps([wifi, dual, apn, cfg_view, clients_read])
-        assert control(port, "apn.add", {"name": "fixture"})[0] == 404
+        assert control(port, "apn.add", {"name": "fixture"})[0] == 400
         assert len(writes()) == before
+
+        # A WebUI login can silently invalidate the catalog cookie (HTTP 200/empty).
+        time.sleep(3.1)  # respect the OEM bridge's intentional login rate limit
+        Vendor.sms_session_expired = True
+        previous_logins = LOG.count(("login",))
+        status, renewed = control(port,"apn.list",{})
+        assert status == 200 and renewed["result"]["writable"] is True, renewed
+        assert LOG.count(("login",)) > previous_logins
+
+        # Exercise the normalized API through authenticated OEM challenge writes.
+        status, added = control(port, "apn.add", {"name":"APN Test", "apn":"test.apn", "pdp_type":3,
+                                                  "auth_mode":1, "username":"test-user", "password":"test-secret"})
+        assert status == 200 and added["result"]["verified"], added
+        assert added["result"]["profile_id"] == "manual-1"
+        assert STORE["profile_name_ui"] == "Fixture", "save must not select the new profile"
+        status, changed = control(port,"apn.modify",{"profile_id":"manual-1","name":"APN Test","apn":"changed.apn"})
+        assert status == 200 and changed["result"]["verified"], changed
+        for prefix in ("", "ipv6_"):
+            parts = STORE[prefix + "APN_config1"].split("($)")
+            assert parts[1] == "changed.apn" and parts[5:7] == ["test-user", "test-secret"]
+        assert control(port,"apn.enable",{"profile_id":"manual-1"})[0] == 200
+        assert STORE["pdp_type_ui"] == "IPv4v6"
+        assert control(port,"apn.delete",{"profile_id":"manual-1"})[0] == 400
+        assert control(port,"apn.set_mode",{"mode":0})[0] == 200
+        assert control(port,"apn.set_mode",{"mode":1,"profile_id":"manual-0"})[0] == 200
+        assert control(port,"apn.delete",{"profile_id":"manual-1"})[0] == 200
+        assert STORE["APN_config1"] == "" and STORE["ipv6_APN_config1"] == ""
+        previous = len(writes())
+        for bad in ({"profile_id":"automatic-0"},{"profile_id":"manual-20"},{"index":1}):
+            assert control(port,"apn.delete",bad)[0] == 400
+        assert len(writes()) == previous
+        Vendor.skip_apn_write = True
+        status, rejected = control(port,"apn.add",{"name":"Not Stored","apn":"absent.apn"})
+        assert status == 502 and "readback" in json.dumps(rejected), rejected
+        assert len(writes()) == previous + 1, "unconfirmed APN writes must never be replayed"
+        Vendor.skip_apn_write = False
 
         _, cloud = call(port, "/cloud/config")
         assert cloud["config"]["enabled"] is True and cloud["config"]["remote_enabled"] is True, cloud

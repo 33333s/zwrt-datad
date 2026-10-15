@@ -622,10 +622,33 @@ impl Bridge {
         keys: &str,
         params: &BTreeMap<String, String>,
     ) -> Result<Value, String> {
+        let apn = keys.split(',').any(|key| {
+            key.starts_with("APN_config")
+                || key.starts_with("ipv6_APN_config")
+                || key == "apn_interface_version"
+        });
         for attempt in 0..2 {
             let token = self.local_token().await?;
+            // GoAhead returns HTTP 200 with empty APN fields after another
+            // client replaces the login. Such a reply is not an empty catalog.
+            if apn && !self.session_alive(&token).await? {
+                self.drop_session().await;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err("OEM APN session unavailable".into());
+            }
             match self.read(&token, keys, params).await {
-                Ok(value) => return Ok(value.get("fields").cloned().unwrap_or(Value::Null)),
+                Ok(value) => {
+                    if apn && !self.session_alive(&token).await? {
+                        self.drop_session().await;
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err("OEM APN session changed during read".into());
+                    }
+                    return Ok(value.get("fields").cloned().unwrap_or(Value::Null));
+                }
                 Err(error) if attempt == 0 => {
                     self.drop_session().await;
                     let _ = error;
@@ -634,6 +657,11 @@ impl Bridge {
             }
         }
         Err("OEM read failed".into())
+    }
+
+    async fn session_alive(&self, token: &str) -> Result<bool, String> {
+        let cookie = self.authorized_cookie(token).await?;
+        Ok(self.get("loginfo", &cookie).await?.0["loginfo"] == "ok")
     }
 
     /// Single-command read (no `multi_data`), as the WebUI does for paged
@@ -677,6 +705,16 @@ impl Bridge {
     }
 
     /// Perform an allow-listed OEM action with the local session.
+    pub async fn local_write_once(
+        &self,
+        goform_id: &str,
+        params: &Map<String, Value>,
+    ) -> Result<Value, String> {
+        let token = self.local_token().await?;
+        self.write(&token, goform_id, params, true).await
+    }
+
+    /// Retry only the caller's known-safe OEM operations after session rejection.
     pub async fn local_write(
         &self,
         goform_id: &str,

@@ -123,7 +123,10 @@ try {
     Write-Host '[4/5] Installing and verifying service health...'
     # Once started, the device owns the transaction and rollback even if ADB is lost.
     $launched = $true
-    [void](Device-Shell "nohup sh $remoteStage/deploy-transaction.sh $remoteStage > $remoteStage/deploy.log 2>&1 < /dev/null &")
+    # Keep ADB alive until the detached transaction has actually emitted output.
+    # Some adbd builds close the shell before the child reaches nohup/exec.
+    $launch = 'nohup sh {0}/deploy-transaction.sh {0} > {0}/deploy.log 2>&1 < /dev/null & launch_pid=$!; launch_wait=0; while [ ! -s {0}/deploy.log ] && kill -0 "$launch_pid" 2>/dev/null; do launch_wait=$((launch_wait + 1)); [ "$launch_wait" -le 10 ] || exit 1; sleep 1; done; test -s {0}/deploy.log' -f $remoteStage
+    [void](Device-Shell $launch)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt 180) {
         $result = ''

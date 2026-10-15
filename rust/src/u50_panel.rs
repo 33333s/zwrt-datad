@@ -146,9 +146,14 @@ pub fn apn_config(reply: &Value) -> Result<Value, String> {
         let name = format!("APN_config{index}");
         let v6_name = format!("ipv6_APN_config{index}");
         let id = format!("manual-{index}");
-        let parsed = text(reply, &name, 8192)
-            .and_then(|raw| profile(raw, id.clone()))
-            .or_else(|| text(reply, &v6_name, 8192).and_then(|raw| profile(raw, id)));
+        let ipv4 = text(reply, &name, 8192).and_then(|raw| profile(raw, id.clone()));
+        let ipv6 = text(reply, &v6_name, 8192).and_then(|raw| profile(raw, id));
+        // IPv6-only profiles have a named but otherwise empty IPv4 placeholder.
+        let parsed = if ipv4.as_ref().is_some_and(|p| !p["pdp_type"].is_null()) {
+            ipv4
+        } else {
+            ipv6.or(ipv4)
+        };
         if let Some(parsed) = parsed {
             manual.push(parsed);
         }
@@ -267,6 +272,17 @@ mod tests {
         ] {
             assert!(!config.to_string().contains(secret));
         }
+    }
+
+    #[test]
+    fn ipv6_only_profile_ignores_empty_ipv4_placeholder() {
+        let config = apn_config(&json!({"apn_mode":"manual","m_profile_name":"V6",
+            "APN_config0":"V6($)($)($)($)($)($)($)($)($)($)($)($)",
+            "ipv6_APN_config0":"V6($)v6.apn($)manual($)*99#($)none($)($)($)IPv6($)auto($)($)auto($)($)"
+        })).unwrap();
+        assert_eq!(config["manual"][0]["pdp_type"], 2);
+        assert_eq!(config["manual"][0]["apn"], "v6.apn");
+        assert_eq!(config["enabled_id"], "manual-0");
     }
 
     #[test]

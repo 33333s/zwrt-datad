@@ -79,6 +79,10 @@ elif name=='cp':
  if args[-1]==str(data/'zwrt-datad.deploy-new') and fault=='interrupt' and once('interrupted'):
   import signal
   os.kill(os.getppid(),signal.SIGTERM)
+ if args[-1]==str(data/'zwrt-datad.deploy-new') and fault=='hangup' and once('hung-up'):
+  import signal
+  os.kill(os.getppid(),signal.SIGHUP)
+  os.kill(os.getpid(),signal.SIGHUP)
  if args[-1]==str(data/'zwrt-datad.deploy-new') and fault=='detached':
   import time
   for _ in range(100):
@@ -258,6 +262,11 @@ healthy_token "$2" '4242:123'
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.strip(), '4242:123')
         self.assertNotIn('unexpected-scan', p.stderr)
+
+    def test_transaction_and_children_ignore_adb_hangup(self):
+        self.run_deploy('hangup')
+        self.assertTrue((self.base/'hung-up').exists())
+        self.assertTrue((self.stage/'result').read_text().startswith('SUCCESS:'))
 
     def test_failures_restore_files_service_and_mount(self):
         for fault in ('start','health','restart-loop','unit-write','reload','copy','remount-ro','interrupt'):

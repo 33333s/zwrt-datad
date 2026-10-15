@@ -28,6 +28,7 @@ mod state;
 mod task_schedule;
 mod traffic_history;
 mod u50;
+mod u50_apn;
 mod u50_ctl;
 mod u50_diag;
 mod u50_oem;

@@ -2,6 +2,7 @@
 # Runs under nohup on the modem. ADB is only a transport/observer, never the
 # transaction owner. Backups live on /cache; no partition/firmware operations.
 set -eu
+trap '' HUP
 umask 077
 DIR=/cache/zwrt-datad
 STAGE=${1:?missing staging directory}
@@ -71,7 +72,7 @@ restore_unit() {
 
 finish() {
     rc=$?
-    trap - EXIT HUP INT TERM
+    trap - EXIT INT TERM
     set +e
     recovery=ok
     if [ "$committed" != 1 ]; then
@@ -110,7 +111,9 @@ finish() {
     exit "$rc"
 }
 trap finish EXIT
-trap 'exit 1' HUP INT TERM
+# Do not re-arm HUP after nohup: both the transaction and its child commands
+# must survive adbd closing the launching shell. TERM/INT still roll back.
+trap 'exit 1' INT TERM
 
 cd "$STAGE"
 echo 'Verifying staged files and existing installation...'

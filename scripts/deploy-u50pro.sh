@@ -77,7 +77,7 @@ done
 "${ADB[@]}" push "$(win_path "$stage_dir/SHA256SUMS")" "$remote_stage/SHA256SUMS" >/dev/null
 "${ADB[@]}" shell "cd $remote_stage && sha256sum -c SHA256SUMS && chmod 700 zwrt-datad && . ./service-control.sh && run_timeout 10 ./zwrt-datad --version" || die "staging verification failed; installed service was not changed"
 echo "== starting independent device transaction =="
-"${ADB[@]}" shell "nohup sh $remote_stage/deploy-transaction.sh $remote_stage > $remote_stage/deploy.log 2>&1 < /dev/null &" || die "could not launch transaction; inspect $remote_stage"
+"${ADB[@]}" shell "nohup sh $remote_stage/deploy-transaction.sh $remote_stage > $remote_stage/deploy.log 2>&1 < /dev/null & launch_pid=\$!; launch_wait=0; while [ ! -s $remote_stage/deploy.log ] && kill -0 \"\$launch_pid\" 2>/dev/null; do launch_wait=\$((launch_wait + 1)); [ \"\$launch_wait\" -le 10 ] || exit 1; sleep 1; done; test -s $remote_stage/deploy.log" || die "could not launch transaction; inspect $remote_stage"
 for ((i=0; i<90; i++)); do
     result="$("${ADB[@]}" shell "cat $remote_stage/result 2>/dev/null" 2>/dev/null | tr -d '\r' || true)"
     case "$result" in

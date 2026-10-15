@@ -109,6 +109,9 @@ class AdbLauncherTest(unittest.TestCase):
         self.assertEqual(len(pushes), 6)
         self.assertTrue(all(line.startswith('-s\tMU5120MOCK\t') for line in pushes))
         self.assertTrue((self.case / 'launched').exists())
+        launch = next(line for line in calls if 'nohup sh ' in line)
+        self.assertIn('while [ ! -s ', launch)
+        self.assertIn('kill -0 "$launch_pid"', launch)
 
     def test_preflight_only_never_writes(self):
         self.run_installer(extra=('-PreflightOnly',))
