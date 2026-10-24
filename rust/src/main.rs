@@ -42,6 +42,7 @@ mod time_control;
 mod traffic_history;
 mod ubus_socket;
 mod update_status;
+mod u30pro;
 mod usb;
 mod webshell;
 mod wifi;
@@ -230,6 +231,8 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
+    // the device backend is chosen once: the ZTE vendor objects, or the U30 Pro with native OpenWrt
+    u30pro::init().await;
     let app = App::new(args.data_dir, interval, token, args.neighbor, args.webshell).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);

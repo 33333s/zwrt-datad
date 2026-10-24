@@ -33,6 +33,7 @@
 | `MC8531` | G5 Ultra |
 | `MU5252` | TopFlow |
 | `MC7523` | G5 Max WiFi |
+| `MU5358` | U30 Pro（原生 OpenWrt，见 [`docs/models/U30PRO.md`](docs/models/U30PRO.md)） |
 
 运行时只有 `device.api_template_supported = 1` 才代表识别到正式模板。不同设备只输出实际支持的状态块；调用方应通过字段是否存在判断能力，不要为缺失功能补 `0`、`-1` 或空对象。
 

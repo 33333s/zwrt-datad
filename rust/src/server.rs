@@ -1440,6 +1440,9 @@ async fn usb_status(State(app): State<App>) -> Json<Value> {
     )
 }
 fn capability_controls() -> Vec<&'static str> {
+    if crate::u30pro::active() {
+        return crate::u30pro::capability_controls();
+    }
     let mut controls = vec![
         "device.login_info",
         "device.login",
@@ -1559,6 +1562,24 @@ async fn control(
             Json(json!({"ok":false,"action":action,"error":{"code":"invalid_request","message":"params must be a JSON object"}})),
         )
             .into_response();
+    }
+    // U30 Pro: its own device actions; datad's generic ones (None) continue below, the ZTE ones do not exist there
+    if crate::u30pro::active() {
+        let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
+        match crate::u30pro::control(action, &params).await {
+            None => {}
+            Some(crate::control::Outcome::Ok(value)) => return control_ok(action, value),
+            Some(crate::control::Outcome::Invalid(error)) => return invalid_parameter(action, &error),
+            Some(crate::control::Outcome::Failed(error)) => return control_failed(action, error),
+            Some(crate::control::Outcome::Coded(code)) => return coded_failure(action, code),
+            Some(crate::control::Outcome::NotHandled) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"ok":false,"action":action,"error":{"code":"unknown_action","message":"not available on this device"}})),
+                )
+                    .into_response();
+            }
+        }
     }
     if action == "time.status" {
         if body

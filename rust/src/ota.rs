@@ -455,6 +455,9 @@ impl Ota {
     }
 
     pub async fn check(&mut self) -> Result<Candidate, String> {
+        if crate::u30pro::active() {
+            return Err(crate::u30pro::UPDATE_REFUSED.into());
+        }
         if self.status.state == "installing" {
             return Err("update_in_progress".into());
         }
@@ -569,6 +572,9 @@ impl Ota {
         snapshot: &Value,
         manual: bool,
     ) -> Result<(), String> {
+        if crate::u30pro::active() {
+            return Err(crate::u30pro::UPDATE_REFUSED.into());
+        }
         let reasons = self.safety(snapshot, manual);
         if !reasons.is_empty() {
             self.status.state = "waiting_idle".into();
@@ -869,7 +875,8 @@ impl Ota {
 /// `ZWRT_DATAD_OTA_DISABLE_AUTO=1` turns automatic checks and installs off.
 /// Installation results are still reconciled either way.
 pub fn auto_updates_disabled() -> bool {
-    auto_disabled(std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").ok().as_deref())
+    crate::u30pro::active()
+        || auto_disabled(std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").ok().as_deref())
 }
 
 fn auto_disabled(value: Option<&str>) -> bool {

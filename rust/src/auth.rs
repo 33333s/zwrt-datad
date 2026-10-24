@@ -57,6 +57,9 @@ pub async fn verify_password(username: &str, password: &str) -> bool {
     if username.is_empty() || username.len() > 256 || password.len() > 256 {
         return false;
     }
+    if crate::u30pro::active() {
+        return crate::u30pro::verify_password(username, password).await;
+    }
     let Ok(info) = state::ubus("zwrt_web", "web_login_info", json!({})).await else {
         return false;
     };

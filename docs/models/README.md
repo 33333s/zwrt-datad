@@ -24,6 +24,11 @@
   - 展示名称：`G5 Max WiFi`
   - 文档：[`MC7523.md`](MC7523.md)
 
+- `U30PRO`
+  - 匹配：`board_name = zte,u30pro`（原生 OpenWrt，只走 ubus/uci）
+  - 展示名称：`U30 Pro`（`model_name = MU5358`）
+  - 文档：[`U30PRO.md`](U30PRO.md)
+
 待后续补充：
 
 - 其他机型模板

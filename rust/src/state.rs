@@ -90,7 +90,7 @@ fn battery_not_fitted(battery: &Value) -> bool {
     }
 }
 
-fn interface(v: &Value) -> Value {
+pub(crate) fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
 
@@ -1371,6 +1371,9 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
 }
 
 pub async fn collect(sample_interval_ms: u64) -> Snapshot {
+    if crate::u30pro::active() {
+        return crate::u30pro::collect(sample_interval_ms).await;
+    }
     // Vendor ubus implementations on these devices lose replies under a large
     // burst of concurrent clients, so state collection is deliberately serial.
     let common = ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;

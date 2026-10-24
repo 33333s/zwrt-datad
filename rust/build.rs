@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=DATAD_KEYMASTER_WORKER");
+    println!("cargo:rerun-if-env-changed=DATAD_NO_KEYMASTER");
     println!("cargo:rerun-if-changed=keymaster_worker.rs");
     let worker = if env::var_os("CARGO_FEATURE_KEYMASTER_WORKER").is_some() {
         Vec::new()
@@ -15,9 +16,12 @@ fn main() {
                 bytes
             }
             None => {
+                // DATAD_NO_KEYMASTER=1: a build for a device without the ZTE Keymaster library (the U30 Pro on native
+                // OpenWrt); its identity endpoints answer identity_backend_unavailable
                 assert!(
-                    !(env::var("TARGET").unwrap() == "aarch64-unknown-linux-musl"
-                        && env::var("PROFILE").unwrap() == "release"),
+                    env::var_os("DATAD_NO_KEYMASTER").is_some()
+                        || !(env::var("TARGET").unwrap() == "aarch64-unknown-linux-musl"
+                            && env::var("PROFILE").unwrap() == "release"),
                     "Build ARM64 releases with scripts/build.sh so the Keymaster worker is embedded"
                 );
                 Vec::new()

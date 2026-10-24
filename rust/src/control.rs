@@ -198,6 +198,11 @@ pub async fn execute_recovery(action: &str, plan: crate::network_recovery::Plan)
 }
 
 async fn execute_inner(action: &str, params: &Value) -> Outcome {
+    if crate::u30pro::active()
+        && let Some(outcome) = crate::u30pro::control(action, params).await
+    {
+        return outcome;
+    }
     // The process will not outlive these; write the buffered history first.
     if matches!(action, "device.reboot" | "device.poweroff") {
         crate::activity::flush_active().await;
