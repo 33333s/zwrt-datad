@@ -23,7 +23,7 @@
 | `qos` | `u30pro-modem qos`（1 分钟缓存；AMBR 由 kbps 换算成 Mbps） |
 | `interfaces` | `network.interface.lan/wan status`；`cellular` 来自 `snapshot.cellular` |
 | `clients` | `hostapd.wlan0 get_clients` + `luci-rpc getDHCPLeases`；只有 Wi-Fi 客户端，不做黑白名单 |
-| `wlan` | `u30pro-native-control wifi_get`（单频段热点） |
+| `wlan` | `uci get wireless`：标准 `/etc/config/wireless` 里 radio0 和第一个 mode ap 的接口（单频段热点） |
 | `dhcp` | `uci get network` / `uci get dhcp` |
 | `sms` | `u30pro-modem sms_list`（1 分钟缓存；`id` 是首段存储序号，多段短信删除时一起删） |
 
@@ -38,8 +38,8 @@
 | `cellular.connect` / `cellular.disconnect` | `u30pro-native-control cellular_action` |
 | `band.set_lte` / `band.set_nr_sa` / `band.set_nr_nsa` | `u30pro-modem lock_apply`（SA/NSA 共用一组 NR 频段；空串 = 全部支持频段） |
 | `cell.lock_lte` / `cell.lock_nr` / `cell.unlock_all` | `lock_apply`（`cell`）/ `lock_reset` |
-| `wifi.configure` / `wifi.status` / `wifi.state` | `u30pro-native-control wifi_apply` / `wifi_get` / `wifi_toggle` |
-| `client.kick` | `u30pro-native-control wifi_kick` |
+| `wifi.configure` / `wifi.status` / `wifi.state` | `uci set` + `uci commit` wireless（热点那一段：ssid、encryption、key、ieee80211w、maxassoc、hidden、isolate、disabled），再 `network reload` / `uci get wireless` |
+| `client.kick` | `hostapd.wlan0 del_client`（deauth，不封禁） |
 | `sms.send_raw` / `sms.delete` | `u30pro-modem sms_send` / `sms_delete` |
 | `power.direct_supply.set` / `.status` | `u30pro-native-control set_charger_policy`（读回确认） |
 | `qos.reload` | 让 QoS 缓存失效 |

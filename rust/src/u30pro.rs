@@ -2,8 +2,8 @@
 //!
 //! None of the ZTE vendor objects (`zwrt_*`, `zte_nwinfo_api`, ...) exist on that system.  This backend reads and controls the
 //! device only through ubus: the device's own services (`u30pro-modem`, `u30pro-native-control`, `u30pro-cpu`,
-//! `u30pro-storage`, `u30pro-firmware`), the standard OpenWrt ones (`system`, `network.interface.*`, `network.device`,
-//! `hostapd.*`, `luci-rpc`, `session`) and the `uci` object.  It sends no AT commands and reads no vendor files or sysfs: the
+//! `u30pro-storage`, `u30pro-firmware`), the standard OpenWrt ones (`system`, `network`, `network.interface.*`, `network.device`,
+//! `hostapd.*`, `luci-rpc`, `session`) and the `uci` object; the Wi-Fi is the standard `/etc/config/wireless`.  It sends no AT commands and reads no vendor files or sysfs: the
 //! modem is asked through `u30pro-modem snapshot`, which shares one cached query with the device's screen.  Blocks and fields
 //! keep the shape of docs/STATE_SCHEMA.md; what this device does not report is left out rather than faked.
 
@@ -259,10 +259,11 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         .leases
         .get(secs(10), "luci-rpc", "getDHCPLeases", json!({}))
         .await;
-    let wifi = c
-        .wifi
-        .get(secs(10), "u30pro-native-control", "wifi_get", json!({}))
-        .await;
+    let wifi = wifi_from_uci(
+        &c.wifi
+            .get(secs(10), "uci", "get", json!({ "config": "wireless" }))
+            .await,
+    );
     let network_uci = c
         .network_uci
         .get(secs(30), "uci", "get", json!({ "config": "network" }))
@@ -646,6 +647,36 @@ fn encryption(security: &str) -> &str {
     }
 }
 
+/// The hotspot in the standard wireless configuration (`uci get wireless`, applied by netifd and wpad): the radio and its first
+/// interface of mode ap, in the shape the blocks below read (available, enabled, config: band, ssid, security, ...).
+fn wifi_from_uci(reply: &Value) -> Value {
+    let Some(sections) = reply["values"].as_object() else {
+        return json!({ "available": false });
+    };
+    let Some((name, iface)) = sections
+        .iter()
+        .find(|(_, s)| s[".type"] == "wifi-iface" && s["mode"] == "ap")
+    else {
+        return json!({ "available": false });
+    };
+    let radio = sections.get(&text(&iface["device"])).cloned().unwrap_or_else(|| json!({}));
+    let encryption = text(&iface["encryption"]);
+    let security = match encryption.as_str() {
+        "" | "none" => "open",
+        "sae" => "wpa3",
+        "sae-mixed" => "mixed",
+        _ => "wpa2",
+    };
+    json!({"available":true,"enabled":iface["disabled"] != "1" && radio["disabled"] != "1","section":name,
+        "config":{"band":text(&radio["band"]),"channel":text(&radio["channel"]),"htmode":text(&radio["htmode"]),"ssid":text(&iface["ssid"]),
+            "security":security,"encryption":encryption,"password_set":!text(&iface["key"]).is_empty(),"pmf":text(&iface["ieee80211w"]),
+            "hidden":text(&iface["hidden"]) == "1","isolate":text(&iface["isolate"]) == "1","max_clients":text(&iface["maxassoc"])}})
+}
+
+async fn wifi_now() -> Value {
+    wifi_from_uci(&or_object(ubus("uci", "get", json!({ "config": "wireless" })).await))
+}
+
 fn wlan(wifi: &Value) -> Value {
     let config = &wifi["config"];
     let band = if text(&config["band"]) == "2g" { "2g" } else { "5g" };
@@ -750,7 +781,7 @@ pub async fn control(action: &str, params: &Value) -> Option<Outcome> {
         "sms.delete" => sms_delete(params).await,
         "power.direct_supply.set" => direct_supply_set(params).await,
         "wifi.status" | "wifi.state" => {
-            let wifi = or_object(ubus("u30pro-native-control", "wifi_get", json!({})).await);
+            let wifi = wifi_now().await;
             Outcome::Ok(json!({"available":wifi["available"]==true,"enabled":wifi["enabled"]==true,"config":wifi["config"].clone(),
                 "wlan":if wifi["available"]==true { wlan(&wifi) } else { Value::Null }}))
         }
@@ -895,70 +926,79 @@ fn flag(params: &Value, name: &str) -> Result<Option<bool>, String> {
 }
 
 async fn wifi_configure(params: &Value) -> Outcome {
-    let mut config = Map::new();
+    let wifi = wifi_now().await;
+    let Some(section) = wifi["section"].as_str().map(str::to_string) else {
+        return Outcome::Failed("no Wi-Fi hotspot is configured".into());
+    };
+    let mut values = Map::new();
     if let Some(ssid) = params["ssid"].as_str() {
-        config.insert("ssid".into(), json!(ssid));
-    }
-    if let Some(key) = params["key"].as_str() {
-        config.insert("password".into(), json!(key));
+        if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
+            return Outcome::Invalid("ssid must be 1 to 32 bytes without control characters".into());
+        }
+        values.insert("ssid".into(), json!(ssid));
     }
     if let Some(enc) = params["encryption"].as_str() {
-        let (security, pmf) = match enc {
-            "none" | "open" => ("open", "0"),
-            "psk2" | "psk" | "psk-mixed" | "psk2+ccmp" => ("wpa2", "0"),
-            "sae-mixed" | "psk2-sae" => ("mixed", "1"),
-            "sae" => ("wpa3", "2"),
+        let enc = match enc {
+            "none" | "open" => "none",
+            "psk2" | "psk" | "psk2+ccmp" => "psk2+ccmp",
+            "psk-mixed" => "psk-mixed",
+            "sae-mixed" | "psk2-sae" => "sae-mixed",
+            "sae" => "sae",
             other => return Outcome::Invalid(format!("unsupported encryption: {other}")),
         };
-        config.insert("security".into(), json!(security));
-        config.insert("pmf".into(), json!(pmf));
+        values.insert("encryption".into(), json!(enc));
+    }
+    if let Some(key) = params["key"].as_str() {
+        if key.len() < 8 || key.len() > 63 || !key.chars().all(|c| (' '..='~').contains(&c)) {
+            return Outcome::Invalid("key must be 8 to 63 printable ASCII characters".into());
+        }
+        values.insert("key".into(), json!(key));
     }
     if let Some(pmf) = params.get("pmf").and_then(|v| int(v)) {
-        config.insert("pmf".into(), json!(pmf.to_string()));
+        if !(0..=2).contains(&pmf) {
+            return Outcome::Invalid("pmf must be 0, 1 or 2".into());
+        }
+        values.insert("ieee80211w".into(), json!(pmf.to_string()));
     }
     if let Some(max) = params.get("maxassoc").and_then(|v| int(v)) {
-        config.insert("max_clients".into(), json!(max.to_string()));
+        values.insert("maxassoc".into(), json!(max.to_string()));
     }
-    for (input, output) in [("hidden", "hidden"), ("isolate", "isolate")] {
-        match flag(params, input) {
+    for name in ["hidden", "isolate"] {
+        match flag(params, name) {
             Ok(Some(on)) => {
-                config.insert(output.into(), json!(if on { "1" } else { "0" }));
+                values.insert(name.into(), json!(if on { "1" } else { "0" }));
             }
             Ok(None) => {}
             Err(e) => return Outcome::Invalid(e),
         }
     }
-    let enabled = match flag(params, "enabled") {
-        Ok(v) => v,
+    match flag(params, "enabled") {
+        Ok(Some(on)) => {
+            values.insert("disabled".into(), json!(if on { "0" } else { "1" }));
+        }
+        Ok(None) => {}
         Err(e) => return Outcome::Invalid(e),
-    };
-    if config.is_empty() && enabled.is_none() {
+    }
+    if values.is_empty() {
         return Outcome::Invalid("no fields supplied".into());
     }
-    let mut result = json!({});
-    if !config.is_empty() {
-        match call(
-            "u30pro-native-control",
-            "wifi_apply",
-            json!({ "config": Value::Object(config).to_string() }),
-        )
-        .await
-        {
-            Outcome::Ok(reply) => result["apply"] = reply,
-            other => return other,
-        }
+    let encryption = values.get("encryption").and_then(Value::as_str).map(str::to_string)
+        .unwrap_or_else(|| text(&wifi["config"]["encryption"]));
+    if encryption != "none" && !values.contains_key("key") && wifi["config"]["password_set"] != true {
+        return Outcome::Invalid("an encrypted hotspot needs a key".into());
     }
-    if let Some(on) = enabled {
-        let wifi = or_object(ubus("u30pro-native-control", "wifi_get", json!({})).await);
-        if (wifi["enabled"] == true) != on {
-            match call("u30pro-native-control", "wifi_toggle", json!({})).await {
-                Outcome::Ok(reply) => result["toggle"] = reply,
-                other => return other,
-            }
-        }
+    if let Err(e) = ubus("uci", "set", json!({ "config": "wireless", "section": section, "values": Value::Object(values.clone()) })).await {
+        return Outcome::Failed(format!("uci set: {e}"));
     }
+    if let Err(e) = ubus("uci", "commit", json!({ "config": "wireless" })).await {
+        return Outcome::Failed(format!("uci commit: {e}"));
+    }
+    if let Err(e) = ubus("network", "reload", json!({})).await {
+        return Outcome::Failed(format!("network reload: {e}"));
+    }
+    values.remove("key");
     cache().lock().await.wifi.invalidate();
-    Outcome::Ok(result)
+    Outcome::Ok(json!({ "applied": Value::Object(values) }))
 }
 
 fn valid_mac(mac: &str) -> bool {
@@ -981,7 +1021,8 @@ async fn client_kick(params: &Value) -> Outcome {
         return Outcome::Invalid("macs must hold 1 to 32 MAC addresses".into());
     }
     for mac in &macs {
-        if let Outcome::Failed(error) = call("u30pro-native-control", "wifi_kick", json!({ "mac": mac })).await {
+        // hostapd of the hotspot (wpad): deauthenticate, no ban
+        if let Err(error) = ubus("hostapd.wlan0", "del_client", json!({ "addr": mac, "reason": 5, "deauth": true, "ban_time": 0 })).await {
             return Outcome::Failed(format!("{mac}: {error}"));
         }
     }
