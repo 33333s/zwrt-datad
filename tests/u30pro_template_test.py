@@ -72,7 +72,7 @@ print('{}')
              ZWRT_DATAD_U30PRO_SERIAL_FILE=str(serial))
     env.pop('ZWRT_DATAD_BACKEND',None)
     # the LAN listener (login required; loopback counts as a LAN source) next to the local one
-    proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token),'--lan-bind','127.0.0.1','--lan-port',str(lan_port)],
+    proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token),'--lan-bind','127.0.0.1','--lan-port',str(lan_port),'--webshell'],
                           env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def login(user,password):
         basic=base64.b64encode(f'{user}:{password}'.encode()).decode()
@@ -148,6 +148,20 @@ print('{}')
         # the old paths are gone: no cellular_action, and the charge limits are never written
         methods={(o,m) for o,m,_ in logged()}
         assert ('u30pro-native-control','cellular_action') not in methods and ('u30pro-native-control','set_charger_policy') not in methods, methods
+        # a temporary token from the loopback listener (for the device's own pages), valid on the LAN listener's web shell
+        code,data=req('/auth/local',{})
+        assert code==200 and data['token_type']=='Bearer' and data['access_token'], (code,data)
+        def lan(path,token=None):
+            headers={'Authorization':'Bearer '+token} if token else {}
+            try:
+                with urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{lan_port}{path}',headers=headers),timeout=8) as r: return r.status,json.load(r)
+            except urllib.error.HTTPError as e: return e.code,{}
+        code,shell=lan('/webshell/status',data['access_token'])
+        assert code==200 and shell['enabled'] is True, (code,shell)
+        assert lan('/webshell/status')[0]==401 and lan('/webshell/status','wrong')[0]==401
+        request=urllib.request.Request(f'http://127.0.0.1:{lan_port}/auth/local',method='POST',data=b'{}',headers={'Content-Type':'application/json'})
+        try: urllib.request.urlopen(request,timeout=8); assert False, '/auth/local must not exist on the LAN listener'
+        except urllib.error.HTTPError as e: assert e.code in (401,404), e.code
         # LAN login: the router account root, and admin (what apps for the ZTE firmware send) checked as root
         for user,password,want in (('root','fixture-root-pass',200),('admin','fixture-root-pass',200),('admin','wrong',401),
                                    ('Admin','fixture-root-pass',401),('operator','fixture-root-pass',401)):
@@ -156,7 +170,7 @@ print('{}')
         users={b['username'] for o,m,b in logged() if (o,m)==('session','login')}
         assert users=={'root','Admin','operator'}, users
         print('U30 Pro template: board detection, board serial and cloud defaults, ZTE field names (cellular, sim, sms tags, usb, runtime, protection), u30pro.cell '
-              'connect/disconnect and errors, charger_bypass set/readback/unverified, no old paths, LAN login as root or admin PASS')
+              'connect/disconnect and errors, charger_bypass set/readback/unverified, no old paths, local token for the web shell, LAN login as root or admin PASS')
     finally:
         proc.terminate()
         try: proc.wait(timeout=8)

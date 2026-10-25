@@ -150,6 +150,12 @@ curl -s -u admin:your_web_password -X POST \
 {"ok":true,"token_type":"Bearer","access_token":"...","expires_in":43200,"expires_at":1783500000}
 ```
 
+### `POST /auth/local`
+
+只在不需要鉴权的本机回环监听（`9460`，同时配置了 `--lan-bind` 时）提供，不需要任何凭据：返回与 `/auth/login` 相同的临时 Token
+（12 小时）。供设备自身的网页（如 OpenWrt LuCI 的 datad 终端页）为浏览器取一个 Token，再去连 `9461` 的 `/webshell`；能调用它的进程本来
+就能直接使用 `9460` 的全部接口。
+
 ### `POST /auth/exchange`
 
 使用 vendor webtoken 换取 datad Token：

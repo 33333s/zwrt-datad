@@ -991,7 +991,9 @@ impl App {
                     "/cloud/quick-connect",
                     post(cloud_quick_connect).layer(RequestBodyLimitLayer::new(4096)),
                 )
-                .route("/cloud/status", get(cloud_status));
+                .route("/cloud/status", get(cloud_status))
+                // a temporary token for the LAN listener, e.g. for a web page of the device (LuCI) that opens /webshell there
+                .route("/auth/local", post(auth_local));
             router = router
                 .route("/ota/config", get(ota_config_get).post(ota_config_post))
                 .route("/ota/status", get(ota_status))
@@ -1302,6 +1304,20 @@ async fn auth_login(State(app): State<App>, headers: HeaderMap) -> Response {
         )
             .into_response();
     }
+    match app.inner.sessions.lock().await.issue() {
+        Ok((token, expires_at)) => {
+            (StatusCode::OK, Json(auth::token_reply(token, expires_at))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok":false,"error":"token_issue_failed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Loopback listener without authentication only: whoever can call it can already do everything there.
+async fn auth_local(State(app): State<App>) -> Response {
     match app.inner.sessions.lock().await.issue() {
         Ok((token, expires_at)) => {
             (StatusCode::OK, Json(auth::token_reply(token, expires_at))).into_response()
