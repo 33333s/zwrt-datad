@@ -53,7 +53,8 @@ datad 自己的通用动作（hosts、time、schedule、speedtest、nat、state 
 
 ## 登录与更新
 
-`POST /auth/login`：用路由器自己的账号，经 rpcd `session login` 校验（与 LuCI 相同）。静态令牌照常可用。
+`POST /auth/login`：用路由器自己的账号，经 rpcd `session login` 校验（与 LuCI 相同）。为中兴固件写的 App 固定用 `admin`，
+在这台设备上 `admin` 按 `root` 校验（密码是 root 的，即 LuCI 的密码）。静态令牌照常可用。
 datad 的自更新在这台设备上关闭（`ota.check`/`install` 直接拒绝）：新版本通过设备软件源的 apk 包 `zwrt-datad` 安装。
 
 ## 构建

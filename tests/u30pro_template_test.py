@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """U30 Pro (native OpenWrt) template over the real HTTP/control/state path, with a fake ubus of the device's objects:
 board detection, the cellular manager u30pro.cell for connect/disconnect, the screen's direct-supply switch charger_bypass
-(the charge limits in uci are not written), and no call to the old paths through u30pro-native-control."""
-import json, os, pathlib, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+(the charge limits in uci are not written), no call to the old paths through u30pro-native-control, and the LAN login with the
+router account (admin, what apps for the ZTE firmware send, is checked as root)."""
+import base64, json, os, pathlib, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 BIN=pathlib.Path(sys.argv[1]).resolve()
 with tempfile.TemporaryDirectory(prefix='datad-u30pro-test-') as name:
     base=pathlib.Path(name); fixture=base/'device.json'; calls=base/'calls.log'
@@ -43,6 +44,11 @@ if (obj,method)==('u30pro-native-control','charger_bypass'):
     if body.get('enabled') not in ('0','1'): reply({'error':'The setting must be 0 or 1'})
     if not data.get('ignore'): data['behaviour']='inhibit-charge' if body['enabled']=='1' else 'auto'; save()
     reply({'accepted':True,'enabled':data['behaviour']=='inhibit-charge'})
+# rpcd: only the router account root, with its password; a refused login is an error of the ubus call
+if (obj,method)==('session','login'):
+    if body.get('username')=='root' and body.get('password')=='fixture-root-pass': reply({'ubus_rpc_session':'0123456789abcdef0123456789abcdef'})
+    sys.exit(6)
+if (obj,method)==('session','destroy'): reply({})
 print('{}')
 '''); fake.chmod(0o755)
     fixture.write_text(json.dumps({'cell':'connected','behaviour':'auto'}))
@@ -50,11 +56,22 @@ print('{}')
         data=json.loads(fixture.read_text()); data.update(changes)
         p=fixture.with_suffix('.new'); p.write_text(json.dumps(data)); p.replace(fixture)
     def logged(): return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
-    with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
+    ports=[]
+    for _ in range(2):
+        with socket.socket() as sock: sock.bind(('127.0.0.1',0)); ports.append(sock.getsockname()[1])
+    port,lan_port=ports
     env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS='cli',ZWRT_DATAD_UBUS_BIN=str(fake),ZWRT_DATAD_UCI_BIN='/usr/bin/false',
              ZWRT_DATAD_OTA_DISABLE_AUTO='1',U30_FIXTURE=str(fixture),U30_CALLS=str(calls))
     env.pop('ZWRT_DATAD_BACKEND',None)
-    proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    # the LAN listener (login required; loopback counts as a LAN source) next to the local one
+    proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token),'--lan-bind','127.0.0.1','--lan-port',str(lan_port)],
+                          env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    def login(user,password):
+        basic=base64.b64encode(f'{user}:{password}'.encode()).decode()
+        request=urllib.request.Request(f'http://127.0.0.1:{lan_port}/auth/login',method='POST',headers={'Authorization':'Basic '+basic})
+        try:
+            with urllib.request.urlopen(request,timeout=8) as r: return r.status,json.load(r)
+        except urllib.error.HTTPError as e: return e.code,{}
     def req(path,body=None):
         headers={'Content-Type':'application/json','Authorization':'Bearer fixture-u30pro-token'}
         request=urllib.request.Request(f'http://127.0.0.1:{port}{path}',headers=headers,data=None if body is None else json.dumps(body).encode())
@@ -109,7 +126,15 @@ print('{}')
         # the old paths are gone: no cellular_action, and the charge limits are never written
         methods={(o,m) for o,m,_ in logged()}
         assert ('u30pro-native-control','cellular_action') not in methods and ('u30pro-native-control','set_charger_policy') not in methods, methods
-        print('U30 Pro template: board detection, u30pro.cell connect/disconnect and errors, charger_bypass set/readback/unverified, no old paths PASS')
+        # LAN login: the router account root, and admin (what apps for the ZTE firmware send) checked as root
+        for user,password,want in (('root','fixture-root-pass',200),('admin','fixture-root-pass',200),('admin','wrong',401),
+                                   ('Admin','fixture-root-pass',401),('operator','fixture-root-pass',401)):
+            code,data=login(user,password); assert code==want,(user,password,code,data)
+            if want==200: assert data['ok'] is True and data['token_type']=='Bearer' and data['access_token'], data
+        users={b['username'] for o,m,b in logged() if (o,m)==('session','login')}
+        assert users=={'root','Admin','operator'}, users
+        print('U30 Pro template: board detection, u30pro.cell connect/disconnect and errors, charger_bypass set/readback/unverified, '
+              'no old paths, LAN login as root or admin PASS')
     finally:
         proc.terminate()
         try: proc.wait(timeout=8)

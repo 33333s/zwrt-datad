@@ -1221,12 +1221,22 @@ async fn direct_supply_set(params: &Value) -> Outcome {
 
 // ---------------------------------------------------------------------------------------------------------------- login
 
+/// The router account a login name stands for: apps written for the ZTE firmware send its web user `admin`; on OpenWrt that
+/// account is `root`.
+fn account(username: &str) -> &str {
+    if username == "admin" {
+        "root"
+    } else {
+        username
+    }
+}
+
 /// LAN login (POST /auth/login) with the router's own account: rpcd's `session login`, as LuCI does
 pub async fn verify_password(username: &str, password: &str) -> bool {
     let Ok(reply) = ubus(
         "session",
         "login",
-        json!({"username":username,"password":password,"timeout":30}),
+        json!({"username":account(username),"password":password,"timeout":30}),
     )
     .await
     else {
@@ -1242,6 +1252,13 @@ pub async fn verify_password(username: &str, password: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_accounts() {
+        assert_eq!(account("admin"), "root");
+        assert_eq!(account("root"), "root");
+        assert_eq!(account("Admin"), "Admin");
+    }
 
     #[test]
     fn local_dates() {
