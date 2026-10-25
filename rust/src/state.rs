@@ -1724,6 +1724,17 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     {
         let charge_mode = integer(&original_protection, "bat_mode");
         fields.insert("battery".into(),json!({"percent":integer(&battery,"battery_capacity"),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer(&battery,"battery_time_to_full"),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now"),"charge_protection":{"active":charge_mode>=2,"mode":charge_mode}}));
+        if let Some(extra) = crate::charge_protection::snapshot().await
+            && let (Some(target), Some(extra)) = (
+                fields
+                    .get_mut("battery")
+                    .and_then(|battery| battery.get_mut("charge_protection"))
+                    .and_then(Value::as_object_mut),
+                extra.as_object(),
+            )
+        {
+            target.extend(extra.clone());
+        }
     }
     if let Some(mode) = charger
         .get("direct_power_supply_mode")

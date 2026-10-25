@@ -451,8 +451,10 @@ impl App {
     ) -> Result<Self> {
         let time_control = crate::time_control::Manager::new(&data_dir);
         let hosts = crate::hosts::Manager::new(&data_dir);
+        crate::charge_protection::init(&data_dir);
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
+        crate::charge_protection::tick().await;
         let mut initial = state::collect(interval.as_millis() as u64).await;
         initial.fields.insert("time".into(), time_control.status());
         let mut neighbor = NeighborManager::new(neighbor_enabled);
@@ -822,6 +824,7 @@ impl App {
     async fn refresh_snapshot(&self) {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
+        crate::charge_protection::tick().await;
         let round = std::time::Instant::now();
         let mut next = crate::ubus_socket::collecting(state::collect(
             self.inner.interval_ms.load(Ordering::Relaxed),
@@ -2831,7 +2834,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2 + 5);
+        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2 + 5 + 3);
         for action in [
             "time.status",
             "time.config.set",
@@ -2850,12 +2853,15 @@ mod tests {
             "wifi.radio.set",
             "wifi.bandwidth.set",
             "wifi.guest.set",
+            "battery.charge_protection.status",
+            "battery.charge_protection.release",
+            "battery.charge_protection.set",
         ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            88 + 6 + 2 + 2 + 2 + 5
+            88 + 6 + 2 + 2 + 2 + 5 + 3
         );
     }
 
