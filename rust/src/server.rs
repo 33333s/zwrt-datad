@@ -1569,7 +1569,9 @@ async fn control(
         match crate::u30pro::control(action, &params).await {
             None => {}
             Some(crate::control::Outcome::Ok(value)) => return control_ok(action, value),
-            Some(crate::control::Outcome::Invalid(error)) => return invalid_parameter(action, &error),
+            Some(crate::control::Outcome::Invalid(error)) => {
+                return invalid_parameter(action, &error);
+            }
             Some(crate::control::Outcome::Failed(error)) => return control_failed(action, error),
             Some(crate::control::Outcome::Coded(code)) => return coded_failure(action, code),
             Some(crate::control::Outcome::NotHandled) => {

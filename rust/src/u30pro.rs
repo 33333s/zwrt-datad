@@ -44,7 +44,8 @@ pub fn active() -> bool {
 }
 
 /// Updates of datad itself come with the device's package feed (apk), not from the ZWRT release channel.
-pub const UPDATE_REFUSED: &str = "datad on the U30 Pro is updated through the device package feed (apk upgrade zwrt-datad)";
+pub const UPDATE_REFUSED: &str =
+    "datad on the U30 Pro is updated through the device package feed (apk upgrade zwrt-datad)";
 
 // ---------------------------------------------------------------------------------------------------------------- cache
 
@@ -167,7 +168,10 @@ fn ints(value: &Value) -> Vec<i64> {
 }
 
 fn join(list: &[i64]) -> String {
-    list.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+    list.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn scaled(value: &Value, factor: f64) -> Value {
@@ -199,7 +203,11 @@ fn month_day_time(local: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{month:02}-{day:02} {:02}:{:02}", secs / 3600, secs % 3600 / 60)
+    format!(
+        "{month:02}-{day:02} {:02}:{:02}",
+        secs / 3600,
+        secs % 3600 / 60
+    )
 }
 
 async fn device_counters(name: &str) -> (Option<u64>, Option<u64>) {
@@ -327,10 +335,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     }
     let cellular = &modem["cellular"];
     fields.insert("sim".into(), sim(cellular));
-    fields.insert(
-        "net".into(),
-        net(&modem, &bands, &wan),
-    );
+    fields.insert("net".into(), net(&modem, &bands, &wan));
     fields.insert(
         "traffic".into(),
         json!({"rx_speed":c.wan.rx,"tx_speed":c.wan.tx,"max_rx_speed":c.wan.max_rx,"max_tx_speed":c.wan.max_tx,
@@ -369,7 +374,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     }
 }
 
-fn system(info: &Value, board: &Value, cpu: &Value, firmware: &Value, cpu_temp: Option<i64>) -> Value {
+fn system(
+    info: &Value,
+    board: &Value,
+    cpu: &Value,
+    firmware: &Value,
+    cpu_temp: Option<i64>,
+) -> Value {
     let total = int(&info["memory"]["total"]).unwrap_or(0);
     let avail = int(&info["memory"]["available"])
         .or_else(|| int(&info["memory"]["free"]))
@@ -406,7 +417,13 @@ fn temperatures(device: &Value) -> Vec<(String, f64)> {
     zones
 }
 
-fn runtime(info: &Value, cpu: &Value, storage: &Value, zones: &[(String, f64)], lan: &Rate) -> Value {
+fn runtime(
+    info: &Value,
+    cpu: &Value,
+    storage: &Value,
+    zones: &[(String, f64)],
+    lan: &Rate,
+) -> Value {
     let kb = |v: &Value| scaled(v, 1.0 / 1024.0);
     let mut freq = Map::new();
     for core in cpu["cpus"].as_array().into_iter().flatten() {
@@ -465,7 +482,10 @@ fn sim(cellular: &Value) -> Value {
         "unknown"
     } else if upper.contains("PIN") || upper.contains("PUK") {
         "locked"
-    } else if upper.contains("ABSENT") || upper.contains("NOT INSERTED") || upper.contains("NOT_INSERTED") {
+    } else if upper.contains("ABSENT")
+        || upper.contains("NOT INSERTED")
+        || upper.contains("NOT_INSERTED")
+    {
         "absent"
     } else {
         "unknown"
@@ -515,7 +535,9 @@ fn net(modem: &Value, bands: &Value, wan: &Value) -> Value {
     };
     let rsrp = int(&serving["cesq"]["rsrp_dbm"]);
     let rsrq = int(&serving["cesq"]["rsrq_db"]);
-    let snr = number(&modem["sinr_db"]).map(|v| format!("{v:.1}")).unwrap_or_default();
+    let snr = number(&modem["sinr_db"])
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_default();
     let band = int(&serving["phy"]["band"]).filter(|b| *b > 0);
     let band_text = match band {
         Some(b) if sa => format!("n{b}"),
@@ -534,11 +556,27 @@ fn net(modem: &Value, bands: &Value, wan: &Value) -> Value {
         _ => "",
     };
     let csq = int(&serving["csq"]).or_else(|| int(&cellular["signal_csq"]));
-    let rssi = csq.filter(|v| (0..=31).contains(v)).map_or(0, |v| -113 + 2 * v);
+    let rssi = csq
+        .filter(|v| (0..=31).contains(v))
+        .map_or(0, |v| -113 + 2 * v);
     let (lte_rsrp, lte_rsrq, lte_snr, nr_rsrp, nr_rsrq, nr_snr) = if sa {
-        (0, 0, String::new(), rsrp.unwrap_or(0), rsrq.unwrap_or(0), snr)
+        (
+            0,
+            0,
+            String::new(),
+            rsrp.unwrap_or(0),
+            rsrq.unwrap_or(0),
+            snr,
+        )
     } else {
-        (rsrp.unwrap_or(0), rsrq.unwrap_or(0), snr, 0, 0, String::new())
+        (
+            rsrp.unwrap_or(0),
+            rsrq.unwrap_or(0),
+            snr,
+            0,
+            0,
+            String::new(),
+        )
     };
     let lte_hw = ints(&bands["lte_hw"]);
     let nr_hw = ints(&bands["nr_hw"]);
@@ -559,8 +597,12 @@ fn net(modem: &Value, bands: &Value, wan: &Value) -> Value {
             String::new()
         }
     };
-    let has4 = wan["ipv4-address"].as_array().is_some_and(|a| !a.is_empty());
-    let has6 = wan["ipv6-address"].as_array().is_some_and(|a| !a.is_empty());
+    let has4 = wan["ipv4-address"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty());
+    let has6 = wan["ipv6-address"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty());
     let wan_status = match (wan["up"] == true, has4, has6) {
         (true, true, true) => "ipv4_ipv6_connected",
         (true, true, false) => "ipv4_connected",
@@ -607,7 +649,11 @@ fn qos_block(qos: &Value) -> Value {
         .or_else(|| qos["nr"].get(0))
         .cloned()
         .unwrap_or(Value::Null);
-    let mbps = |v: &Value| number(v).map(|kbps| format!("{:.3}", kbps / 1000.0)).unwrap_or_default();
+    let mbps = |v: &Value| {
+        number(v)
+            .map(|kbps| format!("{:.3}", kbps / 1000.0))
+            .unwrap_or_default()
+    };
     json!({"qci":int(&bearer["qi"]).unwrap_or(0),"ambr_dl":mbps(&bearer["dl_ambr"]),"ambr_ul":mbps(&bearer["ul_ambr"])})
 }
 
@@ -625,7 +671,11 @@ fn clients(stations: &Value, leases: &Value) -> Value {
         "5g"
     };
     let mut list = Vec::new();
-    for mac in stations["clients"].as_object().into_iter().flat_map(Map::keys) {
+    for mac in stations["clients"]
+        .as_object()
+        .into_iter()
+        .flat_map(Map::keys)
+    {
         let mac = mac.to_ascii_lowercase();
         let (name, ip) = names.get(&mac).cloned().unwrap_or_default();
         list.push(json!({"name":name,"ip":ip,"mac":mac,"band":band,"guest":false}));
@@ -659,7 +709,10 @@ fn wifi_from_uci(reply: &Value) -> Value {
     else {
         return json!({ "available": false });
     };
-    let radio = sections.get(&text(&iface["device"])).cloned().unwrap_or_else(|| json!({}));
+    let radio = sections
+        .get(&text(&iface["device"]))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let encryption = text(&iface["encryption"]);
     let security = match encryption.as_str() {
         "" | "none" => "open",
@@ -674,12 +727,18 @@ fn wifi_from_uci(reply: &Value) -> Value {
 }
 
 async fn wifi_now() -> Value {
-    wifi_from_uci(&or_object(ubus("uci", "get", json!({ "config": "wireless" })).await))
+    wifi_from_uci(&or_object(
+        ubus("uci", "get", json!({ "config": "wireless" })).await,
+    ))
 }
 
 fn wlan(wifi: &Value) -> Value {
     let config = &wifi["config"];
-    let band = if text(&config["band"]) == "2g" { "2g" } else { "5g" };
+    let band = if text(&config["band"]) == "2g" {
+        "2g"
+    } else {
+        "5g"
+    };
     let ssid = text(&config["ssid"]);
     let enc = encryption(&text(&config["security"])).to_string();
     let enabled = i64::from(wifi["enabled"] == true);
@@ -695,7 +754,14 @@ fn sms_block(sms: &Value, offset: i64) -> (Value, BTreeMap<i64, Vec<i64>>) {
             continue;
         };
         let indexes = ints(&message["indexes"]);
-        parts.insert(id, if indexes.is_empty() { vec![id] } else { indexes });
+        parts.insert(
+            id,
+            if indexes.is_empty() {
+                vec![id]
+            } else {
+                indexes
+            },
+        );
         // +CMGL stat 0 is "received unread"
         let is_unread = int(&message["stat"]) == Some(0);
         unread += i64::from(is_unread);
@@ -782,8 +848,10 @@ pub async fn control(action: &str, params: &Value) -> Option<Outcome> {
         "power.direct_supply.set" => direct_supply_set(params).await,
         "wifi.status" | "wifi.state" => {
             let wifi = wifi_now().await;
-            Outcome::Ok(json!({"available":wifi["available"]==true,"enabled":wifi["enabled"]==true,"config":wifi["config"].clone(),
-                "wlan":if wifi["available"]==true { wlan(&wifi) } else { Value::Null }}))
+            Outcome::Ok(
+                json!({"available":wifi["available"]==true,"enabled":wifi["enabled"]==true,"config":wifi["config"].clone(),
+                "wlan":if wifi["available"]==true { wlan(&wifi) } else { Value::Null }}),
+            )
         }
         "power.direct_supply.status" => {
             let device = or_object(ubus("u30pro-native-control", "get", json!({})).await);
@@ -859,7 +927,9 @@ async fn apply_lock(config: Value) -> Outcome {
     cache().lock().await.bands.invalidate();
     if let Outcome::Ok(mut reply) = outcome {
         confirm_when_registered();
-        reply["confirm"] = json!("automatic once the modem is registered again; otherwise undone after the revert time");
+        reply["confirm"] = json!(
+            "automatic once the modem is registered again; otherwise undone after the revert time"
+        );
         return Outcome::Ok(reply);
     }
     outcome
@@ -881,7 +951,12 @@ async fn set_bands(params: &Value, rat: &str) -> Outcome {
         c.bands.invalidate();
         let bands = c
             .bands
-            .get(Duration::from_secs(300), "u30pro-modem", "bands_get", json!({}))
+            .get(
+                Duration::from_secs(300),
+                "u30pro-modem",
+                "bands_get",
+                json!({}),
+            )
             .await;
         ints(&bands[format!("{rat}_hw").as_str()])
     };
@@ -893,7 +968,10 @@ async fn set_bands(params: &Value, rat: &str) -> Outcome {
         wanted = hardware.clone();
     }
     if let Some(band) = wanted.iter().find(|b| !hardware.contains(b)) {
-        return Outcome::Invalid(format!("band {band} is not supported by this modem ({})", join(&hardware)));
+        return Outcome::Invalid(format!(
+            "band {band} is not supported by this modem ({})",
+            join(&hardware)
+        ));
     }
     wanted.sort_unstable();
     wanted.dedup();
@@ -933,7 +1011,9 @@ async fn wifi_configure(params: &Value) -> Outcome {
     let mut values = Map::new();
     if let Some(ssid) = params["ssid"].as_str() {
         if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
-            return Outcome::Invalid("ssid must be 1 to 32 bytes without control characters".into());
+            return Outcome::Invalid(
+                "ssid must be 1 to 32 bytes without control characters".into(),
+            );
         }
         values.insert("ssid".into(), json!(ssid));
     }
@@ -954,13 +1034,13 @@ async fn wifi_configure(params: &Value) -> Outcome {
         }
         values.insert("key".into(), json!(key));
     }
-    if let Some(pmf) = params.get("pmf").and_then(|v| int(v)) {
+    if let Some(pmf) = params.get("pmf").and_then(int) {
         if !(0..=2).contains(&pmf) {
             return Outcome::Invalid("pmf must be 0, 1 or 2".into());
         }
         values.insert("ieee80211w".into(), json!(pmf.to_string()));
     }
-    if let Some(max) = params.get("maxassoc").and_then(|v| int(v)) {
+    if let Some(max) = params.get("maxassoc").and_then(int) {
         values.insert("maxassoc".into(), json!(max.to_string()));
     }
     for name in ["hidden", "isolate"] {
@@ -982,9 +1062,13 @@ async fn wifi_configure(params: &Value) -> Outcome {
     if values.is_empty() {
         return Outcome::Invalid("no fields supplied".into());
     }
-    let encryption = values.get("encryption").and_then(Value::as_str).map(str::to_string)
+    let encryption = values
+        .get("encryption")
+        .and_then(Value::as_str)
+        .map(str::to_string)
         .unwrap_or_else(|| text(&wifi["config"]["encryption"]));
-    if encryption != "none" && !values.contains_key("key") && wifi["config"]["password_set"] != true {
+    if encryption != "none" && !values.contains_key("key") && wifi["config"]["password_set"] != true
+    {
         return Outcome::Invalid("an encrypted hotspot needs a key".into());
     }
     if let Err(e) = ubus("uci", "set", json!({ "config": "wireless", "section": section, "values": Value::Object(values.clone()) })).await {
@@ -1022,7 +1106,13 @@ async fn client_kick(params: &Value) -> Outcome {
     }
     for mac in &macs {
         // hostapd of the hotspot (wpad): deauthenticate, no ban
-        if let Err(error) = ubus("hostapd.wlan0", "del_client", json!({ "addr": mac, "reason": 5, "deauth": true, "ban_time": 0 })).await {
+        if let Err(error) = ubus(
+            "hostapd.wlan0",
+            "del_client",
+            json!({ "addr": mac, "reason": 5, "deauth": true, "ban_time": 0 }),
+        )
+        .await
+        {
             return Outcome::Failed(format!("{mac}: {error}"));
         }
     }
@@ -1075,7 +1165,11 @@ async fn sms_delete(params: &Value) -> Outcome {
     let mut indexes = Vec::new();
     {
         let c = cache().lock().await;
-        for item in raw.split([';', ',']).map(str::trim).filter(|s| !s.is_empty()) {
+        for item in raw
+            .split([';', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let Ok(id) = item.parse::<i64>() else {
                 return Outcome::Invalid(format!("invalid id: {item}"));
             };
@@ -1117,7 +1211,9 @@ async fn direct_supply_set(params: &Value) -> Outcome {
     .await;
     if let Outcome::Ok(_) = outcome {
         cache().lock().await.device.invalidate();
-        let after = direct_supply(&or_object(ubus("u30pro-native-control", "get", json!({})).await));
+        let after = direct_supply(&or_object(
+            ubus("u30pro-native-control", "get", json!({})).await,
+        ));
         let mut result = after.clone();
         result["changed"] = json!(before["enabled"] != after["enabled"]);
         result["verified"] = json!(after["enabled"] == json!(enabled));
@@ -1142,12 +1238,7 @@ pub async fn verify_password(username: &str, password: &str) -> bool {
     let Some(session) = reply["ubus_rpc_session"].as_str() else {
         return false;
     };
-    let _ = ubus(
-        "session",
-        "destroy",
-        json!({ "ubus_rpc_session": session }),
-    )
-    .await;
+    let _ = ubus("session", "destroy", json!({ "ubus_rpc_session": session })).await;
     true
 }
 
@@ -1186,7 +1277,11 @@ mod tests {
             "cesq":{"rsrp_dbm":-106,"rsrq_db":-17.5},"csq":20,"phy":{"band":8,"pci":57,"dl_earfcn":3725,"dl_bw_idx":2},
             "network":{"mcc":"454","mnc":"12","name":"CMHK"}},"sinr_db":-7.0,"cellular":{}});
         let bands = json!({"lte_hw":[1,3],"nr_hw":[78],"lte":[3],"nr":[78]});
-        let n = net(&modem, &bands, &json!({"up":true,"ipv4-address":[{"address":"10.0.0.1"}]}));
+        let n = net(
+            &modem,
+            &bands,
+            &json!({"up":true,"ipv4-address":[{"address":"10.0.0.1"}]}),
+        );
         assert_eq!(n["type"], "LTE-NSA");
         assert_eq!(n["band"], "LTE BAND 8");
         assert_eq!(n["lte_rsrp"], -106);
