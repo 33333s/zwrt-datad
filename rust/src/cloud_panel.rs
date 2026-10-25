@@ -362,6 +362,8 @@ fn needs_confirmation(action: &str) -> bool {
             | "lan.set_mtu"
             | "dns.set"
             | "power.direct_supply.set"
+            | "battery.charge_protection.release"
+            | "battery.charge_protection.set"
             | "sleep.set"
             | "nfc.set"
             | "apn.set_mode"
@@ -1247,6 +1249,8 @@ mod tests {
             "wifi.interface.delete",
             "dns.set",
             "power.direct_supply.set",
+            "battery.charge_protection.release",
+            "battery.charge_protection.set",
             "sleep.set",
             "nfc.set",
             "traffic.set_limit",

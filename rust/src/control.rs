@@ -60,6 +60,9 @@ pub const ACTIONS: &[&str] = &[
     "lan.set_mtu",
     "dns.set",
     "power.direct_supply.set",
+    "battery.charge_protection.status",
+    "battery.charge_protection.release",
+    "battery.charge_protection.set",
     "usb.set",
     "sleep.set",
     "nfc.set",
@@ -363,6 +366,15 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
             .await
         }
         "power.direct_supply.set" => direct_supply(params).await,
+        "battery.charge_protection.status"
+        | "battery.charge_protection.release"
+        | "battery.charge_protection.set" => {
+            match crate::charge_protection::execute(action, params).await {
+                Ok(value) => Outcome::Ok(value),
+                Err((true, error)) => Outcome::Invalid(error),
+                Err((false, error)) => Outcome::Failed(error),
+            }
+        }
         "usb.set" => {
             mapped_call(
                 params,
