@@ -58,6 +58,7 @@ if (obj,method)==('session','destroy'): reply({})
 print('{}')
 '''); fake.chmod(0o755)
     fixture.write_text(json.dumps({'cell':'connected','behaviour':'auto'}))
+    serial=base/'serial-number'; serial.write_bytes(b'0099FIXTURE\0')
     def setup(**changes):
         data=json.loads(fixture.read_text()); data.update(changes)
         p=fixture.with_suffix('.new'); p.write_text(json.dumps(data)); p.replace(fixture)
@@ -67,7 +68,8 @@ print('{}')
         with socket.socket() as sock: sock.bind(('127.0.0.1',0)); ports.append(sock.getsockname()[1])
     port,lan_port=ports
     env=dict(os.environ,ZWRT_DATAD_DIR=str(base/'cloud'),ZWRT_DATAD_UBUS='cli',ZWRT_DATAD_UBUS_BIN=str(fake),ZWRT_DATAD_UCI_BIN='/usr/bin/false',
-             ZWRT_DATAD_OTA_DISABLE_AUTO='1',U30_FIXTURE=str(fixture),U30_CALLS=str(calls))
+             ZWRT_DATAD_OTA_DISABLE_AUTO='1',U30_FIXTURE=str(fixture),U30_CALLS=str(calls),
+             ZWRT_DATAD_U30PRO_SERIAL_FILE=str(serial))
     env.pop('ZWRT_DATAD_BACKEND',None)
     # the LAN listener (login required; loopback counts as a LAN source) next to the local one
     proc=subprocess.Popen([str(BIN),'-i','200','-p',str(port),'--auth-token-file',str(token),'--lan-bind','127.0.0.1','--lan-port',str(lan_port)],
@@ -103,6 +105,11 @@ print('{}')
         else: raise AssertionError('startup')
         assert state['device']['api_template']=='U30PRO' and state['device']['api_template_supported']==1, state['device']
         assert state['device']['model_name']=='MU5358', state['device']
+        assert state['device']['serial_number']=='0099FIXTURE', state['device']
+        # cloud management defaults of this device: no UFI or WebSSH back end, LuCI on port 80
+        code,cloud=req('/cloud/config')
+        assert code==200 and cloud['config']['platform']=='generic' and cloud['config']['enabled'] is False, cloud
+        assert cloud['config']['services']==[{'name':'设备后台','port':80,'kind':'web'}], cloud['config']['services']
         # the field names of the ZTE templates
         cell=state['interfaces']['cellular']
         assert cell['connect_status']=='ipv4_connected' and cell['enable']==1 and cell['connect_mode']=='auto', cell
@@ -148,7 +155,7 @@ print('{}')
             if want==200: assert data['ok'] is True and data['token_type']=='Bearer' and data['access_token'], data
         users={b['username'] for o,m,b in logged() if (o,m)==('session','login')}
         assert users=={'root','Admin','operator'}, users
-        print('U30 Pro template: board detection, ZTE field names (cellular, sim, sms tags, usb, runtime, protection), u30pro.cell '
+        print('U30 Pro template: board detection, board serial and cloud defaults, ZTE field names (cellular, sim, sms tags, usb, runtime, protection), u30pro.cell '
               'connect/disconnect and errors, charger_bypass set/readback/unverified, no old paths, LAN login as root or admin PASS')
     finally:
         proc.terminate()

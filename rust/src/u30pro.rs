@@ -6,7 +6,7 @@
 //! `u30pro-firmware`), the standard OpenWrt objects (`system`, `network`, `network.interface.*`, `network.device`, `hostapd.*`,
 //! `luci-rpc`, `session`) and the `uci` object; the Wi-Fi is the standard `/etc/config/wireless`.  It sends no AT commands and
 //! reads no vendor files; the only kernel files are those of datad's generic blocks (`usb`, `runtime.connections`,
-//! `runtime.link_rates`).  The modem is asked through `u30pro-modem snapshot`, which shares one cached query with the device's
+//! `runtime.link_rates`) and the board serial in the device tree (`device.serial_number`).  The modem is asked through `u30pro-modem snapshot`, which shares one cached query with the device's
 //! screen.  Blocks and fields keep the shape and the names of the ZTE templates (docs/STATE_SCHEMA.md); what this device does
 //! not report is left out rather than faked.  Needs firmware p535-s90 or newer (`u30pro.cell`, `charger_bypass`).
 
@@ -194,6 +194,28 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// The board's serial number, which the boot loader puts into the device tree (the stable identity of cloud management; not a
+/// subscriber identifier); "" when there is none
+fn board_serial() -> &'static str {
+    static SERIAL: OnceLock<String> = OnceLock::new();
+    SERIAL.get_or_init(|| {
+        let path = std::env::var("ZWRT_DATAD_U30PRO_SERIAL_FILE")
+            .unwrap_or_else(|_| "/proc/device-tree/serial-number".into());
+        clean_serial(&std::fs::read(path).unwrap_or_default())
+    })
+}
+
+/// a device-tree string: NUL-terminated; only a plain alphanumeric value of up to 64 characters is taken
+fn clean_serial(raw: &[u8]) -> String {
+    let value = String::from_utf8_lossy(raw);
+    let value = value.trim_end_matches('\0').trim();
+    if (1..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// `MM-DD HH:MM` of a local time given as seconds (days from the civil calendar algorithm of H. Hinnant)
 fn month_day_time(local: i64) -> String {
     let days = local.div_euclid(86_400);
@@ -312,7 +334,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         json!({"profile":model.to_ascii_lowercase(),"profile_source":"board_model","api_template":"U30PRO",
             "api_template_label":"U30 Pro (native OpenWrt)","api_template_supported":1,"full_ubus":1,"vendor":"ZTE",
             "model_name":model,"hardware_version":"","market_name":"U30 Pro","alias_name":"U30 Pro",
-            "board_name":text(&board["board_name"])}),
+            "board_name":text(&board["board_name"]),"serial_number":board_serial()}),
     );
     fields.insert(
         "system".into(),
@@ -1352,6 +1374,14 @@ mod tests {
             .collect();
         assert_eq!(tags, vec![json!(1), json!(0), json!(2)]);
         assert_eq!(block["unread"], 1);
+    }
+
+    #[test]
+    fn serials() {
+        assert_eq!(clean_serial(b"0099ABCdef\0"), "0099ABCdef");
+        assert_eq!(clean_serial(b"\0"), "");
+        assert_eq!(clean_serial(b"12 34\0"), "");
+        assert_eq!(clean_serial(&[b'1'; 65]), "");
     }
 
     #[test]

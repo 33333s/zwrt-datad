@@ -79,6 +79,24 @@ const CLOUD_FEATURE_DEFAULTS_MARKER: &str = "cloud-feature-defaults-v1";
 
 impl Default for Config {
     fn default() -> Self {
+        // the U30 Pro with native OpenWrt: a UNISOC SoC, and LuCI is its only web back end (no UFI, no WebSSH)
+        if crate::u30pro::active() {
+            return Self {
+                platform: "generic".into(),
+                services: vec![Service {
+                    name: "设备后台".into(),
+                    port: 80,
+                    kind: "web".into(),
+                }],
+                ..Self::zte()
+            };
+        }
+        Self::zte()
+    }
+}
+
+impl Config {
+    fn zte() -> Self {
         Self {
             enabled: false,
             broker: DEFAULT_BROKER.into(),
@@ -464,30 +482,35 @@ impl Cloud {
                     .filter(|value| topic(value))
             })
             .ok_or("设备型号尚未就绪")?;
-        let stable_id = [("modem_msn", info), ("serial_number", info), ("imei", info)]
-            .into_iter()
-            .find_map(|(key, source)| {
-                source
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty() && topic(value))
-                    .map(|value| (key, value))
-            })
-            .or_else(|| {
-                snapshot
-                    .fields
-                    .get("system")
-                    .and_then(|system| system.get("imei"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| {
-                        (14..=16).contains(&value.len())
-                            && value.bytes().all(|c| c.is_ascii_digit())
-                    })
-                    .map(|value| ("imei", value))
-            })
-            .ok_or("设备稳定标识尚未就绪")?;
+        // the U30 Pro (native OpenWrt) has no ZTE device info: its board serial is device.serial_number
+        let stable_id = [
+            ("modem_msn", info),
+            ("serial_number", info),
+            ("imei", info),
+            ("serial_number", device),
+        ]
+        .into_iter()
+        .find_map(|(key, source)| {
+            source
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && topic(value))
+                .map(|value| (key, value))
+        })
+        .or_else(|| {
+            snapshot
+                .fields
+                .get("system")
+                .and_then(|system| system.get("imei"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| {
+                    (14..=16).contains(&value.len()) && value.bytes().all(|c| c.is_ascii_digit())
+                })
+                .map(|value| ("imei", value))
+        })
+        .ok_or("设备稳定标识尚未就绪")?;
         let mut config = self.config.clone();
         config.broker = DEFAULT_BROKER.into();
         config.platform_url = DEFAULT_PLATFORM_URL.into();
@@ -2186,6 +2209,38 @@ mod tests {
             deterministic_uuid("ufi-device:serial_number:SERIAL-fixture")
         );
         fs::remove_dir_all(fallback_dir).unwrap();
+
+        // the U30 Pro: no ZTE device info, the board serial in the device block
+        let board_dir = std::env::temp_dir().join(format!(
+            "datad-quick-connect-board-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&board_dir).unwrap();
+        let mut board = snapshot.clone();
+        board.fields.remove("uci_device_info");
+        board.fields.insert(
+            "device".into(),
+            json!({"api_template":"U30PRO","vendor":"ZTE","serial_number":"0099BOARD"}),
+        );
+        let mut cloud = Cloud::load(&board_dir);
+        cloud
+            .quick_connect(
+                QuickConnect {
+                    username: format!("enr_{}", "c".repeat(32)),
+                    password: "sample-secret".into(),
+                },
+                &board,
+            )
+            .unwrap();
+        let config = &cloud.public_config()["config"];
+        assert_eq!(
+            config["identity"],
+            deterministic_uuid("ufi-device:serial_number:0099BOARD")
+        );
+        assert_eq!(config["model"], "U30PRO");
+        assert_eq!(config["platform"], "generic");
+        fs::remove_dir_all(board_dir).unwrap();
     }
 
     #[test]

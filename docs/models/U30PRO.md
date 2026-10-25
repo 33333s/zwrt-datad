@@ -52,6 +52,16 @@
 datad 自己的通用动作（hosts、time、schedule、speedtest、nat、state 等）照常可用；中兴专有动作（APN、流量统计、NFC、睡眠、USB、
 多 WAN、散热、访客 Wi-Fi、黑白名单等）返回 `unknown_action`。`/ubus/call` 透传照常开放（例如 `u30pro-modem at`）。
 
+## 云管理
+
+与中兴机型相同（[CLOUD.md](../CLOUD.md)），只有两点不同：
+
+- 快速接入的设备标识取自板子序列号（引导程序写进设备树的 `/proc/device-tree/serial-number`，也就是 `/state` 的 `device.serial_number`；
+  不是用户身份信息），按中兴机型的规则生成 UUID：`ufi-device:serial_number:<序列号>`。
+- 没有 `cloud.json` 时的默认值：`platform` 为 `generic`（展锐，不是高通），远程服务只有 LuCI（`设备后台`，80 端口）；这台机器没有 UFI（2333）和 WebSSH（8899）。
+
+设备上的 LuCI 插件 `luci-app-zwrt-datad`（U30 Pro 软件源）用本机 9460 的这些接口提供“服务 → 云管理”页面。
+
 ## 登录与更新
 
 `POST /auth/login`：用路由器自己的账号，经 rpcd `session login` 校验（与 LuCI 相同）。为中兴固件写的 App 固定用 `admin`，
