@@ -5,9 +5,10 @@
 //! the device's rpcd plugins for the rest (`u30pro-modem`, `u30pro-native-control`, `u30pro-cpu`, `u30pro-storage`,
 //! `u30pro-firmware`), the standard OpenWrt objects (`system`, `network`, `network.interface.*`, `network.device`, `hostapd.*`,
 //! `luci-rpc`, `session`) and the `uci` object; the Wi-Fi is the standard `/etc/config/wireless`.  It sends no AT commands and
-//! reads no vendor files or sysfs: the modem is asked through `u30pro-modem snapshot`, which shares one cached query with the
-//! device's screen.  Blocks and fields keep the shape of docs/STATE_SCHEMA.md; what this device does not report is left out
-//! rather than faked.  Needs firmware p535-s90 or newer (`u30pro.cell`, `charger_bypass`).
+//! reads no vendor files; the only kernel files are those of datad's generic blocks (`usb`, `runtime.connections`,
+//! `runtime.link_rates`).  The modem is asked through `u30pro-modem snapshot`, which shares one cached query with the device's
+//! screen.  Blocks and fields keep the shape and the names of the ZTE templates (docs/STATE_SCHEMA.md); what this device does
+//! not report is left out rather than faked.  Needs firmware p535-s90 or newer (`u30pro.cell`, `charger_bypass`).
 
 use crate::{control::Outcome, model::Snapshot, state::ubus};
 use serde_json::{Map, Value, json};
@@ -320,7 +321,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let zones = temperatures(&device);
     fields.insert(
         "thermal".into(),
-        json!({"cpu_celsius":cpu_temp,"zones":zones.iter().map(|(name,t)| json!({"name":name,"celsius":(t*1000.0).round()/1000.0})).collect::<Vec<_>>(),"modems":[]}),
+        json!({"cpu_celsius":cpu_temp,"zones":zones.iter().map(|(name,t)| json!({"name":name,"celsius":(t*1000.0).round()/1000.0})).collect::<Vec<_>>(),"modems":[],
+            "protection":thermal_protection(&device)}),
     );
     fields.insert(
         "runtime".into(),
@@ -348,8 +350,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     fields.insert(
         "interfaces".into(),
         json!({"lan":interface(&lan),"wan4":interface(&wan),"wan6":interface(&wan),"lan_config":{},
-            "cellular":{"state":text(&cellular["state"]),"connected":cellular["connected"]==true,"apn":text(&cellular["apn"]),
-                "ipv4_address":text(&cellular["address"]),"dns":cellular["dns"].clone(),"device":text(&cellular["device"])}}),
+            "cellular":cellular_interface(cellular, &wan)}),
     );
     fields.insert("clients".into(), clients(&stations, &leases));
     if wifi["available"] == true {
@@ -368,6 +369,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         c.sms_parts = parts;
     }
     fields.insert("modems".into(), json!([]));
+    // datad's own USB block, as on the ZTE devices (sysfs)
+    fields.insert("usb".into(), crate::usb::snapshot());
     fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
     Snapshot {
         ts: unix_now(),
@@ -449,7 +452,10 @@ fn runtime(
         "cpu_freq_mhz":freq,"thermal_zones":zones.iter().map(|(name,t)| json!({"type":name,"temp_milli":(t*1000.0).round() as i64})).collect::<Vec<_>>(),
         "memory_kb":{"total":kb(&memory["total"]),"free":kb(&memory["free"]),"available":kb(&memory["available"]),"buffers":kb(&memory["buffered"]),
             "cached":kb(&memory["cached"]),"swap_total":kb(&info["swap"]["total"]),"swap_free":kb(&info["swap"]["free"])},
-        "storage":disk,"throughput":{"rx_bps":lan.rx,"tx_bps":lan.tx,"window_ms":lan.window_ms}})
+        "storage":disk,"connections":crate::state::connections(),
+        // the uplinks: cellular data and the Wi-Fi relay
+        "link_rates":crate::state::link_rates_of(crate::state::now_ms(), &["sipa_eth0", "wlan1"]),
+        "throughput":{"rx_bps":lan.rx,"tx_bps":lan.tx,"window_ms":lan.window_ms}})
 }
 
 fn battery(device: &Value) -> Value {
@@ -461,7 +467,17 @@ fn battery(device: &Value) -> Value {
         "health":1,"charging":i64::from(charging),"charger_connect":int(&charger["online"]).unwrap_or(0),
         "chg_uv":scaled(&source["voltage_now_v"],1e6),"chg_ua":scaled(&source["current_now_ma"],1e3),
         "bat_uv":scaled(&battery["voltage_v"],1e6),"bat_ua":scaled(&battery["current_ma"],1e3),
-        "capacity_level":text(&battery["capacity_level"]),"charger_status":text(&charger["status"])})
+        "capacity_level":text(&battery["capacity_level"]),"charger_status":text(&charger["status"]),
+        // the protection service (u30pro.safety) pauses charging when the battery or the board is hot
+        "charge_protection":{"active":device["safety"]["charge_paused"]==true}})
+}
+
+/// `thermal.protection` from the protection service (u30pro.safety): it pauses charging and powers off, it never limits the
+/// speed or the network; `raw` is its level (ok / warning / critical), null when it has not run
+fn thermal_protection(device: &Value) -> Value {
+    let level = text(&device["safety"]["level"]);
+    json!({"active":!level.is_empty() && level != "ok","speed_limited":false,"network_restricted":false,
+        "raw":if level.is_empty() { Value::Null } else { json!(level) }})
 }
 
 /// "direct supply" is the charger's inhibit-charge behaviour: the device runs from the adapter, the battery is not charged
@@ -492,7 +508,45 @@ fn sim(cellular: &Value) -> Value {
     } else {
         "unknown"
     };
-    json!({"state":state,"raw_state":raw,"modem_state":text(&cellular["state"])})
+    // one SIM slot
+    json!({"state":state,"raw_state":raw,"modem_state":text(&cellular["state"]),"current_slot":1,"dual_sim":0})
+}
+
+/// The ZTE connection status (`net.wan_status`, `connect_status` of `zwrt_data get_wwaniface`) of the netifd interface wan
+fn wan_status(wan: &Value) -> &'static str {
+    let has = |key: &str| wan[key].as_array().is_some_and(|a| !a.is_empty());
+    match (wan["up"] == true, has("ipv4-address"), has("ipv6-address")) {
+        (true, true, true) => "ipv4_ipv6_connected",
+        (true, true, false) => "ipv4_connected",
+        (true, false, true) => "ipv6_connected",
+        _ => "disconnected",
+    }
+}
+
+/// `interfaces.cellular` with the field names of the ZTE data service (`zwrt_data get_wwaniface`), from the cellular manager
+/// (u30pro.cell status) and netifd's wan; `apn` and `dns` as the cellular manager has them.  The device dials by itself at boot
+/// (`connect_mode` auto); there is no roaming switch and no APN profile list, so `roam_enable` and `profile_id` are left out.
+fn cellular_interface(cellular: &Value, wan: &Value) -> Value {
+    let status = if cellular["connected"] == true {
+        wan_status(wan)
+    } else {
+        "disconnected"
+    };
+    let first = |key: &str| text(&wan[key][0]["address"]);
+    let device = match text(&wan["l3_device"]) {
+        name if !name.is_empty() => name,
+        _ => text(&cellular["device"]),
+    };
+    let pdp = match text(&cellular["pdp"]).as_str() {
+        "ipv4" => "IP",
+        "ipv6" => "IPV6",
+        "ipv4v6" => "IPV4V6",
+        _ => "",
+    };
+    json!({"enable":i64::from(cellular["desired_up"]==true),"connect_mode":"auto","connect_status":status,
+        "ipv4_dev_name":device,"ipv6_dev_name":device,"pdp_type":pdp,
+        "ipv4_address":match text(&cellular["address"]) { a if !a.is_empty() => a, _ => first("ipv4-address") },
+        "ipv6_address":first("ipv6-address"),"apn":text(&cellular["apn"]),"dns":cellular["dns"].clone()})
 }
 
 fn bars(rsrp: Option<i64>) -> i64 {
@@ -599,18 +653,7 @@ fn net(modem: &Value, bands: &Value, wan: &Value) -> Value {
             String::new()
         }
     };
-    let has4 = wan["ipv4-address"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty());
-    let has6 = wan["ipv6-address"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty());
-    let wan_status = match (wan["up"] == true, has4, has6) {
-        (true, true, true) => "ipv4_ipv6_connected",
-        (true, true, false) => "ipv4_connected",
-        (true, false, true) => "ipv6_connected",
-        _ => "disconnected",
-    };
+    let wan_status = wan_status(wan);
     let operator = match text(&serving["network"]["name"]) {
         name if !name.is_empty() => name,
         _ => text(&cellular["operator"]),
@@ -765,16 +808,30 @@ fn sms_block(sms: &Value, offset: i64) -> (Value, BTreeMap<i64, Vec<i64>>) {
             },
         );
         // +CMGL stat 0 is "received unread"
-        let is_unread = int(&message["stat"]) == Some(0);
+        let stat = int(&message["stat"]);
+        let is_unread = stat == Some(0);
         unread += i64::from(is_unread);
         let received = int(&message["ts"]);
         list.push(json!({"id":id,"num":text(&message["address"]),"date":received.map(|t| month_day_time(t + offset)).unwrap_or_default(),
-            "received_at":received,"unread":i64::from(is_unread),"text":text(&message["text"])}));
+            "received_at":received,"unread":i64::from(is_unread),"tag":sms_tag(stat),"text":text(&message["text"])}));
     }
+    // sms_list returns every stored message: nothing is cut off
     (
-        json!({"unread":unread,"list":list,"total":list.len(),"capacity":sms["capacity"].clone(),"stale":false}),
+        json!({"unread":unread,"list":list,"total":list.len(),"capacity":sms["capacity"].clone(),"stale":false,"truncated":false}),
         parts,
     )
+}
+
+/// The ZTE message tag (what SMS forwarding reads: 1 received unread, 0 received read; 2 sent, 3 stored unsent) of a +CMGL stat
+/// (0 received unread, 1 received read, 2 stored unsent, 3 stored sent)
+fn sms_tag(stat: Option<i64>) -> Value {
+    match stat {
+        Some(0) => json!(1),
+        Some(1) => json!(0),
+        Some(2) => json!(3),
+        Some(3) => json!(2),
+        _ => Value::Null,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------- control
@@ -1252,6 +1309,50 @@ pub async fn verify_password(username: &str, password: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cellular_as_zte() {
+        let cell = json!({"state":"connected","connected":true,"desired_up":true,"apn":"cmhk","pdp":"ipv4v6",
+            "address":"10.1.2.3","dns":["10.0.0.53"],"device":"sipa_eth0"});
+        let wan = json!({"up":true,"l3_device":"sipa_eth0","ipv4-address":[{"address":"10.1.2.3","mask":30}],
+            "ipv6-address":[{"address":"2001:db8::1","mask":64}]});
+        let c = cellular_interface(&cell, &wan);
+        assert_eq!(c["enable"], 1);
+        assert_eq!(c["connect_mode"], "auto");
+        assert_eq!(c["connect_status"], "ipv4_ipv6_connected");
+        assert_eq!(c["ipv4_dev_name"], "sipa_eth0");
+        assert_eq!(c["pdp_type"], "IPV4V6");
+        assert_eq!(c["ipv4_address"], "10.1.2.3");
+        assert_eq!(c["ipv6_address"], "2001:db8::1");
+        assert_eq!(c["apn"], "cmhk");
+        assert!(c.get("connected").is_none() && c.get("state").is_none());
+        // netifd may still hold the interface for a moment after the manager dropped the link
+        let down = cellular_interface(
+            &json!({"connected":false,"desired_up":false,"pdp":"ipv4"}),
+            &wan,
+        );
+        assert_eq!(down["connect_status"], "disconnected");
+        assert_eq!(down["enable"], 0);
+        assert_eq!(down["pdp_type"], "IP");
+    }
+
+    #[test]
+    fn sms_as_zte() {
+        let sms = json!({"ok":true,"capacity":{"used":3,"total":50},"messages":[
+            {"index":1,"stat":0,"address":"10086","ts":1792846362,"text":"a"},
+            {"index":2,"stat":1,"address":"10086","ts":1792846362,"text":"b"},
+            {"index":3,"stat":3,"address":"10010","text":"c"}]});
+        let (block, _) = sms_block(&sms, 0);
+        assert_eq!(block["truncated"], false);
+        let tags: Vec<_> = block["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["tag"].clone())
+            .collect();
+        assert_eq!(tags, vec![json!(1), json!(0), json!(2)]);
+        assert_eq!(block["unread"], 1);
+    }
 
     #[test]
     fn login_accounts() {

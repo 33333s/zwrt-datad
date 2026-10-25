@@ -1222,7 +1222,14 @@ fn iface_bytes(name: &str) -> Option<(u64, u64)> {
     Some((rx, tx))
 }
 
-fn now_ms() -> u64 {
+/// `runtime.connections`: the device's own sockets
+pub(crate) fn connections() -> Value {
+    let active = tcp_active();
+    let tcp4 = count_lines("/proc/net/tcp", true);
+    json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)})
+}
+
+pub(crate) fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START
         .get_or_init(Instant::now)
@@ -1233,10 +1240,15 @@ fn now_ms() -> u64 {
 }
 
 fn link_rates(now: u64) -> Value {
+    link_rates_of(now, &["rmnet_data0", "V3E1net0", "V3E2net0", "eth0"])
+}
+
+/// `runtime.link_rates` of the named uplink devices (those that exist)
+pub(crate) fn link_rates_of(now: u64, names: &[&str]) -> Value {
     let previous = LINK_PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut previous = previous.lock().unwrap();
     let mut rates = Vec::new();
-    for name in ["rmnet_data0", "V3E1net0", "V3E2net0", "eth0"] {
+    for &name in names {
         let Some((rx, tx)) = iface_bytes(name) else {
             previous.remove(name);
             continue;
@@ -1360,9 +1372,7 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
         }
         freqs.insert(core.clone(), json!({"cur":cur/1000,"max":max/1000}));
     }
-    let active = tcp_active();
-    let tcp4 = count_lines("/proc/net/tcp", true);
-    let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)});
+    let connections = connections();
     let now = now_ms();
     (
         total_usage,

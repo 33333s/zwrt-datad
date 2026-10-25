@@ -27,9 +27,15 @@ if (obj,method)==('system','info'):
     reply({'uptime':100,'localtime':1792900000,'memory':{'total':1000,'free':400,'available':600},'swap':{'total':0,'free':0}})
 if (obj,method)==('u30pro-modem','snapshot'):
     up=data['cell']=='connected'
-    reply({'ok':True,'cellular':{'state':data['cell'],'connected':up,'apn':'cmhk','address':'10.1.2.3' if up else '',
+    reply({'ok':True,'cellular':{'state':data['cell'],'connected':up,'desired_up':up,'apn':'cmhk','pdp':'ipv4v6','address':'10.1.2.3' if up else '',
         'dns':['10.0.0.53'] if up else [],'device':'sipa_eth0','sim':'READY','operator':'CMHK','signal_csq':20},
         'serving':None,'serving_age_s':None,'sinr_db':None})
+if (obj,method)==('network.interface.wan','status'):
+    up=data['cell']=='connected'
+    reply({'up':up,'l3_device':'sipa_eth0','uptime':60,'ipv4-address':[{'address':'10.1.2.3','mask':30}] if up else [],'ipv6-address':[]})
+if (obj,method)==('u30pro-modem','sms_list'):
+    reply({'ok':True,'capacity':{'used':2,'total':50},'messages':[{'index':4,'stat':0,'address':'10086','ts':1792900000,'text':'new'},
+        {'index':5,'stat':1,'address':'10010','ts':1792800000,'text':'old'}]})
 if (obj,method)==('u30pro.cell','reconnect'):
     data['cell']='connected'; save(); reply({'accepted':True})
 if (obj,method)==('u30pro.cell','disconnect'):
@@ -97,17 +103,26 @@ print('{}')
         else: raise AssertionError('startup')
         assert state['device']['api_template']=='U30PRO' and state['device']['api_template_supported']==1, state['device']
         assert state['device']['model_name']=='MU5358', state['device']
-        assert state['interfaces']['cellular']['connected'] is True and state['sim']['state']=='ready', state['interfaces']
+        # the field names of the ZTE templates
+        cell=state['interfaces']['cellular']
+        assert cell['connect_status']=='ipv4_connected' and cell['enable']==1 and cell['connect_mode']=='auto', cell
+        assert cell['ipv4_dev_name']=='sipa_eth0' and cell['pdp_type']=='IPV4V6' and cell['ipv4_address']=='10.1.2.3', cell
+        assert 'connected' not in cell and 'state' not in cell, cell
+        assert state['sim']['state']=='ready' and state['sim']['dual_sim']==0 and state['sim']['current_slot']==1, state['sim']
+        assert {'controllers','devices'} <= set(state.get('usb',{})), state.get('usb')
+        sms=state['sms']; assert sms['truncated'] is False and [m['tag'] for m in sms['list']]==[1,0] and sms['unread']==1, sms
+        assert {'tcp4','udp4'} <= set(state['runtime']['connections']) and isinstance(state['runtime']['link_rates'],list), state['runtime']
+        assert state['thermal']['protection']['active'] is False and state['battery']['charge_protection']=={'active':False}, state['thermal']
         assert state['power']['direct_supply']=={'supported':True,'enabled':False,'mode':'disable'}, state['power']
         caps=req('/capabilities')[1]['control']
         assert {'cellular.connect','cellular.disconnect','power.direct_supply.set'} <= set(caps), caps
         # cellular: the cellular manager's own object
         code,data=action('cellular.disconnect'); assert code==200, (code,data)
         assert ['u30pro.cell','disconnect',{}] in logged(), logged()
-        wait_state(lambda s: s['interfaces']['cellular']['connected'] is False)
+        wait_state(lambda s: s['interfaces']['cellular']['connect_status']=='disconnected')
         code,data=action('cellular.connect'); assert code==200, (code,data)
         assert ['u30pro.cell','reconnect',{}] in logged(), logged()
-        wait_state(lambda s: s['interfaces']['cellular']['connected'] is True)
+        wait_state(lambda s: s['interfaces']['cellular']['connect_status']=='ipv4_connected')
         setup(cell_reject=True); code,data=action('cellular.disconnect'); assert code==502 and 'not running' in json.dumps(data), (code,data)
         setup(cell_reject=False)
         # direct supply: charger_bypass, read back by the plugin
@@ -133,8 +148,8 @@ print('{}')
             if want==200: assert data['ok'] is True and data['token_type']=='Bearer' and data['access_token'], data
         users={b['username'] for o,m,b in logged() if (o,m)==('session','login')}
         assert users=={'root','Admin','operator'}, users
-        print('U30 Pro template: board detection, u30pro.cell connect/disconnect and errors, charger_bypass set/readback/unverified, '
-              'no old paths, LAN login as root or admin PASS')
+        print('U30 Pro template: board detection, ZTE field names (cellular, sim, sms tags, usb, runtime, protection), u30pro.cell '
+              'connect/disconnect and errors, charger_bypass set/readback/unverified, no old paths, LAN login as root or admin PASS')
     finally:
         proc.terminate()
         try: proc.wait(timeout=8)
