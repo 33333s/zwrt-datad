@@ -5,8 +5,9 @@
 
 这台机器跑的是原生 OpenWrt 25.12（[U30pro-openwrt](https://github.com/33333s/U30pro-openwrt)），没有任何中兴原厂对象
 （`zwrt_*`、`zte_nwinfo_api` 等）。后端代码在 `rust/src/u30pro.rs`，**只通过 ubus（含 `uci` 对象）读写**：不发 AT、不读厂商文件、不读 sysfs。
+设备守护进程有自己的 ubus 对象的直接调用它（拨号管理 `u30pro.cell`），其余经设备的 rpcd 插件（`u30pro-modem`、`u30pro-native-control` 等）。
 基带经 `u30pro-modem` 访问，它的 `snapshot` 方法与设备屏幕共用一份缓存查询，datad 每秒轮询也不增加 AT 流量。
-信号与 CPU 占用需要固件 p535-s80 或更新。
+需要固件 p535-s90 或更新（`u30pro.cell`、`charger_bypass`）。
 
 ## 数据来源
 
@@ -17,7 +18,7 @@
 | `runtime` | `u30pro-cpu get`（每核占用与频率）、`system info`（内存/交换）、`u30pro-storage get`（数据分区）、`network.device status br-lan`（吞吐）；无 `connections` |
 | `thermal` | `u30pro-native-control get`：SoC、主板各点、电池温度 |
 | `battery` / `power.direct_supply` | `u30pro-native-control get` 的 `battery`、`charger`；直供电 = 充电策略 `inhibit-charge` |
-| `sim` | `u30pro-modem snapshot` 的 `cellular.sim`（只有状态，不读 ICCID/IMSI/号码） |
+| `sim` | `u30pro-modem snapshot` 的 `cellular.sim`（`cellular` 就是 `u30pro.cell status`；只有状态，不读 ICCID/IMSI/号码） |
 | `net` | `u30pro-modem snapshot`（`serving`：CEREG/C5GREG/COPS/CESQ/CSQ/SPPHYCHINFO/SPENDC，最长 10 秒缓存；`sinr_db`：LTE 服务小区 SINR）、`u30pro-modem bands_get`（5 分钟缓存：支持频段、当前频段、锁小区） |
 | `traffic` | `network.interface.wan status` + `network.device status <l3_device>` 的计数器；没有日/月/累计统计 |
 | `qos` | `u30pro-modem qos`（1 分钟缓存；AMBR 由 kbps 换算成 Mbps） |
@@ -35,13 +36,13 @@
 | 动作 | 实现 |
 |---|---|
 | `device.reboot` | `u30pro-native-control reboot`（PMIC 看门狗重启；PSCI 重启会让 Type-C 和基带状态错乱） |
-| `cellular.connect` / `cellular.disconnect` | `u30pro-native-control cellular_action` |
+| `cellular.connect` / `cellular.disconnect` | `u30pro.cell reconnect` / `disconnect` |
 | `band.set_lte` / `band.set_nr_sa` / `band.set_nr_nsa` | `u30pro-modem lock_apply`（SA/NSA 共用一组 NR 频段；空串 = 全部支持频段） |
 | `cell.lock_lte` / `cell.lock_nr` / `cell.unlock_all` | `lock_apply`（`cell`）/ `lock_reset` |
 | `wifi.configure` / `wifi.status` / `wifi.state` | `uci set` + `uci commit` wireless（热点那一段：ssid、encryption、key、ieee80211w、maxassoc、hidden、isolate、disabled），再 `network reload` / `uci get wireless` |
 | `client.kick` | `hostapd.wlan0 del_client`（deauth，不封禁） |
 | `sms.send_raw` / `sms.delete` | `u30pro-modem sms_send` / `sms_delete` |
-| `power.direct_supply.set` / `.status` | `u30pro-native-control set_charger_policy`（读回确认） |
+| `power.direct_supply.set` / `.status` | `u30pro-native-control charger_bypass`（与屏幕上的开关相同：只切换充电器的 `inhibit-charge`，重启后恢复充电；不改 uci 里的充电限流 `u30pro_native_control.charger`），由插件写后读回确认 / `get` |
 | `qos.reload` | 让 QoS 缓存失效 |
 
 锁频段/锁小区：固件在 120 秒内没收到确认就自动撤销（`lock_apply` 的安全网）。datad 在下发后 10 秒起每 5 秒查一次注册状态，

@@ -1,11 +1,13 @@
 //! The ZTE U30 Pro running native OpenWrt (board name `zte,u30pro`).
 //!
 //! None of the ZTE vendor objects (`zwrt_*`, `zte_nwinfo_api`, ...) exist on that system.  This backend reads and controls the
-//! device only through ubus: the device's own services (`u30pro-modem`, `u30pro-native-control`, `u30pro-cpu`,
-//! `u30pro-storage`, `u30pro-firmware`), the standard OpenWrt ones (`system`, `network`, `network.interface.*`, `network.device`,
-//! `hostapd.*`, `luci-rpc`, `session`) and the `uci` object; the Wi-Fi is the standard `/etc/config/wireless`.  It sends no AT commands and reads no vendor files or sysfs: the
-//! modem is asked through `u30pro-modem snapshot`, which shares one cached query with the device's screen.  Blocks and fields
-//! keep the shape of docs/STATE_SCHEMA.md; what this device does not report is left out rather than faked.
+//! device only through ubus: the device's daemons where they have an object of their own (`u30pro.cell`, the cellular manager),
+//! the device's rpcd plugins for the rest (`u30pro-modem`, `u30pro-native-control`, `u30pro-cpu`, `u30pro-storage`,
+//! `u30pro-firmware`), the standard OpenWrt objects (`system`, `network`, `network.interface.*`, `network.device`, `hostapd.*`,
+//! `luci-rpc`, `session`) and the `uci` object; the Wi-Fi is the standard `/etc/config/wireless`.  It sends no AT commands and
+//! reads no vendor files or sysfs: the modem is asked through `u30pro-modem snapshot`, which shares one cached query with the
+//! device's screen.  Blocks and fields keep the shape of docs/STATE_SCHEMA.md; what this device does not report is left out
+//! rather than faked.  Needs firmware p535-s90 or newer (`u30pro.cell`, `charger_bypass`).
 
 use crate::{control::Outcome, model::Snapshot, state::ubus};
 use serde_json::{Map, Value, json};
@@ -881,13 +883,9 @@ async fn call(service: &str, method: &str, args: Value) -> Outcome {
     }
 }
 
-async fn cellular(action: &str) -> Outcome {
-    call(
-        "u30pro-native-control",
-        "cellular_action",
-        json!({ "action": action }),
-    )
-    .await
+/// A method of the cellular manager u30pro-celld (`reconnect` or `disconnect`); it answers `accepted` or an `error`.
+async fn cellular(method: &str) -> Outcome {
+    call("u30pro.cell", method, json!({})).await
 }
 
 fn param_int(params: &Value, name: &str) -> Result<i64, String> {
@@ -1201,22 +1199,21 @@ async fn direct_supply_set(params: &Value) -> Outcome {
         return Outcome::Failed("this kernel offers no charge policy".into());
     }
     let before = direct_supply(&device);
+    // the screen's switch: only the charger's behaviour, not kept across a restart; the charge limits in
+    // uci (u30pro_native_control.charger) stay as they are
     let outcome = call(
         "u30pro-native-control",
-        "set_charger_policy",
-        json!({"input_limit_ma":int(&charger["user_iin_ma"]).unwrap_or(0).to_string(),
-            "charge_current_ma":int(&charger["user_ichg_ma"]).unwrap_or(0).to_string(),
-            "behaviour":if enabled { "inhibit-charge" } else { "auto" }}),
+        "charger_bypass",
+        json!({ "enabled": if enabled { "1" } else { "0" } }),
     )
     .await;
-    if let Outcome::Ok(_) = outcome {
+    if let Outcome::Ok(reply) = outcome {
         cache().lock().await.device.invalidate();
-        let after = direct_supply(&or_object(
-            ubus("u30pro-native-control", "get", json!({})).await,
-        ));
-        let mut result = after.clone();
-        result["changed"] = json!(before["enabled"] != after["enabled"]);
-        result["verified"] = json!(after["enabled"] == json!(enabled));
+        // read back by the plugin after the write
+        let now = reply["enabled"].as_bool();
+        let mut result = json!({"supported":true,"enabled":now,"mode":now.map(|on| if on { "enable" } else { "disable" })});
+        result["changed"] = json!(before["enabled"] != result["enabled"]);
+        result["verified"] = json!(now == Some(enabled));
         return Outcome::Ok(result);
     }
     outcome
