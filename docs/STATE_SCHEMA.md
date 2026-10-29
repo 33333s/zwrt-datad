@@ -386,3 +386,18 @@ included only when the charger response contains `direct_power_supply_mode`:
 `power.direct_supply.status` for a fresh capability read and
 `power.direct_supply.set` for verified changes. These fields describe firmware
 configuration and do not certify battery isolation or measured power flow.
+
+## Ambient light
+
+`ambient_light` belongs to the MU5252 template and is present only there, when
+the `lightsensor-level` sensor exists (TopFlow):
+
+```json
+{"ambient_light":{"available":true,"enabled":true,"lux":153}}
+```
+
+`enabled` is the driver's `enable` attribute. `lux` is the latest raw level from
+the sensor's input events (about ten a second while enabled), or `null` while
+the sensor is off or before its first event. The driver's own `lux` attribute
+is not refreshed by polling and is not used. Switch the sensor with
+`ambient_light.set` in [`CONTROL_API.md`](CONTROL_API.md).

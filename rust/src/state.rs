@@ -2130,6 +2130,9 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         );
         cooling["vendor_sync_error"] = json!(error);
         fields.insert("cooling".into(), cooling);
+        if let Some(light) = crate::ambient_light::state() {
+            fields.insert("ambient_light".into(), light);
+        }
     } else {
         fields.insert("modems".into(), json!([]));
     }
