@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::CString,
     fs,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -94,25 +94,108 @@ fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
 
-async fn uci_show(package: &str) -> BTreeMap<String, String> {
+/// `uci show` forks the uci binary, and the sample reads a dozen packages a
+/// second (zte_nwinfo alone takes ~30 ms for its ever-growing change file on
+/// TopFlow). A package is run again only once its config file or its pending
+/// changes file has changed.
+type UciStamp = [Option<(i64, i64, u64, u64)>; 2];
+type UciValues = BTreeMap<String, String>;
+static UCI_CACHE: OnceLock<Mutex<BTreeMap<String, (UciStamp, UciValues)>>> = OnceLock::new();
+
+/// None when the package cannot be cached: a test uci binary, or no file
+/// under /etc/config to watch.
+fn uci_stamp(package: &str) -> Option<UciStamp> {
+    if std::env::var_os("ZWRT_DATAD_UCI_BIN").is_some() {
+        return None;
+    }
+    let stamp = |path: String| {
+        fs::metadata(path)
+            .ok()
+            .map(|m| (m.mtime(), m.mtime_nsec(), m.size(), m.ino()))
+    };
+    let config = stamp(format!("/etc/config/{package}"))?;
+    Some([Some(config), stamp(format!("/tmp/.uci/{package}"))])
+}
+
+/// Option values as `uci show` prints them, still quoted.
+async fn uci_show_raw(package: &str) -> BTreeMap<String, String> {
     if validate_name(package).is_err() {
         return BTreeMap::new();
+    }
+    let stamp = uci_stamp(package);
+    let cache = UCI_CACHE.get_or_init(Default::default);
+    if let Some(stamp) = stamp
+        && let Some((cached, values)) = cache.lock().unwrap().get(package)
+        && *cached == stamp
+    {
+        return values.clone();
     }
     let Ok(raw) = command::run(&uci_bin(), ["-q", "show", package], Duration::from_secs(5)).await
     else {
         return BTreeMap::new();
     };
-    String::from_utf8_lossy(&raw)
+    let values: BTreeMap<String, String> = String::from_utf8_lossy(&raw)
         .lines()
         .filter_map(|line| {
-            let (k, raw) = line.split_once('=')?;
+            let (k, v) = line.split_once('=')?;
+            Some((k.into(), v.into()))
+        })
+        .collect();
+    if let Some(stamp) = stamp {
+        cache
+            .lock()
+            .unwrap()
+            .insert(package.to_owned(), (stamp, values.clone()));
+    }
+    values
+}
+async fn uci_show(package: &str) -> BTreeMap<String, String> {
+    uci_show_raw(package)
+        .await
+        .into_iter()
+        .map(|(k, raw)| {
             let v = raw
                 .strip_prefix('\'')
                 .and_then(|x| x.strip_suffix('\''))
+                .map(str::to_owned)
                 .unwrap_or(raw);
-            Some((k.into(), v.into()))
+            (k, v)
         })
         .collect()
+}
+/// A `uci show` value as `uci get` prints it: quotes removed, `'\''` back to
+/// a quote, list items joined by spaces.
+fn uci_unquote(raw: &str) -> String {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => quoted = !quoted,
+            '\\' if !quoted && chars.peek() == Some(&'\'') => {
+                out.push('\'');
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+/// `uci get` for the periodic sample, answered from the cached `uci show` of
+/// the package; anything but a plain `package.section[.option]` path still
+/// asks uci.
+async fn uci_sample(path: &str) -> String {
+    let Some((package, _)) = path.split_once('.') else {
+        return uci_read(path).await;
+    };
+    if path.contains(['@', '[']) || uci_stamp(package).is_none() {
+        return uci_read(path).await;
+    }
+    uci_show_raw(package)
+        .await
+        .get(path)
+        .map(|raw| uci_unquote(raw).trim().to_owned())
+        .unwrap_or_default()
 }
 pub async fn uci_read(path: &str) -> String {
     if path.is_empty()
@@ -489,30 +572,50 @@ fn tcp_aggregation_summary() -> (usize, String, u16, bool) {
         .unwrap_or_default();
     (outgoing.len(), ip, port, true)
 }
-fn proc_find_command(command: &str) -> Option<u32> {
-    let root = std::env::var("ZWRT_DATAD_PROC_ROOT").unwrap_or_else(|_| "/proc".into());
-    fs::read_dir(root)
+/// Walking /proc reads every process's comm or cmdline, 15-30 ms on TopFlow,
+/// and the sample asks three times a second. A hit is remembered by pid and
+/// confirmed with one read; a miss is trusted for PROC_MISS_TTL.
+const PROC_MISS_TTL: Duration = Duration::from_secs(10);
+type ProcHit = (Option<u32>, Instant);
+static PROC_CACHE: OnceLock<Mutex<BTreeMap<String, ProcHit>>> = OnceLock::new();
+
+fn proc_root() -> String {
+    std::env::var("ZWRT_DATAD_PROC_ROOT").unwrap_or_else(|_| "/proc".into())
+}
+fn proc_lookup(root: &str, key: String, matches: impl Fn(&Path) -> bool) -> Option<u32> {
+    let cache = PROC_CACHE.get_or_init(Default::default);
+    let cache_key = format!("{root}\0{key}");
+    if let Some((pid, at)) = cache.lock().unwrap().get(&cache_key).copied() {
+        match pid {
+            Some(pid) if matches(&Path::new(root).join(pid.to_string())) => return Some(pid),
+            None if at.elapsed() < PROC_MISS_TTL => return None,
+            _ => {}
+        }
+    }
+    let found = fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
         .find_map(|entry| {
             let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
-            let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
-            (comm.trim() == command).then_some(pid)
-        })
+            matches(&entry.path()).then_some(pid)
+        });
+    cache
+        .lock()
+        .unwrap()
+        .insert(cache_key, (found, Instant::now()));
+    found
+}
+fn proc_find_command(command: &str) -> Option<u32> {
+    proc_lookup(&proc_root(), format!("comm {command}"), |dir| {
+        fs::read_to_string(dir.join("comm")).is_ok_and(|comm| comm.trim() == command)
+    })
 }
 fn proc_cmdline_contains(needle: &str) -> bool {
-    let root = std::env::var("ZWRT_DATAD_PROC_ROOT").unwrap_or_else(|_| "/proc".into());
-    fs::read_dir(root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry.file_name().to_string_lossy().parse::<u32>().is_ok()
-                && fs::read(entry.path().join("cmdline"))
-                    .ok()
-                    .is_some_and(|raw| String::from_utf8_lossy(&raw).contains(needle))
-        })
+    proc_lookup(&proc_root(), format!("cmdline {needle}"), |dir| {
+        fs::read(dir.join("cmdline"))
+            .is_ok_and(|raw| String::from_utf8_lossy(&raw).contains(needle))
+    })
+    .is_some()
 }
 async fn ipv4_interfaces() -> BTreeMap<String, String> {
     let ip_bin = std::env::var("ZWRT_DATAD_IP_BIN").unwrap_or_else(|_| "/sbin/ip".into());
@@ -986,7 +1089,25 @@ fn read_i64(path: impl AsRef<Path>) -> i64 {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or_default()
 }
-fn thermal_zones() -> (i64, Value, Value) {
+/// Several zones are PMIC ADC channels (~0.3 ms of CPU each) and a sweep of
+/// TopFlow's forty zones costs ~10 ms, while temperatures move slowly, so a
+/// sweep is reused for THERMAL_TTL. Fan control reads its own zone directly.
+const THERMAL_TTL: Duration = Duration::from_secs(5);
+type ThermalSweep = (i64, Value, Value);
+static THERMAL_CACHE: OnceLock<Mutex<Option<(Instant, ThermalSweep)>>> = OnceLock::new();
+
+fn thermal_zones() -> ThermalSweep {
+    let cache = THERMAL_CACHE.get_or_init(Default::default);
+    if let Some((at, sweep)) = &*cache.lock().unwrap()
+        && at.elapsed() < THERMAL_TTL
+    {
+        return sweep.clone();
+    }
+    let sweep = thermal_sweep();
+    *cache.lock().unwrap() = Some((Instant::now(), sweep.clone()));
+    sweep
+}
+fn thermal_sweep() -> ThermalSweep {
     let mut zones = Vec::new();
     let mut runtime_zones = Vec::new();
     let mut cpuss = Vec::new();
@@ -1133,13 +1254,15 @@ fn count_lines(path: &str, header: bool) -> u64 {
     count.saturating_sub(u64::from(header && count > 0))
 }
 
-fn tcp_active() -> u64 {
-    fs::read_to_string("/proc/net/tcp")
-        .unwrap_or_default()
-        .lines()
-        .skip(1)
+/// IPv4 TCP sockets in all states and how many are established.
+fn tcp4_counts() -> (u64, u64) {
+    let text = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+    let rows = text.lines().skip(1);
+    let active = rows
+        .clone()
         .filter(|line| line.split_whitespace().nth(3) == Some("01"))
-        .count() as u64
+        .count();
+    (rows.count() as u64, active as u64)
 }
 
 fn meminfo() -> Value {
@@ -1360,8 +1483,7 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
         }
         freqs.insert(core.clone(), json!({"cur":cur/1000,"max":max/1000}));
     }
-    let active = tcp_active();
-    let tcp4 = count_lines("/proc/net/tcp", true);
+    let (tcp4, active) = tcp4_counts();
     let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)});
     let now = now_ms();
     (
@@ -1941,7 +2063,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         let mut thermal_modems = vec![
             json!({"id":"5G","available":cpu_temp>0,"celsius":if cpu_temp>0 {json!(cpu_temp)} else {Value::Null}}),
         ];
-        let adb = std::env::var("ZWRT_DATAD_ADB_BIN").ok();
+        let adb = crate::external_modem::adb();
         // The vendor UI calls the external modems 4G1 (V3E2) and 4G2 (V3E1).
         for index in [1usize, 0] {
             let id = if index == 0 { "4G2" } else { "4G1" };
@@ -1977,49 +2099,9 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             let ipv4 = object(ubus(&format!("network.interface.{wan}"), "status", json!({})).await);
             let ipv6 =
                 object(ubus(&format!("network.interface.{wan}_6"), "status", json!({})).await);
-            let mut ext_qos = crate::qos::Values::default();
-            let mut sampled_at = 0i64;
-            let mut external_temp = None;
-            if let Some(adb) = &adb {
-                if let Ok(raw) = command::run(
-                    adb,
-                    [
-                        "-s",
-                        serial,
-                        "shell",
-                        "grep QCI= /logfs/key.log | tail -n 64",
-                    ],
-                    Duration::from_secs(5),
-                )
-                .await
-                    && let Some(parsed) = crate::qos::parse_external(&String::from_utf8_lossy(&raw))
-                {
-                    ext_qos = parsed;
-                    sampled_at = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                }
-                if let Ok(raw) = command::run(
-                    adb,
-                    [
-                        "-s",
-                        serial,
-                        "shell",
-                        "cat",
-                        "/sys/devices/virtual/power/zte_power/adc2_temp",
-                    ],
-                    Duration::from_secs(5),
-                )
-                .await
-                {
-                    external_temp = String::from_utf8_lossy(&raw)
-                        .trim()
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|v| (-40..=125).contains(v));
-                }
-            }
+            // Sampled in the background every 30 s; see external_modem.rs.
+            let sample = crate::external_modem::latest(serial).unwrap_or_default();
+            let (ext_qos, sampled_at, external_temp) = (sample.qos, sample.sampled_at, sample.temp);
             thermal_modems.push(json!({"id":id,"available":external_temp.is_some(),"celsius":external_temp,"sampled_at":if external_temp.is_some(){sampled_at}else{0}}));
             modems.push(json!({
                 "id":id,"role":"external_4g","transport":"cdc-ecm","subid":subid,"ifname":ifname,"wan_interface":wan,
@@ -2037,13 +2119,13 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             thermal["modems"] = Value::Array(thermal_modems);
         }
         fields.insert("modems".into(), Value::Array(modems));
-        let mode = uci_read("zwrt_router.network.opms_wan_mode").await;
+        let mode = uci_sample("zwrt_router.network.opms_wan_mode").await;
         let mwan_running = mwan3_running();
         let custom_icg_pid = proc_find_command("icg-client");
         let (tcp_tunnel_count, runtime_ip, runtime_port, icg_running) = tcp_aggregation_summary();
-        let provisioned = !uci_read("zwrt_router.icgmwan.IcgDevId").await.is_empty();
-        let remaining = uci_read("zwrt_router.icgmwan.residual_flow").await;
-        let today_used = uci_read("zwrt_router.icgmwan.count_flow_today").await;
+        let provisioned = !uci_sample("zwrt_router.icgmwan.IcgDevId").await.is_empty();
+        let remaining = uci_sample("zwrt_router.icgmwan.residual_flow").await;
+        let today_used = uci_sample("zwrt_router.icgmwan.count_flow_today").await;
         let config_path = std::env::var("ZWRT_DATAD_ICG_CONFIG")
             .unwrap_or_else(|_| "/etc/config/icg.conf".into());
         let icg_config: BTreeMap<String, String> = fs::read_to_string(config_path)
@@ -2107,12 +2189,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             json!({"mode":mode,"active":mode=="MULTIWAN","service_running":mwan_running}),
         );
         let revision = crate::cooling::control_revision();
-        let fan_enabled = uci_read("zwrt_deviceui.Device.fan_switch_status")
+        let fan_enabled = uci_sample("zwrt_deviceui.Device.fan_switch_status")
             .await
             .parse::<i64>()
             .ok()
             .filter(|v| matches!(v, 0 | 1));
-        let liquid_enabled = uci_read("zwrt_deviceui.Device.liquid_cooling_switch_status")
+        let liquid_enabled = uci_sample("zwrt_deviceui.Device.liquid_cooling_switch_status")
             .await
             .parse::<i64>()
             .ok()
@@ -2231,6 +2313,37 @@ fn validate_name(v: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn uci_show_values_read_back_like_uci_get() {
+        assert_eq!(uci_unquote("'SMULTIWAN'"), "SMULTIWAN");
+        assert_eq!(uci_unquote("interface"), "interface");
+        assert_eq!(uci_unquote("'1' '3' '28'"), "1 3 28");
+        assert_eq!(uci_unquote("'it'\\''s'"), "it's");
+        assert_eq!(uci_unquote("''"), "");
+    }
+    #[test]
+    fn process_lookup_rechecks_a_hit_and_trusts_a_miss() {
+        let root = std::env::temp_dir().join(format!("datad-proc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("41")).unwrap();
+        fs::write(root.join("41/comm"), "icg-client\n").unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let lookup = |name: &str| {
+            proc_lookup(&root_str, format!("comm {name}"), |dir| {
+                fs::read_to_string(dir.join("comm")).is_ok_and(|comm| comm.trim() == name)
+            })
+        };
+        assert_eq!(lookup("icg-client"), Some(41));
+        assert_eq!(lookup("mwan3track"), None);
+        // A process that starts after a miss waits out the miss TTL...
+        fs::create_dir_all(root.join("42")).unwrap();
+        fs::write(root.join("42/comm"), "mwan3track\n").unwrap();
+        assert_eq!(lookup("mwan3track"), None);
+        // ...but one that exits is noticed at once.
+        fs::remove_dir_all(root.join("41")).unwrap();
+        assert_eq!(lookup("icg-client"), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn sleep_state_only_reports_original_ufi_choices() {
         for (raw, expected) in [

@@ -13,6 +13,7 @@ mod control;
 mod cooling;
 mod device_session;
 mod elapsed;
+mod external_modem;
 mod extra_wifi;
 mod files;
 mod hosts;

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.80",
+    "version": "0.10.81",
     "asset": "zwrt-datad-aarch64",
-    "notes": "TopFlow（MU5252 模板）新增环境光传感器接口：/state.ambient_light 给出传感器开关和读数，ambient_light.set 开关传感器，供屏幕自动亮度使用；其他机型不提供。"
+    "notes": "TopFlow 两个外挂 4G 的温度和 QCI/AMBR 改为后台每 30 秒通过 ADB 采样一次并缓存，默认启用（使用固件自带的 adb），不再拖慢状态刷新；此前这两项在正式安装里读不到。状态采集占用约减半：uci 配置只在文件变化时重读，进程检测和温度传感器改为缓存，TopFlow 上 datad 连同子进程从约 13% 单核降到约 6%。"
   }
 }
