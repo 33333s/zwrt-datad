@@ -189,6 +189,7 @@ pub struct Cloud {
     status: Arc<Mutex<Status>>,
     tx: watch::Sender<Option<Config>>,
     nodes: crate::cloud_nodes::RemoteNodes,
+    route: crate::cloud_route::MqttRoute,
 }
 
 impl Cloud {
@@ -249,6 +250,7 @@ impl Cloud {
             status: Arc::new(Mutex::new(status)),
             tx,
             nodes: crate::cloud_nodes::RemoteNodes::load(data_dir),
+            route: crate::cloud_route::MqttRoute::load(data_dir),
         };
         cloud.apply_cloud_feature_defaults(data_dir);
         cloud
@@ -284,7 +286,10 @@ impl Cloud {
         let config = self.tx.subscribe();
         let status = self.status.clone();
         let nodes = self.nodes.clone();
-        tokio::spawn(async move { supervisor(config, state, status, Some(app), nodes).await });
+        let route = self.route.clone();
+        tokio::spawn(
+            async move { supervisor(config, state, status, Some(app), nodes, route).await },
+        );
     }
 
     pub fn public_config(&self) -> Value {
@@ -292,7 +297,8 @@ impl Cloud {
         let configured = !config.password.is_empty();
         config.password.clear();
         json!({"config":config,"password_configured":configured,
-            "remote_nodes":self.nodes.public_view(&self.config)})
+            "remote_nodes":self.nodes.public_view(&self.config),
+            "mqtt_route":self.route.report(&self.config)})
     }
 
     /// Only fields needed by the authorized NMS-hosted UFI settings panel.
@@ -561,6 +567,7 @@ async fn supervisor(
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
     nodes: crate::cloud_nodes::RemoteNodes,
+    route: crate::cloud_route::MqttRoute,
 ) {
     let mut started = false;
     loop {
@@ -585,21 +592,54 @@ async fn supervisor(
                 _ = config_rx.changed() => continue,
             }
         }
+        // A member route tries its endpoint first and falls back to the
+        // configured broker after repeated failures; on the fallback it goes
+        // back to the member endpoint now and then.
+        let mut on_fallback = false;
+        let mut primary_failures = 0;
         loop {
             set_status(&status, "connecting", "");
+            let endpoints = route.endpoints(&config);
+            let fallback = endpoints.fallback.as_ref().filter(|_| on_fallback);
+            route.set_on_fallback(fallback.is_some());
+            let broker = fallback.unwrap_or(&endpoints.primary).clone();
+            let started_at = tokio::time::Instant::now();
             match session(
                 &config,
+                &broker,
+                fallback.is_some().then_some(FALLBACK_RETRY_PRIMARY),
                 state_rx.clone(),
                 config_rx.clone(),
                 status.clone(),
                 app.clone(),
                 nodes.clone(),
+                route.clone(),
             )
             .await
             {
                 SessionEnd::Reconfigure => break,
                 SessionEnd::Stopped => return,
+                SessionEnd::RetryPrimary => {
+                    on_fallback = false;
+                    primary_failures = 0;
+                }
                 SessionEnd::Failed => {
+                    if fallback.is_some() {
+                        on_fallback = false;
+                    } else if endpoints.fallback.is_some() {
+                        // A session that stayed up a while starts the count again.
+                        primary_failures = if started_at.elapsed() >= Duration::from_secs(60) {
+                            1
+                        } else {
+                            primary_failures + 1
+                        };
+                        if primary_failures >= PRIMARY_FAILURES_BEFORE_FALLBACK {
+                            on_fallback = true;
+                            primary_failures = 0;
+                            delay = Duration::from_secs(1);
+                            continue;
+                        }
+                    }
                     crate::update_status::runtime("reconnecting");
                     set_status(
                         &status,
@@ -624,7 +664,14 @@ enum SessionEnd {
     Reconfigure,
     Stopped,
     Failed,
+    /// The fallback session ran long enough; try the member endpoint again.
+    RetryPrimary,
 }
+
+/// Consecutive member-endpoint failures before the fallback is used.
+const PRIMARY_FAILURES_BEFORE_FALLBACK: u32 = 2;
+/// How long a session stays on the fallback before the member endpoint is retried.
+const FALLBACK_RETRY_PRIMARY: Duration = Duration::from_secs(30 * 60);
 
 /// Presence heartbeat period. NMS treats a device as offline after 60 s of
 /// silence, so 20 s keeps a threefold margin while cutting database writes.
@@ -727,19 +774,27 @@ fn mqtt_options(config: &Config, client_id: &str) -> Result<MqttOptions, String>
     Ok(options)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     config: &Config,
+    broker: &str,
+    retry_primary_after: Option<Duration>,
     mut state_rx: watch::Receiver<Snapshot>,
     mut config_rx: watch::Receiver<Option<Config>>,
     status: Arc<Mutex<Status>>,
     app: Option<crate::server::App>,
     nodes: crate::cloud_nodes::RemoteNodes,
+    route: crate::cloud_route::MqttRoute,
 ) -> SessionEnd {
     let pending = pending_username(&config.username);
     let enrollment_root = format!("onboard/{}", config.username);
     let id_hash = Sha256::digest(root(config).as_bytes());
     let client_id = format!("datad-{}", hex(&id_hash[..12]));
-    let Ok(mut options) = mqtt_options(config, &client_id) else {
+    let connect = Config {
+        broker: broker.to_owned(),
+        ..config.clone()
+    };
+    let Ok(mut options) = mqtt_options(&connect, &client_id) else {
         return SessionEnd::Failed;
     };
     options.set_credentials(config.username.clone(), config.password.clone());
@@ -782,8 +837,27 @@ async fn session(
     // independently of the user-selected telemetry reporting interval.
     let mut heartbeat = heartbeat_interval();
     let mut cache = ReportCache::default();
+    let retry_primary = async {
+        match retry_primary_after {
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(retry_primary);
     loop {
         tokio::select! {
+            _ = &mut retry_primary => {
+                bridge.shutdown(); updates.detach_all();
+                if connected && enrolled {
+                    let _ = publish_and_flush(
+                        &client,
+                        &mut eventloop,
+                        format!("{}/status", root(config)),
+                        json!({"online":false}),
+                    ).await;
+                }
+                return SessionEnd::RetryPrimary;
+            }
             changed = config_rx.changed() => {
                 bridge.shutdown(); updates.detach_all();
                 if connected && enrolled {
@@ -823,7 +897,7 @@ async fn session(
                         && let Some(result) = app.cloud_update_result().await {
                             let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                     }
-                    if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, true).await.is_err() {
+                    if report(&client, config, &nodes, &route, &snapshot, &status, webshell_available, app.is_some(), &mut cache, true).await.is_err() {
                         bridge.shutdown(); updates.detach_all();
                         return SessionEnd::Failed;
                     }
@@ -846,7 +920,7 @@ async fn session(
                             set_status(&status,"connected","");
                             crate::update_status::runtime("connected");
                             let snapshot=state_rx.borrow().clone();
-                            if report(&client,config,&nodes,&snapshot,&status,webshell_available,app.is_some(),&mut cache,true).await.is_err() {
+                            if report(&client,config,&nodes,&route,&snapshot,&status,webshell_available,app.is_some(),&mut cache,true).await.is_err() {
                                 bridge.shutdown();updates.detach_all();return SessionEnd::Failed;
                             }
                         } else {
@@ -880,10 +954,29 @@ async fn session(
                         if applied {
                             // Report the new list now instead of at the next tick.
                             let snapshot = state_rx.borrow().clone();
-                            if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
+                            if report(&client, config, &nodes, &route, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
                                 bridge.shutdown(); updates.detach_all();
                                 return SessionEnd::Failed;
                             }
+                        }
+                        continue;
+                    }
+                    if let Ok(set) = serde_json::from_slice::<crate::cloud_route::SetCommand>(&message.payload)
+                        && set.is_route_set()
+                    {
+                        let before = route.endpoints(config);
+                        let result = route.apply(config, &set);
+                        let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
+                        if route.endpoints(config) != before {
+                            // Reconnect so the new endpoints apply.
+                            bridge.shutdown(); updates.detach_all();
+                            let _ = publish_and_flush(
+                                &client,
+                                &mut eventloop,
+                                format!("{}/status", root(config)),
+                                json!({"online":false}),
+                            ).await;
+                            return SessionEnd::Reconfigure;
                         }
                         continue;
                     }
@@ -909,7 +1002,7 @@ async fn session(
                         let _ = publish(&client, format!("{}/command/result", root(config)), result).await;
                 }
                 let snapshot = state_rx.borrow_and_update().clone();
-                if report(&client, config, &nodes, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
+                if report(&client, config, &nodes, &route, &snapshot, &status, webshell_available, app.is_some(), &mut cache, false).await.is_err() {
                     bridge.shutdown(); updates.detach_all();
                     return SessionEnd::Failed;
                 }
@@ -971,6 +1064,7 @@ async fn report(
     client: &AsyncClient,
     config: &Config,
     nodes: &crate::cloud_nodes::RemoteNodes,
+    route: &crate::cloud_route::MqttRoute,
     snapshot: &Snapshot,
     status: &Arc<Mutex<Status>>,
     webshell_available: bool,
@@ -985,6 +1079,7 @@ async fn report(
         "datad.remote_origins",
         "datad.remote_close",
         "datad.remote_nodes",
+        "datad.mqtt_route",
         "datad.nat",
     ];
     // The direct data path: web UI proxy now; files stay on the relay.
@@ -1013,6 +1108,7 @@ async fn report(
         "remote_origins":reported_remote_origins(config),
         "remote_node_origins":nodes.origins(config),
         "remote_nodes_revision":nodes.revision(),
+        "mqtt_route":route.report(config),
         "remote_panel_control_enabled":config.remote_enabled && config.remote_panel_control_enabled && panel_available,
         "remote_webshell_enabled":config.remote_enabled && config.remote_webshell_enabled && webshell_available
     });
@@ -2401,6 +2497,7 @@ mod tests {
             status,
             None,
             Default::default(),
+            Default::default(),
         ));
         let topic = tokio::time::timeout(Duration::from_secs(10), reports_rx.recv())
             .await
@@ -2522,6 +2619,7 @@ mod tests {
             Arc::new(Mutex::new(Status::default())),
             None,
             nodes.clone(),
+            Default::default(),
         ));
         let mut results = Vec::new();
         let mut devices = Vec::new();
@@ -2572,6 +2670,149 @@ mod tests {
         assert_eq!(results[2]["request_id"], "open-1");
         assert_eq!(results[2]["error"]["code"], "invalid_remote_url");
         assert_eq!(nodes.revision(), 3);
+        task.abort();
+        broker.abort();
+    }
+
+    /// `mqtt.route.set` over the real MQTT session: an assigned member endpoint
+    /// is tried first, and after it fails twice the configured broker carries
+    /// the session and the device reports that it runs on the fallback.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite callback requires its HTTP error response type.
+    async fn a_member_route_falls_back_to_the_configured_broker() {
+        let (acceptor, ca_pem) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = Config {
+            enabled: true,
+            broker: format!("wss://{address}/mqtt"),
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+            ca_pem,
+            model: "MU5250".into(),
+            identity: "route-fixture".into(),
+            ..Default::default()
+        };
+        let request_topic = format!("{}/command/request", root(&config));
+        let (seen_tx, mut seen_rx) = mpsc::channel::<(usize, String, Value)>(64);
+        let broker = tokio::spawn(async move {
+            let mut sent = false;
+            for connection in 0.. {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let stream = acceptor.accept(tcp).await.unwrap();
+                let mut ws = accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static("mqtt"));
+                    Ok(response)
+                }).await.unwrap();
+                let mut pending = Vec::new();
+                while let Some(Ok(message)) = ws.next().await {
+                    if let Message::Binary(data) = message {
+                        pending.extend_from_slice(&data);
+                    }
+                    while let Some((header, payload)) = take_mqtt_packet(&mut pending) {
+                        match header >> 4 {
+                            1 => ws
+                                .send(Message::Binary(vec![0x20, 2, 0, 0].into()))
+                                .await
+                                .unwrap(),
+                            8 => ws
+                                .send(Message::Binary(
+                                    vec![0x90, 3, payload[0], payload[1], 1].into(),
+                                ))
+                                .await
+                                .unwrap(),
+                            3 => {
+                                let topic_len =
+                                    usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+                                let topic = String::from_utf8_lossy(&payload[2..2 + topic_len])
+                                    .into_owned();
+                                let mut offset = 2 + topic_len;
+                                if (header >> 1) & 3 == 1 {
+                                    ws.send(Message::Binary(
+                                        vec![0x40, 2, payload[offset], payload[offset + 1]].into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                    offset += 2;
+                                }
+                                let value: Value = serde_json::from_slice(&payload[offset..])
+                                    .unwrap_or(Value::Null);
+                                let assign = topic.ends_with("/telemetry/device") && !sent;
+                                seen_tx.send((connection, topic, value)).await.unwrap();
+                                if assign {
+                                    sent = true;
+                                    let command = json!({"protocol_version":1,"request_id":"route-1","action":"mqtt.route.set",
+                                        "route":"member","broker":"wss://member.invalid/mqtt","revision":1});
+                                    ws.send(Message::Binary(
+                                        mqtt_publish(&request_topic, &command).into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                }
+                            }
+                            12 => ws
+                                .send(Message::Binary(vec![0xd0, 0].into()))
+                                .await
+                                .unwrap(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+        let (_config_tx, config_rx) = watch::channel(Some(config));
+        let (_state_tx, state_rx) = watch::channel(Snapshot {
+            ts: now(),
+            datad: Default::default(),
+            fields: serde_json::Map::new(),
+        });
+        let route = crate::cloud_route::MqttRoute::default();
+        let task = tokio::spawn(supervisor(
+            config_rx,
+            state_rx,
+            Arc::new(Mutex::new(Status::default())),
+            None,
+            Default::default(),
+            route.clone(),
+        ));
+        let mut first = None;
+        let mut result = None;
+        let mut fallback = None;
+        while fallback.is_none() {
+            let (connection, topic, value) =
+                tokio::time::timeout(Duration::from_secs(30), seen_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if topic.ends_with("/telemetry/device") && connection == 0 && first.is_none() {
+                first = Some(value);
+            } else if topic.ends_with("/command/result") {
+                result = Some(value);
+            } else if topic.ends_with("/telemetry/device") && connection > 0 {
+                fallback = Some(value);
+            }
+        }
+        let first = first.unwrap();
+        assert!(
+            first["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("datad.mqtt_route"))
+        );
+        assert_eq!(
+            first["mqtt_route"],
+            json!({"route":"free","revision":0,"via":"primary"})
+        );
+        let result = result.unwrap();
+        assert_eq!(
+            (result["applied"].clone(), result["route"].clone()),
+            (json!(true), json!("member"))
+        );
+        // The member endpoint never answered: the configured broker carries the session.
+        assert_eq!(
+            fallback.unwrap()["mqtt_route"],
+            json!({"route":"member","revision":1,"via":"fallback"})
+        );
         task.abort();
         broker.abort();
     }
@@ -2809,6 +3050,7 @@ mod tests {
             status,
             None,
             Default::default(),
+            Default::default(),
         ));
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut connections = HashSet::new();
@@ -2866,10 +3108,13 @@ mod tests {
                 Duration::from_secs(5),
                 session(
                     &config,
+                    &config.broker,
+                    None,
                     state_rx,
                     config_rx,
                     Arc::new(Mutex::new(Status::default())),
                     None,
+                    Default::default(),
                     Default::default(),
                 ),
             )
@@ -3552,6 +3797,7 @@ mod tests {
             status.clone(),
             None,
             Default::default(),
+            Default::default(),
         ));
         tokio::task::yield_now().await;
         config_tx
@@ -3656,10 +3902,13 @@ mod tests {
             async move {
                 session(
                     &config,
+                    &config.broker,
+                    None,
                     state_rx,
                     config_rx,
                     status,
                     None,
+                    Default::default(),
                     Default::default(),
                 )
                 .await
