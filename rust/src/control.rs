@@ -91,6 +91,7 @@ pub const ACTIONS: &[&str] = &[
     "cooling.fan.set_curve",
     "cooling.liquid.set_enabled",
     "cooling.liquid.set_mode",
+    "ambient_light.set",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -534,6 +535,16 @@ async fn execute_inner(action: &str, params: &Value) -> Outcome {
             Ok(value) => Outcome::Ok(value),
             Err((true, error)) => Outcome::Invalid(error),
             Err((false, error)) => Outcome::Failed(error),
+        },
+        "ambient_light.set" if !crate::apn_targets::multi_modem() => {
+            Outcome::Invalid("ambient_light.set is only available on MU5252".into())
+        }
+        "ambient_light.set" => match boolean(params, "enabled") {
+            Ok(enabled) => match crate::ambient_light::set(enabled).await {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Failed(error),
+            },
+            Err(error) => Outcome::Invalid(error),
         },
         _ => Outcome::NotHandled,
     }

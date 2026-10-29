@@ -501,6 +501,20 @@ State is refreshed after uncertain writes as the hardware may have changed.
 No extra datad startup policy rewrites the mode; reboot persistence is whatever
 the device firmware provides. Both actions use the existing token authentication.
 
+## Ambient light sensor
+
+| action | params | Result |
+|---|---|---|
+| `ambient_light.set` | `enabled`: boolean or 0/1 | `available`, `enabled`, `lux` |
+
+MU5252 template only (TopFlow, see [`models/MU5252.md`](models/MU5252.md)); other
+templates get HTTP 400, and a MU5252 without the `lightsensor-level` input
+device fails with HTTP 502. Enabling writes the driver's `enable`
+attribute and starts a reader for the sensor's input events; disabling stops it.
+The sensor is not enabled at datad startup, so a client turns it on only while it
+needs readings (devui: screen on with auto brightness) and turns it off again.
+`lux` is the raw driver level and is `null` until the first event arrives.
+
 
 ### App forwarding settings
 

@@ -2831,7 +2831,7 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2 + 5);
+        assert_eq!(controls.len(), 88 + 6 + 2 + 2 + 2 + 5 + 1);
         for action in [
             "time.status",
             "time.config.set",
@@ -2850,12 +2850,13 @@ mod tests {
             "wifi.radio.set",
             "wifi.bandwidth.set",
             "wifi.guest.set",
+            "ambient_light.set",
         ] {
             assert!(controls.contains(&action));
         }
         assert_eq!(
             controls.iter().copied().collect::<HashSet<_>>().len(),
-            88 + 6 + 2 + 2 + 2 + 5
+            88 + 6 + 2 + 2 + 2 + 5 + 1
         );
     }
 
