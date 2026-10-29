@@ -74,7 +74,7 @@ OTA 更新来源（`ota.sources`）按列表顺序依次尝试：默认是 `cust
 
 平台另外可以通过 MQTT `remote.nodes.set` 下发最多 8 个中转节点（0.10.70，见 NMS.md），与 `remote_origins` 分开保存在 `remote-nodes.json`，只能由平台写入。`GET /cloud/config` 的 `remote_nodes` 只读显示 `enabled`、`revision`、`nodes` 和当前生效的 `active`；`POST /cloud/config` 可带 `platform_nodes_enabled: false` 关闭全部平台节点（主平台和本地 `remote_origins` 不受影响），带 `true` 重新启用。
 
-NMS 双线路部署可让 MQTT 继续使用稳定的免费控制入口，仅将设备 WebUI/WebShell 数据通道切换至已授权中转。两个远程地址都在设备白名单中时，会员过期后可以回到免费入口，无需重新修改设备配置。会员资格和限速由 NMS 执行，设备备用地址本身不是付费凭据。
+平台还可以通过 MQTT `mqtt.route.set` 让 MQTT 优先连接会员入口、失败时回退到 `broker`（0.10.82，见 NMS.md），保存在 `mqtt-route.json`，`GET /cloud/config` 的 `mqtt_route` 只读显示当前线路。设备 WebUI/WebShell 数据通道可切换至已授权中转。两个远程地址都在设备白名单中时，会员过期后可以回到免费入口，无需重新修改设备配置。会员资格和限速由 NMS 执行，设备备用地址本身不是付费凭据。
 
 ## 按需远程面板状态通道
 

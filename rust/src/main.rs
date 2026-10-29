@@ -6,6 +6,7 @@ mod cloud;
 mod cloud_files;
 mod cloud_nodes;
 mod cloud_panel;
+mod cloud_route;
 mod cloud_shell;
 mod cloud_update;
 mod command;

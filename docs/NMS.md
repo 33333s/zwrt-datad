@@ -36,6 +36,38 @@
 
 设备立即断开该会话的 WebSocket 通道，不等 TTL；其他会话不受影响，重复关闭无副作用，没有应答。收到尚未见过的 `target_session_id` 时只记录该编号，之后重发的 `remote.open` 会被当作已处理而忽略，不会重新打开已结束的会话。字段格式不对或协议版本不是 1 的关闭请求被丢弃。
 
+## `mqtt.route.set`：平台指定的 MQTT 线路（0.10.82）
+
+遥测声明 `datad.mqtt_route` 后，NMS 可以通过 `command/request` 指定设备的 MQTT 线路，设备在 `command/result` 应答：
+
+```json
+{"protocol_version":1,"request_id":"route-1","action":"mqtt.route.set","route":"member","broker":"wss://a.ericsfj.com:16001/mqtt","revision":1793000000000}
+{"protocol_version":1,"request_id":"route-2","action":"mqtt.route.set","route":"free","revision":1793000600000}
+```
+
+- `route` 为 `member` 时必须带 `broker`：`wss` 地址，主机是域名（不接受 IP、`localhost`），不带用户信息、查询串、片段。`free` 不能带 `broker`。
+- `member`：会员地址作为首选 MQTT 入口，`cloud.json` 的 `broker` 作为回退（两者相同时没有回退）。会员地址连续两次连接失败（会话运行超过 60 秒后断开不计入）就改连回退地址；在回退地址上运行 30 分钟后先发 offline 再重新尝试会员地址。
+- `free`：只用 `cloud.json` 的 `broker`，不再尝试会员地址。
+- `revision` 必须大于当前值才生效，相同或更小的被确认但忽略（`applied:false`）。线路、会员地址和 revision 保存在数据目录的 `mqtt-route.json`，重启后仍有效；`cloud.json` 不变。生效的入口变化时设备立即重连。
+- 线路记下下发它的平台（`platform_url` 的 origin）。设备改接其他平台后旧线路不再使用，新平台从 revision 0 重新下发。只有 MQTT 命令通道能写这份配置。
+
+应答：
+
+```json
+{"request_id":"route-1","action":"mqtt.route.set","status":"ok","ok":true,"applied":true,"route":"member","revision":1793000000000,"via":"primary","protocol_version":1,"timestamp":1793000000}
+{"request_id":"route-3","action":"mqtt.route.set","status":"rejected","ok":false,"error":{"code":"invalid_broker"},"route":"member","revision":1793000000000,"via":"primary","protocol_version":1,"timestamp":1793000001}
+```
+
+`route`、`revision`、`via` 是应答时设备持有的线路；`via` 为 `primary` 或 `fallback`（当前会话是否运行在回退地址上）。错误码：`invalid_request`（协议版本、`request_id`、`action` 不合格）、`invalid_broker`、`invalid_route`、`platform_unset`、`save_failed`。
+
+`telemetry/device` 增加 `mqtt_route`：
+
+```json
+{"mqtt_route":{"route":"member","revision":1793000000000,"via":"primary"}}
+```
+
+NMS 通过 EMQX 监听区分设备实际连接的入口；没有会员资格却连在会员入口上的设备，其用户会被 NMS 拒绝服务（见 NMS 仓库 `docs/MEMBERSHIP.md`）。
+
 ## `remote.nodes.set`：平台下发的中转节点（0.10.70）
 
 遥测声明 `datad.remote_nodes` 后，NMS 可以通过 `command/request` 下发一份中转节点列表，设备在 `command/result` 应答：
@@ -58,7 +90,7 @@
 
 `nodes` 是当前**生效**的列表（本地开关关闭时为空，`enabled:false`）。错误码：`invalid_request`（协议版本、`request_id` 不合格）、`too_many_nodes`、`invalid_node`、`platform_unset`、`save_failed`。
 
-信任判断：`remote.open` 的 `remote_url` 和 `mesh.rendezvous_url` 的主机与端口只要是主平台、本地 `remote_origins` 或生效的节点之一即可连接。其余规则不变：`wss` 与会话路径、Bearer 令牌、不带 Origin 头、TLS 证书校验（内置 Mozilla 根证书，Let's Encrypt 可用）、TTL、`remote.close`、`target_ports` 单端口与服务白名单。WebSocket 不跟随重定向。MQTT 与心跳仍只连主平台，STUN 仍按 `remote.open` 下发的列表使用。
+信任判断：`remote.open` 的 `remote_url` 和 `mesh.rendezvous_url` 的主机与端口只要是主平台、本地 `remote_origins` 或生效的节点之一即可连接。其余规则不变：`wss` 与会话路径、Bearer 令牌、不带 Origin 头、TLS 证书校验（内置 Mozilla 根证书，Let's Encrypt 可用）、TTL、`remote.close`、`target_ports` 单端口与服务白名单。WebSocket 不跟随重定向。MQTT 与心跳仍只连主平台（`mqtt.route.set` 指定的会员 MQTT 入口除外），STUN 仍按 `remote.open` 下发的列表使用。
 
 `telemetry/device` 增加 `remote_node_origins`（当前生效的节点列表）和 `remote_nodes_revision`：
 
