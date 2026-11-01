@@ -498,6 +498,36 @@ confirms the requested enum. B20 returns an empty body on a successful write;
 this is accepted only with confirmed readback. Command errors and unconfirmed writes return 502.
 State is refreshed after uncertain writes as the hardware may have changed.
 `verified` confirms the firmware setting, not an electrical current measurement.
+
+## Long-charge protection
+
+TopFlow and U60 Pro hold the battery near 80 % after the device has stayed on the
+charger at 100 % for a while (the stock home page calls it long charging,
+`bat_mode >= 2`). The battery driver starts the hold after `threshold_minutes`
+(960 by default); the stock UI has no switch for it.
+
+| action | params | Result |
+|---|---|---|
+| `battery.charge_protection.status` | none | `supported`, `active`, `mode`, `disabled`, `threshold_minutes`, `default_threshold_minutes` |
+| `battery.charge_protection.release` | none | Same fields plus `released`, and `verified` when a hold was left |
+| `battery.charge_protection.set` | `disabled`: boolean or 0/1 | Same fields plus `changed`, `verified` |
+
+- `release` leaves a running hold now: it writes a different value to the
+  driver's `ui_chg_policy_mode` and then the original one, which resets the
+  charging state and reports customer mode 1 to the stock services, so the
+  battery charges to 100 % again. It does not change the threshold, so the
+  hold can start again later. Without a hold it returns `released:false` and
+  writes nothing. It is refused while the stock ZGD charge policy (5) is on.
+- `set {"disabled":true}` saves the switch in `charge_protection.conf` in the
+  data directory, sets the threshold to 71582 minutes (the largest the driver's
+  millisecond counter holds) and leaves a running hold. The driver forgets the
+  threshold at every boot, so datad applies it again on start and checks it
+  every 30 s while disabled, leaving any hold that still begins.
+  `{"disabled":false}` restores the driver default (960 minutes).
+- `mode` and `active` here come from the driver node; `battery.charge_protection`
+  in `/state` keeps `active`/`mode` from the stock `bat_mode`.
+- Devices without the node return `supported:false` from `status`; `release`
+  and `set` fail with 502. Invalid parameters return 400.
 No extra datad startup policy rewrites the mode; reboot persistence is whatever
 the device firmware provides. Both actions use the existing token authentication.
 

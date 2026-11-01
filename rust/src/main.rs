@@ -2,6 +2,7 @@ mod activity;
 mod ambient_light;
 mod apn_targets;
 mod auth;
+mod charge_protection;
 mod cloud;
 mod cloud_files;
 mod cloud_nodes;

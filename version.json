@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.82",
+    "version": "0.10.83",
     "asset": "zwrt-datad-aarch64",
-    "notes": "NMS 可以通过 MQTT 下发线路：会员、管理员的设备优先连接会员 MQTT 入口，连续两次连不上就回退到原来的免费地址，30 分钟后再试会员入口；会员到期后 NMS 下发免费线路，设备不再尝试会员入口。线路单独保存在 mqtt-route.json，不改动本地 cloud.json。"
+    "notes": "新增长时间充电保护（插电满电约 16 小时后维持约 80%）的读取、手动解除和禁用开关：battery.charge_protection.status/release/set；禁用后 datad 在启动时和每 30 秒重新应用，保持充满到 100%（TopFlow、U60 Pro）。"
   }
 }
