@@ -234,6 +234,17 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
+    // The data dir must exist before the managers below persist into it:
+    // traffic_history writes `<data_dir>/traffic-history.json` and a missing
+    // parent directory made every save fail with ENOENT. `--identity init`
+    // already created it with mode 0700, so use the same mode here.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&args.data_dir)?;
+    }
     let app = App::new(args.data_dir, interval, token, args.neighbor, args.webshell).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
