@@ -26,3 +26,9 @@ review to `zwrt-datad`.
   [faying/zte-u60-pro-mu5250-data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)
   in [issue #140](https://github.com/33333s/zwrt-datad/issues/140); datad's
   socket ubus access and prioritised executor (0.10.56) follow that approach.
+
+- [tomeq82 (@tomeq82)](https://github.com/tomeq82) — reported in
+  [issue #191](https://github.com/33333s/zwrt-datad/issues/191) and fixed in
+  [PR #192](https://github.com/33333s/zwrt-datad/pull/192) the traffic history
+  that was never saved when `--data-dir` did not exist yet; datad creates the
+  data dir at start since 0.10.84.

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.10.83",
+    "version": "0.10.84",
     "asset": "zwrt-datad-aarch64",
-    "notes": "新增长时间充电保护（插电满电约 16 小时后维持约 80%）的读取、手动解除和禁用开关：battery.charge_protection.status/release/set；禁用后 datad 在启动时和每 30 秒重新应用，保持充满到 100%（TopFlow、U60 Pro）。"
+    "notes": "修复用 --data-dir 指定一个还不存在的目录时，流量历史等设置一直存不下来的问题：datad 启动时先以 0700 创建数据目录；目录建不出来时直接退出并报出路径。正式安装不受影响（service.sh 和安装器本来就会创建数据目录）。"
   }
 }
