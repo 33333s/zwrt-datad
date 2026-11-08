@@ -51,10 +51,24 @@ mod webshell;
 mod wifi;
 mod wifi_control;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use server::App;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Creates the data dir (mode 0700) if it is missing; an existing one is left as it is.
+fn create_data_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("cannot create data dir {}", path.display()))
+}
 
 fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()> {
     if !addr.ip().is_loopback() && !require_auth {
@@ -190,11 +204,7 @@ async fn main() -> Result<()> {
     }
     if let Some(operation) = &args.identity {
         if operation == "init" {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&args.data_dir)?;
+            create_data_dir(&args.data_dir)?;
         }
         let identity = identity::Identity::new(&args.data_dir);
         let result = match operation.as_str() {
@@ -234,6 +244,10 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
+    // The data dir must exist before the managers below persist into it:
+    // traffic_history writes `<data_dir>/traffic-history.json` and a missing
+    // parent directory made every save fail with ENOENT.
+    create_data_dir(&args.data_dir)?;
     let app = App::new(args.data_dir, interval, token, args.neighbor, args.webshell).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
