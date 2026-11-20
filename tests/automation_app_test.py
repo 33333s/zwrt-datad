@@ -43,7 +43,8 @@ with tempfile.TemporaryDirectory(prefix='datad-automation-') as tmp:
     auth.chmod(0o600)
     local, lan = port(), port()
     env = dict(os.environ, ZWRT_DATAD_DIR=tmp, ZWRT_DATAD_OTA_DISABLE_AUTO='1',
-        ZWRT_DATAD_UBUS_BIN='/usr/bin/false', ZWRT_DATAD_UCI_BIN='/usr/bin/false')
+        ZWRT_DATAD_UBUS_BIN='/usr/bin/false', ZWRT_DATAD_UCI_BIN='/usr/bin/false',
+        ZWRT_DATAD_ACTIVITY_FLUSH_SECONDS='2')
     args = [str(Path(sys.argv[1]).resolve()), '-p', str(local), '--lan-bind', '127.0.0.1',
         '--lan-port', str(lan), '--auth-token-file', str(auth)]
 
@@ -64,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='datad-automation-') as tmp:
     child = start()
     try:
         for listener in (local, lan):
-            for path, data in [('/activity', None), ('/activity/clear', {}), ('/network/recovery', None),
+            for path, data in [('/activity', None), ('/activity/clear', {}), ('/activity/level', {'level': 'off'}), ('/network/recovery', None),
                                ('/network/recovery', {'enabled': True}), ('/network/recovery/resume', {}), ('/network/recovery/check', {})]:
                 assert call(listener, path, data=data)[0] == 401
                 assert call(listener, path, 'wrong', data)[0] == 401
@@ -72,12 +73,30 @@ with tempfile.TemporaryDirectory(prefix='datad-automation-') as tmp:
         code, initial, cache = call(lan, '/network/recovery', token)
         assert code == 200 and cache == 'no-store' and not initial['config']['enabled']
         assert initial['status'] == 'disabled' and not initial['config']['reboot_after_failures']
+        assert initial['config']['probe_urls'] == ['https://www.baidu.com/', 'https://www.qq.com/',
+            'https://cp.cloudflare.com/generate_204'], initial['config']
+        assert initial['probe_hosts'] == ['www.baidu.com', 'www.qq.com', 'cp.cloudflare.com'], initial
         for bad in ({'interval_seconds': 1}, {'failure_threshold': 0}, {'max_redials': 6},
-                    {'cooldown_seconds': 0}, {'reboot_after_failures': 'true'}, {'unexpected': True}):
+                    {'cooldown_seconds': 0}, {'reboot_after_failures': 'true'}, {'unexpected': True},
+                    {'probe_urls': []}, {'probe_urls': 'https://example.org/'},
+                    {'probe_urls': ['http://example.org/']}, {'probe_urls': ['https://192.168.0.1/']},
+                    {'probe_urls': ['https://localhost/']}, {'probe_urls': ['https://example.org:8443/']},
+                    {'probe_urls': ['https://u:p@example.org/']}, {'probe_urls': ['https://example.org/?x=1']},
+                    {'probe_urls': ['https://example.org/', 'https://EXAMPLE.org/']},
+                    {'probe_urls': ['https://a.example.org/', 'https://b.example.org/', 'https://c.example.org/',
+                                    'https://d.example.org/', 'https://e.example.org/']},
+                    {'probe_hosts': ['example.org']}):
             assert call(lan, '/network/recovery', token, bad)[0] in (400, 422)
         assert not (folder / 'network-recovery.json').exists()
         enabled = dict(initial['config'], enabled=True)
         assert call(lan, '/network/recovery', token, enabled)[0] == 200
+        custom = dict(enabled, probe_urls=['https://example.org/', 'https://cp.cloudflare.com/generate_204'])
+        code, saved, _ = call(lan, '/network/recovery', token, custom)
+        assert code == 200 and saved['config']['probe_urls'] == custom['probe_urls'], saved
+        assert saved['probe_hosts'] == ['example.org', 'cp.cloudflare.com'], saved
+        assert call(local, '/network/recovery', token)[1]['config']['probe_urls'] == custom['probe_urls']
+        assert call(lan, '/network/recovery', token, enabled)[0] == 200
+        assert call(local, '/network/recovery', token)[1]['config']['probe_urls'] == enabled['probe_urls']
         assert call(local, '/network/recovery', token)[1]['status'] == 'waiting'
         # Underlying stub fails, but manual intent must still pause recovery.
         assert call(lan, '/control', token, {'action': 'cellular.disconnect', 'params': {}})[0] == 502
@@ -108,8 +127,98 @@ with tempfile.TemporaryDirectory(prefix='datad-automation-') as tmp:
         child.wait(timeout=10)
         child = start()
         assert call(lan, '/activity', token)[1]['entries'] == []
+
+        # Levels: default standard buffers and writes on an interval. Saving the
+        # recovery settings is a standard-level event that is never merged with
+        # the previous one; a failed test delivery is a basic-level event.
+        journal = folder / 'activity.json'
+        def on_disk():
+            return len(json.loads(journal.read_text())['entries']) if journal.exists() else 0
+        def entries():
+            return len(call(lan, '/activity', token)[1]['entries'])
+        def touch():
+            assert call(lan, '/network/recovery', token, initial['config'])[0] == 200
+        def fail_one():
+            assert call(lan, '/sms/forward/test', token, {})[0] == 400
+        level = call(lan, '/activity', token)[1]
+        assert level['level'] == 'standard' and level['levels'] == ['off', 'basic', 'standard', 'detailed'], level
+        assert level['flush_interval_seconds'] == 2 and level['unsaved'] is False
+        for bad in ({'level': 'verbose'}, {'level': ''}, {'level': 1}, {}, {'level': 'off', 'x': 1}):
+            assert call(lan, '/activity/level', token, bad)[0] in (400, 422), bad
+        assert call(lan, '/activity', token)[1]['level'] == 'standard'
+        base = on_disk()
+        touch()
+        view = call(lan, '/activity', token)[1]
+        assert len(view['entries']) == 1 and view['unsaved'] is True, view
+        assert on_disk() == base, 'standard level must not write at once'
+        for _ in range(60):
+            if on_disk() == base + 1:
+                break
+            time.sleep(.1)
+        assert on_disk() == base + 1, 'interval flush never wrote the entry'
+        assert call(lan, '/activity', token)[1]['unsaved'] is False
+
+        # Detailed writes each entry at once, and its level survives a restart.
+        code, view, _ = call(local, '/activity/level', token, {'level': 'detailed'})
+        assert code == 200 and view['level'] == 'detailed' and view['flush_interval_seconds'] is None, view
+        for _ in range(3):
+            before = on_disk()
+            touch()
+            assert on_disk() == before + 1, 'detailed level must write at once'
+        child.terminate()
+        child.wait(timeout=10)
+        child = start()
+        assert call(lan, '/activity', token)[1]['level'] == 'detailed'
+
+        # Off records nothing; basic records failures but not settings changes.
+        assert call(lan, '/activity/level', token, {'level': 'off'})[0] == 200
+        count = entries()
+        touch()
+        fail_one()
+        assert entries() == count
+        assert call(lan, '/activity/level', token, {'level': 'basic'})[0] == 200
+        assert call(lan, '/activity/clear', token, {})[0] == 200
+        touch()
+        assert entries() == 0
+        fail_one()
+        assert entries() == 1
+        assert call(lan, '/network/recovery/resume', token, {})[0] == 200
+        assert entries() == 1, 'resume is a standard-level event'
+
+        # A normal stop writes whatever is still buffered.
+        child.terminate()
+        child.wait(timeout=10)
+        env['ZWRT_DATAD_ACTIVITY_FLUSH_SECONDS'] = '3600'
+        child = start()
+        assert call(lan, '/activity/level', token, {'level': 'standard'})[0] == 200
+        assert call(lan, '/activity/clear', token, {})[0] == 200
+        touch()
+        assert call(lan, '/activity', token)[1]['unsaved'] is True and on_disk() == 0
+        streams = []
+        for listener in (local, lan):
+            connection = http.client.HTTPConnection('127.0.0.1', listener, timeout=5)
+            connection.request('GET', '/events', headers={'Authorization': 'Bearer ' + token})
+            response = connection.getresponse()
+            assert response.status == 200
+            streams.append((connection, response))
+        child.terminate()
+        try:
+            for _ in range(50):
+                if on_disk() == 1:
+                    break
+                time.sleep(.1)
+            assert on_disk() == 1, 'shutdown must flush before waiting for open SSE streams'
+        finally:
+            for connection, response in streams:
+                response.close()
+                connection.close()
+        child.wait(timeout=10)
+        child = start()
+        assert entries() == 1 and on_disk() == 1, 'stop must write buffered entries'
+        assert call(lan, '/activity/clear', token, {})[0] == 200
+        assert call(lan, '/activity', token)[1]['level'] == 'standard', 'clearing keeps the level'
         assert call(lan, '/network/recovery', token)[1]['config'] == initial['config']
-        print('Automation: private auth, validation, persistent intent, notification errors, filtering and clearing passed')
+        print('Automation: private auth, validation, probe URL list, activity levels and write timing, persistent intent, notification errors, filtering and clearing passed')
     finally:
         child.terminate()
         child.wait(timeout=10)

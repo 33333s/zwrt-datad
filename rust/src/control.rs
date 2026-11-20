@@ -188,6 +188,10 @@ pub async fn execute_recovery(action: &str, plan: crate::network_recovery::Plan)
 }
 
 async fn execute_inner(action: &str, params: &Value) -> Outcome {
+    // Flush before either the U50 OEM path or the generic reboot/poweroff path.
+    if matches!(action, "device.reboot" | "device.poweroff") {
+        crate::activity::flush_active().await;
+    }
     // Daemon-local signaling supervision: not OEM-backed, so it must run on
     // every runtime (the U50 gate below reroutes everything else to Ctl).
     match action {

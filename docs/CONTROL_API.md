@@ -484,24 +484,55 @@ open. Recovery is disabled by default and never runs an unrestricted command.
   and `failed=true` filter the result. `next_before` is the next-page cursor.
   `max_entries` is 300. `storage_ok=false` means persistence failed.
 - `POST /activity/clear` with `{}` clears all categories without changing tasks,
-  forwarding configuration or recovery limits. IDs do not reset.
+  forwarding configuration, recovery limits or the history level. IDs do not reset.
+- `POST /activity/level` with `{"level": "off" | "basic" | "standard" | "detailed"}`
+  selects how much is recorded (below) and returns the same view as `GET /activity`.
+  `GET /activity` also reports `level`, `levels`, `flush_interval_seconds` (`null`
+  at `detailed`) and `unsaved` (entries still only in memory).
+
+History levels (default `standard`; the choice is saved and survives restarts):
+
+| level | records | written to flash |
+|---|---|---|
+| `off` | nothing | – |
+| `basic` | failures, and what recovery does to the network (redial, reboot, back online) | on an interval |
+| `standard` | `basic` plus successful deliveries, task runs and recovery settings changes | on an interval |
+| `detailed` | `standard` plus each change in the recovery probe result | every entry at once |
+
+Below `detailed`, entries are kept in memory and written together every 300 seconds
+when something changed, so a busy device makes at most one write per interval. They
+are also written when the daemon stops normally and before a reboot or poweroff
+that goes through datad. A crash or power loss can lose the entries of the last
+interval; use `detailed` while investigating something that restarts the device.
+`GET /activity` always shows what is in memory. A failed write keeps the entries
+buffered and is retried at the next interval. The recovery intent and action budgets
+are separate safety state and are always written before an action.
 - `GET /network/recovery`: saved configuration plus runtime status, consecutive
   failure count, redial count, next permissible action time and manual-pause state.
 - `POST /network/recovery`: saves `enabled` (default false), `interval_seconds`
   (30/60/120, default 60), `failure_threshold` (3–10, default 3),
   `cooldown_seconds` (180–3600, default 300), `max_redials` (1–5, default 3), and
-  `reboot_after_failures` (default false). Unknown properties are rejected.
+  `reboot_after_failures` (default false), and `probe_urls` (1–4 HTTPS URLs, default
+  `https://www.baidu.com/`, `https://www.qq.com/`, `https://cp.cloudflare.com/generate_204`).
+  A probe URL must use port 443 (or none), carry no credentials, query or fragment, and
+  name a public host: loopback, private, link-local and carrier-grade-NAT addresses and
+  `localhost`/`.local`/`.lan`/`.internal`/`.home.arpa` names are refused, and duplicates
+  are rejected. A saved configuration from before 0.10.72 gets the default list. Unknown
+  properties are rejected. `probe_hosts` in the status is read-only and lists the hosts.
 - `POST /network/recovery/resume` with `{}` explicitly releases a manual pause
   and starts a new redial round after a grace period. Hourly/reboot limits remain.
 - `POST /network/recovery/check` with `{}` performs one read-only connectivity
   check and returns `online` and `checked_at`. It does not increment failure
   counters, enable recovery or perform recovery actions; limited to once per 10s.
 
-Detection uses bounded HTTPS HEAD requests to two fixed, independent hosts
-(`www.baidu.com`, `www.qq.com`), with normal certificate validation, no proxy and
-no redirect following. Any authenticated HTTPS response proves reachability (including HTTP errors,
-which must not be mistaken for a broken cellular connection).
-Both failing for the configured number of rounds triggers a bearer reconnect;
+Detection sends bounded HTTPS HEAD requests to every configured `probe_urls` entry at
+once, with normal certificate validation, no proxy and no redirect following. The first
+authenticated HTTPS response, including an HTTP error, proves reachability and ends the
+round; errors must not be mistaken for a broken cellular connection. The default list
+pairs two sites that answer in mainland China with a Cloudflare address that answers
+almost everywhere, so an overseas SIM, roaming or a VPN is not read as an outage when
+the Chinese sites are unreachable. Every probe failing for the configured number of
+rounds triggers a bearer reconnect;
 optional reboot follows exhausted redials. DNS/TLS/remote-host failures can affect
 this check; it measures reachability, not bandwidth. It does not change bands,
 cell locks, APNs or network mode. A submitted action is recorded as such; only a
