@@ -268,6 +268,7 @@ int main(int argc, char **argv) {
     const char *heartbeat_path = argv[2];
     signal(SIGINT, on_stop);
     signal(SIGTERM, on_stop);
+    const pid_t parent_pid = getppid();
 
     void *h = dlopen("libdiag.so.1", RTLD_NOW);
     if (!h) {
@@ -309,13 +310,21 @@ int main(int argc, char **argv) {
         write_status(status_path, -1, "error", "dci_register_failed");
         return 69;
     }
-    reg_stream(client_id, logs_cb, events_cb);
-    log_cfg(client_id, 1, (uint16 *)CODES, CODE_COUNT);
+    rc = reg_stream(client_id, logs_cb, events_cb);
+    if (rc == 0 || rc == 1001)
+        rc = log_cfg(client_id, 1, (uint16 *)CODES, CODE_COUNT);
+    if (rc != 0 && rc != 1001) {
+        rel_client(&client_id);
+        if (deinit) deinit();
+        write_status(status_path, -1, "error", "dci_subscription_failed");
+        return 70;
+    }
     write_status(status_path, client_id, "running", "");
 
     int stale = 0;
     while (!stop_flag) {
         sleep(1);
+        if (getppid() != parent_pid) break;
         if (write_status(status_path, client_id, "running", "") != 0)
             stop_flag = 1; /* status file unwritable: ordered shutdown */
         struct stat hb;

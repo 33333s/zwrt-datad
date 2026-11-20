@@ -64,7 +64,7 @@ pub(crate) struct Inner {
     ota_view: watch::Receiver<Value>,
     neighbor: Mutex<NeighborManager>,
     webshell: WebShell,
-    activity: Mutex<crate::activity::Journal>,
+    activity: Arc<Mutex<crate::activity::Journal>>,
     recovery: Arc<Mutex<crate::network_recovery::Recovery>>,
     history: Mutex<History>,
     history_tx: watch::Sender<Vec<Usage>>,
@@ -72,6 +72,7 @@ pub(crate) struct Inner {
     tasks: Arc<Mutex<TaskSchedule>>,
     speedtest: Arc<Mutex<SpeedTest>>,
     sms_forward: Arc<Mutex<Forwarder>>,
+    hosts: Mutex<crate::hosts::Manager>,
 }
 
 struct DeviceSession {
@@ -80,6 +81,16 @@ struct DeviceSession {
 }
 
 impl App {
+    pub(crate) async fn panel_hosts_status(&self) -> Value {
+        self.inner.hosts.lock().await.status()
+    }
+    pub(crate) async fn panel_hosts_action(
+        &self,
+        action: &str,
+        params: Value,
+    ) -> Result<String, &'static str> {
+        self.inner.hosts.lock().await.action(action, params).await
+    }
     async fn record(&self, category: &str, action: &str, result: &str, reason: &str, task: &str) {
         self.inner
             .activity
@@ -101,25 +112,50 @@ impl App {
         )
         .await;
     }
+    /// Buffered history entries reach flash together, on a fixed interval.
+    fn spawn_activity_flush(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::activity::flush_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                app.inner.activity.lock().await.flush();
+            }
+        });
+    }
     fn spawn_recovery(&self) {
         let app = self.clone();
         tokio::spawn(async move {
+            let mut last_probe: Option<bool> = None;
             loop {
                 let interval = app.inner.recovery.lock().await.config().interval_seconds;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
-                let generation = {
+                let (generation, probe_urls) = {
                     let mut r = app.inner.recovery.lock().await;
                     if !r.may_probe(crate::activity::now()) {
                         continue;
                     }
-                    r.generation
+                    (r.generation, r.config().probe_urls)
                 };
                 let snapshot = app.inner.snapshot.read().await.clone();
                 if !crate::network_recovery::eligible(&snapshot, crate::activity::now()) {
                     app.inner.recovery.lock().await.hold();
                     continue;
                 }
-                let online = crate::network_recovery::probe().await;
+                let online = crate::network_recovery::probe(&probe_urls).await;
+                // Only visible at the detailed level; a change, not every round.
+                if last_probe.replace(online) != Some(online) {
+                    app.record(
+                        "recovery",
+                        "probe",
+                        if online { "success" } else { "failed" },
+                        if online { "" } else { "unreachable" },
+                        "",
+                    )
+                    .await;
+                }
                 if !crate::network_recovery::eligible(
                     &*app.inner.snapshot.read().await,
                     crate::activity::now(),
@@ -415,7 +451,8 @@ impl App {
         initial
             .fields
             .insert("speedtest".into(), speedtest.status());
-        let activity = crate::activity::Journal::load(&data_dir);
+        let activity = Arc::new(Mutex::new(crate::activity::Journal::load(&data_dir)));
+        crate::activity::install(&activity);
         let recovery = Arc::new(Mutex::new(crate::network_recovery::Recovery::load(
             &data_dir,
         )));
@@ -443,6 +480,7 @@ impl App {
                 neighbor: Mutex::new(neighbor),
                 identity: crate::identity::Identity::new(&data_dir),
                 efs: crate::efs::Efs::new(&data_dir),
+                hosts: Mutex::new(crate::hosts::Manager::new(&data_dir)),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -450,7 +488,7 @@ impl App {
                 sse_slots: Arc::new(Semaphore::new(16)),
                 signal_slots: Arc::new(Semaphore::new(4)),
                 webshell: WebShell::new(webshell_enabled),
-                activity: Mutex::new(activity),
+                activity: activity.clone(),
                 recovery,
                 history: Mutex::new(history),
                 history_tx,
@@ -466,6 +504,7 @@ impl App {
             .await
             .start(app.inner.tx.subscribe(), app.clone());
         app.spawn_recovery();
+        app.spawn_activity_flush();
         app.spawn_sampler();
         app.spawn_ota();
         Ok(app)
@@ -761,7 +800,12 @@ impl App {
         addr: SocketAddr,
         require_auth: bool,
         open_auth_routes: bool,
+        web_ui: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !web_ui || (require_auth && open_auth_routes),
+            "Web UI requires an authenticated listener with login routes; use --lan-bind"
+        );
         let mut router = Router::new()
             .route("/", get(index))
             .route("/healthz", get(health))
@@ -807,6 +851,10 @@ impl App {
             .route(
                 "/activity/clear",
                 post(activity_clear).layer(RequestBodyLimitLayer::new(256)),
+            )
+            .route(
+                "/activity/level",
+                post(activity_level).layer(RequestBodyLimitLayer::new(256)),
             )
             .route(
                 "/network/recovery",
@@ -888,6 +936,12 @@ impl App {
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
+        // Only the fixed public application shell is outside API authentication.
+        // Data, modem operations and long-lived streams retain their existing guards.
+        #[cfg(feature = "web-ui")]
+        if web_ui {
+            router = router.merge(crate::web_ui::routes());
+        }
         if open_auth_routes {
             // Outside `authenticate` so a browser preflight (which carries no
             // token) is answered instead of rejected, inside the LAN filter so
@@ -900,12 +954,19 @@ impl App {
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
+        let shutdown_app = self.clone();
         let result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            // Long-lived SSE/DIAG responses may still be draining. Persist
+            // history as soon as shutdown starts, before waiting for them.
+            shutdown_app.inner.activity.lock().await.flush();
+        })
         .await;
+        self.inner.activity.lock().await.flush();
         self.inner.neighbor.lock().await.shutdown().await;
         result?;
         Ok(())
@@ -1423,9 +1484,12 @@ async fn usb_status(State(app): State<App>) -> Json<Value> {
 }
 fn capability_controls() -> Vec<&'static str> {
     if crate::u50_ctl::get().is_some() {
-        return crate::u50_ctl::CONTROLS.to_vec();
+        let mut controls = crate::u50_ctl::CONTROLS.to_vec();
+        controls.extend_from_slice(&["hosts.status", "hosts.save", "hosts.restore"]);
+        return controls;
     }
     let mut controls = vec![
+        "hosts.status",
         "device.login_info",
         "device.login",
         "device.logout",
@@ -1505,6 +1569,13 @@ async fn signal_stream(State(app): State<App>, headers: HeaderMap) -> Response {
     // Startup/materialization are synchronous and must not block Tokio workers.
     match tokio::task::spawn_blocking(crate::u50_signal::stream_start).await {
         Ok(Ok(_)) => {}
+        Ok(Err(reason)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("signal streamer unavailable: {reason}"),
+            )
+                .into_response();
+        }
         _ => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1825,6 +1896,7 @@ async fn ubus_call(Json(req): Json<UbusCall>) -> Response {
 async fn control(
     State(app): State<App>,
     method: Method,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let _ = method;
@@ -1892,6 +1964,36 @@ async fn control(
                 control_failed(action, "neighbor action unavailable".into())
             }
         };
+    }
+    if action.starts_with("hosts.") {
+        if !webshell_auth(&app, &headers, false).await {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if action == "hosts.status" {
+            if body
+                .get("params")
+                .is_some_and(|v| !v.as_object().is_some_and(Map::is_empty))
+            {
+                return invalid_parameter(action, "hosts.status accepts no parameters");
+            }
+            return control_ok(action, app.panel_hosts_status().await);
+        }
+        if matches!(action, "hosts.save" | "hosts.restore") {
+            if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
+                return invalid_parameter(action, "hosts writes require confirmed=true");
+            }
+            return match app
+                .panel_hosts_action(action, body.get("params").cloned().unwrap_or(json!({})))
+                .await
+            {
+                Ok(revision) => control_ok(action, json!({"revision":revision})),
+                Err(code) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok":false,"action":action,"error":{"code":code}})),
+                )
+                    .into_response(),
+            };
+        }
     }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
@@ -2404,6 +2506,31 @@ async fn activity_get(
             .view(q.before, q.category.as_deref(), q.failed),
     )
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityLevel {
+    level: String,
+}
+async fn activity_level(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<ActivityLevel>,
+) -> Response {
+    if !webshell_auth(&app, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(level) = crate::activity::Level::parse(&body.level) else {
+        return task_app_reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"invalid_activity_level"}),
+        );
+    };
+    let mut journal = app.inner.activity.lock().await;
+    match journal.set_level(level) {
+        Ok(()) => task_app_reply(StatusCode::OK, journal.view(None, None, false)),
+        Err(e) => task_app_reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":e})),
+    }
+}
 async fn activity_clear(
     State(app): State<App>,
     headers: HeaderMap,
@@ -2450,7 +2577,8 @@ async fn recovery_check(
         );
     }
     // Manual check never feeds recovery counters or executes recovery actions.
-    let online = crate::network_recovery::probe().await;
+    let probe_urls = app.inner.recovery.lock().await.config().probe_urls;
+    let online = crate::network_recovery::probe(&probe_urls).await;
     task_app_reply(
         StatusCode::OK,
         json!({"online":online,"checked_at":crate::activity::now()}),
@@ -3132,8 +3260,11 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 90);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 90);
+        assert_eq!(controls.len(), 93);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 93);
+        for action in ["hosts.status", "hosts.save", "hosts.restore"] {
+            assert!(controls.contains(&action));
+        }
     }
 
     #[test]

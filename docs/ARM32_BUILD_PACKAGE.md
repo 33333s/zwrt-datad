@@ -6,7 +6,7 @@
 
 ## 1. 工作目录与产物归属
 
-本机源码仓库为 `D:\Git\zwrt-datad`，当前开发分支为 `arm32`；WSL 对应路径为 `/mnt/d/Git/zwrt-datad`。
+本机源码仓库为 `D:\Git\zwrt-datad`，ARM32 基础分支为 `arm32`，Web 功能可在对应功能分支构建；WSL 对应路径为 `/mnt/d/Git/zwrt-datad`。
 从这份源码构建，不使用 WSL 家目录下可能残留的另一份 `~/zwrt-datad`。
 
 | 路径 | 用途 | 清理原则 |
@@ -49,7 +49,7 @@ git status --short
 
 ## 3. 编译 ARM32 后端
 
-统一使用 [build-arm32-candidate.sh](../scripts/build-arm32-candidate.sh)，不要只执行普通 `cargo build` 后把主机版本拿去部署。
+纯 API 使用 [build-arm32-candidate.sh](../scripts/build-arm32-candidate.sh)。当前带 Web 的部署包按下一小节构建；普通主机 `cargo build` 的产物不能用于 ARM32 部署。
 
 PowerShell：
 
@@ -72,6 +72,21 @@ Get-Content build/reports/arm32-build.log -Tail 12
 主程序为静态二进制，EFS worker 是依赖设备厂商库的独立动态进程；两者的链接方式不同是正常的。
 
 版本以根目录 [version.json](../version.json) 的 `datad.version` 为准。修改版本后必须重新编译再打包，不能只修改安装脚本中的版本或哈希。
+
+### 带内嵌 Web 的版本（当前交付）
+
+```powershell
+npm ci --prefix web
+npm run build --prefix web
+wsl bash -lc 'cd /mnt/d/Git/zwrt-datad && ZIG=~/zig/zig bash scripts/build-arm32-web.sh --candidate > build/reports/arm32-web-build.log 2>&1'
+if ($LASTEXITCODE -ne 0) { throw 'Web-enabled ARM32 build failed' }
+python build/refresh-deploy-package.py --require-web
+if ($LASTEXITCODE -ne 0) { throw 'Packaging failed; do not upload' }
+```
+
+`--candidate` 同步 Web 二进制及配套 provenance，包含 `features: ["web-ui"]`、资源摘要、大小与 `source_dirty`。不带该参数只生成独立的 `build/web-ui/armv7/` 产物。当前本机刷新入口的 `--require-web` 在打包前检查 feature 标记，避免误用纯 API candidate。
+
+网页安装后默认可访问 `http://设备IP:9461/ui/`，原 API 路径继续可用；通过服务参数 `--disable-web-ui` 禁用网页。打包后核对 `package-verification.json`，整套上传二进制、安装脚本及对应安装器/引导文件。
 
 ## 4. 整套刷新 deploy_kano
 

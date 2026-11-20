@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="datad-signal-auth-") as tmp:
         proc.wait(timeout=8)
 
     worker = directory / "streamer"
-    subprocess.run(["cc", "-O2", str(ROOT / "rust/u50_diag_streamer.c"), "-ldl", "-o", str(worker)], check=True)
+    subprocess.run(["cc", "-O2", str(ROOT / "rust/u50_diag_streamer.c"), "-ldl", "-pthread", "-o", str(worker)], check=True)
     heartbeat = directory / "heartbeat"
     heartbeat.touch()
     for bind in ("0.0.0.0", "192.168.0.1", "127.0.0.2"):

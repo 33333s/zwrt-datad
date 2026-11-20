@@ -185,6 +185,8 @@ class Vendor(BaseHTTPRequestHandler):
                       and form.get("AD", [""])[0] == digest(digest(VERSION + "") + Vendor.current_rd))
         if not authorized:
             return self.send_json({"result": "failure"})
+        if action == "REBOOT_DEVICE" and hasattr(Vendor, "reboot_journal"):
+            Vendor.reboot_saw_history = bool(json.loads(Vendor.reboot_journal.read_text())["entries"])
         if action == "DEVELOPER_OPTION_LOGIN":
             # The firmware gates hidden-page goforms behind this second login;
             # it reuses the stored admin hash with a fresh LD challenge and
@@ -369,7 +371,8 @@ esac
         "remote_webshell_enabled": True}))
     cloud_file.chmod(0o600)
     url = f"http://127.0.0.1:{server.server_port}/goform/goform_get_cmd_process"
-    env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_OTA_DISABLE_AUTO": "1"}
+    env = {**os.environ, "ZWRT_DATAD_U50_CFG_BIN": str(cfg), "ZWRT_DATAD_OTA_DISABLE_AUTO": "1",
+           "ZWRT_DATAD_ACTIVITY_FLUSH_SECONDS": "3600"}
     process = subprocess.Popen(
         [BINARY, "--u50-model", "u50s", "--u50-goform-url", url, "--u50-data-dir", str(folder / "data"),
          "--port", str(port), "--lan-port", str(lan_port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -871,7 +874,16 @@ esac
         assert status == 200 and result["verified"] and result["settings"]["mtu"] == 1450, result
 
         # Device actions and unmapped actions.
+        # Reboot must flush buffered activity before handing control to the
+        # OEM. The fake OEM records whether the journal is already on disk.
+        assert call(port, "/activity/clear", {}, auth_headers)[0] == 200
+        assert call(port, "/network/recovery", {"enabled": False}, auth_headers)[0] == 200
+        assert call(port, "/activity", headers=auth_headers)[1]["unsaved"] is True
+        journal = folder / "data" / "activity.json"
+        assert json.loads(journal.read_text())["entries"] == []
+        Vendor.reboot_journal = journal
         assert control(port, "device.reboot", {})[0] == 200 and writes()[-1][1] == "REBOOT_DEVICE"
+        assert Vendor.reboot_saw_history, "U50 reboot reached OEM before buffered history was saved"
         assert control(port, "wifi.configure", {"section": "main_2g", "bogus": "x"})[0] == 400
         assert control(port, "cooling.fan.set_mode", {"mode": "custom"})[0] == 404
 

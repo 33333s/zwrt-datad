@@ -22,6 +22,8 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
 
 typedef unsigned char byte;
 typedef unsigned short uint16;
@@ -36,6 +38,9 @@ static volatile sig_atomic_t stop_flag = 0;
 static void on_stop(int s) { (void)s; stop_flag = 1; }
 
 static int cli[MAXC] = {-1, -1, -1, -1};
+/* libdiag invokes callbacks on its own thread. Own descriptors under one
+ * lock so a callback cannot close a newly accepted/reused descriptor. */
+static pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_sub_on = 0;      /* DIAG codes subscribed */
 static char g_bind[24] = "127.0.0.1";
 static unsigned long total_pkts = 0;
@@ -47,8 +52,11 @@ static int write_status(const char *path, int client_id, const char *state,
     snprintf(tmp, sizeof(tmp), "%s.new", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return -1;
+    pthread_mutex_lock(&clients_lock);
     int n = 0;
     for (int i = 0; i < MAXC; i++) if (cli[i] >= 0) n++;
+    unsigned long total = total_pkts, sent = sent_pkts;
+    pthread_mutex_unlock(&clients_lock);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     fprintf(f, "{\"state\":\"%s\",\"reason\":\"%s\",\"client_id\":%d,"
@@ -56,31 +64,54 @@ static int write_status(const char *path, int client_id, const char *state,
                "\"clients\":%d,\"subscribed\":%d,"
                "\"total\":%lu,\"sent\":%lu,\"codes\":%d}",
             state, reason, client_id, (long)ts.tv_sec, (long)getpid(),
-            port, g_bind, n, g_sub_on, total_pkts, sent_pkts, NCODES);
+            port, g_bind, n, g_sub_on, total, sent, NCODES);
     fclose(f);
     return rename(tmp, path) == 0 ? 0 : -1;
 }
 
 /* DCI callback: forward each log packet to every connected consumer with a
- * [len u32][code u32] header, one writev syscall per client per packet.
- * A consumer that stops reading gets dropped (SO_SNDTIMEO), never blocking
- * the diag dispatch thread. */
+ * [len u32][code u32] header. Sends have a bounded timeout; a partial frame
+ * closes that consumer, never leaving a corrupted frame on a live stream. */
 static void logs_cb(unsigned char *ptr, int len) {
-    total_pkts++;
-    if (len < 4) return;
+    if (!ptr || len < 4 || len > 65535) return;
     unsigned short code = (unsigned short)(ptr[2] | (ptr[3] << 8));
-    unsigned char hdr[8];
-    *(int *)hdr = len;
-    *(int *)(hdr + 4) = (int)code;
+    unsigned char hdr[8] = {0};
+    for (int i = 0; i < 4; i++) hdr[i] = (unsigned int)len >> (i * 8);
+    hdr[4] = code & 0xff;
+    hdr[5] = code >> 8;
     struct iovec iov[2] = {{hdr, 8}, {ptr, (size_t)len}};
+    struct msghdr msg = {0};
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 2;
+    pthread_mutex_lock(&clients_lock);
+    total_pkts++;
     for (int i = 0; i < MAXC; i++) {
         if (cli[i] < 0) continue;
-        if (writev(cli[i], iov, 2) != 8 + len) {
+        if (sendmsg(cli[i], &msg, MSG_NOSIGNAL) != 8 + len) {
             close(cli[i]); cli[i] = -1;
             continue;
         }
         sent_pkts++;
     }
+    pthread_mutex_unlock(&clients_lock);
+}
+
+/* With no modem packets, write errors never reveal a closed HTTP relay.
+ * Probe read-side EOF/errors so reconnects cannot exhaust all four slots. */
+static int reap_clients(void) {
+    int count = 0;
+    pthread_mutex_lock(&clients_lock);
+    for (int i = 0; i < MAXC; i++) {
+        if (cli[i] < 0) continue;
+        unsigned char byte;
+        ssize_t n = recv(cli[i], &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            close(cli[i]);
+            cli[i] = -1;
+        } else count++;
+    }
+    pthread_mutex_unlock(&clients_lock);
+    return count;
 }
 
 static void events_cb(unsigned char *p, int l) { (void)p; (void)l; }
@@ -104,6 +135,8 @@ int main(int argc, char **argv) {
     snprintf(g_bind, sizeof(g_bind), "%s", bind_addr);
     signal(SIGINT, on_stop);
     signal(SIGTERM, on_stop);
+    signal(SIGPIPE, SIG_IGN);
+    const pid_t parent_pid = getppid();
     write_status(status_path, -1, "starting", "", port);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -159,7 +192,13 @@ int main(int argc, char **argv) {
         write_status(status_path, -1, "error", "dci_register_failed", port);
         return 70;
     }
-    reg_stream(client_id, logs_cb, events_cb);
+    rc = reg_stream(client_id, logs_cb, events_cb);
+    if (rc != 0 && rc != 1001) {
+        rel_client(&client_id);
+        if (deinit) deinit();
+        write_status(status_path, -1, "error", "dci_stream_failed", port);
+        return 71;
+    }
     /* Subscription is enabled only while consumers are connected: with no
      * client the modem keeps logging anyway, and dispatching hundreds of
      * callbacks per second to a forwarder that drops them all is pure CPU
@@ -167,7 +206,10 @@ int main(int argc, char **argv) {
     write_status(status_path, client_id, "running", "", port);
 
     int stale = 0;
+    int config_failures = 0;
+    const char *failure = "";
     while (!stop_flag) {
+        if (getppid() != parent_pid) { failure = "supervisor_exited"; break; }
         struct timeval tv = {1, 0};
         fd_set rf;
         FD_ZERO(&rf);
@@ -177,7 +219,7 @@ int main(int argc, char **argv) {
             socklen_t cl = sizeof(ca);
             int c = accept(ls, (struct sockaddr *)&ca, &cl);
             if (c >= 0) {
-                struct timeval stv = {2, 0};
+                struct timeval stv = {0, 200000};
                 setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
                 int nd = 1;
                 setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
@@ -188,23 +230,30 @@ int main(int argc, char **argv) {
                 setsockopt(c, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
                 setsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
                 setsockopt(c, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+                reap_clients();
+                pthread_mutex_lock(&clients_lock);
                 int slot = -1;
                 for (int i = 0; i < MAXC; i++)
                     if (cli[i] < 0) { slot = i; break; }
                 if (slot < 0) close(c);
                 else cli[slot] = c;
+                pthread_mutex_unlock(&clients_lock);
             }
         }
-        int have_clients = 0;
-        for (int i = 0; i < MAXC; i++) if (cli[i] >= 0) have_clients = 1;
-        if (have_clients && !g_sub_on) {
-            log_cfg(client_id, 1, (uint16 *)CODES, NCODES);
-            g_sub_on = 1;
-        } else if (!have_clients && g_sub_on) {
-            log_cfg(client_id, 0, (uint16 *)CODES, NCODES);
-            g_sub_on = 0;
+        int wanted = reap_clients() > 0;
+        if (wanted != g_sub_on) {
+            rc = log_cfg(client_id, wanted, (uint16 *)CODES, NCODES);
+            if (rc == 0 || rc == 1001) {
+                g_sub_on = wanted;
+                config_failures = 0;
+            } else if (++config_failures >= 5) {
+                failure = "log_config_failed";
+                break;
+            }
         }
-        if (write_status(status_path, client_id, "running", "", port) != 0)
+        if (write_status(status_path, client_id,
+                         config_failures ? "retrying" : "running",
+                         config_failures ? "log_config_failed" : "", port) != 0)
             stop_flag = 1; /* status unwritable: ordered shutdown */
         struct stat hb;
         if (stat(heartbeat_path, &hb) != 0) {
@@ -215,12 +264,14 @@ int main(int argc, char **argv) {
             if (stale > 10) stop_flag = 1; /* supervisor gone: exit */
         }
     }
+    pthread_mutex_lock(&clients_lock);
     for (int i = 0; i < MAXC; i++)
         if (cli[i] >= 0) { close(cli[i]); cli[i] = -1; }
+    pthread_mutex_unlock(&clients_lock);
     log_cfg(client_id, 0, (uint16 *)CODES, NCODES);
     rel_client(&client_id);
     if (deinit) deinit();
-    write_status(status_path, -1, "stopped",
-                 stale > 10 ? "supervisor_timeout" : "", port);
-    return 0;
+    write_status(status_path, -1, *failure ? "error" : "stopped",
+                 stale > 10 ? "supervisor_timeout" : failure, port);
+    return *failure ? 72 : 0;
 }

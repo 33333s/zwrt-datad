@@ -108,6 +108,9 @@ SUCCESS: session 表示本次开机有效，重启后执行 sh /cache/zwrt-datad
 不会解锁、开启工厂模式、刷写分区或重启设备。仍使用设备自带 sh/systemctl 等基础工具。
 App：ZWRT 模式，设备局域网 IP，端口 9461，admin + 原厂后台密码。
 """, encoding="utf-8")
+    if "web-ui" in provenance.get("features", []):
+        note = args.output / "Go安装说明.txt"
+        note.write_text(note.read_text(encoding="utf-8") + "\n本包内置网页版：安装后访问 http://设备IP:9461/ui/，使用设备管理账号密码登录。\n网页默认开启，可用启动参数 --disable-web-ui 禁用；原API接口继续可用。\n", encoding="utf-8")
     print(json.dumps(info["files"], indent=2))
 
 

@@ -1383,6 +1383,7 @@ async fn collect(
 /// U50 runtime listener and feature options.
 #[derive(Clone, Default)]
 pub struct RunOptions {
+    pub web_ui: bool,
     pub enable_webshell: bool,
     /// Enable the read-only signaling capture worker (diag DCI client).
     pub signaling: bool,
@@ -1405,6 +1406,7 @@ pub async fn run(
     options: RunOptions,
 ) -> Result<()> {
     let RunOptions {
+        web_ui,
         enable_webshell,
         signaling,
         lan_addr,
@@ -1461,12 +1463,12 @@ pub async fn run(
     app.spawn_sms_forward();
     let result = if let Some(lan_addr) = lan_addr {
         tokio::try_join!(
-            app.clone().serve(bind, false, false),
-            app.serve(lan_addr, true, true)
+            app.clone().serve(bind, false, false, false),
+            app.serve(lan_addr, true, true, web_ui)
         )
         .map(|_| ())
     } else {
-        app.serve(bind, local_requires_auth, false)
+        app.serve(bind, local_requires_auth, false, web_ui)
             .await
             .map(|_| ())
     };

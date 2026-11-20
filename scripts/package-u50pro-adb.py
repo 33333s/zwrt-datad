@@ -73,6 +73,8 @@ App 选择 ZWRT，地址填设备 IP（通常 192.168.0.1），端口 9461，adm
 出现 FAILED 或连接中断时，先按提示检查 .deploy.* 目录里的 result / deploy.log，再决定是否重试。
 校验和或空间不足会中止安装，不要替换 payload 内的单个文件绕过校验。
 '''
+    if 'web-ui' in info.get('features', []):
+        readme += '\n本包内置网页版：安装后访问 http://设备IP:9461/ui/，使用设备管理账号密码登录。\n网页默认开启，可用启动参数 --disable-web-ui 禁用；原API接口继续可用。\n'
     put(kit / '使用说明.txt', readme.encode('utf-8-sig'))
     zip_path = output / f'U50Pro_ADB_{version}.zip'
     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
