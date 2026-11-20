@@ -72,6 +72,7 @@ pub(crate) struct Inner {
     tasks: Arc<Mutex<TaskSchedule>>,
     speedtest: Arc<Mutex<SpeedTest>>,
     sms_forward: Arc<Mutex<Forwarder>>,
+    hosts: Mutex<crate::hosts::Manager>,
 }
 
 struct DeviceSession {
@@ -80,6 +81,16 @@ struct DeviceSession {
 }
 
 impl App {
+    pub(crate) async fn panel_hosts_status(&self) -> Value {
+        self.inner.hosts.lock().await.status()
+    }
+    pub(crate) async fn panel_hosts_action(
+        &self,
+        action: &str,
+        params: Value,
+    ) -> Result<String, &'static str> {
+        self.inner.hosts.lock().await.action(action, params).await
+    }
     async fn record(&self, category: &str, action: &str, result: &str, reason: &str, task: &str) {
         self.inner
             .activity
@@ -469,6 +480,7 @@ impl App {
                 neighbor: Mutex::new(neighbor),
                 identity: crate::identity::Identity::new(&data_dir),
                 efs: crate::efs::Efs::new(&data_dir),
+                hosts: Mutex::new(crate::hosts::Manager::new(&data_dir)),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -1461,9 +1473,12 @@ async fn usb_status(State(app): State<App>) -> Json<Value> {
 }
 fn capability_controls() -> Vec<&'static str> {
     if crate::u50_ctl::get().is_some() {
-        return crate::u50_ctl::CONTROLS.to_vec();
+        let mut controls = crate::u50_ctl::CONTROLS.to_vec();
+        controls.extend_from_slice(&["hosts.status", "hosts.save", "hosts.restore"]);
+        return controls;
     }
     let mut controls = vec![
+        "hosts.status",
         "device.login_info",
         "device.login",
         "device.logout",
@@ -1870,6 +1885,7 @@ async fn ubus_call(Json(req): Json<UbusCall>) -> Response {
 async fn control(
     State(app): State<App>,
     method: Method,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let _ = method;
@@ -1937,6 +1953,36 @@ async fn control(
                 control_failed(action, "neighbor action unavailable".into())
             }
         };
+    }
+    if action.starts_with("hosts.") {
+        if !webshell_auth(&app, &headers, false).await {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if action == "hosts.status" {
+            if body
+                .get("params")
+                .is_some_and(|v| !v.as_object().is_some_and(Map::is_empty))
+            {
+                return invalid_parameter(action, "hosts.status accepts no parameters");
+            }
+            return control_ok(action, app.panel_hosts_status().await);
+        }
+        if matches!(action, "hosts.save" | "hosts.restore") {
+            if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
+                return invalid_parameter(action, "hosts writes require confirmed=true");
+            }
+            return match app
+                .panel_hosts_action(action, body.get("params").cloned().unwrap_or(json!({})))
+                .await
+            {
+                Ok(revision) => control_ok(action, json!({"revision":revision})),
+                Err(code) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok":false,"action":action,"error":{"code":code}})),
+                )
+                    .into_response(),
+            };
+        }
     }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
@@ -3203,8 +3249,11 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 90);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 90);
+        assert_eq!(controls.len(), 93);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 93);
+        for action in ["hosts.status", "hosts.save", "hosts.restore"] {
+            assert!(controls.contains(&action));
+        }
     }
 
     #[test]

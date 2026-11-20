@@ -259,13 +259,14 @@ import json, sys
 d = json.load(sys.stdin)
 controls = d["controls"]
 assert d["control"] == controls
-assert len(controls) == 90, ("unexpected control count", len(controls))
+assert len(controls) == 93, ("unexpected control count", len(controls))
 assert len(set(controls)) == len(controls), "duplicate control names"
 required = {
     "sms.forward.set", "sms.forward.test", "schedule.task.put", "schedule.task.remove",
     "cloud.remote_features.set", "schedule.reboot.set", "speedtest.start", "speedtest.stop",
     "network.set_mode", "sms.send_raw",
     "signal.stream.start", "signal.stream.stop", "signal.stream.status",
+    "hosts.status", "hosts.save", "hosts.restore",
 }
 assert required <= set(controls), ("missing controls", sorted(required - set(controls)))
 assert d["discovery"] == ["ubus.list", "ubus.list_verbose"]

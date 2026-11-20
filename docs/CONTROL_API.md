@@ -36,6 +36,14 @@ Content-Type: application/json
 
 UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
+## Hosts
+
+`hosts.status` 按需读取 `/etc/hosts`、SHA-256 版本与备份状态；`hosts.save`
+接受 `content` 和 `expected_revision`，`hosts.restore` 接受 `expected_revision`。
+写操作必须在请求顶层提供 `confirmed:true`，最多 4096 字节 UTF-8，不接受自定义路径。
+三项操作在 9460/9461 都要求 Bearer 鉴权。U50 写入时临时打开根分区并恢复原挂载状态。
+详见 [HOSTS_CONTROL.md](HOSTS_CONTROL.md)。
+
 ## U50 官方后台避让（0.10.71）
 
 仅在 `/capabilities.controls` 同时包含以下动作时显示入口。沿用 `/control` 的鉴权，不需要 OEM 会话，也不会修改 datad/App 登录状态。

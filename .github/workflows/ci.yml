@@ -87,6 +87,7 @@ jobs:
       - run: python3 ../tests/tasks_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/lan_history_app_test.py target/debug/zwrt-datad
       - run: python3 ../tests/automation_app_test.py target/debug/zwrt-datad
+      - run: python3 ../tests/hosts_api_test.py target/debug/zwrt-datad
       - run: python3 ../tests/neighbor_http_test.py target/debug/zwrt-datad
       - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
       - run: python3 ../tests/wifi_control_test.py target/debug/zwrt-datad
