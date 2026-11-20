@@ -401,12 +401,12 @@ try:
         go('ota', 'datad 更新')
         expect(page.get_by_label('空闲时自动更新', exact=True)).to_be_enabled()
         ota['automatic_updates_allowed'] = False
-        go('device', '设备信息')
-        go('ota', 'datad 更新')
+        with page.expect_response(lambda response: response.url.endswith('/ota/app') and response.request.method == 'GET'):
+            page.get_by_role('button', name='刷新', exact=True).click()
         expect(page.get_by_label('空闲时自动更新', exact=True)).to_be_disabled()
         del ota['automatic_updates_allowed']
-        go('device', '设备信息')
-        go('ota', 'datad 更新')
+        with page.expect_response(lambda response: response.url.endswith('/ota/app') and response.request.method == 'GET'):
+            page.get_by_role('button', name='刷新', exact=True).click()
         expect(page.get_by_label('空闲时自动更新', exact=True)).to_be_enabled()
         page.get_by_role('button', name='检查更新', exact=True).click()
         page.get_by_text('Fixture release', exact=True).first.wait_for()
