@@ -1505,6 +1505,13 @@ async fn signal_stream(State(app): State<App>, headers: HeaderMap) -> Response {
     // Startup/materialization are synchronous and must not block Tokio workers.
     match tokio::task::spawn_blocking(crate::u50_signal::stream_start).await {
         Ok(Ok(_)) => {}
+        Ok(Err(reason)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("signal streamer unavailable: {reason}"),
+            )
+                .into_response();
+        }
         _ => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,

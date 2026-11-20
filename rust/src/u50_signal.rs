@@ -13,7 +13,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,6 +44,8 @@ struct Supervisor {
 
 static RUN: OnceLock<Mutex<Supervisor>> = OnceLock::new();
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static HEARTBEAT_STARTED: OnceLock<()> = OnceLock::new();
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Enable the collector for this process (U50 runtime `--u50-signaling`).
 pub fn enable() {
@@ -65,6 +70,21 @@ pub fn configure(data_dir: &Path) {
     if run.data_dir != data_dir {
         run.data_dir = data_dir.to_path_buf();
     }
+    // OEM state collection can take tens of seconds (e.g. web-login contention).
+    // Its cadence must not determine whether a healthy DIAG process survives.
+    HEARTBEAT_STARTED.get_or_init(|| {
+        let heartbeat = data_dir.join(HEARTBEAT_NAME);
+        let stream_status = data_dir.join(STREAM_STATUS_NAME);
+        std::thread::spawn(move || {
+            while !SHUTTING_DOWN.load(Ordering::Relaxed) {
+                touch_heartbeat(&heartbeat);
+                if let Ok(mut stream) = stream_supervisor().try_lock() {
+                    check_stream_health(&mut stream, &stream_status);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    });
 }
 
 /// The `signaling` state block; refreshed on every state sample.
@@ -157,7 +177,15 @@ fn ensure_running(run: &mut Supervisor, worker: &Path, status: &Path, heartbeat:
     if let Some(child) = run.child.as_mut()
         && child.try_wait().map(|w| w.is_none()).unwrap_or(false)
     {
-        return; // still alive
+        let uptime = run.last_spawn.map(|at| at.elapsed()).unwrap_or_default();
+        if uptime < Duration::from_secs(10) || read_status(status, SystemTime::now()).is_some() {
+            if uptime >= RESPAWN_MAX {
+                run.backoff = RESPAWN_MIN;
+            }
+            return;
+        }
+        // A hung library can leave the PID alive but stop writing status.
+        terminate_child(child);
     }
     let exited = run.child.is_some();
     run.child = None;
@@ -191,10 +219,15 @@ fn ensure_running(run: &mut Supervisor, worker: &Path, status: &Path, heartbeat:
 }
 
 fn touch_heartbeat(path: &Path) {
-    if let Ok(mut f) = fs::File::options().create(true).append(true).open(path) {
+    if let Ok(mut f) = fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
         let _ = f.write_all(b"h");
     }
-    // mtime is what the worker checks; append updates it
+    // mtime is what the worker checks; keep the file bounded to one byte.
 }
 
 /// Read and age-check the status file; keeps the worker's bounded fields.
@@ -281,16 +314,12 @@ fn bounded(value: &Value, depth: usize) -> Value {
 /// Stop the worker when the daemon shuts down: SIGTERM first so it can
 /// deregister its DCI client cleanly, then reap.
 pub fn shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
     stream_stop().ok();
     if let Ok(mut run) = supervisor().lock()
         && let Some(mut child) = run.child.take()
     {
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child(&mut child);
     }
 }
 
@@ -302,6 +331,7 @@ pub fn shutdown() {
 
 const STREAMER_NAME: &str = "diag-streamer";
 const STREAM_STATUS_NAME: &str = "diag-stream-status.json";
+const STREAM_START_TIMEOUT: Duration = Duration::from_secs(8);
 /// Internal loopback transport. Never expose this unauthenticated port to LAN.
 pub const STREAM_PORT: u16 = 9483;
 
@@ -349,6 +379,69 @@ fn stream_child_alive(srun: &mut StreamSupervisor) -> bool {
         .is_some_and(|c| c.try_wait().map(|w| w.is_none()).unwrap_or(false))
 }
 
+fn terminate_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    for _ in 0..10 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn ready_stream_status(path: &Path, pid: u32) -> bool {
+    read_status_keep(path, SystemTime::now(), STREAM_KEEP).is_some_and(|s| {
+        s.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
+            && matches!(
+                s.get("state").and_then(Value::as_str),
+                Some("running" | "retrying")
+            )
+    })
+}
+
+// A stuck native library can retain open TCP connections forever. Reap it so
+// the authenticated HTTP stream ends and the App's reconnect starts a fresh
+// worker. Never restart for an absence of radio packets alone.
+fn check_stream_health(run: &mut StreamSupervisor, status: &Path) {
+    if run
+        .started_at
+        .is_some_and(|at| at.elapsed() > Duration::from_secs(10))
+        && let Some(child) = run.child.as_mut()
+        && !ready_stream_status(status, child.id())
+    {
+        terminate_child(child);
+        run.child = None;
+        run.started_at = None;
+    }
+}
+
+fn wait_stream_ready(child: &mut Child, status: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            let reason = read_status_keep(status, SystemTime::now(), STREAM_KEEP)
+                .and_then(|s| s.get("reason").and_then(Value::as_str).map(str::to_owned))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "worker_exited".into());
+            return Err(reason);
+        }
+        if ready_stream_status(status, child.id()) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("worker_start_timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Current streamer state; shares the supervisor heartbeat so the child can
 /// detect daemon death, and reads its bounded status JSON when running.
 pub fn stream_status() -> Value {
@@ -372,7 +465,14 @@ pub fn stream_status() -> Value {
                     .started_at
                     .and_then(|at| at.elapsed().as_secs().try_into().ok())
                     .unwrap_or(0);
-                out.insert("running".into(), json!(true));
+                let ready = srun
+                    .child
+                    .as_ref()
+                    .is_some_and(|c| ready_stream_status(&status, c.id()));
+                out.insert("running".into(), json!(ready));
+                if !ready {
+                    out.insert("reason".into(), json!("worker_not_ready"));
+                }
                 out.insert("uptime".into(), json!(uptime));
                 if let Some(status) = read_status_keep(&status, SystemTime::now(), STREAM_KEEP) {
                     for (key, value) in status {
@@ -383,10 +483,12 @@ pub fn stream_status() -> Value {
                 srun.child = None;
                 out.insert("running".into(), json!(false));
                 // A stale status file still explains the last run's outcome.
-                if let Some(status) = read_status_keep(&status, SystemTime::now(), STREAM_KEEP)
-                    && let Some(state) = status.get("state")
-                {
-                    out.insert("last_state".into(), state.clone());
+                if let Some(status) = read_status_keep(&status, SystemTime::now(), STREAM_KEEP) {
+                    for key in ["state", "reason"] {
+                        if let Some(value) = status.get(key) {
+                            out.insert(key.into(), value.clone());
+                        }
+                    }
                 }
             }
             let _ = worker; // materialized lazily on start
@@ -403,16 +505,26 @@ pub fn stream_start() -> Result<Value, String> {
     };
     let (worker, status, heartbeat) = stream_paths(&run).map_err(String::from)?;
     let blob = streamer_blob().expect("checked in stream_paths");
-    materialize_worker(&worker, blob).map_err(String::from)?;
     let mut srun = stream_supervisor()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if stream_child_alive(&mut srun) {
+    if stream_child_alive(&mut srun)
+        && srun
+            .child
+            .as_ref()
+            .is_some_and(|c| ready_stream_status(&status, c.id()))
+    {
         return Ok(
             json!({"started": true, "already": true, "path":"/signal/stream", "auth_required":true}),
         );
     }
+    if let Some(child) = srun.child.as_mut() {
+        terminate_child(child);
+    }
     srun.child = None;
+    materialize_worker(&worker, blob).map_err(String::from)?;
+    let _ = fs::remove_file(&status);
+    touch_heartbeat(&heartbeat);
     match Command::new(&worker)
         .arg(&status)
         .arg(&heartbeat)
@@ -424,7 +536,11 @@ pub fn stream_start() -> Result<Value, String> {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
+            if let Err(reason) = wait_stream_ready(&mut child, &status, STREAM_START_TIMEOUT) {
+                terminate_child(&mut child);
+                return Err(reason);
+            }
             srun.started_at = Some(std::time::Instant::now());
             srun.child = Some(child);
             touch_heartbeat(&heartbeat);
@@ -443,12 +559,7 @@ pub fn stream_stop() -> Result<Value, String> {
         srun.started_at = None;
         return Ok(json!({"stopped": true, "already": true}));
     };
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    let _ = child.kill();
-    let _ = child.wait();
+    terminate_child(&mut child);
     srun.started_at = None;
     Ok(json!({"stopped": true}))
 }
@@ -456,6 +567,102 @@ pub fn stream_stop() -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_is_bounded_and_fresh() {
+        let dir = std::env::temp_dir().join(format!("sig-heartbeat-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+        fs::write(&path, vec![b'h'; 10000]).unwrap();
+        for _ in 0..20 {
+            touch_heartbeat(&path);
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"h");
+        assert!(
+            fs::metadata(&path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap()
+                < Duration::from_secs(2)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_start_requires_matching_ready_pid_and_bounds_hangs() {
+        let dir = std::env::temp_dir().join(format!("sig-ready-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let status = dir.join("status");
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let write = |pid, state| {
+            fs::write(
+                &status,
+                json!({"pid":pid,"ts":ts,"state":state}).to_string(),
+            )
+            .unwrap()
+        };
+        write(child.id() + 1, "running");
+        assert!(!ready_stream_status(&status, child.id()));
+        write(child.id(), "starting");
+        assert_eq!(
+            wait_stream_ready(&mut child, &status, Duration::from_millis(100)).unwrap_err(),
+            "worker_start_timeout"
+        );
+        write(child.id(), "running");
+        assert!(wait_stream_ready(&mut child, &status, Duration::from_millis(100)).is_ok());
+        terminate_child(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
+        fs::write(
+            &status,
+            json!({"pid":child.id(),"ts":ts,"state":"error","reason":"dci_register_failed"})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_stream_ready(&mut child, &status, Duration::from_millis(100)).unwrap_err(),
+            "dci_register_failed"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_reaps_stalled_stream_but_keeps_idle_healthy_stream() {
+        let dir = std::env::temp_dir().join(format!("sig-watchdog-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let status = dir.join("status");
+        let child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut run = StreamSupervisor {
+            child: Some(child),
+            started_at: Some(std::time::Instant::now() - Duration::from_secs(20)),
+        };
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fs::write(
+            &status,
+            json!({"pid":run.child.as_ref().unwrap().id(),"ts":ts,"state":"running","total":0})
+                .to_string(),
+        )
+        .unwrap();
+        check_stream_health(&mut run, &status);
+        assert!(
+            stream_child_alive(&mut run),
+            "no packets is not an unhealthy worker"
+        );
+        fs::remove_file(&status).unwrap();
+        check_stream_health(&mut run, &status);
+        assert!(run.child.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn write_status_file(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join(STATUS_NAME);

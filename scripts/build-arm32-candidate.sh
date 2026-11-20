@@ -34,7 +34,7 @@ file "$ROOT/build/u50-diag-worker" | grep -q "ELF 32-bit.*ARM"
 export DATAD_DIAG_WORKER="$ROOT/build/u50-diag-worker"
 
 # Signaling streamer: same embed scheme; adds the loopback TCP fan-out.
-"$ROOT/build/arm32-toolchain/cc-glibc" -Os -Wl,--strip-all -fno-stack-protector -o "$ROOT/build/u50-diag-streamer" "$ROOT/rust/u50_diag_streamer.c" -ldl
+"$ROOT/build/arm32-toolchain/cc-glibc" -Os -Wl,--strip-all -fno-stack-protector -o "$ROOT/build/u50-diag-streamer" "$ROOT/rust/u50_diag_streamer.c" -ldl -pthread
 file "$ROOT/build/u50-diag-streamer" | grep -q "ELF 32-bit.*ARM"
 export DATAD_DIAG_STREAMER="$ROOT/build/u50-diag-streamer"
 
