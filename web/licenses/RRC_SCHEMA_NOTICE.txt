@@ -1,0 +1,10 @@
+RrcSchemaData.kt contains constraint data exported from the generated RRCLTE and
+RRCNR modules distributed in pycrate 0.8.1 (LGPL v2.1 or later).
+Upstream: https://github.com/P1sec/pycrate
+The exported graph is reproducible using build_rrc_schema.py in the signal test
+source directory. Its input corpus and graph hashes are recorded in
+app/src/test/resources/rrc-pycrate/manifest.json. The Android runtime does not
+include the Python interpreter or pycrate runtime code. RrcUperDecoder.kt is an
+independent Kotlin implementation tested against pycrate-produced JSON.
+The upstream license text is reproduced in RRC_SCHEMA_LICENSE.txt alongside this
+notice. Protocol definitions originate from 3GPP TS 36.331 / TS 38.331.

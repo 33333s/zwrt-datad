@@ -102,6 +102,8 @@ SUCCESS: session 表示本次开机有效，重启后执行 sh /cache/zwrt-datad
 
 App：ZWRT 模式，设备局域网 IP（通常 192.168.0.1），端口 9461，admin + 原厂后台密码。
 """
+    if "web-ui" in provenance.get("features", []):
+        readme += "\n本包内置网页版，安装后访问 http://设备IP:9461/ui/，使用设备管理账号密码登录。\n网页默认开启；需要禁用时在服务启动参数中加入 --disable-web-ui。原 API 接口继续可用。\n"
     (args.output / "使用说明.txt").write_bytes(readme.encode("utf-8"))
     print(f"Packaged {version} ({digest}) into {args.output}")
 

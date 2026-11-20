@@ -800,7 +800,12 @@ impl App {
         addr: SocketAddr,
         require_auth: bool,
         open_auth_routes: bool,
+        web_ui: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !web_ui || (require_auth && open_auth_routes),
+            "Web UI requires an authenticated listener with login routes; use --lan-bind"
+        );
         let mut router = Router::new()
             .route("/", get(index))
             .route("/healthz", get(health))
@@ -930,6 +935,12 @@ impl App {
         }
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
+        }
+        // Only the fixed public application shell is outside API authentication.
+        // Data, modem operations and long-lived streams retain their existing guards.
+        #[cfg(feature = "web-ui")]
+        if web_ui {
+            router = router.merge(crate::web_ui::routes());
         }
         if open_auth_routes {
             // Outside `authenticate` so a browser preflight (which carries no

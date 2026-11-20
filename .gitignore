@@ -2,6 +2,8 @@
 /zwrt-datad-aarch64
 /build/
 /rust/target/
+/web/node_modules/
+/web/dist/
 __pycache__/
 *.py[cod]
 

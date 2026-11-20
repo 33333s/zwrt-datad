@@ -9,6 +9,37 @@ permissions:
   contents: read
 
 jobs:
+  web-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy,rustfmt
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: node --test tests/web_unit_test.mjs tests/web_app_ports_test.mjs tests/web_signal_state_test.mjs tests/web_toast_test.mjs tests/web_login_test.mjs
+      - run: cargo test --manifest-path rust/Cargo.toml --locked --features web-ui
+      - run: cargo build --manifest-path rust/Cargo.toml --locked --features web-ui
+      - run: cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets --features web-ui -- -D warnings
+      - run: python3 tests/web_ui_http_test.py rust/target/debug/zwrt-datad
+      - name: Browser regression with mock API
+        run: |
+          python3 -m venv "$RUNNER_TEMP/web-browser-env"
+          "$RUNNER_TEMP/web-browser-env/bin/pip" install playwright
+          "$RUNNER_TEMP/web-browser-env/bin/playwright" install --with-deps chromium
+          "$RUNNER_TEMP/web-browser-env/bin/python" tests/web_browser_test.py
+          "$RUNNER_TEMP/web-browser-env/bin/python" tests/web_app_browser_test.py
   u50get-build:
     runs-on: ubuntu-latest
     timeout-minutes: 5

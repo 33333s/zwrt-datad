@@ -39,6 +39,8 @@ mod u50_root;
 mod u50_signal;
 mod u50_sys;
 mod usb;
+#[cfg(feature = "web-ui")]
+mod web_ui;
 mod webshell;
 mod wifi;
 
@@ -102,6 +104,9 @@ struct Args {
     neighbor: bool,
     #[arg(long)]
     webshell: bool,
+    /// Disable the bundled Web interface on the authenticated LAN listener.
+    #[arg(long)]
+    disable_web_ui: bool,
     #[arg(long)]
     auth_token_file: Option<PathBuf>,
     #[arg(long)]
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
         }
     }
     let args = Args::parse();
+    let web_ui = cfg!(feature = "web-ui") && !args.disable_web_ui;
     anyhow::ensure!(
         args.u50_model.is_some()
             || (args.u50_enroll_dir.is_none()
@@ -177,6 +183,7 @@ async fn main() -> Result<()> {
             args.once,
             Duration::from_millis(args.interval.clamp(500, 5000)),
             u50::RunOptions {
+                web_ui: web_ui && !args.u50_loopback_only,
                 enable_webshell: args.u50_enable_webshell,
                 signaling: args.u50_signaling,
                 lan_addr: if args.u50_loopback_only {
@@ -272,18 +279,29 @@ async fn main() -> Result<()> {
     if let Some(lan_bind) = args.lan_bind {
         let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
         tokio::try_join!(
-            app.clone().serve(addr, false, false),
-            app.serve(lan_addr, true, true)
+            app.clone().serve(addr, false, false, false),
+            app.serve(lan_addr, true, true, web_ui)
         )?;
         Ok(())
     } else {
-        app.serve(addr, local_requires_auth, false).await
+        app.serve(addr, local_requires_auth, false, false).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_interface_is_opt_out_without_changing_listener_options() {
+        let defaults = Args::try_parse_from(["zwrt-datad"]).unwrap();
+        assert!(!defaults.disable_web_ui);
+        assert!(defaults.lan_bind.is_none());
+        let disabled = Args::try_parse_from(["zwrt-datad", "--disable-web-ui"]).unwrap();
+        assert!(disabled.disable_web_ui);
+        assert!(disabled.lan_bind.is_none());
+        assert!(Args::try_parse_from(["zwrt-datad", "--web-ui"]).is_err());
+    }
 
     #[test]
     fn refuses_unauthenticated_non_loopback_listener() {
